@@ -1,6 +1,7 @@
 pub mod api;
 pub mod crypto;
 pub mod manifest;
+pub mod netlock;
 pub mod server;
 
 use clap::{Parser, Subcommand};

@@ -1,0 +1,789 @@
+//! Network lock (nftables kill switch) — prevents IP leaks when VPN is down.
+//!
+//! Uses a dedicated `table inet airvpn_lock` at priority -300 instead of
+//! Eddie's `flush ruleset` approach. Eddie uses flush-ruleset for iptables
+//! cross-compatibility; we are nftables-only. The rule contents and ordering
+//! are 1:1 with Eddie's NetworkLockNftables.cs.
+//!
+//! Security model: nftables `drop` is terminal across all tables. A packet
+//! must be `accept`ed by ALL chains at the same hook to proceed. Our chains
+//! at priority -300 run before everything else and default to `drop`.
+//!
+//! Reference: Eddie src/Lib.Platform.Linux/NetworkLockNftables.cs
+
+use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
+use std::io::Write;
+use std::net::IpAddr;
+use std::process::Command;
+
+const TABLE_NAME: &str = "airvpn_lock";
+const PRIORITY: i32 = -300;
+
+/// Configuration for the network lock.
+pub struct NetlockConfig {
+    pub allow_lan: bool,
+    pub allow_dhcp: bool,
+    pub allow_ping: bool,
+    pub allowed_ips: Vec<String>,
+}
+
+/// Compute SHA-256 hex digest of a string (matching Eddie's Crypto.Manager.HashSHA256).
+fn sha256_hex(input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    let result = hasher.finalize();
+    hex::encode(result)
+}
+
+/// Classify an IP/CIDR string as v4 or v6.
+fn classify_ip(ip_str: &str) -> Option<IpVersion> {
+    // Strip CIDR prefix if present
+    let addr_part = ip_str.split('/').next()?;
+    let addr: IpAddr = addr_part.parse().ok()?;
+    match addr {
+        IpAddr::V4(_) => Some(IpVersion::V4),
+        IpAddr::V6(_) => Some(IpVersion::V6),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum IpVersion {
+    V4,
+    V6,
+}
+
+/// Ensure an IP string has a CIDR suffix. If none, appends /32 (v4) or /128 (v6).
+fn ensure_cidr(ip_str: &str) -> String {
+    if ip_str.contains('/') {
+        return ip_str.to_string();
+    }
+    match classify_ip(ip_str) {
+        Some(IpVersion::V4) => format!("{}/32", ip_str),
+        Some(IpVersion::V6) => format!("{}/128", ip_str),
+        None => ip_str.to_string(),
+    }
+}
+
+/// Generate the full nftables ruleset as a string (for writing to tmpfile + nft -f).
+///
+/// Rule ordering matches Eddie's NetworkLockNftables.cs Activation() exactly,
+/// adapted from separate ip/ip6 tables to a single inet table.
+pub fn generate_ruleset(config: &NetlockConfig) -> String {
+    let mut r = String::new();
+
+    // Table definition
+    r.push_str(&format!("table inet {} {{\n", TABLE_NAME));
+
+    // =========================================================================
+    // INPUT chain
+    // =========================================================================
+    r.push_str(&format!(
+        "  chain input {{\n    type filter hook input priority {}; policy drop;\n",
+        PRIORITY
+    ));
+
+    // 1. Loopback accept (Eddie: ip filter INPUT iifname "lo" + ip6 filter INPUT iifname "lo")
+    r.push_str("    iifname \"lo\" counter accept\n");
+
+    // 2. IPv6 anti-spoof: reject ::1 not from lo
+    //    (Eddie: ip6 filter INPUT iifname != "lo" ip6 saddr ::1 counter reject)
+    r.push_str("    iifname != \"lo\" ip6 saddr ::1 counter reject\n");
+
+    // 3. DHCP rules
+    if config.allow_dhcp {
+        // Eddie: ip filter INPUT ip saddr 255.255.255.255 counter accept
+        r.push_str("    ip saddr 255.255.255.255 counter accept\n");
+        // Eddie: ip6 filter INPUT ip6 saddr ff02::1:2 counter accept
+        r.push_str("    ip6 saddr ff02::1:2 counter accept\n");
+        // Eddie: ip6 filter INPUT ip6 saddr ff05::1:3 counter accept
+        r.push_str("    ip6 saddr ff05::1:3 counter accept\n");
+    }
+
+    // 4. LAN rules (Eddie: netlock.allow_private)
+    if config.allow_lan {
+        // IPv4 RFC1918 bidirectional
+        r.push_str("    ip saddr 192.168.0.0/16 ip daddr 192.168.0.0/16 counter accept\n");
+        r.push_str("    ip saddr 10.0.0.0/8 ip daddr 10.0.0.0/8 counter accept\n");
+        r.push_str("    ip saddr 172.16.0.0/12 ip daddr 172.16.0.0/12 counter accept\n");
+
+        // IPv6 link-local, multicast, ULA
+        r.push_str("    ip6 saddr fe80::/10 ip6 daddr fe80::/10 counter accept\n");
+        r.push_str("    ip6 saddr ff00::/8 ip6 daddr ff00::/8 counter accept\n");
+        r.push_str("    ip6 saddr fc00::/7 ip6 daddr fc00::/7 counter accept\n");
+    }
+
+    // 5. ICMP/ICMPv6 (Eddie: netlock.allow_ping)
+    if config.allow_ping {
+        // Eddie: ip filter INPUT icmp type echo-request counter accept
+        r.push_str("    icmp type echo-request counter accept\n");
+        // Eddie: ip6 filter INPUT meta l4proto ipv6-icmp counter accept
+        r.push_str("    meta l4proto ipv6-icmp counter accept\n");
+    }
+
+    // 6. IPv6 RH0 drop — disable processing of routing header type 0 (ping-pong attack)
+    //    (Eddie: ip6 filter INPUT rt type 0 counter drop)
+    r.push_str("    ip6 nexthdr routing rt type 0 counter drop\n");
+
+    // 7. IPv6 NDP — required for IPv6 address allocation (hoplimit 255)
+    //    (Eddie: 4 separate rules for router-advert, neighbor-solicit, neighbor-advert, redirect)
+    r.push_str(
+        "    meta l4proto ipv6-icmp icmpv6 type nd-router-advert ip6 hoplimit 255 counter accept\n",
+    );
+    r.push_str(
+        "    meta l4proto ipv6-icmp icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 counter accept\n",
+    );
+    r.push_str(
+        "    meta l4proto ipv6-icmp icmpv6 type nd-neighbor-advert ip6 hoplimit 255 counter accept\n",
+    );
+    r.push_str(
+        "    meta l4proto ipv6-icmp icmpv6 type nd-redirect ip6 hoplimit 255 counter accept\n",
+    );
+
+    // 8. Conntrack: allow established/related
+    //    (Eddie: ip filter INPUT ct state related,established + ip6 filter INPUT ct state related,established)
+    r.push_str("    ct state related,established counter accept\n");
+
+    // 9. Per-IP allowlist incoming
+    for ip_str in &config.allowed_ips {
+        let cidr = ensure_cidr(ip_str);
+        match classify_ip(&cidr) {
+            Some(IpVersion::V4) => {
+                let comment =
+                    format!("airvpn_ip_{}", sha256_hex(&format!("ipv4_in_{}_1", cidr)));
+                r.push_str(&format!(
+                    "    ip saddr {} counter accept comment \"{}\"\n",
+                    cidr, comment
+                ));
+            }
+            Some(IpVersion::V6) => {
+                let comment =
+                    format!("airvpn_ip_{}", sha256_hex(&format!("ipv6_in_{}_1", cidr)));
+                r.push_str(&format!(
+                    "    ip6 saddr {} counter accept comment \"{}\"\n",
+                    cidr, comment
+                ));
+            }
+            None => {}
+        }
+    }
+
+    // 10. Final drop (redundant with policy, but provides a handle for rule insertion)
+    //     (Eddie: "eddie_ip_filter_INPUT_latest_rule" / "eddie_ip6_filter_INPUT_latest_rule")
+    r.push_str("    counter drop comment \"airvpn_filter_input_latest_rule\"\n");
+
+    r.push_str("  }\n\n");
+
+    // =========================================================================
+    // FORWARD chain
+    // =========================================================================
+    r.push_str(&format!(
+        "  chain forward {{\n    type filter hook forward priority {}; policy drop;\n",
+        PRIORITY
+    ));
+
+    // 1. IPv6 RH0 drop
+    r.push_str("    ip6 nexthdr routing rt type 0 counter drop\n");
+
+    // Final drop (handle for interface insertion)
+    r.push_str("    counter drop comment \"airvpn_filter_forward_latest_rule\"\n");
+
+    r.push_str("  }\n\n");
+
+    // =========================================================================
+    // OUTPUT chain
+    // =========================================================================
+    r.push_str(&format!(
+        "  chain output {{\n    type filter hook output priority {}; policy drop;\n",
+        PRIORITY
+    ));
+
+    // 1. Loopback accept
+    r.push_str("    oifname \"lo\" counter accept\n");
+
+    // 2. IPv6 RH0 drop (Eddie puts this before DHCP/LAN in output)
+    r.push_str("    ip6 nexthdr routing rt type 0 counter drop\n");
+
+    // 3. DHCP rules
+    if config.allow_dhcp {
+        // Eddie: ip filter OUTPUT ip daddr 255.255.255.255 counter accept
+        r.push_str("    ip daddr 255.255.255.255 counter accept\n");
+        // Eddie: ip6 filter OUTPUT ip6 daddr ff02::1:2 counter accept
+        r.push_str("    ip6 daddr ff02::1:2 counter accept\n");
+        // Eddie: ip6 filter OUTPUT ip6 daddr ff05::1:3 counter accept
+        r.push_str("    ip6 daddr ff05::1:3 counter accept\n");
+    }
+
+    // 4. LAN rules (Eddie: netlock.allow_private)
+    if config.allow_lan {
+        // IPv4 RFC1918 bidirectional (same as input)
+        r.push_str("    ip saddr 192.168.0.0/16 ip daddr 192.168.0.0/16 counter accept\n");
+        r.push_str("    ip saddr 10.0.0.0/8 ip daddr 10.0.0.0/8 counter accept\n");
+        r.push_str("    ip saddr 172.16.0.0/12 ip daddr 172.16.0.0/12 counter accept\n");
+
+        // IPv4 multicast (output only — Eddie has these in output but not input)
+        r.push_str("    ip saddr 192.168.0.0/16 ip daddr 224.0.0.0/24 counter accept\n");
+        r.push_str("    ip saddr 10.0.0.0/8 ip daddr 224.0.0.0/24 counter accept\n");
+        r.push_str("    ip saddr 172.16.0.0/12 ip daddr 224.0.0.0/24 counter accept\n");
+
+        // SSDP (Simple Service Discovery Protocol)
+        r.push_str("    ip saddr 192.168.0.0/16 ip daddr 239.255.255.250 counter accept\n");
+        r.push_str("    ip saddr 10.0.0.0/8 ip daddr 239.255.255.250 counter accept\n");
+        r.push_str("    ip saddr 172.16.0.0/12 ip daddr 239.255.255.250 counter accept\n");
+
+        // SLPv2 (Service Location Protocol version 2)
+        r.push_str("    ip saddr 192.168.0.0/16 ip daddr 239.255.255.253 counter accept\n");
+        r.push_str("    ip saddr 10.0.0.0/8 ip daddr 239.255.255.253 counter accept\n");
+        r.push_str("    ip saddr 172.16.0.0/12 ip daddr 239.255.255.253 counter accept\n");
+
+        // IPv6 link-local, multicast, ULA
+        r.push_str("    ip6 saddr fe80::/10 ip6 daddr fe80::/10 counter accept\n");
+        r.push_str("    ip6 saddr ff00::/8 ip6 daddr ff00::/8 counter accept\n");
+        r.push_str("    ip6 saddr fc00::/7 ip6 daddr fc00::/7 counter accept\n");
+    }
+
+    // 5. ICMP/ICMPv6 (Eddie: netlock.allow_ping)
+    if config.allow_ping {
+        // Eddie: ip filter OUTPUT icmp type echo-reply counter accept
+        r.push_str("    icmp type echo-reply counter accept\n");
+        // Eddie: ip6 filter OUTPUT meta l4proto ipv6-icmp counter accept
+        r.push_str("    meta l4proto ipv6-icmp counter accept\n");
+    }
+
+    // 6. Conntrack: allow established/related (output)
+    //    (Eddie: ip filter OUTPUT ct state related,established + ip6 filter OUTPUT ct state related,established)
+    r.push_str("    ct state related,established counter accept\n");
+
+    // 7. Per-IP allowlist outgoing
+    for ip_str in &config.allowed_ips {
+        let cidr = ensure_cidr(ip_str);
+        match classify_ip(&cidr) {
+            Some(IpVersion::V4) => {
+                let comment =
+                    format!("airvpn_ip_{}", sha256_hex(&format!("ipv4_out_{}_1", cidr)));
+                r.push_str(&format!(
+                    "    ip daddr {} counter accept comment \"{}\"\n",
+                    cidr, comment
+                ));
+            }
+            Some(IpVersion::V6) => {
+                let comment =
+                    format!("airvpn_ip_{}", sha256_hex(&format!("ipv6_out_{}_1", cidr)));
+                r.push_str(&format!(
+                    "    ip6 daddr {} counter accept comment \"{}\"\n",
+                    cidr, comment
+                ));
+            }
+            None => {}
+        }
+    }
+
+    // 8. Final drop (handle for rule insertion)
+    r.push_str("    counter drop comment \"airvpn_filter_output_latest_rule\"\n");
+
+    r.push_str("  }\n");
+    r.push_str("}\n");
+
+    r
+}
+
+/// Activate the network lock: write ruleset to tmpfile and load via `nft -f`.
+pub fn activate(config: &NetlockConfig) -> Result<()> {
+    let ruleset = generate_ruleset(config);
+
+    // Write to a temporary file
+    let mut tmpfile =
+        tempfile::NamedTempFile::new().context("failed to create temporary nftables file")?;
+    tmpfile
+        .write_all(ruleset.as_bytes())
+        .context("failed to write nftables ruleset to tmpfile")?;
+    tmpfile
+        .flush()
+        .context("failed to flush nftables tmpfile")?;
+
+    let output = Command::new("nft")
+        .arg("-f")
+        .arg(tmpfile.path())
+        .output()
+        .context("failed to execute nft")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("nft -f failed: {}", stderr);
+    }
+
+    Ok(())
+}
+
+/// Deactivate the network lock: delete our dedicated table.
+pub fn deactivate() -> Result<()> {
+    let output = Command::new("nft")
+        .args(["delete", "table", "inet", TABLE_NAME])
+        .output()
+        .context("failed to execute nft delete table")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("nft delete table failed: {}", stderr);
+    }
+
+    Ok(())
+}
+
+/// Check if our nftables table exists.
+pub fn is_active() -> bool {
+    let output = Command::new("nft")
+        .args(["list", "table", "inet", TABLE_NAME])
+        .output();
+
+    match output {
+        Ok(o) => o.status.success(),
+        Err(_) => false,
+    }
+}
+
+/// Allow VPN interface traffic (called when tunnel comes up).
+///
+/// Inserts accept rules for the interface into input, forward, and output chains,
+/// positioned before the final drop rule (matching Eddie's handle-based insertion).
+///
+/// Eddie equivalent: netlock-nftables-interface action=add
+pub fn allow_interface(iface: &str) -> Result<()> {
+    // Input: iifname "<iface>" accept
+    nft_insert_before_latest(
+        "input",
+        &format!(
+            "iifname \"{}\" counter accept comment \"airvpn_interface_input_{}\"",
+            iface, iface
+        ),
+    )?;
+
+    // Forward: iifname "<iface>" accept
+    nft_insert_before_latest(
+        "forward",
+        &format!(
+            "iifname \"{}\" counter accept comment \"airvpn_interface_forward_{}\"",
+            iface, iface
+        ),
+    )?;
+
+    // Output: oifname "<iface>" accept
+    nft_insert_before_latest(
+        "output",
+        &format!(
+            "oifname \"{}\" counter accept comment \"airvpn_interface_output_{}\"",
+            iface, iface
+        ),
+    )?;
+
+    Ok(())
+}
+
+/// Remove VPN interface rules (called when tunnel goes down).
+///
+/// Eddie equivalent: netlock-nftables-interface action=del
+pub fn deallow_interface(iface: &str) -> Result<()> {
+    for chain in &["input", "forward", "output"] {
+        let dir = match *chain {
+            "input" => "input",
+            "forward" => "forward",
+            "output" => "output",
+            _ => unreachable!(),
+        };
+        let comment = format!("airvpn_interface_{}_{}", dir, iface);
+        nft_delete_by_comment(chain, &comment)?;
+    }
+    Ok(())
+}
+
+/// Insert a rule into a chain, positioned before the "latest_rule" sentinel.
+///
+/// Uses `nft -a list chain` to find the handle of the sentinel rule,
+/// then `nft insert rule ... position <handle>`.
+fn nft_insert_before_latest(chain: &str, rule: &str) -> Result<()> {
+    let comment_search = format!("airvpn_filter_{}_latest_rule", chain);
+    let handle = find_rule_handle(chain, &comment_search)?;
+
+    let nft_cmd = format!(
+        "insert rule inet {} {} position {} {}",
+        TABLE_NAME, chain, handle, rule
+    );
+
+    let output = Command::new("nft")
+        .args(nft_cmd.split_whitespace().collect::<Vec<_>>())
+        .output()
+        .context("failed to execute nft insert rule")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("nft insert rule failed: {}", stderr);
+    }
+
+    Ok(())
+}
+
+/// Delete a rule by its comment tag.
+fn nft_delete_by_comment(chain: &str, comment: &str) -> Result<()> {
+    match find_rule_handle(chain, comment) {
+        Ok(handle) => {
+            let output = Command::new("nft")
+                .args([
+                    "delete",
+                    "rule",
+                    "inet",
+                    TABLE_NAME,
+                    chain,
+                    "handle",
+                    &handle,
+                ])
+                .output()
+                .context("failed to execute nft delete rule")?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!("nft delete rule failed: {}", stderr);
+            }
+            Ok(())
+        }
+        Err(_) => {
+            // Rule already removed — not an error
+            Ok(())
+        }
+    }
+}
+
+/// Find the nftables handle number for a rule identified by its comment.
+///
+/// Runs `nft -n -a list chain inet airvpn_lock <chain>` and searches
+/// for the line containing the comment, extracting `# handle <N>`.
+fn find_rule_handle(chain: &str, comment: &str) -> Result<String> {
+    let output = Command::new("nft")
+        .args(["-n", "-a", "list", "chain", "inet", TABLE_NAME, chain])
+        .output()
+        .context("failed to execute nft list chain")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("nft list chain failed: {}", stderr);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if line.contains(comment) {
+            // Lines look like: `    counter drop comment "..." # handle 42`
+            if let Some(handle_pos) = line.rfind("# handle ") {
+                let handle_str = &line[handle_pos + 9..];
+                let handle = handle_str.trim();
+                if !handle.is_empty() {
+                    return Ok(handle.to_string());
+                }
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "rule with comment '{}' not found in chain '{}'",
+        comment,
+        chain
+    )
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_config() -> NetlockConfig {
+        NetlockConfig {
+            allow_lan: false,
+            allow_dhcp: true,
+            allow_ping: true,
+            allowed_ips: vec![],
+        }
+    }
+
+    #[test]
+    fn test_ruleset_basic() {
+        let config = default_config();
+        let ruleset = generate_ruleset(&config);
+
+        // Table structure
+        assert!(ruleset.contains(&format!("table inet {}", TABLE_NAME)));
+
+        // Chain definitions with correct priority and policy
+        assert!(ruleset.contains(&format!(
+            "type filter hook input priority {}; policy drop;",
+            PRIORITY
+        )));
+        assert!(ruleset.contains(&format!(
+            "type filter hook forward priority {}; policy drop;",
+            PRIORITY
+        )));
+        assert!(ruleset.contains(&format!(
+            "type filter hook output priority {}; policy drop;",
+            PRIORITY
+        )));
+
+        // Loopback accept (input and output)
+        assert!(ruleset.contains("iifname \"lo\" counter accept"));
+        assert!(ruleset.contains("oifname \"lo\" counter accept"));
+
+        // IPv6 anti-spoof
+        assert!(ruleset.contains("iifname != \"lo\" ip6 saddr ::1 counter reject"));
+
+        // Conntrack in both input and output
+        let ct_count = ruleset.matches("ct state related,established counter accept").count();
+        assert_eq!(ct_count, 2, "should have conntrack rule in both input and output");
+
+        // Final sentinel rules
+        assert!(ruleset.contains("airvpn_filter_input_latest_rule"));
+        assert!(ruleset.contains("airvpn_filter_forward_latest_rule"));
+        assert!(ruleset.contains("airvpn_filter_output_latest_rule"));
+
+        // DHCP rules present (allow_dhcp=true by default)
+        assert!(ruleset.contains("ip saddr 255.255.255.255 counter accept"));
+        assert!(ruleset.contains("ip6 saddr ff02::1:2 counter accept"));
+
+        // Ping rules present (allow_ping=true by default)
+        assert!(ruleset.contains("icmp type echo-request counter accept"));
+        assert!(ruleset.contains("icmp type echo-reply counter accept"));
+    }
+
+    #[test]
+    fn test_ruleset_with_allowed_ips() {
+        let config = NetlockConfig {
+            allow_lan: false,
+            allow_dhcp: false,
+            allow_ping: false,
+            allowed_ips: vec![
+                "185.236.200.1".to_string(),
+                "2001:db8::1".to_string(),
+                "10.128.0.0/24".to_string(),
+            ],
+        };
+        let ruleset = generate_ruleset(&config);
+
+        // IPv4 incoming allowlist with SHA256 comment
+        let expected_v4_in_comment = format!(
+            "airvpn_ip_{}",
+            sha256_hex("ipv4_in_185.236.200.1/32_1")
+        );
+        assert!(
+            ruleset.contains(&format!(
+                "ip saddr 185.236.200.1/32 counter accept comment \"{}\"",
+                expected_v4_in_comment
+            )),
+            "should contain IPv4 incoming allowlist rule with comment"
+        );
+
+        // IPv4 outgoing allowlist with SHA256 comment
+        let expected_v4_out_comment = format!(
+            "airvpn_ip_{}",
+            sha256_hex("ipv4_out_185.236.200.1/32_1")
+        );
+        assert!(
+            ruleset.contains(&format!(
+                "ip daddr 185.236.200.1/32 counter accept comment \"{}\"",
+                expected_v4_out_comment
+            )),
+            "should contain IPv4 outgoing allowlist rule with comment"
+        );
+
+        // IPv6 allowlist
+        let expected_v6_in_comment = format!(
+            "airvpn_ip_{}",
+            sha256_hex("ipv6_in_2001:db8::1/128_1")
+        );
+        assert!(
+            ruleset.contains(&format!(
+                "ip6 saddr 2001:db8::1/128 counter accept comment \"{}\"",
+                expected_v6_in_comment
+            )),
+            "should contain IPv6 incoming allowlist rule"
+        );
+
+        // CIDR passthrough (already has /24)
+        let expected_cidr_out_comment = format!(
+            "airvpn_ip_{}",
+            sha256_hex("ipv4_out_10.128.0.0/24_1")
+        );
+        assert!(
+            ruleset.contains(&format!(
+                "ip daddr 10.128.0.0/24 counter accept comment \"{}\"",
+                expected_cidr_out_comment
+            )),
+            "should preserve existing CIDR prefix"
+        );
+    }
+
+    #[test]
+    fn test_ruleset_allow_lan() {
+        let config = NetlockConfig {
+            allow_lan: true,
+            allow_dhcp: false,
+            allow_ping: false,
+            allowed_ips: vec![],
+        };
+        let ruleset = generate_ruleset(&config);
+
+        // RFC1918 in input
+        assert!(ruleset.contains("ip saddr 192.168.0.0/16 ip daddr 192.168.0.0/16 counter accept"));
+        assert!(ruleset.contains("ip saddr 10.0.0.0/8 ip daddr 10.0.0.0/8 counter accept"));
+        assert!(ruleset.contains("ip saddr 172.16.0.0/12 ip daddr 172.16.0.0/12 counter accept"));
+
+        // IPv6 link-local, multicast, ULA in input
+        assert!(ruleset.contains("ip6 saddr fe80::/10 ip6 daddr fe80::/10 counter accept"));
+        assert!(ruleset.contains("ip6 saddr ff00::/8 ip6 daddr ff00::/8 counter accept"));
+        assert!(ruleset.contains("ip6 saddr fc00::/7 ip6 daddr fc00::/7 counter accept"));
+
+        // Output-only multicast rules
+        assert!(ruleset.contains("ip saddr 192.168.0.0/16 ip daddr 224.0.0.0/24 counter accept"));
+        assert!(ruleset.contains("ip saddr 10.0.0.0/8 ip daddr 224.0.0.0/24 counter accept"));
+        assert!(ruleset.contains("ip saddr 172.16.0.0/12 ip daddr 224.0.0.0/24 counter accept"));
+
+        // SSDP
+        assert!(ruleset.contains("ip saddr 192.168.0.0/16 ip daddr 239.255.255.250 counter accept"));
+        assert!(ruleset.contains("ip saddr 10.0.0.0/8 ip daddr 239.255.255.250 counter accept"));
+        assert!(ruleset.contains("ip saddr 172.16.0.0/12 ip daddr 239.255.255.250 counter accept"));
+
+        // SLPv2
+        assert!(ruleset.contains("ip saddr 192.168.0.0/16 ip daddr 239.255.255.253 counter accept"));
+        assert!(ruleset.contains("ip saddr 10.0.0.0/8 ip daddr 239.255.255.253 counter accept"));
+        assert!(ruleset.contains("ip saddr 172.16.0.0/12 ip daddr 239.255.255.253 counter accept"));
+    }
+
+    #[test]
+    fn test_ruleset_no_lan() {
+        let config = NetlockConfig {
+            allow_lan: false,
+            allow_dhcp: false,
+            allow_ping: false,
+            allowed_ips: vec![],
+        };
+        let ruleset = generate_ruleset(&config);
+
+        // No RFC1918
+        assert!(!ruleset.contains("192.168.0.0/16"));
+        assert!(!ruleset.contains("10.0.0.0/8"));
+        assert!(!ruleset.contains("172.16.0.0/12"));
+
+        // No IPv6 LAN
+        assert!(!ruleset.contains("fe80::/10"));
+        assert!(!ruleset.contains("ff00::/8"));
+        assert!(!ruleset.contains("fc00::/7"));
+
+        // No multicast
+        assert!(!ruleset.contains("224.0.0.0/24"));
+        assert!(!ruleset.contains("239.255.255.250"));
+        assert!(!ruleset.contains("239.255.255.253"));
+    }
+
+    #[test]
+    fn test_ruleset_ipv6_ndp() {
+        let config = default_config();
+        let ruleset = generate_ruleset(&config);
+
+        // All four NDP types with hoplimit 255 (Eddie's exact rules)
+        assert!(
+            ruleset.contains(
+                "meta l4proto ipv6-icmp icmpv6 type nd-router-advert ip6 hoplimit 255 counter accept"
+            ),
+            "should have NDP router-advert rule"
+        );
+        assert!(
+            ruleset.contains(
+                "meta l4proto ipv6-icmp icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 counter accept"
+            ),
+            "should have NDP neighbor-solicit rule"
+        );
+        assert!(
+            ruleset.contains(
+                "meta l4proto ipv6-icmp icmpv6 type nd-neighbor-advert ip6 hoplimit 255 counter accept"
+            ),
+            "should have NDP neighbor-advert rule"
+        );
+        assert!(
+            ruleset.contains(
+                "meta l4proto ipv6-icmp icmpv6 type nd-redirect ip6 hoplimit 255 counter accept"
+            ),
+            "should have NDP redirect rule"
+        );
+    }
+
+    #[test]
+    fn test_ruleset_ipv6_rh0_drop() {
+        let config = default_config();
+        let ruleset = generate_ruleset(&config);
+
+        // RH0 drop in input, forward, and output chains
+        let rh0_count = ruleset
+            .matches("ip6 nexthdr routing rt type 0 counter drop")
+            .count();
+        assert_eq!(
+            rh0_count, 3,
+            "should have IPv6 RH0 drop in input, forward, and output chains"
+        );
+    }
+
+    #[test]
+    fn test_sha256_hex_deterministic() {
+        // Verify our SHA-256 produces consistent results
+        let hash1 = sha256_hex("ipv4_in_185.236.200.1/32_1");
+        let hash2 = sha256_hex("ipv4_in_185.236.200.1/32_1");
+        assert_eq!(hash1, hash2);
+        assert_eq!(hash1.len(), 64, "SHA-256 hex digest should be 64 characters");
+    }
+
+    #[test]
+    fn test_ensure_cidr() {
+        assert_eq!(ensure_cidr("10.0.0.1"), "10.0.0.1/32");
+        assert_eq!(ensure_cidr("10.0.0.0/8"), "10.0.0.0/8");
+        assert_eq!(ensure_cidr("2001:db8::1"), "2001:db8::1/128");
+        assert_eq!(ensure_cidr("2001:db8::/32"), "2001:db8::/32");
+    }
+
+    #[test]
+    fn test_ruleset_rule_ordering() {
+        // Verify the exact ordering within the input chain matches Eddie
+        let config = NetlockConfig {
+            allow_lan: true,
+            allow_dhcp: true,
+            allow_ping: true,
+            allowed_ips: vec!["1.2.3.4".to_string()],
+        };
+        let ruleset = generate_ruleset(&config);
+
+        // Extract just the input chain rules (between "chain input" and next "chain")
+        let input_start = ruleset.find("chain input").expect("input chain");
+        let input_end = ruleset[input_start..]
+            .find("\n  }\n")
+            .map(|p| input_start + p)
+            .expect("input chain end");
+        let input_section = &ruleset[input_start..input_end];
+
+        // Verify ordering: loopback < anti-spoof < dhcp < lan < ping < rh0 < ndp < ct < allowlist < sentinel
+        let pos_lo = input_section.find("iifname \"lo\"").expect("loopback");
+        let pos_antispoof = input_section.find("iifname != \"lo\" ip6 saddr ::1").expect("antispoof");
+        let pos_dhcp = input_section.find("ip saddr 255.255.255.255").expect("dhcp");
+        let pos_lan = input_section.find("ip saddr 192.168.0.0/16 ip daddr 192.168.0.0/16").expect("lan");
+        let pos_ping = input_section.find("icmp type echo-request").expect("ping");
+        let pos_rh0 = input_section.find("ip6 nexthdr routing rt type 0").expect("rh0");
+        let pos_ndp = input_section.find("icmpv6 type nd-router-advert").expect("ndp");
+        let pos_ct = input_section.find("ct state related,established").expect("ct");
+        let pos_allowlist = input_section.find("ip saddr 1.2.3.4/32").expect("allowlist");
+        let pos_sentinel = input_section.find("airvpn_filter_input_latest_rule").expect("sentinel");
+
+        assert!(pos_lo < pos_antispoof, "loopback before anti-spoof");
+        assert!(pos_antispoof < pos_dhcp, "anti-spoof before dhcp");
+        assert!(pos_dhcp < pos_lan, "dhcp before lan");
+        assert!(pos_lan < pos_ping, "lan before ping");
+        assert!(pos_ping < pos_rh0, "ping before rh0");
+        assert!(pos_rh0 < pos_ndp, "rh0 before ndp");
+        assert!(pos_ndp < pos_ct, "ndp before conntrack");
+        assert!(pos_ct < pos_allowlist, "conntrack before allowlist");
+        assert!(pos_allowlist < pos_sentinel, "allowlist before sentinel");
+    }
+}

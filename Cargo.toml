@@ -32,5 +32,11 @@ rpassword = "7"
 # Keyring (v2s mode)
 secret-service = { version = "5", features = ["rt-async-io-crypto-rust"] }
 
+# Hashing (netlock SHA-256 comment tags)
+hex = "0.4"
+
+# Temp files (netlock ruleset loading)
+tempfile = "3"
+
 # Error handling
 anyhow = "1"
