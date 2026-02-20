@@ -1,3 +1,5 @@
+pub mod crypto;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
