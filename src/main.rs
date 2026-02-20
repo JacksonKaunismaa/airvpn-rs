@@ -1,3 +1,4 @@
+pub mod api;
 pub mod crypto;
 
 use clap::{Parser, Subcommand};
