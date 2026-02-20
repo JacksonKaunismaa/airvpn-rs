@@ -15,6 +15,7 @@ pub struct Manifest {
     pub bootstrap_urls: Vec<String>,
 }
 
+#[derive(Debug)]
 pub struct Server {
     pub name: String,
     pub group: String,
