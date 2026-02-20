@@ -1,5 +1,6 @@
 pub mod api;
 pub mod crypto;
+pub mod dns;
 pub mod manifest;
 pub mod netlock;
 pub mod server;
