@@ -1,13 +1,4 @@
-pub mod api;
-pub mod config;
-pub mod crypto;
-pub mod dns;
-pub mod manifest;
-pub mod netlock;
-pub mod profile;
-pub mod recovery;
-pub mod server;
-pub mod wireguard;
+use airvpn::{api, config, dns, manifest, netlock, recovery, server, wireguard};
 
 use std::sync::atomic::Ordering;
 
