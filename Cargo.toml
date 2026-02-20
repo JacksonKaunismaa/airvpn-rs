@@ -40,3 +40,5 @@ tempfile = "3"
 
 # Error handling
 anyhow = "1"
+pbkdf2 = "0.12"
+sha1 = "0.10"
