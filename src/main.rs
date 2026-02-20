@@ -3,6 +3,7 @@ pub mod crypto;
 pub mod manifest;
 pub mod netlock;
 pub mod server;
+pub mod wireguard;
 
 use clap::{Parser, Subcommand};
 
