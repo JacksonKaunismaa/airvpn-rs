@@ -152,10 +152,13 @@ pub fn is_pid_alive(pid: u32) -> bool {
 /// 4. netlock::deactivate() (delete nft table — removed last to prevent leaks)
 /// 5. Remove state file
 fn recover_from_state(state: &State) -> Result<()> {
+    let mut cleanup_failed = false;
+
     // 1. Disconnect WireGuard
     if !state.wg_config_path.is_empty() {
         if let Err(e) = wireguard::disconnect(&state.wg_config_path) {
             eprintln!("warning: failed to disconnect WireGuard: {}", e);
+            cleanup_failed = true;
         }
     } else if !state.wg_interface.is_empty() {
         // Config path unknown (crash before state update) — delete interface directly
@@ -168,6 +171,7 @@ fn recover_from_state(state: &State) -> Result<()> {
             })
         {
             eprintln!("warning: failed to delete WireGuard interface {}: {}", state.wg_interface, e);
+            cleanup_failed = true;
         }
     }
 
@@ -190,17 +194,24 @@ fn recover_from_state(state: &State) -> Result<()> {
     // 3. Restore DNS
     if let Err(e) = dns::deactivate() {
         eprintln!("warning: failed to restore DNS: {}", e);
+        cleanup_failed = true;
     }
 
     // 4. Deactivate network lock if it was active (last — prevents traffic leaks)
     if state.lock_active {
         if let Err(e) = netlock::deactivate() {
             eprintln!("warning: failed to deactivate network lock: {}", e);
+            cleanup_failed = true;
         }
     }
 
-    // 5. Remove state file
-    remove()?;
+    // 5. Only remove state file if all cleanup steps succeeded.
+    // If any failed, keep it so next startup can retry recovery.
+    if cleanup_failed {
+        eprintln!("warning: some cleanup steps failed; keeping state file for next recovery attempt");
+    } else {
+        remove()?;
+    }
 
     Ok(())
 }

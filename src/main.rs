@@ -646,6 +646,7 @@ fn cmd_disconnect_internal(config_path: &str, iface: &str, lock_active: bool, bl
     ipv6::restore(blocked_ipv6);
     // 3. Restore DNS
     let _ = dns::deactivate();
+    dns::flush();
     // 4. Remove interface-specific nft rules before deactivating table
     if lock_active {
         if !iface.is_empty() {
