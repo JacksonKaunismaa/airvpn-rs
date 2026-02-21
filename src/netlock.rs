@@ -291,6 +291,13 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
 pub fn activate(config: &NetlockConfig) -> Result<()> {
     let ruleset = generate_ruleset(config);
 
+    // Clean up stale table from previous crash before creating fresh one
+    if is_active() {
+        if let Err(e) = deactivate() {
+            eprintln!("warning: failed to remove stale nftables table: {}", e);
+        }
+    }
+
     // Write to a temporary file
     let mut tmpfile =
         tempfile::NamedTempFile::new().context("failed to create temporary nftables file")?;
@@ -404,13 +411,23 @@ fn nft_insert_before_latest(chain: &str, rule: &str) -> Result<()> {
     let comment_search = format!("airvpn_filter_{}_latest_rule", chain);
     let handle = find_rule_handle(chain, &comment_search)?;
 
-    let nft_cmd = format!(
-        "insert rule inet {} {} position {} {}",
+    // Write command to tmpfile and use nft -f to avoid
+    // split_whitespace breaking quoted arguments
+    let cmd = format!(
+        "insert rule inet {} {} position {} {}\n",
         TABLE_NAME, chain, handle, rule
     );
 
+    let mut tmpfile =
+        tempfile::NamedTempFile::new().context("failed to create temporary nft command file")?;
+    tmpfile
+        .write_all(cmd.as_bytes())
+        .context("failed to write nft command")?;
+    tmpfile.flush().context("failed to flush nft command file")?;
+
     let output = Command::new("nft")
-        .args(nft_cmd.split_whitespace().collect::<Vec<_>>())
+        .arg("-f")
+        .arg(tmpfile.path())
         .output()
         .context("failed to execute nft insert rule")?;
 

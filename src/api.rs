@@ -126,9 +126,16 @@ fn fetch_encrypted(params: &[(String, String)]) -> Result<String> {
                     continue;
                 }
 
-                let body = response
-                    .bytes()
-                    .with_context(|| format!("{}: failed to read response body", base_url))?;
+                let body = match response.bytes() {
+                    Ok(b) => b,
+                    Err(e) => {
+                        last_error = Some(
+                            anyhow::Error::new(e)
+                                .context(format!("{}: failed to read response body", base_url)),
+                        );
+                        continue;
+                    }
+                };
 
                 let xml = crypto::decrypt_response(&body, &session_key.key, &session_key.iv)
                     .with_context(|| format!("{}: failed to decrypt response", base_url))?;

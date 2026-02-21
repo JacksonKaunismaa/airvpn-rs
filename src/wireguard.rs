@@ -29,6 +29,27 @@ pub fn generate_config(key: &WireGuardKey, server: &Server, mode: &Mode, user: &
         format!("{}:{}", endpoint_ip, mode.port)
     };
 
+    let mut peer_section = format!(
+        "\
+[Peer]
+PublicKey = {}
+",
+        user.wg_public_key,
+    );
+
+    if !key.wg_preshared.is_empty() {
+        peer_section.push_str(&format!("PresharedKey = {}\n", key.wg_preshared));
+    }
+
+    peer_section.push_str(&format!(
+        "\
+Endpoint = {}
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 15
+",
+        endpoint,
+    ));
+
     Ok(format!(
         "\
 [Interface]
@@ -36,19 +57,11 @@ PrivateKey = {}
 Address = {}/32, {}/128
 MTU = 1320
 
-[Peer]
-PublicKey = {}
-PresharedKey = {}
-Endpoint = {}
-AllowedIPs = 0.0.0.0/0, ::/0
-PersistentKeepalive = 15
-",
+{}",
         key.wg_private_key,
         key.wg_ipv4,
         key.wg_ipv6,
-        user.wg_public_key,
-        key.wg_preshared,
-        endpoint,
+        peer_section,
     ))
 }
 
@@ -71,6 +84,13 @@ pub fn connect(config: &str) -> Result<(String, String)> {
     std::fs::write(&config_path, config)
         .with_context(|| format!("failed to write WireGuard config to {}", config_path))?;
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to set WireGuard config permissions: {}", config_path))?;
+    }
+
     // Interface name = basename without .conf
     let iface = Path::new(&config_path)
         .file_stem()
@@ -83,6 +103,8 @@ pub fn connect(config: &str) -> Result<(String, String)> {
         .context("failed to execute wg-quick up")?;
 
     if !output.status.success() {
+        // Clean up config file containing private keys
+        let _ = std::fs::remove_file(&config_path);
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("wg-quick up failed: {}", stderr);
     }
@@ -194,6 +216,21 @@ mod tests {
         assert!(config.contains("Endpoint = 185.32.12.1:1637"));
         assert!(config.contains("AllowedIPs = 0.0.0.0/0, ::/0"));
         assert!(config.contains("PersistentKeepalive = 15"));
+    }
+
+    #[test]
+    fn test_generate_config_empty_preshared_key() {
+        let mut key = test_key();
+        key.wg_preshared = String::new();
+        let server = test_server();
+        let mode = test_mode();
+        let user = test_user();
+
+        let config = generate_config(&key, &server, &mode, &user).unwrap();
+        assert!(
+            !config.contains("PresharedKey"),
+            "empty preshared key should not produce PresharedKey line"
+        );
     }
 
     #[test]

@@ -4,10 +4,10 @@
 //! killed, a subsequent `airvpn recover` can clean up (tear down WireGuard,
 //! restore DNS, remove nftables rules).
 //!
-//! Recovery sequence matches Eddie's Recovery.cs pattern:
-//! 1. netlock::deactivate() (delete nft table)
+//! Recovery sequence matches normal disconnect order (WireGuard → DNS → netlock):
+//! 1. wireguard::disconnect(config_path) (wg-quick down)
 //! 2. dns::deactivate() (restore resolv.conf)
-//! 3. wireguard::disconnect(config_path) (wg-quick down)
+//! 3. netlock::deactivate() (delete nft table — removed last to prevent leaks)
 //! 4. Remove state file
 //!
 //! Reference: Eddie src/Lib.Core/Recovery.cs
@@ -99,16 +99,16 @@ fn is_pid_alive(pid: u32) -> bool {
     kill(Pid::from_raw(pid as i32), None).is_ok()
 }
 
-/// Run the recovery cleanup sequence (matching Eddie):
-/// 1. netlock::deactivate() (delete nft table)
+/// Run the recovery cleanup sequence (matches normal disconnect order):
+/// 1. wireguard::disconnect(config_path) (wg-quick down)
 /// 2. dns::deactivate() (restore resolv.conf)
-/// 3. wireguard::disconnect(config_path) (wg-quick down)
+/// 3. netlock::deactivate() (delete nft table — removed last to prevent leaks)
 /// 4. Remove state file
 fn recover_from_state(state: &State) -> Result<()> {
-    // 1. Deactivate network lock if it was active
-    if state.lock_active {
-        if let Err(e) = netlock::deactivate() {
-            eprintln!("warning: failed to deactivate network lock: {}", e);
+    // 1. Disconnect WireGuard
+    if !state.wg_config_path.is_empty() {
+        if let Err(e) = wireguard::disconnect(&state.wg_config_path) {
+            eprintln!("warning: failed to disconnect WireGuard: {}", e);
         }
     }
 
@@ -117,10 +117,10 @@ fn recover_from_state(state: &State) -> Result<()> {
         eprintln!("warning: failed to restore DNS: {}", e);
     }
 
-    // 3. Disconnect WireGuard
-    if !state.wg_config_path.is_empty() {
-        if let Err(e) = wireguard::disconnect(&state.wg_config_path) {
-            eprintln!("warning: failed to disconnect WireGuard: {}", e);
+    // 3. Deactivate network lock if it was active (last — prevents traffic leaks)
+    if state.lock_active {
+        if let Err(e) = netlock::deactivate() {
+            eprintln!("warning: failed to deactivate network lock: {}", e);
         }
     }
 

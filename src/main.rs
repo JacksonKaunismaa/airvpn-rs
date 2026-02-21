@@ -165,6 +165,14 @@ fn cmd_connect(
             allowed_ips,
         };
         netlock::activate(&lock_config)?;
+        recovery::save(&recovery::State {
+            lock_active: true,
+            wg_interface: String::new(),
+            wg_config_path: String::new(),
+            dns_ipv4: String::new(),
+            dns_ipv6: String::new(),
+            pid: std::process::id(),
+        })?;
         println!("Network lock active (dedicated nftables table)");
     }
 
@@ -172,6 +180,14 @@ fn cmd_connect(
     let wg_config = wireguard::generate_config(wg_key, server_ref, mode, &user_info)?;
     println!("Connecting to {} via mode {}...", server_ref.name, mode.title);
     let (config_path, iface) = wireguard::connect(&wg_config)?;
+    recovery::save(&recovery::State {
+        lock_active: !no_lock,
+        wg_interface: iface.clone(),
+        wg_config_path: config_path.clone(),
+        dns_ipv4: String::new(),
+        dns_ipv6: String::new(),
+        pid: std::process::id(),
+    })?;
     println!("WireGuard interface: {}", iface);
 
     // 10. Allow VPN interface in netlock
@@ -186,7 +202,6 @@ fn cmd_connect(
     // 12. Save credentials for next time
     config::save_credentials(&username, &password)?;
 
-    // 13. Save recovery state
     recovery::save(&recovery::State {
         lock_active: !no_lock,
         wg_interface: iface.clone(),

@@ -95,11 +95,20 @@ pub fn activate(dns_ipv4: &str, dns_ipv6: &str, iface: &str) -> Result<()> {
     let backup_path = Path::new(BACKUP_PATH);
 
     if resolv_path.exists() && !backup_path.exists() {
-        fs::copy(resolv_path, backup_path).context("failed to backup /etc/resolv.conf")?;
+        fs::rename(resolv_path, backup_path).context("failed to backup /etc/resolv.conf")?;
     }
 
     let expected = build_resolv_conf(dns_ipv4, dns_ipv6);
     fs::write(resolv_path, &expected).context("failed to write /etc/resolv.conf")?;
+
+    // Eddie sets 0644 explicitly (S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH)
+    // so non-root processes can read resolv.conf for DNS resolution
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(resolv_path, fs::Permissions::from_mode(0o644))
+            .context("failed to set /etc/resolv.conf permissions")?;
+    }
 
     Ok(())
 }
@@ -149,6 +158,14 @@ pub fn check_and_reapply(dns_ipv4: &str, dns_ipv6: &str) -> Result<bool> {
 
     if current != expected {
         fs::write(resolv_path, &expected).context("failed to re-apply /etc/resolv.conf")?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(resolv_path, fs::Permissions::from_mode(0o644))
+                .context("failed to set /etc/resolv.conf permissions")?;
+        }
+
         Ok(true)
     } else {
         Ok(false)

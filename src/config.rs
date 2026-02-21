@@ -74,8 +74,12 @@ pub fn resolve_credentials(
     }
 
     // 3. Prompt on stdin
-    let username = rpassword::prompt_password("AirVPN username: ")
-        .context("failed to read username from stdin")?;
+    use std::io::Write;
+    print!("AirVPN username: ");
+    std::io::stdout().flush().context("failed to flush stdout")?;
+    let mut username = String::new();
+    std::io::stdin().read_line(&mut username).context("failed to read username from stdin")?;
+    let username = username.trim().to_string();
     if username.is_empty() {
         bail!("username cannot be empty");
     }
