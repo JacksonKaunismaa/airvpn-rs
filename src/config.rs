@@ -170,4 +170,90 @@ mod tests {
         let expanded = expand_tilde("/tmp/test.profile");
         assert_eq!(expanded, PathBuf::from("/tmp/test.profile"));
     }
+
+    #[test]
+    fn test_expand_tilde_relative_path() {
+        let expanded = expand_tilde("relative/path");
+        assert_eq!(expanded, PathBuf::from("relative/path"));
+    }
+
+    #[test]
+    fn test_expand_tilde_empty_string() {
+        let expanded = expand_tilde("");
+        assert_eq!(expanded, PathBuf::from(""));
+    }
+
+    #[test]
+    fn test_expand_tilde_just_tilde_slash() {
+        // "~/" should expand to home dir
+        let expanded = expand_tilde("~/");
+        assert!(!expanded.to_str().unwrap().starts_with('~'));
+    }
+
+    #[test]
+    fn test_expand_tilde_bare_tilde() {
+        // Just "~" without "/" does NOT match the strip_prefix("~/") pattern
+        // so it should be returned as-is
+        let expanded = expand_tilde("~");
+        assert_eq!(expanded, PathBuf::from("~"));
+    }
+
+    #[test]
+    fn test_expand_tilde_nested_tilde() {
+        // Tilde not at start should be left alone
+        let expanded = expand_tilde("/foo/~/bar");
+        assert_eq!(expanded, PathBuf::from("/foo/~/bar"));
+    }
+
+    #[test]
+    fn test_expand_tilde_deep_path() {
+        let expanded = expand_tilde("~/a/b/c/d/e.txt");
+        assert!(expanded.to_str().unwrap().ends_with("a/b/c/d/e.txt"));
+        assert!(!expanded.to_str().unwrap().starts_with('~'));
+    }
+
+    // -------------------------------------------------------------------
+    // resolve_credentials with partial flags should error
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_credentials_only_username_errors() {
+        let result = resolve_credentials(Some("alice"), None);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("both --username and --password"),
+            "should mention both flags are required"
+        );
+    }
+
+    #[test]
+    fn test_resolve_credentials_only_password_errors() {
+        let result = resolve_credentials(None, Some("s3cret"));
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("both --username and --password"),
+            "should mention both flags are required"
+        );
+    }
+
+    #[test]
+    fn test_resolve_credentials_both_cli_flags() {
+        let (user, pass) = resolve_credentials(Some("bob"), Some("pass123")).unwrap();
+        assert_eq!(user, "bob");
+        assert_eq!(pass, "pass123");
+    }
+
+    #[test]
+    fn test_expand_tilde_home_set() {
+        // Ensure expand_tilde produces a path that contains the HOME dir
+        let home = std::env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            let expanded = expand_tilde("~/.config/test");
+            assert!(
+                expanded.to_str().unwrap().starts_with(&home),
+                "expanded path should start with HOME: {}",
+                expanded.display()
+            );
+        }
+    }
 }

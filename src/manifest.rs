@@ -818,4 +818,314 @@ mod tests {
         assert_eq!(user.keys[0].name, "laptop");
         assert_eq!(user.keys[1].name, "phone");
     }
+
+    // -------------------------------------------------------------------
+    // split_ips tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_split_ips_comma_separated() {
+        assert_eq!(split_ips("1.2.3.4,5.6.7.8"), vec!["1.2.3.4", "5.6.7.8"]);
+    }
+
+    #[test]
+    fn test_split_ips_semicolon_separated() {
+        assert_eq!(split_ips("1.2.3.4;5.6.7.8"), vec!["1.2.3.4", "5.6.7.8"]);
+    }
+
+    #[test]
+    fn test_split_ips_mixed_separators() {
+        assert_eq!(
+            split_ips("1.2.3.4,5.6.7.8;9.10.11.12"),
+            vec!["1.2.3.4", "5.6.7.8", "9.10.11.12"]
+        );
+    }
+
+    #[test]
+    fn test_split_ips_empty_string() {
+        let result: Vec<String> = split_ips("");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_split_ips_whitespace_only() {
+        let result: Vec<String> = split_ips("   ");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_split_ips_single_ip() {
+        assert_eq!(split_ips("10.0.0.1"), vec!["10.0.0.1"]);
+    }
+
+    #[test]
+    fn test_split_ips_whitespace_around() {
+        assert_eq!(split_ips(" 1.2.3.4 , 5.6.7.8 "), vec!["1.2.3.4", "5.6.7.8"]);
+    }
+
+    #[test]
+    fn test_split_ips_trailing_separator() {
+        // Trailing comma should not produce empty element
+        assert_eq!(split_ips("1.2.3.4,"), vec!["1.2.3.4"]);
+    }
+
+    #[test]
+    fn test_split_ips_leading_separator() {
+        // Leading comma should not produce empty element
+        assert_eq!(split_ips(",1.2.3.4"), vec!["1.2.3.4"]);
+    }
+
+    // -------------------------------------------------------------------
+    // parse_bool tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_bool_true_variants() {
+        assert!(parse_bool("true"));
+        assert!(parse_bool("TRUE"));
+        assert!(parse_bool("True"));
+        assert!(parse_bool("1"));
+        assert!(parse_bool("yes"));
+        assert!(parse_bool("YES"));
+        assert!(parse_bool("Yes"));
+    }
+
+    #[test]
+    fn test_parse_bool_false_variants() {
+        assert!(!parse_bool("false"));
+        assert!(!parse_bool("FALSE"));
+        assert!(!parse_bool("0"));
+        assert!(!parse_bool("no"));
+        assert!(!parse_bool("NO"));
+    }
+
+    #[test]
+    fn test_parse_bool_empty() {
+        assert!(!parse_bool(""));
+    }
+
+    #[test]
+    fn test_parse_bool_garbage() {
+        assert!(!parse_bool("garbage"));
+        assert!(!parse_bool("maybe"));
+        assert!(!parse_bool("2"));
+    }
+
+    // -------------------------------------------------------------------
+    // parse_i64 tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_i64_valid() {
+        assert_eq!(parse_i64("42"), 42);
+        assert_eq!(parse_i64("0"), 0);
+        assert_eq!(parse_i64("1000000"), 1_000_000);
+    }
+
+    #[test]
+    fn test_parse_i64_negative() {
+        assert_eq!(parse_i64("-1"), -1);
+        assert_eq!(parse_i64("-999"), -999);
+    }
+
+    #[test]
+    fn test_parse_i64_empty() {
+        assert_eq!(parse_i64(""), 0);
+    }
+
+    #[test]
+    fn test_parse_i64_garbage() {
+        assert_eq!(parse_i64("abc"), 0);
+        assert_eq!(parse_i64("12.5"), 0);
+        assert_eq!(parse_i64("12abc"), 0);
+    }
+
+    // -------------------------------------------------------------------
+    // parse_user with message attribute — should bail
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_user_with_message_bails() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<user login="testuser" wg_public_key="PubKey==" message="Your subscription has expired">
+  <keys />
+</user>"#;
+
+        let result = parse_user(xml);
+        assert!(result.is_err(), "parse_user should bail when message attribute is present");
+        assert!(
+            result.unwrap_err().to_string().contains("subscription has expired"),
+            "error should contain the message text"
+        );
+    }
+
+    #[test]
+    fn test_parse_user_with_empty_message_ok() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<user login="testuser" wg_public_key="PubKey==" message="">
+  <keys>
+    <key name="default" wg_private_key="Priv==" wg_ipv4="10.0.0.1"
+         wg_ipv6="fd00::1" wg_dns_ipv4="10.0.0.1" wg_dns_ipv6="fd00::53"
+         wg_preshared="" />
+  </keys>
+</user>"#;
+
+        let user = parse_user(xml).expect("empty message should not bail");
+        assert_eq!(user.login, "testuser");
+    }
+
+    // -------------------------------------------------------------------
+    // parse_user with no <user> element
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_user_missing_user_element() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<response status="ok" />"#;
+
+        let result = parse_user(xml);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("missing <user>"),
+            "should report missing user element"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // parse_manifest with empty servers/modes
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_manifest_empty_servers() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<manifest time="1708444800">
+  <servers />
+  <servers_groups />
+  <modes>
+    <mode title="WireGuard UDP 1637" type="wireguard"
+          protocol="UDP" port="1637" entry_index="0" />
+  </modes>
+  <urls />
+</manifest>"#;
+
+        let manifest = parse_manifest(xml).expect("failed to parse manifest");
+        assert!(manifest.servers.is_empty());
+        assert_eq!(manifest.modes.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_manifest_no_wireguard_modes() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<manifest time="1708444800">
+  <servers />
+  <servers_groups />
+  <modes>
+    <mode title="OpenVPN UDP 443" type="openvpn"
+          protocol="UDP" port="443" entry_index="0" />
+  </modes>
+  <urls />
+</manifest>"#;
+
+        let manifest = parse_manifest(xml).expect("failed to parse manifest");
+        assert!(manifest.modes.is_empty(), "only wireguard modes should be kept");
+    }
+
+    // -------------------------------------------------------------------
+    // parse_manifest force_reauth_ts
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_manifest_force_reauth_ts() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<manifest time="1708444800" force_reauth_ts="1700000000">
+  <servers />
+  <servers_groups />
+  <modes />
+  <urls />
+</manifest>"#;
+
+        let manifest = parse_manifest(xml).expect("failed to parse manifest");
+        assert_eq!(manifest.force_reauth_ts, 1_700_000_000);
+    }
+
+    // -------------------------------------------------------------------
+    // check_api_error edge cases
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_check_api_error_empty_error_attribute() {
+        // Empty error="" should NOT bail
+        let xml = r#"<manifest error="" />"#;
+        let result = check_api_error(xml);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_check_api_error_no_error_attribute() {
+        let xml = r#"<manifest time="123" />"#;
+        let result = check_api_error(xml);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_check_api_error_empty_document() {
+        let result = check_api_error("");
+        assert!(result.is_ok());
+    }
+
+    // -------------------------------------------------------------------
+    // parse_manifest messages
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_manifest_messages() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<manifest time="1708444800">
+  <servers />
+  <servers_groups />
+  <modes />
+  <urls />
+  <messages>
+    <message kind="info" text="Welcome to AirVPN" url="https://airvpn.org" />
+    <message kind="warning" text="Scheduled maintenance" url="" />
+    <message kind="" text="" url="" />
+  </messages>
+</manifest>"#;
+
+        let manifest = parse_manifest(xml).expect("failed to parse manifest");
+        // Only messages with non-empty text are kept
+        assert_eq!(manifest.messages.len(), 2);
+        assert_eq!(manifest.messages[0].kind, "info");
+        assert_eq!(manifest.messages[0].text, "Welcome to AirVPN");
+        assert_eq!(manifest.messages[0].url, "https://airvpn.org");
+        assert_eq!(manifest.messages[1].kind, "warning");
+        assert_eq!(manifest.messages[1].text, "Scheduled maintenance");
+    }
+
+    // -------------------------------------------------------------------
+    // IPs with semicolons (Eddie format)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_ips_entry_semicolon_split() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<manifest time="1708444800">
+  <servers>
+    <server name="Semi" group=""
+            ips_entry="1.2.3.4;5.6.7.8" ips_exit="9.10.11.12"
+            country_code="US" location="Test"
+            scorebase="0" bw="0" bw_max="1000"
+            users="0" users_max="100"
+            support_ipv4="true" support_ipv6="false"
+            warning_open="" warning_closed="" />
+  </servers>
+  <servers_groups />
+  <modes />
+  <urls />
+</manifest>"#;
+
+        let manifest = parse_manifest(xml).expect("failed to parse manifest");
+        let server = &manifest.servers[0];
+        assert_eq!(server.ips_entry, vec!["1.2.3.4", "5.6.7.8"]);
+    }
 }

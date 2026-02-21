@@ -824,4 +824,135 @@ mod tests {
         let filtered = filter_servers(&servers, &[], &deny, &[], &[]);
         assert!(filtered.is_empty());
     }
+
+    // -------------------------------------------------------------------
+    // filter_servers: server in both allow and deny — deny wins
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_filter_server_in_both_allow_and_deny_lists() {
+        let servers = vec![
+            make_server_cc("Alpha", "IT"),
+            make_server_cc("Beta", "NL"),
+            make_server_cc("Gamma", "DE"),
+        ];
+        // Alpha is in both allow and deny — deny should win
+        let allow = vec!["Alpha".to_string(), "Beta".to_string()];
+        let deny = vec!["Alpha".to_string()];
+        let filtered = filter_servers(&servers, &allow, &deny, &[], &[]);
+        let names: Vec<&str> = filtered.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["Beta"], "deny should take precedence over allow");
+    }
+
+    #[test]
+    fn test_filter_country_in_both_allow_and_deny() {
+        let servers = vec![
+            make_server_cc("Alpha", "IT"),
+            make_server_cc("Beta", "NL"),
+            make_server_cc("Gamma", "DE"),
+        ];
+        // IT is in both allow and deny countries — deny should win
+        let allow_cc = vec!["IT".to_string(), "NL".to_string()];
+        let deny_cc = vec!["IT".to_string()];
+        let filtered = filter_servers(&servers, &[], &[], &allow_cc, &deny_cc);
+        let names: Vec<&str> = filtered.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["Beta"], "deny_country should take precedence over allow_country");
+    }
+
+    // -------------------------------------------------------------------
+    // ServerPenalties::get() after long elapsed time (penalty fully decayed)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_penalty_decay_over_time() {
+        let mut penalties = ServerPenalties::new();
+        penalties.penalize("Alpha", 30);
+
+        // Manually set the timestamp to 60 minutes ago so penalty is fully decayed
+        // We need to adjust the stored timestamp to simulate time passage
+        if let Some(entry) = penalties.penalties.get_mut("Alpha") {
+            // Set timestamp to 60 minutes ago: penalty 30, decays 1/min, so 30 min decays it to 0
+            entry.1 = Instant::now() - std::time::Duration::from_secs(60 * 60);
+        }
+
+        // After 60 minutes, a penalty of 30 should be fully decayed (30 - 60 = negative → 0)
+        assert_eq!(penalties.get("Alpha"), 0, "penalty should be fully decayed after 60 minutes");
+    }
+
+    #[test]
+    fn test_penalty_partial_decay() {
+        let mut penalties = ServerPenalties::new();
+        penalties.penalize("Alpha", 30);
+
+        // Set timestamp to 10 minutes ago: penalty 30 - 10 = 20
+        if let Some(entry) = penalties.penalties.get_mut("Alpha") {
+            entry.1 = Instant::now() - std::time::Duration::from_secs(10 * 60);
+        }
+
+        assert_eq!(penalties.get("Alpha"), 20, "penalty should decay by 1 per minute");
+    }
+
+    #[test]
+    fn test_penalty_accumulation() {
+        let mut penalties = ServerPenalties::new();
+        penalties.penalize("Alpha", 30);
+        penalties.penalize("Alpha", 30);
+        // Penalty should accumulate: 30 + 30 = 60
+        assert_eq!(penalties.get("Alpha"), 60);
+    }
+
+    // -------------------------------------------------------------------
+    // Edge case: empty server list for filter
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_filter_empty_server_list() {
+        let servers: Vec<Server> = vec![];
+        let filtered = filter_servers(&servers, &[], &[], &[], &[]);
+        assert!(filtered.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // Score edge cases
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_score_zero_everything() {
+        let s = make_server("Zero", 0, 1000, 0, 100, 0, "", "");
+        // LoadPerc: bw_cur = 0, load_perc = 0
+        // UsersPerc: 0
+        // ScoreBase: 0
+        // Total: 0
+        assert_eq!(score(&s), 0);
+    }
+
+    #[test]
+    fn test_score_with_ping_high_latency() {
+        let s = make_server("Far", 500_000, 1000, 50, 250, 10, "", "");
+        // Base score = 30, ping = 500ms
+        // Total = 500 + 0 + 10 + 20 = 530
+        assert_eq!(score_with_ping(&s, 500), 530);
+    }
+
+    // -------------------------------------------------------------------
+    // load_perc and users_perc edge cases
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_load_perc_zero_bandwidth() {
+        let s = make_server("NoBW", 0, 1000, 0, 100, 0, "", "");
+        assert_eq!(load_perc(&s), 0);
+    }
+
+    #[test]
+    fn test_users_perc_zero_users() {
+        let s = make_server("NoUsers", 500_000, 1000, 0, 250, 0, "", "");
+        assert_eq!(users_perc(&s), 0);
+    }
+
+    #[test]
+    fn test_users_perc_full() {
+        let s = make_server("Full", 500_000, 1000, 250, 250, 0, "", "");
+        assert_eq!(users_perc(&s), 100);
+    }
 }

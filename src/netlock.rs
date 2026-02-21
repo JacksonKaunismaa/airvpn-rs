@@ -958,4 +958,265 @@ mod tests {
         assert!(pos_ct < pos_allowlist, "conntrack before allowlist");
         assert!(pos_allowlist < pos_sentinel, "allowlist before sentinel");
     }
+
+    // -------------------------------------------------------------------
+    // classify_ip tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_ip_ipv4() {
+        assert_eq!(classify_ip("192.168.1.1"), Some(IpVersion::V4));
+    }
+
+    #[test]
+    fn test_classify_ip_ipv6() {
+        assert_eq!(classify_ip("2001:db8::1"), Some(IpVersion::V6));
+    }
+
+    #[test]
+    fn test_classify_ip_ipv4_cidr() {
+        assert_eq!(classify_ip("10.0.0.0/8"), Some(IpVersion::V4));
+    }
+
+    #[test]
+    fn test_classify_ip_ipv6_cidr() {
+        assert_eq!(classify_ip("fe80::/10"), Some(IpVersion::V6));
+    }
+
+    #[test]
+    fn test_classify_ip_invalid() {
+        assert_eq!(classify_ip("not-an-ip"), None);
+    }
+
+    #[test]
+    fn test_classify_ip_empty() {
+        assert_eq!(classify_ip(""), None);
+    }
+
+    #[test]
+    fn test_classify_ip_loopback_v4() {
+        assert_eq!(classify_ip("127.0.0.1"), Some(IpVersion::V4));
+    }
+
+    #[test]
+    fn test_classify_ip_loopback_v6() {
+        assert_eq!(classify_ip("::1"), Some(IpVersion::V6));
+    }
+
+    // -------------------------------------------------------------------
+    // ensure_cidr edge cases
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_ensure_cidr_empty_string() {
+        // Empty string can't be parsed as IP — returned as-is
+        assert_eq!(ensure_cidr(""), "");
+    }
+
+    #[test]
+    fn test_ensure_cidr_invalid_ip() {
+        // Invalid IP — returned as-is (no CIDR appended)
+        assert_eq!(ensure_cidr("not-an-ip"), "not-an-ip");
+    }
+
+    #[test]
+    fn test_ensure_cidr_already_has_cidr_v4() {
+        assert_eq!(ensure_cidr("10.0.0.0/8"), "10.0.0.0/8");
+    }
+
+    #[test]
+    fn test_ensure_cidr_already_has_cidr_v6() {
+        assert_eq!(ensure_cidr("fe80::/10"), "fe80::/10");
+    }
+
+    #[test]
+    fn test_ensure_cidr_bare_v4() {
+        assert_eq!(ensure_cidr("192.168.1.1"), "192.168.1.1/32");
+    }
+
+    #[test]
+    fn test_ensure_cidr_bare_v6() {
+        assert_eq!(ensure_cidr("::1"), "::1/128");
+    }
+
+    // -------------------------------------------------------------------
+    // generate_ruleset with allow_ipv4ipv6translation: true (NAT64)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_ruleset_nat64_enabled() {
+        let config = NetlockConfig {
+            allow_lan: false,
+            allow_dhcp: false,
+            allow_ping: false,
+            allow_ipv4ipv6translation: true,
+            allowed_ips_incoming: vec![],
+            allowed_ips_outgoing: vec![],
+            incoming_policy_accept: false,
+        };
+        let ruleset = generate_ruleset(&config);
+
+        // NAT64 rules should appear in both INPUT and OUTPUT chains
+        let nat64_well_known = "ip6 saddr 64:ff9b::/96 ip6 daddr 64:ff9b::/96 counter accept";
+        let nat64_local = "ip6 saddr 64:ff9b:1::/48 ip6 daddr 64:ff9b:1::/48 counter accept";
+
+        // Count occurrences — should be 2 each (input + output)
+        let wk_count = ruleset.matches(nat64_well_known).count();
+        let local_count = ruleset.matches(nat64_local).count();
+        assert_eq!(wk_count, 2, "NAT64 well-known prefix should appear in input and output");
+        assert_eq!(local_count, 2, "NAT64 local-use prefix should appear in input and output");
+    }
+
+    #[test]
+    fn test_ruleset_nat64_disabled() {
+        let config = NetlockConfig {
+            allow_lan: false,
+            allow_dhcp: false,
+            allow_ping: false,
+            allow_ipv4ipv6translation: false,
+            allowed_ips_incoming: vec![],
+            allowed_ips_outgoing: vec![],
+            incoming_policy_accept: false,
+        };
+        let ruleset = generate_ruleset(&config);
+
+        assert!(!ruleset.contains("64:ff9b::"), "NAT64 rules should NOT appear when disabled");
+    }
+
+    // -------------------------------------------------------------------
+    // generate_ruleset with incoming_policy_accept: true
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_ruleset_incoming_policy_accept_adds_output_conntrack() {
+        let config = NetlockConfig {
+            allow_lan: false,
+            allow_dhcp: false,
+            allow_ping: false,
+            allow_ipv4ipv6translation: false,
+            allowed_ips_incoming: vec![],
+            allowed_ips_outgoing: vec![],
+            incoming_policy_accept: true,
+        };
+        let ruleset = generate_ruleset(&config);
+
+        // INPUT chain always has ct state related,established
+        // OUTPUT chain should ALSO have ct state established when incoming_policy_accept=true
+        // The OUTPUT version uses "ct state established" (not "related,established")
+        assert!(
+            ruleset.contains("ct state established counter accept"),
+            "OUTPUT should have conntrack when incoming_policy_accept=true"
+        );
+
+        // INPUT still has related,established
+        assert!(
+            ruleset.contains("ct state related,established counter accept"),
+            "INPUT should still have related,established conntrack"
+        );
+    }
+
+    #[test]
+    fn test_ruleset_incoming_policy_drop_no_output_conntrack() {
+        let config = default_config(); // incoming_policy_accept=false
+        let ruleset = generate_ruleset(&config);
+
+        // Only INPUT should have conntrack, not OUTPUT
+        // Count "ct state" occurrences
+        let ct_related = ruleset.matches("ct state related,established counter accept").count();
+        assert_eq!(ct_related, 1, "only INPUT should have ct state related,established");
+
+        // "ct state established counter accept" should NOT appear (that's the OUTPUT-only rule)
+        assert!(
+            !ruleset.contains("ct state established counter accept"),
+            "OUTPUT conntrack should be absent when incoming_policy_accept=false"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Ruleset with both incoming AND outgoing allowlisted IPs
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_ruleset_mixed_incoming_outgoing_ips() {
+        let config = NetlockConfig {
+            allow_lan: false,
+            allow_dhcp: false,
+            allow_ping: false,
+            allow_ipv4ipv6translation: false,
+            allowed_ips_incoming: vec![
+                "10.0.0.1".to_string(),
+                "2001:db8::1".to_string(),
+            ],
+            allowed_ips_outgoing: vec![
+                "203.0.113.5".to_string(),
+                "2001:db8::ff".to_string(),
+            ],
+            incoming_policy_accept: false,
+        };
+        let ruleset = generate_ruleset(&config);
+
+        // INPUT: incoming IPs get saddr accept
+        assert!(ruleset.contains("ip saddr 10.0.0.1/32 counter accept"),
+            "incoming IPv4 should have saddr accept in INPUT");
+        assert!(ruleset.contains("ip6 saddr 2001:db8::1/128 counter accept"),
+            "incoming IPv6 should have saddr accept in INPUT");
+
+        // OUTPUT: incoming IPs get daddr + ct state established (response only)
+        assert!(ruleset.contains("ip daddr 10.0.0.1/32 ct state established counter accept"),
+            "incoming IPv4 should have daddr ct state established in OUTPUT");
+        assert!(ruleset.contains("ip6 daddr 2001:db8::1/128 ct state established counter accept"),
+            "incoming IPv6 should have daddr ct state established in OUTPUT");
+
+        // OUTPUT: outgoing IPs get unrestricted daddr accept
+        assert!(ruleset.contains("ip daddr 203.0.113.5/32 counter accept"),
+            "outgoing IPv4 should have unrestricted daddr accept in OUTPUT");
+        assert!(ruleset.contains("ip6 daddr 2001:db8::ff/128 counter accept"),
+            "outgoing IPv6 should have unrestricted daddr accept in OUTPUT");
+
+        // Outgoing IPs should NOT appear in INPUT
+        assert!(!ruleset.contains("ip saddr 203.0.113.5"),
+            "outgoing IPs should not appear as saddr in INPUT");
+        assert!(!ruleset.contains("ip6 saddr 2001:db8::ff"),
+            "outgoing IPv6 should not appear as saddr in INPUT");
+    }
+
+    // -------------------------------------------------------------------
+    // Invalid IP in allowlist should be silently skipped
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_ruleset_invalid_ip_in_allowlist_skipped() {
+        let config = NetlockConfig {
+            allow_lan: false,
+            allow_dhcp: false,
+            allow_ping: false,
+            allow_ipv4ipv6translation: false,
+            allowed_ips_incoming: vec!["not-an-ip".to_string()],
+            allowed_ips_outgoing: vec!["also-invalid".to_string()],
+            incoming_policy_accept: false,
+        };
+        let ruleset = generate_ruleset(&config);
+
+        // Invalid IPs should not appear in any rule
+        assert!(!ruleset.contains("not-an-ip"), "invalid IP should be skipped");
+        assert!(!ruleset.contains("also-invalid"), "invalid IP should be skipped");
+
+        // Ruleset should still be structurally valid
+        assert!(ruleset.contains("table inet"));
+        assert!(ruleset.contains("chain input"));
+        assert!(ruleset.contains("chain output"));
+    }
+
+    // -------------------------------------------------------------------
+    // SHA-256 consistency test
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_sha256_hex_different_inputs() {
+        let hash_a = sha256_hex("input_a");
+        let hash_b = sha256_hex("input_b");
+        assert_ne!(hash_a, hash_b, "different inputs should produce different hashes");
+        assert_eq!(hash_a.len(), 64);
+        assert_eq!(hash_b.len(), 64);
+    }
 }

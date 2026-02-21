@@ -424,4 +424,135 @@ mod tests {
             other => panic!("expected Stop, got {:?}", other),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Additional normalize_arch tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_normalize_arch_returns_non_empty() {
+        // Regardless of platform, normalize_arch should never be empty
+        let arch = normalize_arch();
+        assert!(!arch.is_empty());
+        // On known platforms, verify the mapping
+        let raw = std::env::consts::ARCH;
+        match raw {
+            "x86_64" => assert_eq!(arch, "x64"),
+            "aarch64" => assert_eq!(arch, "arm64"),
+            "arm" => assert_eq!(arch, "armv7l"),
+            other => assert_eq!(arch, other, "unknown arch should pass through unchanged"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional base_params tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_base_params_has_all_six_keys() {
+        let params = base_params("testuser", "testpass");
+        assert_eq!(params.len(), 6, "base_params should return exactly 6 params");
+
+        let keys: Vec<&str> = params.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys.contains(&"login"), "missing 'login' param");
+        assert!(keys.contains(&"password"), "missing 'password' param");
+        assert!(keys.contains(&"software"), "missing 'software' param");
+        assert!(keys.contains(&"arch"), "missing 'arch' param");
+        assert!(keys.contains(&"system"), "missing 'system' param");
+        assert!(keys.contains(&"version"), "missing 'version' param");
+    }
+
+    #[test]
+    fn test_base_params_credential_values() {
+        let params = base_params("alice", "hunter2");
+        let login = params.iter().find(|(k, _)| k == "login").unwrap();
+        let password = params.iter().find(|(k, _)| k == "password").unwrap();
+        assert_eq!(login.1, "alice");
+        assert_eq!(password.1, "hunter2");
+    }
+
+    #[test]
+    fn test_base_params_software_version() {
+        let params = base_params("u", "p");
+        let software = params.iter().find(|(k, _)| k == "software").unwrap();
+        assert_eq!(software.1, SOFTWARE_ID);
+        let version = params.iter().find(|(k, _)| k == "version").unwrap();
+        assert_eq!(version.1, "296");
+    }
+
+    #[test]
+    fn test_base_params_system_includes_arch() {
+        let params = base_params("u", "p");
+        let arch_val = params.iter().find(|(k, _)| k == "arch").unwrap();
+        let system_val = params.iter().find(|(k, _)| k == "system").unwrap();
+        // system should be "linux_{arch}"
+        assert_eq!(system_val.1, format!("linux_{}", arch_val.1));
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional parse_connect_response edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_connect_response_whitespace_only() {
+        // Only whitespace — should hit EOF → Ok
+        let xml = "   \n\t  ";
+        let d = parse_connect_response(xml).unwrap();
+        assert!(matches!(d, ConnectDirective::Ok));
+    }
+
+    #[test]
+    fn test_connect_response_xml_declaration_only() {
+        // Just an XML declaration, no elements
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>"#;
+        let d = parse_connect_response(xml).unwrap();
+        assert!(matches!(d, ConnectDirective::Ok));
+    }
+
+    #[test]
+    fn test_connect_response_nested_elements_ignored() {
+        // Nested elements after root should not affect result
+        let xml = r#"<connect><inner message="ignored" error="ignored" /></connect>"#;
+        let d = parse_connect_response(xml).unwrap();
+        // Root <connect> has no error/message, so Ok
+        assert!(matches!(d, ConnectDirective::Ok));
+    }
+
+    #[test]
+    fn test_connect_response_multiple_attributes() {
+        // Root element with many attributes
+        let xml = r#"<connect status="ok" version="2" region="eu" error="" message="" />"#;
+        let d = parse_connect_response(xml).unwrap();
+        // error="" and message="" are both empty → Ok
+        assert!(matches!(d, ConnectDirective::Ok));
+    }
+
+    #[test]
+    fn test_connect_response_comment_before_element() {
+        // XML comment before root element
+        let xml = r#"<!-- comment --><connect error="Auth failed" />"#;
+        let d = parse_connect_response(xml).unwrap();
+        match d {
+            ConnectDirective::Stop(msg) => assert_eq!(msg, "Auth failed"),
+            other => panic!("expected Stop, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_connect_response_empty_error_attribute() {
+        // Empty error attribute should NOT trigger Stop — proceed to check message
+        let xml = r#"<connect error="" message="Please wait" />"#;
+        let d = parse_connect_response(xml).unwrap();
+        match d {
+            ConnectDirective::Retry(msg) => assert_eq!(msg, "Please wait"),
+            other => panic!("expected Retry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_connect_response_invalid_xml() {
+        let xml = r#"<not closed"#;
+        let result = parse_connect_response(xml);
+        assert!(result.is_err(), "malformed XML should return error");
+    }
 }

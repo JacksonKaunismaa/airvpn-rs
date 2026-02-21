@@ -667,4 +667,170 @@ mod tests {
         assert!(ProfileFormat::from_header(b"v1n").is_err());
         assert!(ProfileFormat::from_header(b"xyz").is_err());
     }
+
+    // -------------------------------------------------------------------
+    // ProfileFormat::from_header additional edge cases
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_profile_format_from_header_empty() {
+        assert!(ProfileFormat::from_header(b"").is_err());
+    }
+
+    #[test]
+    fn test_profile_format_from_header_too_long() {
+        // 4 bytes should not match any 3-byte header
+        assert!(ProfileFormat::from_header(b"v2nn").is_err());
+    }
+
+    #[test]
+    fn test_profile_format_from_header_case_sensitive() {
+        // Uppercase should not match
+        assert!(ProfileFormat::from_header(b"V2N").is_err());
+        assert!(ProfileFormat::from_header(b"V2S").is_err());
+        assert!(ProfileFormat::from_header(b"V2P").is_err());
+    }
+
+    #[test]
+    fn test_profile_format_from_header_v3() {
+        // Future version should fail
+        assert!(ProfileFormat::from_header(b"v3n").is_err());
+    }
+
+    #[test]
+    fn test_profile_format_header_roundtrip() {
+        // Each format's header() should round-trip through from_header()
+        for fmt in &[ProfileFormat::V2N, ProfileFormat::V2S, ProfileFormat::V2P] {
+            let header = fmt.header();
+            let parsed = ProfileFormat::from_header(header).unwrap();
+            assert_eq!(parsed, *fmt);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // generate_id uniqueness
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_generate_id_uniqueness() {
+        let ids: Vec<String> = (0..100).map(|_| generate_id()).collect();
+        // All should be 64 chars, all hex
+        for id in &ids {
+            assert_eq!(id.len(), 64);
+            assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+        // All should be unique
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), 100, "100 generated IDs should all be unique");
+    }
+
+    #[test]
+    fn test_generate_id_lowercase_hex() {
+        let id = generate_id();
+        // hex::encode produces lowercase
+        assert!(id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+    }
+
+    // -------------------------------------------------------------------
+    // encrypt_with_password / decrypt_with_password with various payloads
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_encrypt_decrypt_empty_payload() {
+        let plaintext = b"";
+        let password = "test-password";
+        let encrypted = encrypt_with_password(plaintext, password, NOT_SECRET_PAYLOAD);
+        let decrypted = decrypt_with_password(&encrypted, password, NOT_SECRET_PAYLOAD.len());
+        assert_eq!(decrypted.as_deref(), Some(plaintext.as_slice()));
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_one_byte() {
+        let plaintext = b"\x42";
+        let password = "test-password";
+        let encrypted = encrypt_with_password(plaintext, password, NOT_SECRET_PAYLOAD);
+        let decrypted = decrypt_with_password(&encrypted, password, NOT_SECRET_PAYLOAD.len());
+        assert_eq!(decrypted.as_deref(), Some(plaintext.as_slice()));
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_block_aligned_16_bytes() {
+        // Exactly 16 bytes = 1 AES block. With PKCS7, this produces 2 blocks.
+        let plaintext = b"0123456789abcdef";
+        assert_eq!(plaintext.len(), 16);
+        let password = "test-password";
+        let encrypted = encrypt_with_password(plaintext, password, NOT_SECRET_PAYLOAD);
+        let decrypted = decrypt_with_password(&encrypted, password, NOT_SECRET_PAYLOAD.len());
+        assert_eq!(decrypted.as_deref(), Some(plaintext.as_slice()));
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_large_payload() {
+        // 10KB payload
+        let plaintext: Vec<u8> = (0..10240).map(|i| (i % 256) as u8).collect();
+        let password = "test-password-for-large-data";
+        let encrypted = encrypt_with_password(&plaintext, password, NOT_SECRET_PAYLOAD);
+        let decrypted = decrypt_with_password(&encrypted, password, NOT_SECRET_PAYLOAD.len());
+        assert_eq!(decrypted.as_deref(), Some(plaintext.as_slice()));
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_unicode_password() {
+        let plaintext = b"sensitive data";
+        let password = "\u{1F512}\u{1F511}"; // lock + key emojis
+        let encrypted = encrypt_with_password(plaintext, password, NOT_SECRET_PAYLOAD);
+        let decrypted = decrypt_with_password(&encrypted, password, NOT_SECRET_PAYLOAD.len());
+        assert_eq!(decrypted.as_deref(), Some(plaintext.as_slice()));
+    }
+
+    #[test]
+    fn test_decrypt_too_short_blob() {
+        // A blob that's too short to contain even the minimum structure
+        let tiny = vec![0u8; 10];
+        let result = decrypt_with_password(&tiny, "password", NOT_SECRET_PAYLOAD.len());
+        assert!(result.is_none(), "too-short blob should fail decryption");
+    }
+
+    #[test]
+    fn test_decrypt_wrong_password() {
+        let plaintext = b"secret data";
+        let encrypted = encrypt_with_password(plaintext, "correct", NOT_SECRET_PAYLOAD);
+        let result = decrypt_with_password(&encrypted, "wrong", NOT_SECRET_PAYLOAD.len());
+        assert!(result.is_none(), "wrong password should fail HMAC verification");
+    }
+
+    // -------------------------------------------------------------------
+    // Profile file too small
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_load_profile_too_small() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny.profile");
+        // Write only 10 bytes — less than HEADER_LEN + ID_LEN = 67
+        std::fs::write(&path, b"v2n_short").unwrap();
+        let result = load_profile(&path, || bail!("should not be called"));
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("too small"),
+            "should report file too small"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Profile ID length validation
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_save_profile_wrong_id_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad_id.profile");
+        // ID is too short (10 chars instead of 64)
+        let result = save_profile(&path, ProfileFormat::V2N, "short_id_", b"data", "");
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("64"),
+            "should mention required ID length"
+        );
+    }
 }
