@@ -8,10 +8,13 @@
 //! Reference: Eddie src/Lib.Core/Providers/Service.cs
 
 use anyhow::{Context, Result};
+use quick_xml::events::Event;
+use quick_xml::reader::Reader;
 use reqwest::blocking::Client;
 use std::time::Duration;
 
 use crate::crypto;
+use crate::manifest::attr_opt;
 
 // ---------------------------------------------------------------------------
 // Constants — exported for netlock whitelisting and other modules
@@ -38,6 +41,69 @@ pub const RSA_EXPONENT_B64: &str = "AQAB";
 
 /// Software identifier sent in API requests.
 const SOFTWARE_ID: &str = "EddieDesktop_2.24.6";
+
+// ---------------------------------------------------------------------------
+// Connect directive — parsed from act=connect response
+// ---------------------------------------------------------------------------
+
+/// Server directive returned by `act=connect` pre-authorization.
+///
+/// Eddie checks `message` and `message_action` attributes on the response:
+/// - No message → proceed normally
+/// - `message_action="stop"` → abort connection
+/// - `message_action="next"` → skip this server, try next (5s delay in Eddie)
+/// - Any other message → retry with delay (10s in Eddie)
+///
+/// Reference: Eddie src/Lib.Core/Session.cs:195-217
+#[derive(Debug)]
+pub enum ConnectDirective {
+    /// No message — proceed with connection.
+    Ok,
+    /// Server says stop — abort connection entirely.
+    Stop(String),
+    /// Server says try a different server.
+    Next(String),
+    /// Server sent a message but no hard stop/next — retry with delay.
+    Retry(String),
+}
+
+/// Parse the `act=connect` XML response into a [`ConnectDirective`].
+///
+/// Checks `error`, `message`, and `message_action` attributes on the root element,
+/// matching Eddie's Session.cs logic.
+fn parse_connect_response(xml: &str) -> Result<ConnectDirective> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                // Check for error attribute first (same as check_api_error)
+                if let Some(err) = attr_opt(e, b"error") {
+                    if !err.is_empty() {
+                        return Ok(ConnectDirective::Stop(err));
+                    }
+                }
+                // Check for message + message_action (Eddie Session.cs:195-217)
+                if let Some(msg) = attr_opt(e, b"message") {
+                    if !msg.is_empty() {
+                        let action = attr_opt(e, b"message_action").unwrap_or_default();
+                        return match action.as_str() {
+                            "stop" => Ok(ConnectDirective::Stop(msg)),
+                            "next" => Ok(ConnectDirective::Next(msg)),
+                            _ => Ok(ConnectDirective::Retry(msg)),
+                        };
+                    }
+                }
+                // Root element has no error/message — all clear
+                return Ok(ConnectDirective::Ok);
+            }
+            Ok(Event::Eof) => return Ok(ConnectDirective::Ok),
+            Err(e) => anyhow::bail!("XML parse error in connect response: {e}"),
+            _ => {} // skip declarations, comments, etc.
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Manifest fetch
@@ -83,24 +149,27 @@ pub fn fetch_user_with_key(
 ///
 /// Eddie sends this before launching the WireGuard tunnel.
 /// The server may use it to allocate resources or verify authorization.
+/// Returns a [`ConnectDirective`] indicating whether to proceed, stop, or retry.
 ///
 /// Reference: Eddie src/Lib.Core/Session.cs:174
-pub fn fetch_connect(username: &str, password: &str, server_name: &str) -> Result<String> {
+pub fn fetch_connect(username: &str, password: &str, server_name: &str) -> Result<ConnectDirective> {
     fetch_connect_with_key(username, password, server_name, None, None)
 }
 
 /// Pre-connection authorization with optional RSA key override (for key rotation).
+/// Returns a [`ConnectDirective`] parsed from the server's response.
 pub fn fetch_connect_with_key(
     username: &str,
     password: &str,
     server_name: &str,
     rsa_mod: Option<&str>,
     rsa_exp: Option<&str>,
-) -> Result<String> {
+) -> Result<ConnectDirective> {
     let mut params = base_params(username, password);
     params.insert(0, ("act".into(), "connect".into()));
     params.insert(1, ("server".into(), server_name.into()));
-    fetch_encrypted(&params, rsa_mod, rsa_exp)
+    let xml = fetch_encrypted(&params, rsa_mod, rsa_exp)?;
+    parse_connect_response(&xml)
 }
 
 /// Normalize CPU architecture to match Eddie's naming convention.
@@ -243,5 +312,104 @@ mod tests {
     fn test_fetch_manifest_real() {
         let xml = super::fetch_manifest("testuser", "testpass").unwrap();
         assert!(xml.contains("<manifest"));
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_connect_response tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_connect_response_ok() {
+        let xml = r#"<connect />"#;
+        let d = parse_connect_response(xml).unwrap();
+        assert!(matches!(d, ConnectDirective::Ok));
+    }
+
+    #[test]
+    fn test_connect_response_ok_with_empty_message() {
+        let xml = r#"<connect message="" />"#;
+        let d = parse_connect_response(xml).unwrap();
+        assert!(matches!(d, ConnectDirective::Ok));
+    }
+
+    #[test]
+    fn test_connect_response_stop_from_error() {
+        let xml = r#"<connect error="Account expired" />"#;
+        let d = parse_connect_response(xml).unwrap();
+        match d {
+            ConnectDirective::Stop(msg) => assert_eq!(msg, "Account expired"),
+            other => panic!("expected Stop, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_connect_response_stop_from_message_action() {
+        let xml = r#"<connect message="Banned" message_action="stop" />"#;
+        let d = parse_connect_response(xml).unwrap();
+        match d {
+            ConnectDirective::Stop(msg) => assert_eq!(msg, "Banned"),
+            other => panic!("expected Stop, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_connect_response_next() {
+        let xml = r#"<connect message="Server full" message_action="next" />"#;
+        let d = parse_connect_response(xml).unwrap();
+        match d {
+            ConnectDirective::Next(msg) => assert_eq!(msg, "Server full"),
+            other => panic!("expected Next, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_connect_response_retry_unknown_action() {
+        let xml = r#"<connect message="Temporary issue" message_action="wait" />"#;
+        let d = parse_connect_response(xml).unwrap();
+        match d {
+            ConnectDirective::Retry(msg) => assert_eq!(msg, "Temporary issue"),
+            other => panic!("expected Retry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_connect_response_retry_no_action() {
+        // message present but no message_action → Retry (Eddie default branch)
+        let xml = r#"<connect message="Please wait" />"#;
+        let d = parse_connect_response(xml).unwrap();
+        match d {
+            ConnectDirective::Retry(msg) => assert_eq!(msg, "Please wait"),
+            other => panic!("expected Retry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_connect_response_error_takes_priority() {
+        // When both error and message are present, error wins (checked first)
+        let xml = r#"<connect error="Fatal" message="Try again" message_action="next" />"#;
+        let d = parse_connect_response(xml).unwrap();
+        match d {
+            ConnectDirective::Stop(msg) => assert_eq!(msg, "Fatal"),
+            other => panic!("expected Stop from error attr, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_connect_response_empty_xml() {
+        // Empty document → Ok (EOF before any element)
+        let xml = "";
+        let d = parse_connect_response(xml).unwrap();
+        assert!(matches!(d, ConnectDirective::Ok));
+    }
+
+    #[test]
+    fn test_connect_response_start_element() {
+        // Non-empty element (not self-closing) — should still parse root attrs
+        let xml = r#"<response message="Maintenance" message_action="stop"></response>"#;
+        let d = parse_connect_response(xml).unwrap();
+        match d {
+            ConnectDirective::Stop(msg) => assert_eq!(msg, "Maintenance"),
+            other => panic!("expected Stop, got {:?}", other),
+        }
     }
 }

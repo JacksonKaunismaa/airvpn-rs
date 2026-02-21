@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::time::Instant;
+
 use anyhow::{bail, Context};
 
 use crate::manifest::Server;
@@ -13,10 +16,58 @@ use crate::manifest::Server;
 //
 // We use "Speed" scoreType (Eddie default: servers.scoretype="Speed"):
 //   All factors are 1.0 (ScoreBase *= 1, LoadPerc *= 1, UsersPerc *= 1)
-// Penality is always 0 (we don't track it).
+// Penalty tracking via ServerPenalties (Eddie: Penality field on ConnectionInfo).
 // Ping is always 0 (no ping data; we skip Eddie's Ping==-1 → 99995 path).
 // Result is truncated to i64 to match Eddie's `(int)(sum)` cast.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Penalty tracking (Eddie: ConnectionInfo.Penality + advanced.penality_on_error)
+//
+// When a connection fails (ResetLevel::Error), the server receives a penalty
+// that decays over time. Penalized servers sort lower in selection, causing
+// automatic server rotation on reconnection.
+// ---------------------------------------------------------------------------
+
+/// Tracks per-server penalties with time-based expiry.
+///
+/// Eddie stores `Penality` as a raw int on `ConnectionInfo` and multiplies by
+/// `penality_factor` (default 1000) in `Score()`. We store the penalty duration
+/// and application time, expiring penalties after `duration_secs` elapses.
+pub struct ServerPenalties {
+    penalties: HashMap<String, (i64, Instant)>,
+}
+
+impl ServerPenalties {
+    pub fn new() -> Self {
+        Self {
+            penalties: HashMap::new(),
+        }
+    }
+
+    /// Apply a penalty to a server.
+    ///
+    /// `duration_secs` is how long the penalty stays active (Eddie default: 30s
+    /// via `advanced.penality_on_error`).
+    pub fn penalize(&mut self, server_name: &str, duration_secs: i64) {
+        self.penalties
+            .insert(server_name.to_string(), (duration_secs, Instant::now()));
+    }
+
+    /// Get active penalty for a server (0 if expired or none).
+    pub fn get(&self, server_name: &str) -> i64 {
+        match self.penalties.get(server_name) {
+            Some((penalty, when)) => {
+                if when.elapsed().as_secs() < *penalty as u64 {
+                    *penalty
+                } else {
+                    0
+                }
+            }
+            None => 0,
+        }
+    }
+}
 
 /// Compute load as a percentage, matching Eddie's `LoadPerc()`.
 ///
@@ -53,7 +104,7 @@ fn users_perc(server: &Server) -> i64 {
 /// Score = PenalityB + PingB + LoadB + ScoreB + UsersB
 /// ```
 /// With Speed factors (all 1.0):
-/// - PenalityB = 0 (penality always 0)
+/// - PenalityB = 0 (base score excludes penalty; see `score_with_penalty()`)
 /// - PingB = 0 (no ping data)
 /// - LoadB = LoadPerc * 1
 /// - ScoreB = ScoreBase * 1
@@ -70,7 +121,7 @@ pub fn score(server: &Server) -> i64 {
         return 99997;
     }
 
-    let penality_b = 0; // Penality * 1000; penality always 0
+    let penality_b = 0; // Base score excludes penalty; use score_with_penalty() for penalty-aware scoring
     let ping_b = 0; // Ping * 1; no ping data, use 0
 
     let load = load_perc(server);
@@ -84,6 +135,22 @@ pub fn score(server: &Server) -> i64 {
     let users_b = users;
 
     (penality_b + ping_b + load_b + score_b + users_b) as i64
+}
+
+/// Compute server score including penalty, matching Eddie's `Score()` with
+/// `Penality * penality_factor` (default factor = 1000).
+///
+/// Sentinel values (99995+) from warnings are not modified — a closed server
+/// stays closed regardless of penalties.
+pub fn score_with_penalty(server: &Server, penalties: &ServerPenalties) -> i64 {
+    let base = score(server);
+    // Don't inflate sentinel values (warnings/errors)
+    if base >= 99995 {
+        return base;
+    }
+    let penalty = penalties.get(&server.name);
+    // Eddie: Penality * penality_factor where penality_factor defaults to 1000
+    base + penalty * 1000
 }
 
 /// Select best server: filter, score, sort, pick first.
@@ -107,6 +174,37 @@ pub fn select_server<'a>(
     servers
         .iter()
         .min_by(|a, b| score(a).cmp(&score(b)))
+        .context("no servers available")
+}
+
+/// Select best server with penalty-aware scoring.
+///
+/// Like `select_server`, but uses `score_with_penalty` so that recently-failed
+/// servers sort lower, causing automatic rotation to a different server.
+/// If `server_name` is `Some`, find by exact name match (bypasses penalties).
+pub fn select_server_with_penalties<'a>(
+    servers: &'a [Server],
+    server_name: Option<&str>,
+    penalties: &ServerPenalties,
+) -> anyhow::Result<&'a Server> {
+    if servers.is_empty() {
+        bail!("no servers available");
+    }
+
+    // Explicit server name bypasses penalty scoring (user knows what they want)
+    if let Some(name) = server_name {
+        return servers
+            .iter()
+            .find(|s| s.name == name)
+            .with_context(|| format!("server '{name}' not found"));
+    }
+
+    // Score all servers with penalties and pick the lowest.
+    servers
+        .iter()
+        .min_by(|a, b| {
+            score_with_penalty(a, penalties).cmp(&score_with_penalty(b, penalties))
+        })
         .context("no servers available")
 }
 
@@ -294,5 +392,90 @@ mod tests {
         ];
         let selected = select_server(&servers, None).unwrap();
         assert_eq!(selected.name, "Good");
+    }
+
+    // -------------------------------------------------------------------
+    // Penalty tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_penalty_fresh_is_zero() {
+        let penalties = ServerPenalties::new();
+        assert_eq!(penalties.get("anything"), 0);
+    }
+
+    #[test]
+    fn test_penalty_active() {
+        let mut penalties = ServerPenalties::new();
+        penalties.penalize("Alpha", 30);
+        // Penalty was just applied — should be active
+        assert_eq!(penalties.get("Alpha"), 30);
+    }
+
+    #[test]
+    fn test_penalty_other_server_unaffected() {
+        let mut penalties = ServerPenalties::new();
+        penalties.penalize("Alpha", 30);
+        assert_eq!(penalties.get("Beta"), 0);
+    }
+
+    #[test]
+    fn test_score_with_penalty_normal() {
+        let s = make_server("Alpha", 500_000, 1000, 50, 250, 10, "", "");
+        let mut penalties = ServerPenalties::new();
+        penalties.penalize("Alpha", 30);
+        // Base score = 30 (from test_score_normal_server)
+        // Penalty contribution = 30 * 1000 = 30000
+        assert_eq!(score_with_penalty(&s, &penalties), 30030);
+    }
+
+    #[test]
+    fn test_score_with_penalty_no_penalty() {
+        let s = make_server("Alpha", 500_000, 1000, 50, 250, 10, "", "");
+        let penalties = ServerPenalties::new();
+        // No penalty → same as base score
+        assert_eq!(score_with_penalty(&s, &penalties), score(&s));
+    }
+
+    #[test]
+    fn test_score_with_penalty_sentinel_unchanged() {
+        // warning_closed → base score 99998; penalty should NOT inflate it
+        let s = make_server("Closed", 500_000, 1000, 50, 250, 10, "", "maintenance");
+        let mut penalties = ServerPenalties::new();
+        penalties.penalize("Closed", 30);
+        assert_eq!(score_with_penalty(&s, &penalties), 99998);
+    }
+
+    #[test]
+    fn test_select_server_with_penalties_rotates() {
+        let servers = vec![
+            // Score: 30 (best without penalty)
+            make_server("Best", 500_000, 1000, 50, 250, 10, "", ""),
+            // Score: 160
+            make_server("Second", 50_000_000, 1000, 200, 250, 0, "", ""),
+        ];
+        let mut penalties = ServerPenalties::new();
+        // Without penalty, "Best" wins
+        let selected = select_server_with_penalties(&servers, None, &penalties).unwrap();
+        assert_eq!(selected.name, "Best");
+
+        // Penalize "Best" — now "Second" should win (30 + 30*1000 = 30030 > 160)
+        penalties.penalize("Best", 30);
+        let selected = select_server_with_penalties(&servers, None, &penalties).unwrap();
+        assert_eq!(selected.name, "Second");
+    }
+
+    #[test]
+    fn test_select_server_with_penalties_explicit_name_ignores_penalty() {
+        let servers = vec![
+            make_server("Alpha", 500_000, 1000, 50, 250, 10, "", ""),
+            make_server("Beta", 500_000, 1000, 50, 250, 10, "", ""),
+        ];
+        let mut penalties = ServerPenalties::new();
+        penalties.penalize("Alpha", 30);
+        // Explicit name should still find Alpha despite penalty
+        let selected =
+            select_server_with_penalties(&servers, Some("Alpha"), &penalties).unwrap();
+        assert_eq!(selected.name, "Alpha");
     }
 }

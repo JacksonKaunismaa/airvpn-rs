@@ -119,7 +119,7 @@ struct RawServerAttrs {
 // ---------------------------------------------------------------------------
 
 /// Get a decoded attribute value from an XML element. Returns None if absent.
-fn attr_opt(e: &quick_xml::events::BytesStart<'_>, name: &[u8]) -> Option<String> {
+pub fn attr_opt(e: &quick_xml::events::BytesStart<'_>, name: &[u8]) -> Option<String> {
     for attr in e.attributes().flatten() {
         if attr.key.as_ref() == name {
             return String::from_utf8(attr.value.to_vec()).ok();

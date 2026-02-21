@@ -79,39 +79,80 @@ pub fn flush() {
     }
 }
 
-/// Configure systemd-resolved for VPN DNS on the given interface.
+/// Get all network interface names from /sys/class/net/, excluding loopback.
 ///
-/// Eddie sets DNS and default-route on the VPN interface so that
-/// systemd-resolved routes all queries through the tunnel.
-fn configure_systemd_resolved(dns_ipv4: &str, dns_ipv6: &str, iface: &str) -> Result<()> {
-    // Build DNS args, only including non-empty addresses
-    let mut dns_args = vec!["dns", iface];
-    if !dns_ipv4.is_empty() {
-        dns_args.push(dns_ipv4);
+/// Eddie uses if_nameindex() to enumerate interfaces. We read /sys/class/net/
+/// which is the sysfs equivalent and avoids needing libc bindings.
+fn list_interfaces() -> Vec<String> {
+    let mut ifaces = Vec::new();
+    if let Ok(entries) = fs::read_dir("/sys/class/net") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name != "lo" && name != "lo0" {
+                ifaces.push(name);
+            }
+        }
     }
-    if !dns_ipv6.is_empty() {
-        dns_args.push(dns_ipv6);
-    }
+    ifaces
+}
 
-    let output = Command::new("resolvectl")
-        .args(&dns_args)
-        .output()
-        .context("failed to execute resolvectl dns")?;
+/// Configure systemd-resolved for all interfaces: set VPN DNS on VPN interface,
+/// disable default-route on all others to prevent DNS leaks.
+///
+/// Eddie iterates ALL network interfaces and sets default-route=false on every
+/// non-VPN interface so systemd-resolved doesn't route DNS through them.
+/// Only the VPN interface gets DNS servers + default-route=true.
+///
+/// Reference: Eddie impl.cpp dns-switch-do (lines ~228-321)
+fn configure_systemd_resolved_all(dns_ipv4: &str, dns_ipv6: &str, vpn_iface: &str) -> Result<()> {
+    let ifaces = list_interfaces();
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("resolvectl dns failed: {}", stderr);
-    }
+    for iface in &ifaces {
+        if iface == vpn_iface {
+            // VPN interface: set DNS servers and default-route=true
+            let mut dns_args = vec!["dns", iface.as_str()];
+            if !dns_ipv4.is_empty() {
+                dns_args.push(dns_ipv4);
+            }
+            if !dns_ipv6.is_empty() {
+                dns_args.push(dns_ipv6);
+            }
 
-    // resolvectl default-route <iface> true
-    let output = Command::new("resolvectl")
-        .args(["default-route", iface, "true"])
-        .output()
-        .context("failed to execute resolvectl default-route")?;
+            let output = Command::new("resolvectl")
+                .args(&dns_args)
+                .output()
+                .context("failed to execute resolvectl dns")?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("resolvectl default-route failed: {}", stderr);
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!("resolvectl dns on {} failed: {}", iface, stderr);
+            }
+
+            let output = Command::new("resolvectl")
+                .args(["default-route", iface.as_str(), "true"])
+                .output()
+                .context("failed to execute resolvectl default-route")?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!("resolvectl default-route on {} failed: {}", iface, stderr);
+            }
+        } else {
+            // Non-VPN interface: set default-route=false to prevent DNS leak.
+            // Non-fatal — interface may not support it (e.g. virtual bridges).
+            let output = Command::new("resolvectl")
+                .args(["default-route", iface.as_str(), "false"])
+                .output();
+            if let Ok(o) = &output {
+                if !o.status.success() {
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    eprintln!(
+                        "warning: resolvectl default-route false on {} failed (non-fatal): {}",
+                        iface, stderr
+                    );
+                }
+            }
+        }
     }
 
     Ok(())
@@ -126,9 +167,10 @@ pub fn activate(dns_ipv4: &str, dns_ipv6: &str, iface: &str) -> Result<()> {
         anyhow::bail!("no DNS servers provided (both IPv4 and IPv6 are empty)");
     }
 
-    // If systemd-resolved is active, configure it
+    // If systemd-resolved is active, configure all interfaces:
+    // VPN interface gets DNS + default-route=true, all others get default-route=false.
     if is_systemd_resolved_active() {
-        configure_systemd_resolved(dns_ipv4, dns_ipv6, iface)?;
+        configure_systemd_resolved_all(dns_ipv4, dns_ipv6, iface)?;
     }
 
     // Always do the resolv.conf swap (Eddie does both regardless)
@@ -279,5 +321,30 @@ mod tests {
         // depends on the system. On CI/containers, systemd-resolved is
         // typically not running.
         let _active = is_systemd_resolved_active();
+    }
+
+    #[test]
+    fn test_list_interfaces_excludes_loopback() {
+        let ifaces = list_interfaces();
+        // lo and lo0 should never appear
+        assert!(
+            !ifaces.iter().any(|i| i == "lo" || i == "lo0"),
+            "loopback interfaces should be excluded, got: {:?}",
+            ifaces
+        );
+    }
+
+    #[test]
+    fn test_list_interfaces_returns_some() {
+        let ifaces = list_interfaces();
+        // Every Linux system has at least one non-loopback interface
+        // (e.g. eth0, ens3, wlan0, docker0). On a bare container this
+        // may be empty if /sys/class/net is missing, which is fine.
+        if Path::new("/sys/class/net").exists() {
+            assert!(
+                !ifaces.is_empty(),
+                "/sys/class/net exists but no non-loopback interfaces found"
+            );
+        }
     }
 }

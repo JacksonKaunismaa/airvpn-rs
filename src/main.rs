@@ -24,6 +24,9 @@ enum Commands {
         /// Allow LAN traffic through lock
         #[arg(long)]
         allow_lan: bool,
+        /// Disable auto-reconnection (single-shot mode)
+        #[arg(long)]
+        no_reconnect: bool,
         /// AirVPN username (overrides saved credentials)
         #[arg(long)]
         username: Option<String>,
@@ -61,9 +64,10 @@ fn main() -> anyhow::Result<()> {
             server,
             no_lock,
             allow_lan,
+            no_reconnect,
             username,
             password,
-        } => cmd_connect(server, no_lock, allow_lan, username, password),
+        } => cmd_connect(server, no_lock, allow_lan, no_reconnect, username, password),
         Commands::Disconnect => cmd_disconnect(),
         Commands::Status => cmd_status(),
         Commands::Servers { sort, debug, username, password } => cmd_servers(&sort, debug, username, password),
@@ -93,6 +97,28 @@ fn preflight_checks() -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Connect — reconnection levels (Eddie: Session.cs reset levels)
+// ---------------------------------------------------------------------------
+
+/// Determines what happens when a connection ends or fails.
+///
+/// Mirrors Eddie's `m_reset` string values ("", "RETRY", "ERROR", "SWITCH", "FATAL")
+/// from Session.cs, but as a proper enum.
+#[allow(dead_code)] // Switch is defined for Eddie protocol completeness
+enum ResetLevel {
+    /// User requested disconnect (Ctrl+C / SIGTERM). Clean exit.
+    None,
+    /// Retry the same server (Eddie: "RETRY"). Short delay.
+    Retry,
+    /// Server error — penalize and rotate (Eddie: "ERROR" + Penality += penality_on_error).
+    Error,
+    /// Immediate server switch (Eddie: "SWITCH"). No delay.
+    Switch,
+    /// Fatal error — give up entirely (Eddie: "FATAL").
+    Fatal,
+}
+
+// ---------------------------------------------------------------------------
 // Connect
 // ---------------------------------------------------------------------------
 
@@ -100,6 +126,7 @@ fn cmd_connect(
     server_name: Option<String>,
     no_lock: bool,
     allow_lan: bool,
+    no_reconnect: bool,
     cli_username: Option<String>,
     cli_password: Option<String>,
 ) -> anyhow::Result<()> {
@@ -165,188 +192,320 @@ fn cmd_connect(
     let user_xml = api::fetch_user_with_key(&username, &password, rsa_mod, rsa_exp)?;
     let user_info = manifest::parse_user(&user_xml)?;
 
-    // 5. Select server
-    let server_ref = server::select_server(&manifest.servers, server_name.as_deref())?;
-    println!(
-        "Selected server: {} ({}, {})",
-        server_ref.name, server_ref.location, server_ref.country_code
-    );
-
-    // 5b. Pre-connection authorization (non-fatal — Eddie: "If failed, continue anyway")
-    println!("Authorizing connection...");
-    if let Err(e) = api::fetch_connect_with_key(&username, &password, &server_ref.name, rsa_mod, rsa_exp) {
-        eprintln!("warning: pre-connection authorization failed: {:#}", e);
-    }
-
-    // 6. Select WireGuard mode (first available)
+    // 4. Select WireGuard mode (first available) — invariant across reconnections
     let mode = manifest
         .modes
         .first()
         .ok_or_else(|| anyhow::anyhow!("No WireGuard modes available"))?;
 
-    // 7. Get WireGuard key (first/default)
+    // 5. Get WireGuard key (first/default) — invariant across reconnections
     let wg_key = user_info
         .keys
         .first()
         .ok_or_else(|| anyhow::anyhow!("No WireGuard keys in user data"))?;
 
-    // 8. Activate network lock (BEFORE connecting -- this is critical)
-    if !no_lock {
-        println!("Activating network lock...");
-        let mut allowed_ips: Vec<String> = server_ref.ips_entry.clone();
-        // Also whitelist API bootstrap IPs (extract bare IP from URLs like "http://1.2.3.4")
-        for url in api::BOOTSTRAP_IPS {
-            if let Some(ip) = extract_ip_from_url(url) {
-                allowed_ips.push(ip);
+    // -----------------------------------------------------------------------
+    // Reconnection loop (Eddie: Session.cs outer `for (; CancelRequested == false;)`)
+    //
+    // The --server flag forces a specific server only on the FIRST attempt.
+    // On ResetLevel::Error, we clear it so select_server_with_penalties can
+    // pick a different (non-penalized) server.
+    // -----------------------------------------------------------------------
+
+    let mut penalties = server::ServerPenalties::new();
+    let mut forced_server: Option<&str> = server_name.as_deref();
+
+    loop {
+        // Check for shutdown before attempting connection
+        if shutdown.load(Ordering::Relaxed) {
+            println!("Shutdown requested before connection attempt.");
+            break;
+        }
+
+        // 6. Select server (penalty-aware)
+        let server_ref = server::select_server_with_penalties(
+            &manifest.servers,
+            forced_server,
+            &penalties,
+        )?;
+        println!(
+            "Selected server: {} ({}, {})",
+            server_ref.name, server_ref.location, server_ref.country_code
+        );
+
+        // 6b. Pre-connection authorization (Eddie: Session.cs:173-218)
+        let reset_from_auth = match api::fetch_connect_with_key(
+            &username,
+            &password,
+            &server_ref.name,
+            rsa_mod,
+            rsa_exp,
+        ) {
+            Ok(api::ConnectDirective::Ok) => {
+                println!("Authorizing connection... OK");
+                Option::<ResetLevel>::None
+            }
+            Ok(api::ConnectDirective::Stop(msg)) => {
+                eprintln!("Server rejected connection: {}", msg);
+                Some(ResetLevel::Fatal)
+            }
+            Ok(api::ConnectDirective::Next(msg)) => {
+                // Eddie: Penality += penality_on_error, waitingSecs = 5
+                eprintln!("Server says try another: {}", msg);
+                Some(ResetLevel::Error)
+            }
+            Ok(api::ConnectDirective::Retry(msg)) => {
+                eprintln!("Server message: {}", msg);
+                Some(ResetLevel::Retry)
+            }
+            Err(e) => {
+                // Non-fatal — Eddie: "If failed, continue anyway"
+                eprintln!("warning: pre-connection authorization failed: {:#}", e);
+                Option::<ResetLevel>::None
+            }
+        };
+
+        // Handle auth-level reset before establishing infrastructure
+        if let Some(level) = reset_from_auth {
+            match level {
+                ResetLevel::Fatal => {
+                    anyhow::bail!("Fatal: server rejected connection");
+                }
+                ResetLevel::Error => {
+                    penalties.penalize(&server_ref.name, 30);
+                    forced_server = Option::None; // clear forced server for rotation
+                    if no_reconnect {
+                        anyhow::bail!("Server directed to try another (--no-reconnect)");
+                    }
+                    eprintln!("Penalized {}. Trying another server in 5s...", server_ref.name);
+                    interruptible_sleep(&shutdown, 5);
+                    continue;
+                }
+                ResetLevel::Retry => {
+                    if no_reconnect {
+                        anyhow::bail!("Server asked to retry (--no-reconnect)");
+                    }
+                    eprintln!("Retrying in 10s...");
+                    interruptible_sleep(&shutdown, 10);
+                    continue;
+                }
+                _ => {} // None/Switch don't occur from auth
             }
         }
-        let lock_config = netlock::NetlockConfig {
-            allow_lan,
-            allow_dhcp: true,
-            allow_ping: true,
-            allow_ipv4ipv6translation: true,
-            allowed_ips,
-        };
-        netlock::activate(&lock_config)?;
+
+        // 7. Activate network lock (BEFORE connecting -- this is critical)
+        if !no_lock {
+            println!("Activating network lock...");
+            let mut allowed_ips: Vec<String> = server_ref.ips_entry.clone();
+            // Also whitelist API bootstrap IPs (extract bare IP from URLs like "http://1.2.3.4")
+            for url in api::BOOTSTRAP_IPS {
+                if let Some(ip) = extract_ip_from_url(url) {
+                    allowed_ips.push(ip);
+                }
+            }
+            let lock_config = netlock::NetlockConfig {
+                allow_lan,
+                allow_dhcp: true,
+                allow_ping: true,
+                allow_ipv4ipv6translation: true,
+                allowed_ips,
+            };
+            netlock::activate(&lock_config)?;
+            recovery::save(&recovery::State {
+                lock_active: true,
+                wg_interface: String::new(),
+                wg_config_path: String::new(),
+                dns_ipv4: String::new(),
+                dns_ipv6: String::new(),
+                pid: std::process::id(),
+                blocked_ipv6_ifaces: vec![],
+            })?;
+            println!("Network lock active (dedicated nftables table)");
+        }
+
+        // 7b. Block IPv6 on all interfaces (Eddie default: network.ipv6.mode="in-block")
+        let blocked_ipv6_ifaces = ipv6::block_all();
+        if !blocked_ipv6_ifaces.is_empty() {
+            println!("IPv6 disabled on {} interfaces", blocked_ipv6_ifaces.len());
+        }
         recovery::save(&recovery::State {
-            lock_active: true,
+            lock_active: !no_lock,
             wg_interface: String::new(),
             wg_config_path: String::new(),
             dns_ipv4: String::new(),
             dns_ipv6: String::new(),
             pid: std::process::id(),
-            blocked_ipv6_ifaces: vec![],
+            blocked_ipv6_ifaces: blocked_ipv6_ifaces.clone(),
         })?;
-        println!("Network lock active (dedicated nftables table)");
-    }
 
-    // 8b. Block IPv6 on all interfaces (Eddie default: network.ipv6.mode="in-block")
-    let blocked_ipv6_ifaces = ipv6::block_all();
-    if !blocked_ipv6_ifaces.is_empty() {
-        println!("IPv6 disabled on {} interfaces", blocked_ipv6_ifaces.len());
-    }
-    recovery::save(&recovery::State {
-        lock_active: !no_lock,
-        wg_interface: String::new(),
-        wg_config_path: String::new(),
-        dns_ipv4: String::new(),
-        dns_ipv6: String::new(),
-        pid: std::process::id(),
-        blocked_ipv6_ifaces: blocked_ipv6_ifaces.clone(),
-    })?;
-
-    // 9. Generate WireGuard config and connect
-    let wg_config = wireguard::generate_config(wg_key, server_ref, mode, &user_info)?;
-    println!("Connecting to {} via mode {}...", server_ref.name, mode.title);
-    let (config_path, iface) = match wireguard::connect(&wg_config) {
-        Ok(result) => result,
-        Err(e) => {
-            // Restore IPv6 before removing netlock
-            ipv6::restore(&blocked_ipv6_ifaces);
-            // Clean up netlock before bailing — otherwise the firewall
-            // stays active and blocks all traffic
-            if !no_lock {
-                eprintln!("WireGuard connection failed, removing network lock...");
-                let _ = netlock::deactivate();
+        // 8. Generate WireGuard config and connect
+        let wg_config = wireguard::generate_config(wg_key, server_ref, mode, &user_info)?;
+        println!("Connecting to {} via mode {}...", server_ref.name, mode.title);
+        let (config_path, iface) = match wireguard::connect(&wg_config) {
+            Ok(result) => result,
+            Err(e) => {
+                eprintln!("WireGuard connection failed: {:#}", e);
+                // Restore IPv6 before removing netlock
+                ipv6::restore(&blocked_ipv6_ifaces);
+                if !no_lock {
+                    eprintln!("Removing network lock...");
+                    let _ = netlock::deactivate();
+                }
+                let _ = recovery::remove();
+                // Treat as Error (penalize + rotate)
+                penalties.penalize(&server_ref.name, 30);
+                forced_server = Option::None;
+                if no_reconnect {
+                    return Err(e.context("WireGuard connection failed"));
+                }
+                eprintln!("Reconnecting in 3s (penalized {})...", server_ref.name);
+                interruptible_sleep(&shutdown, 3);
+                continue;
             }
-            let _ = recovery::remove();
-            return Err(e.context("WireGuard connection failed"));
-        }
-    };
-    recovery::save(&recovery::State {
-        lock_active: !no_lock,
-        wg_interface: iface.clone(),
-        wg_config_path: config_path.clone(),
-        dns_ipv4: String::new(),
-        dns_ipv6: String::new(),
-        pid: std::process::id(),
-        blocked_ipv6_ifaces: blocked_ipv6_ifaces.clone(),
-    })?;
-    println!("WireGuard interface: {}", iface);
-
-    // Wait for first WireGuard handshake (Eddie: handshake_timeout_first=50s)
-    println!("Waiting for handshake...");
-    if let Err(e) = wireguard::wait_for_handshake(&iface, 50) {
-        eprintln!("Handshake failed: {:#}", e);
-        eprintln!("Cleaning up...");
-        // Order: WG down → IPv6 restore → netlock deactivate (same as disconnect)
-        let _ = wireguard::disconnect(&config_path);
-        ipv6::restore(&blocked_ipv6_ifaces);
-        if !no_lock {
-            let _ = netlock::deactivate();
-        }
-        let _ = recovery::remove();
-        return Err(e);
-    }
-    println!("Handshake established.");
-
-    // 10-13: Remaining setup — if any step fails, clean up established connection
-    if let Err(e) = (|| -> anyhow::Result<()> {
-        // 10. Allow VPN interface in netlock
-        if !no_lock {
-            netlock::allow_interface(&iface)?;
-        }
-
-        // 11. Activate DNS
-        dns::activate(&wg_key.wg_dns_ipv4, &wg_key.wg_dns_ipv6, &iface)?;
-        println!("DNS configured: {}, {}", wg_key.wg_dns_ipv4, wg_key.wg_dns_ipv6);
-
-        // 12. Save credentials (non-fatal — don't kill connection over keyring issues)
-        if let Err(e) = config::save_credentials(&username, &password) {
-            eprintln!("warning: failed to save credentials: {:#}", e);
-        }
-
-        // 13. Save recovery state
+        };
         recovery::save(&recovery::State {
             lock_active: !no_lock,
             wg_interface: iface.clone(),
             wg_config_path: config_path.clone(),
-            dns_ipv4: wg_key.wg_dns_ipv4.clone(),
-            dns_ipv6: wg_key.wg_dns_ipv6.clone(),
+            dns_ipv4: String::new(),
+            dns_ipv6: String::new(),
             pid: std::process::id(),
             blocked_ipv6_ifaces: blocked_ipv6_ifaces.clone(),
         })?;
+        println!("WireGuard interface: {}", iface);
 
-        Ok(())
-    })() {
-        eprintln!("Setup failed after WireGuard connected: {:#}", e);
-        eprintln!("Cleaning up...");
-        let _ = cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces);
-        return Err(e);
+        // Wait for first WireGuard handshake (Eddie: handshake_timeout_first=50s)
+        println!("Waiting for handshake...");
+        if let Err(e) = wireguard::wait_for_handshake(&iface, 50) {
+            eprintln!("Handshake failed: {:#}", e);
+            // Order: WG down -> IPv6 restore -> netlock deactivate
+            let _ = wireguard::disconnect(&config_path);
+            ipv6::restore(&blocked_ipv6_ifaces);
+            if !no_lock {
+                let _ = netlock::deactivate();
+            }
+            let _ = recovery::remove();
+            // Treat as Error (penalize + rotate)
+            penalties.penalize(&server_ref.name, 30);
+            forced_server = Option::None;
+            if no_reconnect {
+                return Err(e);
+            }
+            eprintln!("Reconnecting in 3s (penalized {})...", server_ref.name);
+            interruptible_sleep(&shutdown, 3);
+            continue;
+        }
+        println!("Handshake established.");
+
+        // 9-12: Remaining setup — if any step fails, clean up and treat as fatal
+        // (DNS/netlock setup failures are not transient server issues)
+        if let Err(e) = (|| -> anyhow::Result<()> {
+            // 9. Allow VPN interface in netlock
+            if !no_lock {
+                netlock::allow_interface(&iface)?;
+            }
+
+            // 10. Activate DNS
+            dns::activate(&wg_key.wg_dns_ipv4, &wg_key.wg_dns_ipv6, &iface)?;
+            println!("DNS configured: {}, {}", wg_key.wg_dns_ipv4, wg_key.wg_dns_ipv6);
+
+            // 11. Save credentials (non-fatal — don't kill connection over keyring issues)
+            if let Err(e) = config::save_credentials(&username, &password) {
+                eprintln!("warning: failed to save credentials: {:#}", e);
+            }
+
+            // 12. Save recovery state
+            recovery::save(&recovery::State {
+                lock_active: !no_lock,
+                wg_interface: iface.clone(),
+                wg_config_path: config_path.clone(),
+                dns_ipv4: wg_key.wg_dns_ipv4.clone(),
+                dns_ipv6: wg_key.wg_dns_ipv6.clone(),
+                pid: std::process::id(),
+                blocked_ipv6_ifaces: blocked_ipv6_ifaces.clone(),
+            })?;
+
+            Ok(())
+        })() {
+            eprintln!("Setup failed after WireGuard connected: {:#}", e);
+            eprintln!("Cleaning up...");
+            let _ = cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces);
+            return Err(e);
+        }
+
+        println!(
+            "\nConnected to {} via {}.{}",
+            server_ref.name,
+            iface,
+            if no_reconnect {
+                " Press Ctrl+C to disconnect."
+            } else {
+                " Press Ctrl+C to disconnect. Auto-reconnect enabled."
+            }
+        );
+
+        // 13. Monitor loop — determines ResetLevel when connection ends
+        let reset_level = loop {
+            if shutdown.load(Ordering::Relaxed) {
+                println!("\nDisconnecting...");
+                break ResetLevel::None;
+            }
+
+            // Check interface still exists
+            if !wireguard::is_connected(&iface) {
+                eprintln!("WireGuard interface {} disappeared!", iface);
+                break ResetLevel::Error;
+            }
+
+            // Check handshake staleness (Eddie: handshake_timeout_connected=200s)
+            if wireguard::is_handshake_stale(&iface, 200) {
+                eprintln!("WireGuard handshake stale (>200s) -- tunnel may be dead");
+                break ResetLevel::Error;
+            }
+
+            // Periodic DNS re-check (matching Eddie's DnsSwitchCheck)
+            let _ = dns::check_and_reapply(&wg_key.wg_dns_ipv4, &wg_key.wg_dns_ipv6);
+
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        };
+
+        // Clean disconnect for this iteration
+        cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces)?;
+
+        // Handle reset level (Eddie: Session.cs phase 6 cleanup + wait)
+        match reset_level {
+            ResetLevel::None | ResetLevel::Fatal => break,
+            ResetLevel::Error => {
+                if no_reconnect {
+                    eprintln!("Connection lost (--no-reconnect, exiting).");
+                    break;
+                }
+                penalties.penalize(&server_ref.name, 30);
+                forced_server = Option::None; // clear forced server for rotation
+                eprintln!(
+                    "Connection lost. Reconnecting in 3s (penalized {})...",
+                    server_ref.name
+                );
+                interruptible_sleep(&shutdown, 3);
+            }
+            ResetLevel::Retry => {
+                if no_reconnect {
+                    eprintln!("Connection lost (--no-reconnect, exiting).");
+                    break;
+                }
+                eprintln!("Retrying same server in 1s...");
+                interruptible_sleep(&shutdown, 1);
+            }
+            ResetLevel::Switch => {
+                if no_reconnect {
+                    eprintln!("Server switch requested (--no-reconnect, exiting).");
+                    break;
+                }
+                forced_server = Option::None;
+                eprintln!("Switching server...");
+            }
+        }
     }
-
-    println!(
-        "\nConnected to {} via {}. Press Ctrl+C to disconnect.",
-        server_ref.name, iface
-    );
-
-    // 15. Monitor loop
-    loop {
-        if shutdown.load(Ordering::Relaxed) {
-            println!("\nDisconnecting...");
-            break;
-        }
-
-        // Check interface still exists
-        if !wireguard::is_connected(&iface) {
-            eprintln!("WireGuard interface {} disappeared!", iface);
-            break;
-        }
-
-        // Check handshake staleness (Eddie: handshake_timeout_connected=200s)
-        if wireguard::is_handshake_stale(&iface, 200) {
-            eprintln!("WireGuard handshake stale (>200s) — tunnel may be dead");
-            break;
-        }
-
-        // Periodic DNS re-check (matching Eddie's DnsSwitchCheck)
-        let _ = dns::check_and_reapply(&wg_key.wg_dns_ipv4, &wg_key.wg_dns_ipv6);
-
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    }
-
-    // Clean disconnect
-    cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces)?;
 
     Ok(())
 }
@@ -513,6 +672,19 @@ fn cmd_recover() -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Sleep for `secs` seconds, checking the shutdown flag each second.
+///
+/// Returns early if the shutdown signal is received, so reconnection delays
+/// don't prevent responsive Ctrl+C handling.
+fn interruptible_sleep(shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>, secs: u64) {
+    for _ in 0..secs {
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
 
 /// Extract the host (IP or hostname) from a URL like "http://63.33.78.166"
 /// or "http://[2a03:b0c0::1]" or "http://bootme.org".
