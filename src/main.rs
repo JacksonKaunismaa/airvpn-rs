@@ -1,4 +1,4 @@
-use airvpn::{api, config, dns, manifest, netlock, recovery, server, wireguard};
+use airvpn::{api, config, dns, ipv6, manifest, netlock, recovery, server, wireguard};
 
 use std::sync::atomic::Ordering;
 
@@ -131,8 +131,12 @@ fn cmd_connect(
         manifest.modes.len()
     );
 
+    // Use rotated RSA key from manifest if provided
+    let rsa_mod = manifest.rsa_modulus.as_deref();
+    let rsa_exp = manifest.rsa_exponent.as_deref();
+
     println!("Fetching user data...");
-    let user_xml = api::fetch_user(&username, &password)?;
+    let user_xml = api::fetch_user_with_key(&username, &password, rsa_mod, rsa_exp)?;
     let user_info = manifest::parse_user(&user_xml)?;
 
     // 5. Select server
@@ -144,7 +148,7 @@ fn cmd_connect(
 
     // 5b. Pre-connection authorization
     println!("Authorizing connection...");
-    api::fetch_connect(&username, &password, &server_ref.name)
+    api::fetch_connect_with_key(&username, &password, &server_ref.name, rsa_mod, rsa_exp)
         .context("pre-connection authorization failed")?;
 
     // 6. Select WireGuard mode (first available)
@@ -184,8 +188,15 @@ fn cmd_connect(
             dns_ipv4: String::new(),
             dns_ipv6: String::new(),
             pid: std::process::id(),
+            blocked_ipv6_ifaces: vec![],
         })?;
         println!("Network lock active (dedicated nftables table)");
+    }
+
+    // 8b. Block IPv6 on all interfaces (Eddie default: network.ipv6.mode="in-block")
+    let blocked_ipv6_ifaces = ipv6::block_all();
+    if !blocked_ipv6_ifaces.is_empty() {
+        println!("IPv6 disabled on {} interfaces", blocked_ipv6_ifaces.len());
     }
 
     // 9. Generate WireGuard config and connect
@@ -194,6 +205,8 @@ fn cmd_connect(
     let (config_path, iface) = match wireguard::connect(&wg_config) {
         Ok(result) => result,
         Err(e) => {
+            // Restore IPv6 before removing netlock
+            ipv6::restore(&blocked_ipv6_ifaces);
             // Clean up netlock before bailing — otherwise the firewall
             // stays active and blocks all traffic
             if !no_lock {
@@ -211,8 +224,24 @@ fn cmd_connect(
         dns_ipv4: String::new(),
         dns_ipv6: String::new(),
         pid: std::process::id(),
+        blocked_ipv6_ifaces: blocked_ipv6_ifaces.clone(),
     })?;
     println!("WireGuard interface: {}", iface);
+
+    // Wait for first WireGuard handshake (Eddie: handshake_timeout_first=50s)
+    println!("Waiting for handshake...");
+    if let Err(e) = wireguard::wait_for_handshake(&iface, 50) {
+        eprintln!("Handshake failed: {:#}", e);
+        eprintln!("Cleaning up...");
+        ipv6::restore(&blocked_ipv6_ifaces);
+        if !no_lock {
+            let _ = netlock::deactivate();
+        }
+        let _ = wireguard::disconnect(&config_path);
+        let _ = recovery::remove();
+        return Err(e);
+    }
+    println!("Handshake established.");
 
     // 10-13: Remaining setup — if any step fails, clean up established connection
     if let Err(e) = (|| -> anyhow::Result<()> {
@@ -238,13 +267,14 @@ fn cmd_connect(
             dns_ipv4: wg_key.wg_dns_ipv4.clone(),
             dns_ipv6: wg_key.wg_dns_ipv6.clone(),
             pid: std::process::id(),
+            blocked_ipv6_ifaces: blocked_ipv6_ifaces.clone(),
         })?;
 
         Ok(())
     })() {
         eprintln!("Setup failed after WireGuard connected: {:#}", e);
         eprintln!("Cleaning up...");
-        let _ = cmd_disconnect_internal(&config_path, &iface, !no_lock);
+        let _ = cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces);
         return Err(e);
     }
 
@@ -266,6 +296,12 @@ fn cmd_connect(
             break;
         }
 
+        // Check handshake staleness (Eddie: handshake_timeout_connected=200s)
+        if wireguard::is_handshake_stale(&iface, 200) {
+            eprintln!("WireGuard handshake stale (>200s) — tunnel may be dead");
+            break;
+        }
+
         // Periodic DNS re-check (matching Eddie's DnsSwitchCheck)
         let _ = dns::check_and_reapply(&wg_key.wg_dns_ipv4, &wg_key.wg_dns_ipv6);
 
@@ -273,7 +309,7 @@ fn cmd_connect(
     }
 
     // Clean disconnect
-    cmd_disconnect_internal(&config_path, &iface, !no_lock)?;
+    cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces)?;
 
     Ok(())
 }
@@ -304,20 +340,22 @@ fn cmd_disconnect() -> anyhow::Result<()> {
         eprintln!("PID {} did not exit, forcing cleanup...", state.pid);
     }
 
-    cmd_disconnect_internal(&state.wg_config_path, &state.wg_interface, state.lock_active)
+    cmd_disconnect_internal(&state.wg_config_path, &state.wg_interface, state.lock_active, &state.blocked_ipv6_ifaces)
 }
 
-fn cmd_disconnect_internal(config_path: &str, _iface: &str, lock_active: bool) -> anyhow::Result<()> {
+fn cmd_disconnect_internal(config_path: &str, _iface: &str, lock_active: bool, blocked_ipv6: &[String]) -> anyhow::Result<()> {
     // Same order as Eddie:
     // 1. wg-quick down
     let _ = wireguard::disconnect(config_path);
-    // 2. Restore DNS
+    // 2. Restore IPv6
+    ipv6::restore(blocked_ipv6);
+    // 3. Restore DNS
     let _ = dns::deactivate();
-    // 3. Remove netlock
+    // 4. Remove netlock
     if lock_active {
         let _ = netlock::deactivate();
     }
-    // 4. Remove state
+    // 5. Remove state
     let _ = recovery::remove();
     println!("Disconnected.");
     Ok(())

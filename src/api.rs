@@ -56,7 +56,8 @@ pub fn fetch_manifest(username: &str, password: &str) -> Result<String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs().to_string())
         .unwrap_or_else(|_| "0".into())));
-    fetch_encrypted(&params)
+    // Bootstrap: always use hardcoded key (no rotation available yet)
+    fetch_encrypted(&params, None, None)
 }
 
 /// Fetch user data (act=user).
@@ -66,9 +67,19 @@ pub fn fetch_manifest(username: &str, password: &str) -> Result<String> {
 ///
 /// Reference: Eddie Engine.cs Auth() -> FetchUrls({act=user})
 pub fn fetch_user(username: &str, password: &str) -> Result<String> {
+    fetch_user_with_key(username, password, None, None)
+}
+
+/// Fetch user data with optional RSA key override (for key rotation).
+pub fn fetch_user_with_key(
+    username: &str,
+    password: &str,
+    rsa_mod: Option<&str>,
+    rsa_exp: Option<&str>,
+) -> Result<String> {
     let mut params = base_params(username, password);
     params.insert(0, ("act".into(), "user".into()));
-    fetch_encrypted(&params)
+    fetch_encrypted(&params, rsa_mod, rsa_exp)
 }
 
 /// Pre-connection authorization (act=connect).
@@ -78,10 +89,21 @@ pub fn fetch_user(username: &str, password: &str) -> Result<String> {
 ///
 /// Reference: Eddie src/Lib.Core/Session.cs:174
 pub fn fetch_connect(username: &str, password: &str, server_name: &str) -> Result<String> {
+    fetch_connect_with_key(username, password, server_name, None, None)
+}
+
+/// Pre-connection authorization with optional RSA key override (for key rotation).
+pub fn fetch_connect_with_key(
+    username: &str,
+    password: &str,
+    server_name: &str,
+    rsa_mod: Option<&str>,
+    rsa_exp: Option<&str>,
+) -> Result<String> {
     let mut params = base_params(username, password);
     params.insert(0, ("act".into(), "connect".into()));
     params.insert(1, ("server".into(), server_name.into()));
-    fetch_encrypted(&params)
+    fetch_encrypted(&params, rsa_mod, rsa_exp)
 }
 
 /// Normalize CPU architecture to match Eddie's naming convention.
@@ -111,8 +133,17 @@ fn base_params(username: &str, password: &str) -> Vec<(String, String)> {
 }
 
 /// Encrypt params and POST to bootstrap IPs with fallback.
-fn fetch_encrypted(params: &[(String, String)]) -> Result<String> {
-    let public_key = crypto::build_rsa_public_key(RSA_MODULUS_B64, RSA_EXPONENT_B64)
+///
+/// If `rsa_modulus` / `rsa_exponent` are provided, they override the
+/// hardcoded constants. This supports RSA key rotation via the manifest.
+fn fetch_encrypted(
+    params: &[(String, String)],
+    rsa_modulus: Option<&str>,
+    rsa_exponent: Option<&str>,
+) -> Result<String> {
+    let modulus = rsa_modulus.unwrap_or(RSA_MODULUS_B64);
+    let exponent = rsa_exponent.unwrap_or(RSA_EXPONENT_B64);
+    let public_key = crypto::build_rsa_public_key(modulus, exponent)
         .context("failed to build AirVPN RSA public key")?;
 
     let (s_b64, d_b64, session_key) = crypto::build_envelope(&public_key, params)

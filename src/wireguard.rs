@@ -145,6 +145,78 @@ pub fn is_connected(iface: &str) -> bool {
     Path::new(&format!("/sys/class/net/{}", iface)).exists()
 }
 
+/// Get the Unix timestamp of the latest handshake for an interface.
+/// Returns None if no handshake has occurred yet.
+///
+/// Uses `wg show <iface> latest-handshakes` which outputs:
+///   <public_key>\t<unix_timestamp>\n
+/// A timestamp of 0 means no handshake yet.
+pub fn latest_handshake(iface: &str) -> Option<u64> {
+    let output = Command::new("wg")
+        .args(["show", iface, "latest-handshakes"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Format: "<pubkey>\t<timestamp>\n"
+    for line in stdout.lines() {
+        if let Some(ts_str) = line.split('\t').nth(1) {
+            if let Ok(ts) = ts_str.trim().parse::<u64>() {
+                if ts > 0 {
+                    return Some(ts);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Wait for the first WireGuard handshake after connection.
+///
+/// Eddie uses handshake_timeout_first=50 seconds. If no handshake arrives
+/// within the timeout, the tunnel is likely misconfigured (wrong key,
+/// blocked port, unreachable server).
+pub fn wait_for_handshake(iface: &str, timeout_secs: u64) -> Result<()> {
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+
+    loop {
+        if start.elapsed() > timeout {
+            anyhow::bail!(
+                "no WireGuard handshake within {}s — server may be unreachable or key may be wrong",
+                timeout_secs
+            );
+        }
+
+        if latest_handshake(iface).is_some() {
+            return Ok(());
+        }
+
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+/// Check if the latest handshake is stale (older than threshold).
+///
+/// Eddie uses handshake_timeout_connected=200 seconds.
+/// Returns true if handshake is stale or missing.
+pub fn is_handshake_stale(iface: &str, max_age_secs: u64) -> bool {
+    match latest_handshake(iface) {
+        None => true,
+        Some(ts) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            now.saturating_sub(ts) > max_age_secs
+        }
+    }
+}
+
 // =============================================================================
 // Tests
 // =============================================================================

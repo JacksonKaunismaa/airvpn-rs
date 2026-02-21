@@ -4,11 +4,12 @@
 //! killed, a subsequent `airvpn recover` can clean up (tear down WireGuard,
 //! restore DNS, remove nftables rules).
 //!
-//! Recovery sequence matches normal disconnect order (WireGuard → DNS → netlock):
+//! Recovery sequence matches normal disconnect order (WireGuard → IPv6 → DNS → netlock):
 //! 1. wireguard::disconnect(config_path) (wg-quick down)
-//! 2. dns::deactivate() (restore resolv.conf)
-//! 3. netlock::deactivate() (delete nft table — removed last to prevent leaks)
-//! 4. Remove state file
+//! 2. ipv6::restore() (re-enable IPv6 on blocked interfaces)
+//! 3. dns::deactivate() (restore resolv.conf)
+//! 4. netlock::deactivate() (delete nft table — removed last to prevent leaks)
+//! 5. Remove state file
 //!
 //! Reference: Eddie src/Lib.Core/Recovery.cs
 
@@ -20,7 +21,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::{dns, netlock, wireguard};
+use crate::{dns, ipv6, netlock, wireguard};
 
 const PRIMARY_STATE_DIR: &str = "/run/airvpn-rs";
 const PRIMARY_STATE_FILE: &str = "/run/airvpn-rs/state.json";
@@ -34,6 +35,8 @@ pub struct State {
     pub dns_ipv4: String,
     pub dns_ipv6: String,
     pub pid: u32,
+    #[serde(default)]
+    pub blocked_ipv6_ifaces: Vec<String>,
 }
 
 /// Determine the state file path. Prefers /run/airvpn-rs/ but falls back
@@ -144,9 +147,10 @@ pub fn is_pid_alive(pid: u32) -> bool {
 
 /// Run the recovery cleanup sequence (matches normal disconnect order):
 /// 1. wireguard::disconnect(config_path) (wg-quick down)
-/// 2. dns::deactivate() (restore resolv.conf)
-/// 3. netlock::deactivate() (delete nft table — removed last to prevent leaks)
-/// 4. Remove state file
+/// 2. ipv6::restore() (re-enable IPv6 on blocked interfaces)
+/// 3. dns::deactivate() (restore resolv.conf)
+/// 4. netlock::deactivate() (delete nft table — removed last to prevent leaks)
+/// 5. Remove state file
 fn recover_from_state(state: &State) -> Result<()> {
     // 1. Disconnect WireGuard
     if !state.wg_config_path.is_empty() {
@@ -167,19 +171,25 @@ fn recover_from_state(state: &State) -> Result<()> {
         }
     }
 
-    // 2. Restore DNS
+    // 2. Restore IPv6 on previously blocked interfaces
+    if !state.blocked_ipv6_ifaces.is_empty() {
+        ipv6::restore(&state.blocked_ipv6_ifaces);
+        eprintln!("restored IPv6 on {} interfaces", state.blocked_ipv6_ifaces.len());
+    }
+
+    // 3. Restore DNS
     if let Err(e) = dns::deactivate() {
         eprintln!("warning: failed to restore DNS: {}", e);
     }
 
-    // 3. Deactivate network lock if it was active (last — prevents traffic leaks)
+    // 4. Deactivate network lock if it was active (last — prevents traffic leaks)
     if state.lock_active {
         if let Err(e) = netlock::deactivate() {
             eprintln!("warning: failed to deactivate network lock: {}", e);
         }
     }
 
-    // 4. Remove state file
+    // 5. Remove state file
     remove()?;
 
     Ok(())
@@ -284,6 +294,7 @@ mod tests {
             dns_ipv4: "10.128.0.1".to_string(),
             dns_ipv6: "fd7d:76ee:3c49:9950::1".to_string(),
             pid: 12345,
+            blocked_ipv6_ifaces: vec!["eth0".to_string(), "wlan0".to_string()],
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -295,6 +306,7 @@ mod tests {
         assert_eq!(parsed.dns_ipv4, state.dns_ipv4);
         assert_eq!(parsed.dns_ipv6, state.dns_ipv6);
         assert_eq!(parsed.pid, state.pid);
+        assert_eq!(parsed.blocked_ipv6_ifaces, state.blocked_ipv6_ifaces);
     }
 
     #[test]
@@ -306,6 +318,7 @@ mod tests {
             dns_ipv4: "10.0.0.1".to_string(),
             dns_ipv6: "fd00::1".to_string(),
             pid: 99999,
+            blocked_ipv6_ifaces: vec![],
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -317,6 +330,22 @@ mod tests {
         assert!(json.contains("\"dns_ipv4\": \"10.0.0.1\""));
         assert!(json.contains("\"dns_ipv6\": \"fd00::1\""));
         assert!(json.contains("\"pid\": 99999"));
+        assert!(json.contains("\"blocked_ipv6_ifaces\""));
+    }
+
+    #[test]
+    fn test_state_deserialize_without_blocked_ipv6_ifaces() {
+        // Old state files won't have the field — serde(default) should handle it
+        let json = r#"{
+            "lock_active": true,
+            "wg_interface": "wg0",
+            "wg_config_path": "/tmp/wg0.conf",
+            "dns_ipv4": "10.0.0.1",
+            "dns_ipv6": "fd00::1",
+            "pid": 12345
+        }"#;
+        let state: State = serde_json::from_str(json).unwrap();
+        assert!(state.blocked_ipv6_ifaces.is_empty());
     }
 
     #[test]

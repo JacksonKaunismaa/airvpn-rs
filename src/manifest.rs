@@ -13,6 +13,10 @@ pub struct Manifest {
     pub servers: Vec<Server>,
     pub modes: Vec<Mode>,
     pub bootstrap_urls: Vec<String>,
+    /// RSA modulus from manifest (base64). If present, overrides the hardcoded key.
+    pub rsa_modulus: Option<String>,
+    /// RSA exponent from manifest (base64). If present, overrides the hardcoded key.
+    pub rsa_exponent: Option<String>,
 }
 
 // UserInfo and WireGuardKey are parsed separately via parse_user() from the act=user response.
@@ -234,6 +238,13 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
     let mut modes: Vec<Mode> = Vec::new();
     let mut bootstrap_urls: Vec<String> = Vec::new();
 
+    // RSA key rotation: parsed from <manifest> attributes or nested <rsa> element
+    let mut rsa_modulus: Option<String> = None;
+    let mut rsa_exponent: Option<String> = None;
+    // Track nested <rsa><RSAParameters><Modulus>/<Exponent> text content
+    let mut in_rsa_modulus = false;
+    let mut in_rsa_exponent = false;
+
     loop {
         match reader.read_event() {
             Err(e) => bail!("XML parse error at position {}: {e}", reader.error_position()),
@@ -310,8 +321,52 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
                 }
             }
 
-            // ---------- Start / End elements — nothing to track ----------
-            Ok(Event::Start(_)) | Ok(Event::End(_)) => {}
+            // ---------- Start elements ----------
+            Ok(Event::Start(ref e)) => {
+                match e.name().as_ref() {
+                    b"manifest" => {
+                        // RSA key rotation: attributes on the root <manifest> element
+                        if let Some(m) = attr_opt(e, b"auth_rsa_modulus") {
+                            if !m.is_empty() {
+                                rsa_modulus = Some(m);
+                            }
+                        }
+                        if let Some(x) = attr_opt(e, b"auth_rsa_exponent") {
+                            if !x.is_empty() {
+                                rsa_exponent = Some(x);
+                            }
+                        }
+                    }
+                    b"Modulus" => { in_rsa_modulus = true; }
+                    b"Exponent" => { in_rsa_exponent = true; }
+                    _ => {}
+                }
+            }
+
+            // ---------- End elements ----------
+            Ok(Event::End(ref e)) => {
+                match e.name().as_ref() {
+                    b"Modulus" => { in_rsa_modulus = false; }
+                    b"Exponent" => { in_rsa_exponent = false; }
+                    _ => {}
+                }
+            }
+
+            // ---------- Text content (for nested RSA elements) ----------
+            Ok(Event::Text(ref e)) => {
+                if in_rsa_modulus {
+                    let text = e.unescape().unwrap_or_default().trim().to_string();
+                    if !text.is_empty() && rsa_modulus.is_none() {
+                        rsa_modulus = Some(text);
+                    }
+                } else if in_rsa_exponent {
+                    let text = e.unescape().unwrap_or_default().trim().to_string();
+                    if !text.is_empty() && rsa_exponent.is_none() {
+                        rsa_exponent = Some(text);
+                    }
+                }
+            }
+
             _ => {}
         }
     }
@@ -326,6 +381,8 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
         servers,
         modes,
         bootstrap_urls,
+        rsa_modulus,
+        rsa_exponent,
     })
 }
 
@@ -646,6 +703,65 @@ mod tests {
             "error message should contain 'Session expired', got: {}",
             err
         );
+    }
+
+    #[test]
+    fn test_rsa_key_from_nested_element() {
+        // The FULL_MANIFEST fixture has <rsa><RSAParameters><Modulus>/<Exponent>
+        let manifest = parse_manifest(FULL_MANIFEST).expect("failed to parse manifest");
+        assert_eq!(manifest.rsa_modulus.as_deref(), Some("base64modulus=="));
+        assert_eq!(manifest.rsa_exponent.as_deref(), Some("AQAB"));
+    }
+
+    #[test]
+    fn test_rsa_key_from_manifest_attributes() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<manifest time="1708444800" auth_rsa_modulus="AttrModulus==" auth_rsa_exponent="AQAB">
+  <servers />
+  <servers_groups />
+  <modes>
+    <mode title="WireGuard UDP 1637" type="wireguard"
+          protocol="UDP" port="1637" entry="0" />
+  </modes>
+  <urls />
+</manifest>"#;
+
+        let manifest = parse_manifest(xml).expect("failed to parse manifest");
+        assert_eq!(manifest.rsa_modulus.as_deref(), Some("AttrModulus=="));
+        assert_eq!(manifest.rsa_exponent.as_deref(), Some("AQAB"));
+    }
+
+    #[test]
+    fn test_rsa_key_attributes_take_precedence_over_nested() {
+        // When both formats are present, attributes (parsed first) win
+        // because nested text only sets the field if rsa_modulus is None.
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<manifest time="1708444800" auth_rsa_modulus="FromAttr==" auth_rsa_exponent="AttrExp">
+  <rsa><RSAParameters><Modulus>FromNested==</Modulus><Exponent>NestedExp</Exponent></RSAParameters></rsa>
+  <servers />
+  <servers_groups />
+  <modes />
+  <urls />
+</manifest>"#;
+
+        let manifest = parse_manifest(xml).expect("failed to parse manifest");
+        assert_eq!(manifest.rsa_modulus.as_deref(), Some("FromAttr=="));
+        assert_eq!(manifest.rsa_exponent.as_deref(), Some("AttrExp"));
+    }
+
+    #[test]
+    fn test_rsa_key_absent() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<manifest time="1708444800">
+  <servers />
+  <servers_groups />
+  <modes />
+  <urls />
+</manifest>"#;
+
+        let manifest = parse_manifest(xml).expect("failed to parse manifest");
+        assert!(manifest.rsa_modulus.is_none());
+        assert!(manifest.rsa_exponent.is_none());
     }
 
     #[test]

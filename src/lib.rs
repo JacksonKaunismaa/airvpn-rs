@@ -2,6 +2,7 @@ pub mod api;
 pub mod config;
 pub mod crypto;
 pub mod dns;
+pub mod ipv6;
 pub mod manifest;
 pub mod netlock;
 pub mod profile;
