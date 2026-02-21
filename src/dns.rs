@@ -276,6 +276,15 @@ pub fn deactivate() -> Result<()> {
         }
     }
 
+    // Revert DNS on all non-loopback interfaces to their defaults
+    // (removes VPN DNS we set during activate)
+    let ifaces = list_interfaces();
+    for iface in &ifaces {
+        let _ = Command::new("resolvectl")
+            .args(["revert", iface.as_str()])
+            .output();
+    }
+
     // Restart systemd-resolved if active so it picks up the restored resolv.conf
     // (Eddie: `service systemd-resolved restart`)
     if is_systemd_resolved_active() {

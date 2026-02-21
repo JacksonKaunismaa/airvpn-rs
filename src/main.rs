@@ -220,7 +220,7 @@ fn cmd_connect(
     let rsa_exp = manifest.rsa_exponent.as_deref();
 
     println!("Fetching user data...");
-    let user_xml = api::fetch_user_with_key(&username, &password, rsa_mod, rsa_exp)?;
+    let user_xml = api::fetch_user_with_key(&username, &password, rsa_mod, rsa_exp, &manifest.bootstrap_urls)?;
     let user_info = manifest::parse_user(&user_xml)?;
 
     // 4. Select WireGuard mode (first available) — invariant across reconnections
@@ -315,6 +315,7 @@ fn cmd_connect(
             &server_ref.name,
             rsa_mod,
             rsa_exp,
+            &manifest.bootstrap_urls,
         ) {
             Ok(api::ConnectDirective::Ok) => {
                 println!("Authorizing connection... OK");
@@ -374,6 +375,12 @@ fn cmd_connect(
             let mut allowed_ips: Vec<String> = server_ref.ips_entry.clone();
             // Also whitelist API bootstrap IPs (extract bare IP from URLs like "http://1.2.3.4")
             for url in api::BOOTSTRAP_IPS {
+                if let Some(ip) = extract_ip_from_url(url) {
+                    allowed_ips.push(ip);
+                }
+            }
+            // Also whitelist manifest bootstrap URLs (Eddie merges these into the URL list)
+            for url in &manifest.bootstrap_urls {
                 if let Some(ip) = extract_ip_from_url(url) {
                     allowed_ips.push(ip);
                 }
