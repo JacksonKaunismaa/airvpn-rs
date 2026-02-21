@@ -30,7 +30,7 @@ pub struct Manifest {
 
 // UserInfo and WireGuardKey are parsed separately via parse_user() from the act=user response.
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Server {
     pub name: String,
     pub group: String,

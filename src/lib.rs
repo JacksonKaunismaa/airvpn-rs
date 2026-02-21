@@ -8,4 +8,5 @@ pub mod netlock;
 pub mod profile;
 pub mod recovery;
 pub mod server;
+pub mod verify;
 pub mod wireguard;

@@ -153,6 +153,53 @@ pub fn score_with_penalty(server: &Server, penalties: &ServerPenalties) -> i64 {
     base + penalty * 1000
 }
 
+/// Filter servers by allowlist/denylist rules (matching Eddie's GetConnections filtering).
+///
+/// Rules:
+/// - deny_server/deny_country always exclude
+/// - If any allow_server/allow_country specified, only those are included
+/// - Filtering is case-insensitive for server names and country codes
+pub fn filter_servers<'a>(
+    servers: &'a [Server],
+    allow_servers: &[String],
+    deny_servers: &[String],
+    allow_countries: &[String],
+    deny_countries: &[String],
+) -> Vec<&'a Server> {
+    servers
+        .iter()
+        .filter(|s| {
+            // Denylist takes precedence
+            if deny_servers
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(&s.name))
+            {
+                return false;
+            }
+            if deny_countries
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(&s.country_code))
+            {
+                return false;
+            }
+
+            // If any allowlist specified, server must match at least one
+            let has_allowlist = !allow_servers.is_empty() || !allow_countries.is_empty();
+            if has_allowlist {
+                let server_allowed = allow_servers
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case(&s.name));
+                let country_allowed = allow_countries
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case(&s.country_code));
+                return server_allowed || country_allowed;
+            }
+
+            true
+        })
+        .collect()
+}
+
 /// Select best server: filter, score, sort, pick first.
 /// If `server_name` is `Some`, find by exact name match instead.
 pub fn select_server<'a>(
@@ -477,5 +524,172 @@ mod tests {
         let selected =
             select_server_with_penalties(&servers, Some("Alpha"), &penalties).unwrap();
         assert_eq!(selected.name, "Alpha");
+    }
+
+    // -------------------------------------------------------------------
+    // filter_servers tests
+    // -------------------------------------------------------------------
+
+    /// Helper to build a test Server with a specific country code.
+    fn make_server_cc(name: &str, country_code: &str) -> Server {
+        Server {
+            name: name.to_string(),
+            group: String::new(),
+            ips_entry: vec!["1.2.3.4".to_string()],
+            ips_exit: vec!["5.6.7.8".to_string()],
+            country_code: country_code.to_string(),
+            location: "Test".to_string(),
+            scorebase: 0,
+            bandwidth: 500_000,
+            bandwidth_max: 1000,
+            users: 50,
+            users_max: 250,
+            support_ipv4: true,
+            support_ipv6: true,
+            warning_open: String::new(),
+            warning_closed: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_filter_no_rules_passes_all() {
+        let servers = vec![
+            make_server_cc("Alpha", "IT"),
+            make_server_cc("Beta", "NL"),
+            make_server_cc("Gamma", "DE"),
+        ];
+        let filtered = filter_servers(&servers, &[], &[], &[], &[]);
+        assert_eq!(filtered.len(), 3);
+    }
+
+    #[test]
+    fn test_filter_deny_server() {
+        let servers = vec![
+            make_server_cc("Alpha", "IT"),
+            make_server_cc("Beta", "NL"),
+            make_server_cc("Gamma", "DE"),
+        ];
+        let deny = vec!["Beta".to_string()];
+        let filtered = filter_servers(&servers, &[], &deny, &[], &[]);
+        let names: Vec<&str> = filtered.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["Alpha", "Gamma"]);
+    }
+
+    #[test]
+    fn test_filter_deny_country() {
+        let servers = vec![
+            make_server_cc("Alpha", "IT"),
+            make_server_cc("Beta", "NL"),
+            make_server_cc("Gamma", "IT"),
+        ];
+        let deny_cc = vec!["IT".to_string()];
+        let filtered = filter_servers(&servers, &[], &[], &[], &deny_cc);
+        let names: Vec<&str> = filtered.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["Beta"]);
+    }
+
+    #[test]
+    fn test_filter_allow_server() {
+        let servers = vec![
+            make_server_cc("Alpha", "IT"),
+            make_server_cc("Beta", "NL"),
+            make_server_cc("Gamma", "DE"),
+        ];
+        let allow = vec!["Alpha".to_string(), "Gamma".to_string()];
+        let filtered = filter_servers(&servers, &allow, &[], &[], &[]);
+        let names: Vec<&str> = filtered.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["Alpha", "Gamma"]);
+    }
+
+    #[test]
+    fn test_filter_allow_country() {
+        let servers = vec![
+            make_server_cc("Alpha", "IT"),
+            make_server_cc("Beta", "NL"),
+            make_server_cc("Gamma", "IT"),
+            make_server_cc("Delta", "DE"),
+        ];
+        let allow_cc = vec!["IT".to_string()];
+        let filtered = filter_servers(&servers, &[], &[], &allow_cc, &[]);
+        let names: Vec<&str> = filtered.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["Alpha", "Gamma"]);
+    }
+
+    #[test]
+    fn test_filter_deny_takes_precedence_over_allow() {
+        // Alpha is in IT (allowed country) but also explicitly denied
+        let servers = vec![
+            make_server_cc("Alpha", "IT"),
+            make_server_cc("Beta", "IT"),
+        ];
+        let allow_cc = vec!["IT".to_string()];
+        let deny = vec!["Alpha".to_string()];
+        let filtered = filter_servers(&servers, &[], &deny, &allow_cc, &[]);
+        let names: Vec<&str> = filtered.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["Beta"]);
+    }
+
+    #[test]
+    fn test_filter_deny_country_takes_precedence_over_allow_server() {
+        // Alpha is explicitly allowed by name but its country IT is denied
+        let servers = vec![
+            make_server_cc("Alpha", "IT"),
+            make_server_cc("Beta", "NL"),
+        ];
+        let allow = vec!["Alpha".to_string()];
+        let deny_cc = vec!["IT".to_string()];
+        let filtered = filter_servers(&servers, &allow, &[], &[], &deny_cc);
+        // Alpha is denied by country, Beta doesn't match allow_server
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_filter_case_insensitive_country() {
+        let servers = vec![
+            make_server_cc("Alpha", "IT"),
+            make_server_cc("Beta", "NL"),
+        ];
+        let allow_cc = vec!["it".to_string()];
+        let filtered = filter_servers(&servers, &[], &[], &allow_cc, &[]);
+        let names: Vec<&str> = filtered.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["Alpha"]);
+    }
+
+    #[test]
+    fn test_filter_case_insensitive_server_name() {
+        let servers = vec![
+            make_server_cc("Alpha", "IT"),
+            make_server_cc("Beta", "NL"),
+        ];
+        let deny = vec!["alpha".to_string()];
+        let filtered = filter_servers(&servers, &[], &deny, &[], &[]);
+        let names: Vec<&str> = filtered.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["Beta"]);
+    }
+
+    #[test]
+    fn test_filter_allow_server_and_allow_country_union() {
+        // allow_server=["Alpha"] + allow_country=["NL"] should include both
+        let servers = vec![
+            make_server_cc("Alpha", "IT"),
+            make_server_cc("Beta", "NL"),
+            make_server_cc("Gamma", "DE"),
+        ];
+        let allow = vec!["Alpha".to_string()];
+        let allow_cc = vec!["NL".to_string()];
+        let filtered = filter_servers(&servers, &allow, &[], &allow_cc, &[]);
+        let names: Vec<&str> = filtered.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["Alpha", "Beta"]);
+    }
+
+    #[test]
+    fn test_filter_all_denied_returns_empty() {
+        let servers = vec![
+            make_server_cc("Alpha", "IT"),
+            make_server_cc("Beta", "NL"),
+        ];
+        let deny = vec!["Alpha".to_string(), "Beta".to_string()];
+        let filtered = filter_servers(&servers, &[], &deny, &[], &[]);
+        assert!(filtered.is_empty());
     }
 }

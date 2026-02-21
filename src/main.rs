@@ -1,4 +1,4 @@
-use airvpn::{api, config, dns, ipv6, manifest, netlock, recovery, server, wireguard};
+use airvpn::{api, config, dns, ipv6, manifest, netlock, recovery, server, verify, wireguard};
 
 use std::sync::atomic::Ordering;
 
@@ -33,6 +33,18 @@ enum Commands {
         /// AirVPN password (overrides saved credentials)
         #[arg(long)]
         password: Option<String>,
+        /// Only connect to these servers (repeatable)
+        #[arg(long)]
+        allow_server: Vec<String>,
+        /// Never connect to these servers (repeatable)
+        #[arg(long)]
+        deny_server: Vec<String>,
+        /// Only connect to servers in these countries (repeatable, 2-letter code)
+        #[arg(long)]
+        allow_country: Vec<String>,
+        /// Never connect to servers in these countries (repeatable, 2-letter code)
+        #[arg(long)]
+        deny_country: Vec<String>,
     },
     /// Disconnect from AirVPN
     Disconnect,
@@ -67,7 +79,22 @@ fn main() -> anyhow::Result<()> {
             no_reconnect,
             username,
             password,
-        } => cmd_connect(server, no_lock, allow_lan, no_reconnect, username, password),
+            allow_server,
+            deny_server,
+            allow_country,
+            deny_country,
+        } => cmd_connect(
+            server,
+            no_lock,
+            allow_lan,
+            no_reconnect,
+            username,
+            password,
+            allow_server,
+            deny_server,
+            allow_country,
+            deny_country,
+        ),
         Commands::Disconnect => cmd_disconnect(),
         Commands::Status => cmd_status(),
         Commands::Servers { sort, debug, username, password } => cmd_servers(&sort, debug, username, password),
@@ -129,6 +156,10 @@ fn cmd_connect(
     no_reconnect: bool,
     cli_username: Option<String>,
     cli_password: Option<String>,
+    allow_server: Vec<String>,
+    deny_server: Vec<String>,
+    allow_country: Vec<String>,
+    deny_country: Vec<String>,
 ) -> anyhow::Result<()> {
     // 0. Pre-flight checks (root, wg-quick, nft)
     preflight_checks()?;
@@ -205,6 +236,38 @@ fn cmd_connect(
         .ok_or_else(|| anyhow::anyhow!("No WireGuard keys in user data"))?;
 
     // -----------------------------------------------------------------------
+    // Server filtering (Eddie: GetConnections allow/deny filtering)
+    //
+    // Apply CLI allow/deny filters once before the reconnection loop. The
+    // filtered list is used for all server selection attempts.
+    // -----------------------------------------------------------------------
+
+    let filtered_servers: Vec<manifest::Server> = server::filter_servers(
+        &manifest.servers,
+        &allow_server,
+        &deny_server,
+        &allow_country,
+        &deny_country,
+    )
+    .into_iter()
+    .cloned()
+    .collect();
+    if filtered_servers.is_empty() {
+        anyhow::bail!("no servers match the allow/deny filters");
+    }
+    let has_filters = !allow_server.is_empty()
+        || !deny_server.is_empty()
+        || !allow_country.is_empty()
+        || !deny_country.is_empty();
+    if has_filters {
+        println!(
+            "Filters applied: {} of {} servers eligible",
+            filtered_servers.len(),
+            manifest.servers.len()
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Reconnection loop (Eddie: Session.cs outer `for (; CancelRequested == false;)`)
     //
     // The --server flag forces a specific server only on the FIRST attempt.
@@ -222,9 +285,9 @@ fn cmd_connect(
             break;
         }
 
-        // 6. Select server (penalty-aware)
+        // 6. Select server (penalty-aware, from filtered list)
         let server_ref = server::select_server_with_penalties(
-            &manifest.servers,
+            &filtered_servers,
             forced_server,
             &penalties,
         )?;
@@ -408,6 +471,20 @@ fn cmd_connect(
             // 10. Activate DNS
             dns::activate(&wg_key.wg_dns_ipv4, &wg_key.wg_dns_ipv6, &iface)?;
             println!("DNS configured: {}, {}", wg_key.wg_dns_ipv4, wg_key.wg_dns_ipv6);
+
+            // 10b. Verify tunnel is working (Eddie: Service.cs check/tun endpoint)
+            println!("Verifying tunnel...");
+            match verify::check_tunnel(&server_ref.name, &wg_key.wg_ipv4) {
+                Ok(()) => println!("Tunnel verified."),
+                Err(e) => eprintln!("warning: tunnel verification failed: {:#}", e),
+            }
+
+            // 10c. Verify DNS goes through VPN (Eddie: Service.cs check/dns endpoint)
+            println!("Verifying DNS...");
+            match verify::check_dns(&server_ref.name) {
+                Ok(()) => println!("DNS verified."),
+                Err(e) => eprintln!("warning: DNS verification failed: {:#}", e),
+            }
 
             // 11. Save credentials (non-fatal — don't kill connection over keyring issues)
             if let Err(e) = config::save_credentials(&username, &password) {
