@@ -84,9 +84,17 @@ pub fn flush() {
 /// Eddie sets DNS and default-route on the VPN interface so that
 /// systemd-resolved routes all queries through the tunnel.
 fn configure_systemd_resolved(dns_ipv4: &str, dns_ipv6: &str, iface: &str) -> Result<()> {
-    // resolvectl dns <iface> <dns_ipv4> <dns_ipv6>
+    // Build DNS args, only including non-empty addresses
+    let mut dns_args = vec!["dns", iface];
+    if !dns_ipv4.is_empty() {
+        dns_args.push(dns_ipv4);
+    }
+    if !dns_ipv6.is_empty() {
+        dns_args.push(dns_ipv6);
+    }
+
     let output = Command::new("resolvectl")
-        .args(["dns", iface, dns_ipv4, dns_ipv6])
+        .args(&dns_args)
         .output()
         .context("failed to execute resolvectl dns")?;
 

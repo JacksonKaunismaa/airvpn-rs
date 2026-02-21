@@ -131,6 +131,15 @@ fn cmd_connect(
         manifest.modes.len()
     );
 
+    // Display any service messages from AirVPN
+    for msg in &manifest.messages {
+        match msg.kind.as_str() {
+            "error" => eprintln!("[AirVPN Error] {}", msg.text),
+            "warning" => eprintln!("[AirVPN Warning] {}", msg.text),
+            _ => println!("[AirVPN] {}", msg.text),
+        }
+    }
+
     // Use rotated RSA key from manifest if provided
     let rsa_mod = manifest.rsa_modulus.as_deref();
     let rsa_exp = manifest.rsa_exponent.as_deref();
@@ -233,11 +242,12 @@ fn cmd_connect(
     if let Err(e) = wireguard::wait_for_handshake(&iface, 50) {
         eprintln!("Handshake failed: {:#}", e);
         eprintln!("Cleaning up...");
+        // Order: WG down → IPv6 restore → netlock deactivate (same as disconnect)
+        let _ = wireguard::disconnect(&config_path);
         ipv6::restore(&blocked_ipv6_ifaces);
         if !no_lock {
             let _ = netlock::deactivate();
         }
-        let _ = wireguard::disconnect(&config_path);
         let _ = recovery::remove();
         return Err(e);
     }

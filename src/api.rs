@@ -186,8 +186,13 @@ fn fetch_encrypted(
                     }
                 };
 
-                let xml = crypto::decrypt_response(&body, &session_key.key, &session_key.iv)
-                    .with_context(|| format!("{}: failed to decrypt response", base_url))?;
+                let xml = match crypto::decrypt_response(&body, &session_key.key, &session_key.iv) {
+                    Ok(xml) => xml,
+                    Err(e) => {
+                        last_error = Some(e.context(format!("{}: failed to decrypt response", base_url)));
+                        continue;
+                    }
+                };
 
                 return Ok(xml);
             }

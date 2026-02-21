@@ -223,8 +223,8 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
 
     // IPv4/IPv6 translation (NAT64 — RFC 6052/8215)
     if config.allow_ipv4ipv6translation {
-        r.push_str("    ip6 daddr 64:ff9b::/96 counter accept\n");
-        r.push_str("    ip6 daddr 64:ff9b:1::/48 counter accept\n");
+        r.push_str("    ip6 saddr 64:ff9b::/96 ip6 daddr 64:ff9b::/96 counter accept\n");
+        r.push_str("    ip6 saddr 64:ff9b:1::/48 ip6 daddr 64:ff9b:1::/48 counter accept\n");
     }
 
     // 4. LAN rules (Eddie: netlock.allow_private)
@@ -383,11 +383,20 @@ pub fn allow_interface(iface: &str) -> Result<()> {
         ),
     )?;
 
-    // Forward: iifname "<iface>" accept
+    // Forward: iifname "<iface>" accept (traffic forwarded FROM tunnel)
     nft_insert_before_latest(
         "forward",
         &format!(
             "iifname \"{}\" counter accept comment \"airvpn_interface_forward_{}\"",
+            iface, iface
+        ),
+    )?;
+
+    // Forward: oifname "<iface>" accept (traffic forwarded TO tunnel)
+    nft_insert_before_latest(
+        "forward",
+        &format!(
+            "oifname \"{}\" counter accept comment \"airvpn_interface_forward_out_{}\"",
             iface, iface
         ),
     )?;
@@ -423,6 +432,11 @@ pub fn deallow_interface(iface: &str) -> Result<()> {
         let comment = format!("airvpn_interface_{}_{}", dir, iface);
         nft_delete_by_comment(chain, &comment)?;
     }
+
+    // Also remove the oifname forward rule
+    let comment_out = format!("airvpn_interface_forward_out_{}", iface);
+    nft_delete_by_comment("forward", &comment_out)?;
+
     Ok(())
 }
 

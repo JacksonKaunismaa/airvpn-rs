@@ -9,6 +9,13 @@ use quick_xml::reader::Reader;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
+pub struct Message {
+    pub kind: String,
+    pub text: String,
+    pub url: String,
+}
+
+#[derive(Debug)]
 pub struct Manifest {
     pub servers: Vec<Server>,
     pub modes: Vec<Mode>,
@@ -17,6 +24,8 @@ pub struct Manifest {
     pub rsa_modulus: Option<String>,
     /// RSA exponent from manifest (base64). If present, overrides the hardcoded key.
     pub rsa_exponent: Option<String>,
+    pub force_reauth_ts: i64,
+    pub messages: Vec<Message>,
 }
 
 // UserInfo and WireGuardKey are parsed separately via parse_user() from the act=user response.
@@ -237,6 +246,8 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
     let mut raw_servers: Vec<RawServerAttrs> = Vec::new();
     let mut modes: Vec<Mode> = Vec::new();
     let mut bootstrap_urls: Vec<String> = Vec::new();
+    let mut messages: Vec<Message> = Vec::new();
+    let mut force_reauth_ts: i64 = 0;
 
     // RSA key rotation: parsed from <manifest> attributes or nested <rsa> element
     let mut rsa_modulus: Option<String> = None;
@@ -317,6 +328,14 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
                             }
                         }
                     }
+                    b"message" => {
+                        let kind = attr_opt(e, b"kind").unwrap_or_default();
+                        let text = attr_opt(e, b"text").unwrap_or_default();
+                        let url = attr_opt(e, b"url").unwrap_or_default();
+                        if !text.is_empty() {
+                            messages.push(Message { kind, text, url });
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -325,6 +344,9 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
             Ok(Event::Start(ref e)) => {
                 match e.name().as_ref() {
                     b"manifest" => {
+                        force_reauth_ts = attr_opt(e, b"force_reauth_ts")
+                            .and_then(|s| s.parse::<i64>().ok())
+                            .unwrap_or(0);
                         // RSA key rotation: attributes on the root <manifest> element
                         if let Some(m) = attr_opt(e, b"auth_rsa_modulus") {
                             if !m.is_empty() {
@@ -383,6 +405,8 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
         bootstrap_urls,
         rsa_modulus,
         rsa_exponent,
+        force_reauth_ts,
+        messages,
     })
 }
 
