@@ -41,20 +41,34 @@ const SOFTWARE_ID: &str = "AirvpnRust_0.1.0";
 // Manifest fetch
 // ---------------------------------------------------------------------------
 
-/// Fetch the encrypted manifest from AirVPN's API.
+/// Fetch the server manifest (act=manifest).
 ///
-/// Tries each bootstrap IP in order. On the first successful response,
-/// decrypts and returns the XML manifest string.
+/// Returns XML with servers, modes, RSA key, bootstrap URLs.
+/// Does NOT contain user/WireGuard data — use fetch_user() for that.
 ///
-/// Reference: Eddie Service.cs FetchUrls() + FetchUrl()
+/// Reference: Eddie Service.cs OnRefresh() -> FetchUrls({act=manifest})
 pub fn fetch_manifest(username: &str, password: &str) -> Result<String> {
-    let public_key = crypto::build_rsa_public_key(RSA_MODULUS_B64, RSA_EXPONENT_B64)
-        .context("failed to build AirVPN RSA public key")?;
+    let mut params = base_params(username, password);
+    params.insert(0, ("act".into(), "manifest".into()));
+    params.insert(1, ("ts".into(), "0".into()));
+    fetch_encrypted(&params)
+}
 
-    // Build request parameters matching Eddie's FetchUrls()
-    let params: Vec<(String, String)> = vec![
-        ("act".into(), "manifest".into()),
-        ("ts".into(), "0".into()),
+/// Fetch user data (act=user).
+///
+/// Returns XML with WireGuard keys, certificates, per-device keys.
+/// The root element is <user> with <keys><key .../></keys> children.
+///
+/// Reference: Eddie Engine.cs Auth() -> FetchUrls({act=user})
+pub fn fetch_user(username: &str, password: &str) -> Result<String> {
+    let mut params = base_params(username, password);
+    params.insert(0, ("act".into(), "user".into()));
+    fetch_encrypted(&params)
+}
+
+/// Common parameters sent with every API call (matching Eddie's FetchUrls).
+fn base_params(username: &str, password: &str) -> Vec<(String, String)> {
+    vec![
         ("login".into(), username.into()),
         ("password".into(), password.into()),
         ("software".into(), SOFTWARE_ID.into()),
@@ -63,11 +77,16 @@ pub fn fetch_manifest(username: &str, password: &str) -> Result<String> {
             "system".into(),
             format!("linux_{}", std::env::consts::ARCH),
         ),
-        ("version".into(), "1".into()),
-    ];
+        ("version".into(), "296".into()),
+    ]
+}
 
-    // Build encrypted envelope
-    let (s_b64, d_b64, session_key) = crypto::build_envelope(&public_key, &params)
+/// Encrypt params and POST to bootstrap IPs with fallback.
+fn fetch_encrypted(params: &[(String, String)]) -> Result<String> {
+    let public_key = crypto::build_rsa_public_key(RSA_MODULUS_B64, RSA_EXPONENT_B64)
+        .context("failed to build AirVPN RSA public key")?;
+
+    let (s_b64, d_b64, session_key) = crypto::build_envelope(&public_key, params)
         .context("failed to build API envelope")?;
 
     let client = Client::builder()
