@@ -81,14 +81,24 @@ pub fn connect(config: &str) -> Result<(String, String)> {
     let (_, path) = tmpfile.keep().context("failed to persist temporary config file")?;
     let config_path = path.to_string_lossy().to_string();
 
-    std::fs::write(&config_path, config)
-        .with_context(|| format!("failed to write WireGuard config to {}", config_path))?;
-
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to set WireGuard config permissions: {}", config_path))?;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&config_path)
+            .with_context(|| format!("failed to create WireGuard config: {}", config_path))?;
+        f.write_all(config.as_bytes())
+            .with_context(|| format!("failed to write WireGuard config: {}", config_path))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&config_path, config)
+            .with_context(|| format!("failed to write WireGuard config to {}", config_path))?;
     }
 
     // Interface name = basename without .conf

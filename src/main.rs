@@ -2,6 +2,7 @@ use airvpn::{api, config, dns, manifest, netlock, recovery, server, wireguard};
 
 use std::sync::atomic::Ordering;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -138,7 +139,8 @@ fn cmd_connect(
 
     // 5b. Pre-connection authorization
     println!("Authorizing connection...");
-    let _ = api::fetch_connect(&username, &password, &server_ref.name);
+    api::fetch_connect(&username, &password, &server_ref.name)
+        .context("pre-connection authorization failed")?;
 
     // 6. Select WireGuard mode (first available)
     let mode = manifest

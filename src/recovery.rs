@@ -64,13 +64,24 @@ fn find_state_file() -> Option<PathBuf> {
 pub fn save(state: &State) -> Result<()> {
     let path = state_path();
     let json = serde_json::to_string_pretty(state).context("failed to serialize state")?;
-    fs::write(&path, json).with_context(|| format!("failed to write state file: {}", path.display()))?;
-    // Restrict state file to owner-only (contains paths to private key material)
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to set state file permissions: {}", path.display()))?;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("failed to create state file: {}", path.display()))?;
+        f.write_all(json.as_bytes())
+            .with_context(|| format!("failed to write state file: {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(&path, json)
+            .with_context(|| format!("failed to write state file: {}", path.display()))?;
     }
     Ok(())
 }

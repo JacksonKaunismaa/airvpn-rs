@@ -314,15 +314,25 @@ pub fn save_profile(
             .with_context(|| format!("failed to create profile directory: {}", parent.display()))?;
     }
 
-    std::fs::write(path, &file_data)
-        .with_context(|| format!("failed to write profile: {}", path.display()))?;
-
-    // Set file permissions to 600 (owner read/write only)
+    // Write with correct permissions atomically (no world-readable window)
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to set profile permissions: {}", path.display()))?;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("failed to create profile: {}", path.display()))?;
+        f.write_all(&file_data)
+            .with_context(|| format!("failed to write profile: {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, &file_data)
+            .with_context(|| format!("failed to write profile: {}", path.display()))?;
     }
 
     Ok(())
@@ -426,7 +436,9 @@ pub fn keyring_read(id: &str) -> Result<Option<String>> {
 
     if output.status.success() {
         let password = String::from_utf8(output.stdout)
-            .context("keyring value is not valid UTF-8")?;
+            .context("keyring value is not valid UTF-8")?
+            .trim_end()
+            .to_string();
         if password.is_empty() {
             Ok(None)
         } else {
