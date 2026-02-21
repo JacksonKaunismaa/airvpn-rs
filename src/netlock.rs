@@ -21,12 +21,20 @@ const TABLE_NAME: &str = "airvpn_lock";
 const PRIORITY: i32 = -300;
 
 /// Configuration for the network lock.
+///
+/// Eddie splits allowlisted IPs into two categories:
+/// - **incoming**: IPs that may initiate connections TO us. In INPUT they get
+///   unrestricted `saddr accept`; in OUTPUT they get restricted
+///   `daddr ct state established accept` (response-only).
+/// - **outgoing**: IPs that WE initiate connections to (VPN servers, API IPs).
+///   They only appear in OUTPUT with unrestricted `daddr accept`.
 pub struct NetlockConfig {
     pub allow_lan: bool,
     pub allow_dhcp: bool,
     pub allow_ping: bool,
     pub allow_ipv4ipv6translation: bool,
-    pub allowed_ips: Vec<String>,
+    pub allowed_ips_incoming: Vec<String>,
+    pub allowed_ips_outgoing: Vec<String>,
 }
 
 /// Compute SHA-256 hex digest of a string (matching Eddie's Crypto.Manager.HashSHA256).
@@ -151,8 +159,8 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
     //    (Eddie: ip filter INPUT ct state related,established + ip6 filter INPUT ct state related,established)
     r.push_str("    ct state related,established counter accept\n");
 
-    // 9. Per-IP allowlist incoming
-    for ip_str in &config.allowed_ips {
+    // 9. Per-IP allowlist incoming (only incoming IPs get saddr accept in INPUT)
+    for ip_str in &config.allowed_ips_incoming {
         let cidr = ensure_cidr(ip_str);
         match classify_ip(&cidr) {
             Some(IpVersion::V4) => {
@@ -267,8 +275,34 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
     //    (Eddie: ip filter OUTPUT ct state related,established + ip6 filter OUTPUT ct state related,established)
     r.push_str("    ct state related,established counter accept\n");
 
-    // 7. Per-IP allowlist outgoing
-    for ip_str in &config.allowed_ips {
+    // 7a. Allowlist incoming IPs — response-only (ct state established)
+    //     Eddie: foreach ipsAllowlistIncoming → daddr + ct state established, suffix _2
+    for ip_str in &config.allowed_ips_incoming {
+        let cidr = ensure_cidr(ip_str);
+        match classify_ip(&cidr) {
+            Some(IpVersion::V4) => {
+                let comment =
+                    format!("eddie_ip_{}", sha256_hex(&format!("ipv4_in_{}_2", cidr)));
+                r.push_str(&format!(
+                    "    ip daddr {} ct state established counter accept comment \"{}\"\n",
+                    cidr, comment
+                ));
+            }
+            Some(IpVersion::V6) => {
+                let comment =
+                    format!("eddie_ip_{}", sha256_hex(&format!("ipv6_in_{}_2", cidr)));
+                r.push_str(&format!(
+                    "    ip6 daddr {} ct state established counter accept comment \"{}\"\n",
+                    cidr, comment
+                ));
+            }
+            None => {}
+        }
+    }
+
+    // 7b. Allowlist outgoing IPs — unrestricted
+    //     Eddie: foreach ipsAllowlistOutgoing → daddr accept, suffix _1
+    for ip_str in &config.allowed_ips_outgoing {
         let cidr = ensure_cidr(ip_str);
         match classify_ip(&cidr) {
             Some(IpVersion::V4) => {
@@ -562,7 +596,8 @@ mod tests {
             allow_dhcp: true,
             allow_ping: true,
             allow_ipv4ipv6translation: false,
-            allowed_ips: vec![],
+            allowed_ips_incoming: vec![],
+            allowed_ips_outgoing: vec![],
         }
     }
 
@@ -620,15 +655,20 @@ mod tests {
             allow_dhcp: false,
             allow_ping: false,
             allow_ipv4ipv6translation: false,
-            allowed_ips: vec![
+            allowed_ips_incoming: vec![
                 "185.236.200.1".to_string(),
                 "2001:db8::1".to_string(),
+            ],
+            allowed_ips_outgoing: vec![
                 "10.128.0.0/24".to_string(),
+                "203.0.113.5".to_string(),
             ],
         };
         let ruleset = generate_ruleset(&config);
 
-        // IPv4 incoming allowlist with SHA256 comment
+        // --- INPUT chain: incoming IPs get saddr accept ---
+
+        // IPv4 incoming: saddr accept (comment suffix _1)
         let expected_v4_in_comment = format!(
             "eddie_ip_{}",
             sha256_hex("ipv4_in_185.236.200.1/32_1")
@@ -638,23 +678,10 @@ mod tests {
                 "ip saddr 185.236.200.1/32 counter accept comment \"{}\"",
                 expected_v4_in_comment
             )),
-            "should contain IPv4 incoming allowlist rule with comment"
+            "INPUT should contain IPv4 incoming allowlist saddr rule"
         );
 
-        // IPv4 outgoing allowlist with SHA256 comment
-        let expected_v4_out_comment = format!(
-            "eddie_ip_{}",
-            sha256_hex("ipv4_out_185.236.200.1/32_1")
-        );
-        assert!(
-            ruleset.contains(&format!(
-                "ip daddr 185.236.200.1/32 counter accept comment \"{}\"",
-                expected_v4_out_comment
-            )),
-            "should contain IPv4 outgoing allowlist rule with comment"
-        );
-
-        // IPv6 allowlist
+        // IPv6 incoming: saddr accept (comment suffix _1)
         let expected_v6_in_comment = format!(
             "eddie_ip_{}",
             sha256_hex("ipv6_in_2001:db8::1/128_1")
@@ -664,10 +691,50 @@ mod tests {
                 "ip6 saddr 2001:db8::1/128 counter accept comment \"{}\"",
                 expected_v6_in_comment
             )),
-            "should contain IPv6 incoming allowlist rule"
+            "INPUT should contain IPv6 incoming allowlist saddr rule"
         );
 
-        // CIDR passthrough (already has /24)
+        // Outgoing IPs should NOT appear in INPUT
+        assert!(
+            !ruleset.contains("ip saddr 10.128.0.0/24"),
+            "outgoing IPs should not appear as saddr in INPUT"
+        );
+        assert!(
+            !ruleset.contains("ip saddr 203.0.113.5"),
+            "outgoing IPs should not appear as saddr in INPUT"
+        );
+
+        // --- OUTPUT chain: incoming IPs get ct state established (response-only) ---
+
+        // IPv4 incoming in OUTPUT: daddr + ct state established (comment suffix _2)
+        let expected_v4_in_out_comment = format!(
+            "eddie_ip_{}",
+            sha256_hex("ipv4_in_185.236.200.1/32_2")
+        );
+        assert!(
+            ruleset.contains(&format!(
+                "ip daddr 185.236.200.1/32 ct state established counter accept comment \"{}\"",
+                expected_v4_in_out_comment
+            )),
+            "OUTPUT should contain IPv4 incoming allowlist with ct state established"
+        );
+
+        // IPv6 incoming in OUTPUT: daddr + ct state established (comment suffix _2)
+        let expected_v6_in_out_comment = format!(
+            "eddie_ip_{}",
+            sha256_hex("ipv6_in_2001:db8::1/128_2")
+        );
+        assert!(
+            ruleset.contains(&format!(
+                "ip6 daddr 2001:db8::1/128 ct state established counter accept comment \"{}\"",
+                expected_v6_in_out_comment
+            )),
+            "OUTPUT should contain IPv6 incoming allowlist with ct state established"
+        );
+
+        // --- OUTPUT chain: outgoing IPs get unrestricted daddr accept ---
+
+        // IPv4 outgoing: daddr accept (comment suffix _1)
         let expected_cidr_out_comment = format!(
             "eddie_ip_{}",
             sha256_hex("ipv4_out_10.128.0.0/24_1")
@@ -677,7 +744,28 @@ mod tests {
                 "ip daddr 10.128.0.0/24 counter accept comment \"{}\"",
                 expected_cidr_out_comment
             )),
-            "should preserve existing CIDR prefix"
+            "OUTPUT should contain outgoing allowlist with plain accept (CIDR preserved)"
+        );
+
+        let expected_v4_out_comment = format!(
+            "eddie_ip_{}",
+            sha256_hex("ipv4_out_203.0.113.5/32_1")
+        );
+        assert!(
+            ruleset.contains(&format!(
+                "ip daddr 203.0.113.5/32 counter accept comment \"{}\"",
+                expected_v4_out_comment
+            )),
+            "OUTPUT should contain outgoing allowlist with plain accept"
+        );
+
+        // Incoming IPs should NOT get unrestricted outgoing accept
+        assert!(
+            !ruleset.contains(&format!(
+                "ip daddr 185.236.200.1/32 counter accept comment \"eddie_ip_{}\"",
+                sha256_hex("ipv4_out_185.236.200.1/32_1")
+            )),
+            "incoming IPs should not get unrestricted outgoing accept"
         );
     }
 
@@ -688,7 +776,8 @@ mod tests {
             allow_dhcp: false,
             allow_ping: false,
             allow_ipv4ipv6translation: false,
-            allowed_ips: vec![],
+            allowed_ips_incoming: vec![],
+            allowed_ips_outgoing: vec![],
         };
         let ruleset = generate_ruleset(&config);
 
@@ -725,7 +814,8 @@ mod tests {
             allow_dhcp: false,
             allow_ping: false,
             allow_ipv4ipv6translation: false,
-            allowed_ips: vec![],
+            allowed_ips_incoming: vec![],
+            allowed_ips_outgoing: vec![],
         };
         let ruleset = generate_ruleset(&config);
 
@@ -817,7 +907,8 @@ mod tests {
             allow_dhcp: true,
             allow_ping: true,
             allow_ipv4ipv6translation: false,
-            allowed_ips: vec!["1.2.3.4".to_string()],
+            allowed_ips_incoming: vec!["1.2.3.4".to_string()],
+            allowed_ips_outgoing: vec![],
         };
         let ruleset = generate_ruleset(&config);
 

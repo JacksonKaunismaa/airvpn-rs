@@ -87,6 +87,22 @@ pub fn flush() {
     }
 }
 
+/// Read current DNS servers for an interface via resolvectl.
+///
+/// Returns the raw `resolvectl dns <iface>` output line, e.g.
+/// "Link 2 (eth0): 8.8.8.8 8.8.4.4" — the caller parses IPs from this.
+fn get_interface_dns(iface: &str) -> Option<String> {
+    let output = Command::new("resolvectl")
+        .args(["dns", iface])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
 /// Get all network interface names from /sys/class/net/, excluding loopback.
 ///
 /// Eddie uses if_nameindex() to enumerate interfaces. We read /sys/class/net/
@@ -146,20 +162,23 @@ fn configure_systemd_resolved_all(dns_ipv4: &str, dns_ipv6: &str, vpn_iface: &st
                 anyhow::bail!("resolvectl default-route on {} failed: {}", iface, stderr);
             }
         } else {
-            // Non-VPN interface: back up current default-route state, then set false.
+            // Non-VPN interface: back up current DNS servers + default-route state.
             // Eddie: backs up /run/systemd/resolve/netif/<index> to
             // /etc/systemd_resolve_netif_<iface>.eddievpn before modifying.
+            // We back up both values so we can fully restore on disconnect,
+            // rather than factory-resetting the interface with `resolvectl revert`.
             let backup_path = Path::new("/etc").join(format!("systemd_resolve_{}.airvpn-rs", iface));
             if !backup_path.exists() {
-                let output = Command::new("resolvectl")
+                let dns_state = get_interface_dns(iface).unwrap_or_default();
+                let dr_output = Command::new("resolvectl")
                     .args(["default-route", iface.as_str()])
                     .output();
-                if let Ok(o) = output {
-                    if o.status.success() {
-                        let state = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                        let _ = fs::write(&backup_path, &state);
-                    }
-                }
+                let dr_state = dr_output
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_default();
+                let backup_content = format!("dns={}\ndefault_route={}", dns_state, dr_state);
+                let _ = fs::write(&backup_path, &backup_content);
             }
 
             // Non-VPN interface: set VPN DNS + default-route=false.
@@ -267,8 +286,12 @@ pub fn deactivate() -> Result<()> {
     }
 
     // Restore per-interface systemd-resolved settings from backups.
-    // Eddie: reads /etc/systemd_resolve_netif_<iface>.eddievpn, restores default_route
-    // via resolvectl, then deletes the backup file.
+    // Eddie: reads /etc/systemd_resolve_netif_<iface>.eddievpn, restores DNS servers
+    // and default_route via resolvectl, then deletes the backup file.
+    //
+    // Track which interfaces we successfully restored so we only use
+    // `resolvectl revert` as a fallback for interfaces without backup files.
+    let mut restored_ifaces: Vec<String> = Vec::new();
     if let Ok(entries) = fs::read_dir("/etc") {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
@@ -278,11 +301,46 @@ pub fn deactivate() -> Result<()> {
                     .and_then(|s| s.strip_suffix(".airvpn-rs"))
                     .unwrap_or("");
                 if !iface.is_empty() {
-                    if let Ok(state) = fs::read_to_string(entry.path()) {
-                        let val = if state.contains("yes") { "true" } else { "false" };
-                        let _ = Command::new("resolvectl")
-                            .args(["default-route", iface, val])
-                            .output();
+                    if let Ok(content) = fs::read_to_string(entry.path()) {
+                        let mut dns_line = String::new();
+                        let mut dr_line = String::new();
+                        for line in content.lines() {
+                            if let Some(v) = line.strip_prefix("dns=") {
+                                dns_line = v.to_string();
+                            }
+                            if let Some(v) = line.strip_prefix("default_route=") {
+                                dr_line = v.to_string();
+                            }
+                        }
+
+                        // Restore DNS servers.
+                        // resolvectl dns output format: "Link 2 (eth0): 8.8.8.8 8.8.4.4"
+                        // Extract just the IP addresses from the saved line.
+                        if !dns_line.is_empty() {
+                            let servers: Vec<&str> = dns_line
+                                .split_whitespace()
+                                .filter(|s| s.parse::<std::net::IpAddr>().is_ok())
+                                .collect();
+                            if !servers.is_empty() {
+                                let mut args = vec!["dns", iface];
+                                args.extend(servers);
+                                let _ = Command::new("resolvectl").args(&args).output();
+                            }
+                        }
+
+                        // Restore default-route.
+                        if !dr_line.is_empty() {
+                            let val = if dr_line.contains("yes") {
+                                "true"
+                            } else {
+                                "false"
+                            };
+                            let _ = Command::new("resolvectl")
+                                .args(["default-route", iface, val])
+                                .output();
+                        }
+
+                        restored_ifaces.push(iface.to_string());
                     }
                     let _ = fs::remove_file(entry.path());
                 }
@@ -290,13 +348,17 @@ pub fn deactivate() -> Result<()> {
         }
     }
 
-    // Revert DNS on all non-loopback interfaces to their defaults
-    // (removes VPN DNS we set during activate)
+    // Revert DNS on interfaces that did NOT have backup files.
+    // This is a best-effort fallback — `resolvectl revert` factory-resets
+    // the interface, but it's better than leaving VPN DNS on an interface
+    // we have no saved state for.
     let ifaces = list_interfaces();
     for iface in &ifaces {
-        let _ = Command::new("resolvectl")
-            .args(["revert", iface.as_str()])
-            .output();
+        if !restored_ifaces.contains(iface) {
+            let _ = Command::new("resolvectl")
+                .args(["revert", iface.as_str()])
+                .output();
+        }
     }
 
     // Restart systemd-resolved if active so it picks up the restored resolv.conf

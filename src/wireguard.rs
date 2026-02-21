@@ -12,9 +12,12 @@ use crate::manifest::{Mode, Server, UserInfo, WireGuardKey};
 
 /// Generate a WireGuard config from manifest data.
 ///
-/// The config format matches what wg-quick expects. The endpoint IP is
-/// selected from `server.ips_entry` using `mode.entry_index`, falling back
-/// to the first entry IP if entry_index is out of bounds.
+/// The config format matches what wg-quick expects. IPv4 entry IPs are
+/// preferred over IPv6 (matching Eddie's default `network.entry.iplayer =
+/// "ipv4-ipv6"`), since we block IPv6 on all interfaces during connection.
+/// The endpoint IP is selected at `mode.entry_index` within the preferred
+/// IP version, falling back to the first IP of that version, then trying
+/// the other version.
 ///
 /// IPv6 endpoint IPs are wrapped in brackets per WireGuard convention.
 pub fn generate_config(key: &WireGuardKey, server: &Server, mode: &Mode, user: &UserInfo) -> Result<String> {
@@ -28,8 +31,20 @@ pub fn generate_config(key: &WireGuardKey, server: &Server, mode: &Mode, user: &
         anyhow::bail!("WireGuard mode has no port configured");
     }
 
-    let endpoint_ip = server.ips_entry.get(mode.entry_index)
-        .or_else(|| server.ips_entry.first())
+    // Prefer IPv4 entry IPs (matching Eddie's default network.entry.iplayer="ipv4-ipv6")
+    // Since we block IPv6 on all interfaces, IPv6 entry IPs would fail
+    let ipv4_entries: Vec<&String> = server.ips_entry.iter()
+        .filter(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())
+        .collect();
+    let ipv6_entries: Vec<&String> = server.ips_entry.iter()
+        .filter(|ip| ip.parse::<std::net::Ipv6Addr>().is_ok())
+        .collect();
+
+    // Try IPv4 first (at entry_index), then fall back to IPv6
+    let endpoint_ip = ipv4_entries.get(mode.entry_index)
+        .or_else(|| ipv4_entries.first())
+        .or_else(|| ipv6_entries.get(mode.entry_index))
+        .or_else(|| ipv6_entries.first())
         .ok_or_else(|| anyhow::anyhow!("server {} has no entry IPs", server.name))?;
 
     // IPv6 addresses (containing ':') must be wrapped in brackets for the endpoint

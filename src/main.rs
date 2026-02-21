@@ -408,7 +408,8 @@ fn cmd_connect(
                 allow_dhcp: true,
                 allow_ping: true,
                 allow_ipv4ipv6translation: true,
-                allowed_ips,
+                allowed_ips_incoming: vec![],
+                allowed_ips_outgoing: allowed_ips,
             };
             netlock::activate(&lock_config)?;
             recovery::save(&recovery::State {
