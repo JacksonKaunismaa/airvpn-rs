@@ -11,9 +11,10 @@ use quick_xml::reader::Reader;
 pub struct Manifest {
     pub servers: Vec<Server>,
     pub modes: Vec<Mode>,
-    pub user: UserInfo,
     pub bootstrap_urls: Vec<String>,
 }
+
+// UserInfo and WireGuardKey are parsed separately via parse_user() from the act=user response.
 
 #[derive(Debug)]
 pub struct Server {
@@ -199,13 +200,6 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
     let mut raw_servers: Vec<RawServerAttrs> = Vec::new();
     let mut modes: Vec<Mode> = Vec::new();
     let mut bootstrap_urls: Vec<String> = Vec::new();
-    let mut user: Option<UserInfo> = None;
-
-    // Nested parsing state
-    let mut in_user = false;
-    let mut current_user_login = String::new();
-    let mut current_user_wg_pub = String::new();
-    let mut current_user_keys: Vec<WireGuardKey> = Vec::new();
 
     loop {
         match reader.read_event() {
@@ -279,57 +273,12 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
                             }
                         }
                     }
-                    b"key" if in_user => {
-                        current_user_keys.push(WireGuardKey {
-                            name: attr_opt(e, b"name").unwrap_or_default(),
-                            wg_private_key: attr_opt(e, b"wg_private_key").unwrap_or_default(),
-                            wg_ipv4: attr_opt(e, b"wg_ipv4").unwrap_or_default(),
-                            wg_ipv6: attr_opt(e, b"wg_ipv6").unwrap_or_default(),
-                            wg_dns_ipv4: attr_opt(e, b"wg_dns_ipv4").unwrap_or_default(),
-                            wg_dns_ipv6: attr_opt(e, b"wg_dns_ipv6").unwrap_or_default(),
-                            wg_preshared: attr_opt(e, b"wg_preshared").unwrap_or_default(),
-                        });
-                    }
                     _ => {}
                 }
             }
 
-            // ---------- Start elements (<tag ...>) ----------
-            Ok(Event::Start(ref e)) => {
-                match e.name().as_ref() {
-                    b"user" => {
-                        in_user = true;
-                        current_user_login = attr_opt(e, b"login").unwrap_or_default();
-                        current_user_wg_pub = attr_opt(e, b"wg_public_key").unwrap_or_default();
-                        current_user_keys.clear();
-                    }
-                    // Handle <key> as a Start element too (in case it has children)
-                    b"key" if in_user => {
-                        current_user_keys.push(WireGuardKey {
-                            name: attr_opt(e, b"name").unwrap_or_default(),
-                            wg_private_key: attr_opt(e, b"wg_private_key").unwrap_or_default(),
-                            wg_ipv4: attr_opt(e, b"wg_ipv4").unwrap_or_default(),
-                            wg_ipv6: attr_opt(e, b"wg_ipv6").unwrap_or_default(),
-                            wg_dns_ipv4: attr_opt(e, b"wg_dns_ipv4").unwrap_or_default(),
-                            wg_dns_ipv6: attr_opt(e, b"wg_dns_ipv6").unwrap_or_default(),
-                            wg_preshared: attr_opt(e, b"wg_preshared").unwrap_or_default(),
-                        });
-                    }
-                    _ => {}
-                }
-            }
-
-            // ---------- End elements (</tag>) ----------
-            Ok(Event::End(ref e)) => {
-                if e.name().as_ref() == b"user" && in_user {
-                    in_user = false;
-                    user = Some(UserInfo {
-                        login: std::mem::take(&mut current_user_login),
-                        wg_public_key: std::mem::take(&mut current_user_wg_pub),
-                        keys: std::mem::take(&mut current_user_keys),
-                    });
-                }
-            }
+            // ---------- Start / End elements — nothing to track ----------
+            Ok(Event::Start(_)) | Ok(Event::End(_)) => {}
             _ => {}
         }
     }
@@ -340,14 +289,90 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
         .map(|raw| resolve_server(raw, &groups))
         .collect();
 
-    let user = user.context("manifest missing <user> element")?;
-
     Ok(Manifest {
         servers,
         modes,
-        user,
         bootstrap_urls,
     })
+}
+
+// ---------------------------------------------------------------------------
+// User parser (act=user response)
+// ---------------------------------------------------------------------------
+
+/// Parse the `act=user` API response into a [`UserInfo`].
+///
+/// The root element is `<user login="..." wg_public_key="...">` with
+/// `<keys><key .../></keys>` children containing WireGuard device keys.
+pub fn parse_user(xml: &str) -> anyhow::Result<UserInfo> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut user: Option<UserInfo> = None;
+    let mut in_user = false;
+    let mut login = String::new();
+    let mut wg_public_key = String::new();
+    let mut keys: Vec<WireGuardKey> = Vec::new();
+
+    loop {
+        match reader.read_event() {
+            Err(e) => bail!("XML parse error at position {}: {e}", reader.error_position()),
+            Ok(Event::Eof) => break,
+
+            Ok(Event::Empty(ref e)) => {
+                if e.name().as_ref() == b"key" && in_user {
+                    keys.push(WireGuardKey {
+                        name: attr_opt(e, b"name").unwrap_or_default(),
+                        wg_private_key: attr_opt(e, b"wg_private_key").unwrap_or_default(),
+                        wg_ipv4: attr_opt(e, b"wg_ipv4").unwrap_or_default(),
+                        wg_ipv6: attr_opt(e, b"wg_ipv6").unwrap_or_default(),
+                        wg_dns_ipv4: attr_opt(e, b"wg_dns_ipv4").unwrap_or_default(),
+                        wg_dns_ipv6: attr_opt(e, b"wg_dns_ipv6").unwrap_or_default(),
+                        wg_preshared: attr_opt(e, b"wg_preshared").unwrap_or_default(),
+                    });
+                }
+            }
+
+            Ok(Event::Start(ref e)) => {
+                match e.name().as_ref() {
+                    b"user" => {
+                        in_user = true;
+                        login = attr_opt(e, b"login").unwrap_or_default();
+                        wg_public_key = attr_opt(e, b"wg_public_key").unwrap_or_default();
+                        keys.clear();
+                    }
+                    // Handle <key> as a Start element too (in case it has children)
+                    b"key" if in_user => {
+                        keys.push(WireGuardKey {
+                            name: attr_opt(e, b"name").unwrap_or_default(),
+                            wg_private_key: attr_opt(e, b"wg_private_key").unwrap_or_default(),
+                            wg_ipv4: attr_opt(e, b"wg_ipv4").unwrap_or_default(),
+                            wg_ipv6: attr_opt(e, b"wg_ipv6").unwrap_or_default(),
+                            wg_dns_ipv4: attr_opt(e, b"wg_dns_ipv4").unwrap_or_default(),
+                            wg_dns_ipv6: attr_opt(e, b"wg_dns_ipv6").unwrap_or_default(),
+                            wg_preshared: attr_opt(e, b"wg_preshared").unwrap_or_default(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+
+            Ok(Event::End(ref e)) => {
+                if e.name().as_ref() == b"user" && in_user {
+                    in_user = false;
+                    user = Some(UserInfo {
+                        login: std::mem::take(&mut login),
+                        wg_public_key: std::mem::take(&mut wg_public_key),
+                        keys: std::mem::take(&mut keys),
+                    });
+                }
+            }
+
+            _ => {}
+        }
+    }
+
+    user.context("user response missing <user> element")
 }
 
 // ---------------------------------------------------------------------------
@@ -405,18 +430,6 @@ mod tests {
     <url address="http://eddie.website/api/" />
     <url address="http://185.60.40.11:8080/" />
   </urls>
-
-  <user login="testuser" wg_public_key="PublicKeyBase64==">
-    <keys>
-      <key name="default"
-           wg_private_key="PrivateKeyBase64=="
-           wg_ipv4="10.128.0.42"
-           wg_ipv6="fd7d:76ee:3c49:9950::42"
-           wg_dns_ipv4="10.128.0.1"
-           wg_dns_ipv6="fd7d:76ee:3c49:9950::1"
-           wg_preshared="PresharedKeyBase64==" />
-    </keys>
-  </user>
 </manifest>"#;
 
     #[test]
@@ -469,20 +482,6 @@ mod tests {
         assert_eq!(manifest.bootstrap_urls.len(), 2);
         assert_eq!(manifest.bootstrap_urls[0], "http://eddie.website/api/");
         assert_eq!(manifest.bootstrap_urls[1], "http://185.60.40.11:8080/");
-
-        // --- User ---
-        assert_eq!(manifest.user.login, "testuser");
-        assert_eq!(manifest.user.wg_public_key, "PublicKeyBase64==");
-        assert_eq!(manifest.user.keys.len(), 1);
-
-        let key = &manifest.user.keys[0];
-        assert_eq!(key.name, "default");
-        assert_eq!(key.wg_private_key, "PrivateKeyBase64==");
-        assert_eq!(key.wg_ipv4, "10.128.0.42");
-        assert_eq!(key.wg_ipv6, "fd7d:76ee:3c49:9950::42");
-        assert_eq!(key.wg_dns_ipv4, "10.128.0.1");
-        assert_eq!(key.wg_dns_ipv6, "fd7d:76ee:3c49:9950::1");
-        assert_eq!(key.wg_preshared, "PresharedKeyBase64==");
     }
 
     #[test]
@@ -514,16 +513,6 @@ mod tests {
   </modes>
 
   <urls />
-
-  <user login="testuser" wg_public_key="Pub==">
-    <keys>
-      <key name="default"
-           wg_private_key="Priv=="
-           wg_ipv4="10.0.0.1" wg_ipv6="fd00::1"
-           wg_dns_ipv4="10.128.0.1" wg_dns_ipv6="fd00::53"
-           wg_preshared="PSK==" />
-    </keys>
-  </user>
 </manifest>"#;
 
         let manifest = parse_manifest(xml).expect("failed to parse manifest");
@@ -564,21 +553,66 @@ mod tests {
           protocol="UDP" port="1637" entry_index="0" />
   </modes>
   <urls />
-
-  <user login="testuser" wg_public_key="Pub==">
-    <keys>
-      <key name="default"
-           wg_private_key="Priv=="
-           wg_ipv4="10.0.0.1" wg_ipv6="fd00::1"
-           wg_dns_ipv4="10.128.0.1" wg_dns_ipv6="fd00::53"
-           wg_preshared="PSK==" />
-    </keys>
-  </user>
 </manifest>"#;
 
         let manifest = parse_manifest(xml).expect("failed to parse manifest");
         let vega = &manifest.servers[0];
         assert_eq!(vega.ips_entry, vec!["1.2.3.4", "5.6.7.8"]);
         assert_eq!(vega.ips_exit, vec!["9.10.11.12", "13.14.15.16"]);
+    }
+
+    #[test]
+    fn test_parse_user() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<user login="testuser" wg_public_key="PublicKeyBase64==">
+  <keys>
+    <key name="default"
+         wg_private_key="PrivateKeyBase64=="
+         wg_ipv4="10.128.0.42"
+         wg_ipv6="fd7d:76ee:3c49:9950::42"
+         wg_dns_ipv4="10.128.0.1"
+         wg_dns_ipv6="fd7d:76ee:3c49:9950::1"
+         wg_preshared="PresharedKeyBase64==" />
+  </keys>
+</user>"#;
+
+        let user = parse_user(xml).expect("failed to parse user");
+        assert_eq!(user.login, "testuser");
+        assert_eq!(user.wg_public_key, "PublicKeyBase64==");
+        assert_eq!(user.keys.len(), 1);
+
+        let key = &user.keys[0];
+        assert_eq!(key.name, "default");
+        assert_eq!(key.wg_private_key, "PrivateKeyBase64==");
+        assert_eq!(key.wg_ipv4, "10.128.0.42");
+        assert_eq!(key.wg_ipv6, "fd7d:76ee:3c49:9950::42");
+        assert_eq!(key.wg_dns_ipv4, "10.128.0.1");
+        assert_eq!(key.wg_dns_ipv6, "fd7d:76ee:3c49:9950::1");
+        assert_eq!(key.wg_preshared, "PresharedKeyBase64==");
+    }
+
+    #[test]
+    fn test_parse_user_multiple_keys() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<user login="multi" wg_public_key="PubMulti==">
+  <keys>
+    <key name="laptop"
+         wg_private_key="PrivLaptop=="
+         wg_ipv4="10.128.0.1" wg_ipv6="fd00::1"
+         wg_dns_ipv4="10.128.0.1" wg_dns_ipv6="fd00::53"
+         wg_preshared="PSK1==" />
+    <key name="phone"
+         wg_private_key="PrivPhone=="
+         wg_ipv4="10.128.0.2" wg_ipv6="fd00::2"
+         wg_dns_ipv4="10.128.0.1" wg_dns_ipv6="fd00::53"
+         wg_preshared="PSK2==" />
+  </keys>
+</user>"#;
+
+        let user = parse_user(xml).expect("failed to parse user");
+        assert_eq!(user.login, "multi");
+        assert_eq!(user.keys.len(), 2);
+        assert_eq!(user.keys[0].name, "laptop");
+        assert_eq!(user.keys[1].name, "phone");
     }
 }

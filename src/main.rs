@@ -34,6 +34,9 @@ enum Commands {
         /// Sort by: score, load, users, name
         #[arg(long, default_value = "score")]
         sort: String,
+        /// Dump raw manifest XML instead of table
+        #[arg(long)]
+        debug: bool,
     },
     /// Clean up stale state after crash
     Recover,
@@ -49,7 +52,7 @@ fn main() -> anyhow::Result<()> {
         } => cmd_connect(server, no_lock, allow_lan),
         Commands::Disconnect => cmd_disconnect(),
         Commands::Status => cmd_status(),
-        Commands::Servers { sort } => cmd_servers(&sort),
+        Commands::Servers { sort, debug } => cmd_servers(&sort, debug),
         Commands::Recover => cmd_recover(),
     }
 }
@@ -65,17 +68,19 @@ fn cmd_connect(server_name: Option<String>, no_lock: bool, allow_lan: bool) -> a
     // 2. Resolve credentials
     let (username, password) = config::resolve_credentials(None, None)?;
 
-    // 3. Fetch manifest
+    // 3. Fetch manifest + user data (two separate API calls)
     println!("Fetching server list...");
-    let xml = api::fetch_manifest(&username, &password)?;
-
-    // 4. Parse manifest
-    let manifest = manifest::parse_manifest(&xml)?;
+    let manifest_xml = api::fetch_manifest(&username, &password)?;
+    let manifest = manifest::parse_manifest(&manifest_xml)?;
     println!(
         "Found {} servers, {} WireGuard modes",
         manifest.servers.len(),
         manifest.modes.len()
     );
+
+    println!("Fetching user data...");
+    let user_xml = api::fetch_user(&username, &password)?;
+    let user_info = manifest::parse_user(&user_xml)?;
 
     // 5. Select server
     let server_ref = server::select_server(&manifest.servers, server_name.as_deref())?;
@@ -91,11 +96,10 @@ fn cmd_connect(server_name: Option<String>, no_lock: bool, allow_lan: bool) -> a
         .ok_or_else(|| anyhow::anyhow!("No WireGuard modes available"))?;
 
     // 7. Get WireGuard key (first/default)
-    let wg_key = manifest
-        .user
+    let wg_key = user_info
         .keys
         .first()
-        .ok_or_else(|| anyhow::anyhow!("No WireGuard keys in manifest"))?;
+        .ok_or_else(|| anyhow::anyhow!("No WireGuard keys in user data"))?;
 
     // 8. Activate network lock (BEFORE connecting -- this is critical)
     if !no_lock {
@@ -122,7 +126,7 @@ fn cmd_connect(server_name: Option<String>, no_lock: bool, allow_lan: bool) -> a
         "Connecting to {}:{}...",
         server_ref.ips_entry[mode.entry_index], mode.port
     );
-    let wg_config = wireguard::generate_config(wg_key, server_ref, mode, &manifest.user);
+    let wg_config = wireguard::generate_config(wg_key, server_ref, mode, &user_info);
     let (config_path, iface) = wireguard::connect(&wg_config)?;
     println!("WireGuard interface: {}", iface);
 
@@ -232,9 +236,19 @@ fn cmd_status() -> anyhow::Result<()> {
 // Servers
 // ---------------------------------------------------------------------------
 
-fn cmd_servers(sort: &str) -> anyhow::Result<()> {
+fn cmd_servers(sort: &str, debug: bool) -> anyhow::Result<()> {
     let (username, password) = config::resolve_credentials(None, None)?;
     let xml = api::fetch_manifest(&username, &password)?;
+
+    if debug {
+        // Redact credentials from the raw XML before printing
+        let redacted = xml
+            .replace(&username, "[REDACTED_USER]")
+            .replace(&password, "[REDACTED_PASS]");
+        println!("{}", redacted);
+        return Ok(());
+    }
+
     let manifest = manifest::parse_manifest(&xml)?;
 
     let mut servers: Vec<&manifest::Server> = manifest.servers.iter().collect();
