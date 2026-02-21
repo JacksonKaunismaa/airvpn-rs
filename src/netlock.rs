@@ -369,6 +369,11 @@ pub fn is_active() -> bool {
 ///
 /// Eddie equivalent: netlock-nftables-interface action=add
 pub fn allow_interface(iface: &str) -> Result<()> {
+    // Validate interface name to prevent nft command injection
+    if iface.len() > 15 || !iface.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        anyhow::bail!("invalid interface name: {:?}", iface);
+    }
+
     // Input: iifname "<iface>" accept
     nft_insert_before_latest(
         "input",
@@ -403,6 +408,11 @@ pub fn allow_interface(iface: &str) -> Result<()> {
 ///
 /// Eddie equivalent: netlock-nftables-interface action=del
 pub fn deallow_interface(iface: &str) -> Result<()> {
+    // Validate interface name to prevent nft command injection
+    if iface.len() > 15 || !iface.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        anyhow::bail!("invalid interface name: {:?}", iface);
+    }
+
     for chain in &["input", "forward", "output"] {
         let dir = match *chain {
             "input" => "input",

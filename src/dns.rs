@@ -20,7 +20,7 @@ const BACKUP_PATH: &str = "/etc/resolv.conf.airvpn-rs";
 ///
 /// Matches Eddie's format: header comment block + nameserver lines.
 fn build_resolv_conf(dns_ipv4: &str, dns_ipv6: &str) -> String {
-    format!(
+    let mut content = format!(
         "\
 #
 # Created by airvpn-rs. Do not edit.
@@ -31,12 +31,18 @@ fn build_resolv_conf(dns_ipv4: &str, dns_ipv6: &str) -> String {
 #
 # mv {} /etc/resolv.conf
 #
-nameserver {}
-nameserver {}
-
 ",
-        BACKUP_PATH, BACKUP_PATH, dns_ipv4, dns_ipv6,
-    )
+        BACKUP_PATH, BACKUP_PATH,
+    );
+
+    if !dns_ipv4.is_empty() {
+        content.push_str(&format!("nameserver {}\n", dns_ipv4));
+    }
+    if !dns_ipv6.is_empty() {
+        content.push_str(&format!("nameserver {}\n", dns_ipv6));
+    }
+    content.push('\n');
+    content
 }
 
 /// Check if systemd-resolved is active.
@@ -108,6 +114,10 @@ fn configure_systemd_resolved(dns_ipv4: &str, dns_ipv6: &str, iface: &str) -> Re
 /// Eddie always writes resolv.conf AND configures systemd-resolved if active.
 /// The resolv.conf swap is the universal fallback; systemd-resolved is layered on top.
 pub fn activate(dns_ipv4: &str, dns_ipv6: &str, iface: &str) -> Result<()> {
+    if dns_ipv4.is_empty() && dns_ipv6.is_empty() {
+        anyhow::bail!("no DNS servers provided (both IPv4 and IPv6 are empty)");
+    }
+
     // If systemd-resolved is active, configure it
     if is_systemd_resolved_active() {
         configure_systemd_resolved(dns_ipv4, dns_ipv6, iface)?;
@@ -122,6 +132,13 @@ pub fn activate(dns_ipv4: &str, dns_ipv6: &str, iface: &str) -> Result<()> {
     }
 
     let expected = build_resolv_conf(dns_ipv4, dns_ipv6);
+
+    // If resolv.conf became a symlink (e.g., NetworkManager recreated it),
+    // remove the symlink before writing to avoid corrupting the target
+    if resolv_path.is_symlink() {
+        let _ = fs::remove_file(resolv_path);
+    }
+
     fs::write(resolv_path, &expected).context("failed to write /etc/resolv.conf")?;
 
     // Eddie sets 0644 explicitly (S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH)
@@ -181,6 +198,12 @@ pub fn check_and_reapply(dns_ipv4: &str, dns_ipv6: &str) -> Result<bool> {
     let current = fs::read_to_string(resolv_path).context("failed to read /etc/resolv.conf")?;
 
     if current != expected {
+        // If resolv.conf became a symlink (e.g., NetworkManager recreated it),
+        // remove the symlink before writing to avoid corrupting the target
+        if resolv_path.is_symlink() {
+            let _ = fs::remove_file(resolv_path);
+        }
+
         fs::write(resolv_path, &expected).context("failed to re-apply /etc/resolv.conf")?;
 
         #[cfg(unix)]

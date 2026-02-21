@@ -470,10 +470,16 @@ pub fn keyring_write(id: &str, password: &str) -> Result<()> {
         .spawn()
         .context("failed to run secret-tool for keyring store")?;
 
-    if let Some(ref mut stdin) = child.stdin {
+    // Write password and close stdin (secret-tool reads until EOF)
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("failed to open secret-tool stdin")?;
         stdin
             .write_all(password.as_bytes())
             .context("failed to write password to secret-tool stdin")?;
+        // stdin dropped here, closing the pipe -> secret-tool sees EOF
     }
 
     let status = child.wait().context("failed to wait for secret-tool")?;

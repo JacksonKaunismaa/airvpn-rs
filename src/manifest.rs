@@ -127,7 +127,7 @@ fn elem_name(e: &quick_xml::events::BytesStart<'_>) -> String {
 
 /// Split a comma-separated IP list into a Vec, filtering empty strings.
 fn split_ips(s: &str) -> Vec<String> {
-    s.split(',')
+    s.split([',', ';'])
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(String::from)

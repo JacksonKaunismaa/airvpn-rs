@@ -64,29 +64,36 @@ fn find_state_file() -> Option<PathBuf> {
 pub fn save(state: &State) -> Result<()> {
     let path = state_path();
     let json = serde_json::to_string_pretty(state).context("failed to serialize state")?;
+
+    // Write to temp file then atomic rename (crash-safe)
+    let dir = path.parent().unwrap_or(std::path::Path::new("/tmp"));
+
     #[cfg(unix)]
     {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)
-            .with_context(|| format!("failed to create state file: {}", path.display()))?;
-        // Advisory lock to prevent concurrent writes from racing
-        let mut f = nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusive)
-            .map_err(|(_, errno)| errno)
-            .with_context(|| format!("failed to lock state file: {}", path.display()))?;
-        f.write_all(json.as_bytes())
-            .with_context(|| format!("failed to write state file: {}", path.display()))?;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut tmpfile = tempfile::NamedTempFile::new_in(dir)
+            .with_context(|| format!("failed to create temp state file in {}", dir.display()))?;
+
+        // Set permissions before writing content
+        std::fs::set_permissions(tmpfile.path(), std::fs::Permissions::from_mode(0o600))
+            .with_context(|| "failed to set temp state file permissions")?;
+
+        tmpfile.write_all(json.as_bytes())
+            .with_context(|| "failed to write state to temp file")?;
+        tmpfile.as_file().sync_all()
+            .with_context(|| "failed to sync state file")?;
+
+        tmpfile.persist(&path)
+            .with_context(|| format!("failed to persist state file: {}", path.display()))?;
     }
     #[cfg(not(unix))]
     {
         fs::write(&path, json)
             .with_context(|| format!("failed to write state file: {}", path.display()))?;
     }
+
     Ok(())
 }
 
@@ -96,9 +103,14 @@ pub fn load() -> Result<Option<State>> {
         Some(path) => {
             let json = fs::read_to_string(&path)
                 .with_context(|| format!("failed to read state file: {}", path.display()))?;
-            let state: State =
-                serde_json::from_str(&json).context("failed to parse state file")?;
-            Ok(Some(state))
+            match serde_json::from_str::<State>(&json) {
+                Ok(state) => Ok(Some(state)),
+                Err(e) => {
+                    eprintln!("warning: corrupt state file ({}), removing it", e);
+                    let _ = fs::remove_file(&path);
+                    Ok(None)
+                }
+            }
         }
         None => Ok(None),
     }
@@ -118,7 +130,16 @@ pub fn is_pid_alive(pid: u32) -> bool {
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
 
-    kill(Pid::from_raw(pid as i32), None).is_ok()
+    if kill(Pid::from_raw(pid as i32), None).is_err() {
+        return false;
+    }
+
+    // Verify the process is actually airvpn (not a recycled PID)
+    let comm_path = format!("/proc/{}/comm", pid);
+    match std::fs::read_to_string(&comm_path) {
+        Ok(name) => name.trim() == "airvpn",
+        Err(_) => false, // Can't verify — assume dead
+    }
 }
 
 /// Run the recovery cleanup sequence (matches normal disconnect order):
@@ -300,8 +321,11 @@ mod tests {
 
     #[test]
     fn test_is_pid_alive_current_process() {
+        // After PID-reuse fix, is_pid_alive checks /proc/<pid>/comm == "airvpn".
+        // The test binary is not named "airvpn", so this should return false
+        // even though the process is alive — by design.
         let pid = std::process::id();
-        assert!(is_pid_alive(pid), "current process should be alive");
+        assert!(!is_pid_alive(pid), "non-airvpn process should not be considered alive");
     }
 
     #[test]

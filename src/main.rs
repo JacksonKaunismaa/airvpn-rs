@@ -214,26 +214,39 @@ fn cmd_connect(
     })?;
     println!("WireGuard interface: {}", iface);
 
-    // 10. Allow VPN interface in netlock
-    if !no_lock {
-        netlock::allow_interface(&iface)?;
+    // 10-13: Remaining setup — if any step fails, clean up established connection
+    if let Err(e) = (|| -> anyhow::Result<()> {
+        // 10. Allow VPN interface in netlock
+        if !no_lock {
+            netlock::allow_interface(&iface)?;
+        }
+
+        // 11. Activate DNS
+        dns::activate(&wg_key.wg_dns_ipv4, &wg_key.wg_dns_ipv6, &iface)?;
+        println!("DNS configured: {}, {}", wg_key.wg_dns_ipv4, wg_key.wg_dns_ipv6);
+
+        // 12. Save credentials (non-fatal — don't kill connection over keyring issues)
+        if let Err(e) = config::save_credentials(&username, &password) {
+            eprintln!("warning: failed to save credentials: {:#}", e);
+        }
+
+        // 13. Save recovery state
+        recovery::save(&recovery::State {
+            lock_active: !no_lock,
+            wg_interface: iface.clone(),
+            wg_config_path: config_path.clone(),
+            dns_ipv4: wg_key.wg_dns_ipv4.clone(),
+            dns_ipv6: wg_key.wg_dns_ipv6.clone(),
+            pid: std::process::id(),
+        })?;
+
+        Ok(())
+    })() {
+        eprintln!("Setup failed after WireGuard connected: {:#}", e);
+        eprintln!("Cleaning up...");
+        let _ = cmd_disconnect_internal(&config_path, &iface, !no_lock);
+        return Err(e);
     }
-
-    // 11. Activate DNS
-    dns::activate(&wg_key.wg_dns_ipv4, &wg_key.wg_dns_ipv6, &iface)?;
-    println!("DNS configured: {}, {}", wg_key.wg_dns_ipv4, wg_key.wg_dns_ipv6);
-
-    // 12. Save credentials for next time
-    config::save_credentials(&username, &password)?;
-
-    recovery::save(&recovery::State {
-        lock_active: !no_lock,
-        wg_interface: iface.clone(),
-        wg_config_path: config_path.clone(),
-        dns_ipv4: wg_key.wg_dns_ipv4.clone(),
-        dns_ipv6: wg_key.wg_dns_ipv6.clone(),
-        pid: std::process::id(),
-    })?;
 
     println!(
         "\nConnected to {} via {}. Press Ctrl+C to disconnect.",
@@ -270,6 +283,7 @@ fn cmd_connect(
 // ---------------------------------------------------------------------------
 
 fn cmd_disconnect() -> anyhow::Result<()> {
+    preflight_checks()?;
     let state = recovery::load()?.ok_or_else(|| anyhow::anyhow!("No active connection found"))?;
 
     // If the connect process is still running, signal it to shut down gracefully
@@ -417,6 +431,7 @@ fn cmd_servers(
 // ---------------------------------------------------------------------------
 
 fn cmd_recover() -> anyhow::Result<()> {
+    preflight_checks()?;
     recovery::force_recover()
 }
 
