@@ -512,6 +512,41 @@ mod tests {
     }
 
     #[test]
+    fn test_build_resolv_conf_ipv4_only() {
+        let content = build_resolv_conf("10.0.0.1", "");
+        assert!(content.contains("nameserver 10.0.0.1"));
+        assert!(!content.contains("nameserver \n")); // No empty nameserver line
+        // Should not have a second nameserver line
+        assert_eq!(content.matches("nameserver").count(), 1);
+    }
+
+    #[test]
+    fn test_build_resolv_conf_ipv6_only() {
+        let content = build_resolv_conf("", "fd00::1");
+        assert!(content.contains("nameserver fd00::1"));
+        assert_eq!(content.matches("nameserver").count(), 1);
+    }
+
+    #[test]
+    fn test_build_resolv_conf_both() {
+        let content = build_resolv_conf("10.0.0.1", "fd00::1");
+        assert_eq!(content.matches("nameserver").count(), 2);
+    }
+
+    #[test]
+    fn test_build_resolv_conf_neither() {
+        let content = build_resolv_conf("", "");
+        assert_eq!(content.matches("nameserver").count(), 0);
+    }
+
+    #[test]
+    fn test_list_interfaces_no_loopback() {
+        let ifaces = list_interfaces();
+        assert!(!ifaces.contains(&"lo".to_string()));
+        assert!(!ifaces.contains(&"lo0".to_string()));
+    }
+
+    #[test]
     fn test_list_interfaces_returns_some() {
         let ifaces = list_interfaces();
         // Every Linux system has at least one non-loopback interface

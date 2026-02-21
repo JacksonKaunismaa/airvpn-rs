@@ -61,6 +61,37 @@ fn ping_ip(ip: &str) -> Option<u64> {
     None
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ping_results_new() {
+        let pr = PingResults::new();
+        assert_eq!(pr.get("any_server"), -1);
+    }
+
+    #[test]
+    fn test_ping_results_get_existing() {
+        let mut pr = PingResults::new();
+        pr.latencies.insert("TestServer".to_string(), 42);
+        assert_eq!(pr.get("TestServer"), 42);
+    }
+
+    #[test]
+    fn test_ping_results_get_missing() {
+        let pr = PingResults::new();
+        assert_eq!(pr.get("NoSuchServer"), -1);
+    }
+
+    #[test]
+    fn test_ping_results_negative_one_sentinel() {
+        let mut pr = PingResults::new();
+        pr.latencies.insert("FailedServer".to_string(), -1);
+        assert_eq!(pr.get("FailedServer"), -1);
+    }
+}
+
 /// Measure latency for all servers (pings first IPv4 entry IP of each).
 ///
 /// This is a simplified version of Eddie's Latency job -- single ping per server,

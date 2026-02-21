@@ -397,6 +397,30 @@ mod tests {
     }
 
     #[test]
+    fn test_state_with_blocked_ipv6() {
+        let state = State {
+            lock_active: true,
+            wg_interface: "wg0".to_string(),
+            wg_config_path: "/tmp/wg0.conf".to_string(),
+            dns_ipv4: "10.0.0.1".to_string(),
+            dns_ipv6: "fd00::1".to_string(),
+            pid: 12345,
+            blocked_ipv6_ifaces: vec!["eth0".to_string(), "wlan0".to_string()],
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let parsed: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.blocked_ipv6_ifaces, vec!["eth0", "wlan0"]);
+    }
+
+    #[test]
+    fn test_state_empty_blocked_ipv6_default() {
+        // Old state files without blocked_ipv6_ifaces should deserialize with empty vec
+        let json = r#"{"lock_active":true,"wg_interface":"wg0","wg_config_path":"/tmp/wg0.conf","dns_ipv4":"10.0.0.1","dns_ipv6":"fd00::1","pid":12345}"#;
+        let state: State = serde_json::from_str(json).unwrap();
+        assert!(state.blocked_ipv6_ifaces.is_empty());
+    }
+
+    #[test]
     fn test_load_no_state_file() {
         // If no state file exists at either location, load should return None.
         // This test depends on the test environment not having stale state files,

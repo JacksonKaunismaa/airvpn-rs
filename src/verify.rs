@@ -222,4 +222,12 @@ mod tests {
         let token = generate_random_token();
         assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
     }
+
+    #[test]
+    fn test_generate_random_token_is_lowercase_hex() {
+        let token = generate_random_token();
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+        // hex::encode produces lowercase
+        assert_eq!(token, token.to_lowercase());
+    }
 }

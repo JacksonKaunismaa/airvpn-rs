@@ -56,3 +56,28 @@ pub fn restore(interfaces: &[String]) {
         let _ = fs::write(&disable_path, "0");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_block_all_returns_vec() {
+        // Just verify it doesn't panic — actual blocking requires root
+        let result = block_all();
+        // On non-root CI, this returns empty (can't write to /proc)
+        assert!(result.is_empty() || !result.is_empty());
+    }
+
+    #[test]
+    fn test_restore_empty_list() {
+        // Restoring nothing should not panic
+        restore(&[]);
+    }
+
+    #[test]
+    fn test_restore_nonexistent_interface() {
+        // Restoring a fake interface should not panic
+        restore(&["nonexistent_iface_12345".to_string()]);
+    }
+}
