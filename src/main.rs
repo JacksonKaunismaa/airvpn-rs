@@ -1,4 +1,4 @@
-use airvpn::{api, config, dns, ipv6, manifest, netlock, recovery, server, verify, wireguard};
+use airvpn::{api, config, dns, ipv6, manifest, netlock, pinger, recovery, server, verify, wireguard};
 
 use std::sync::atomic::Ordering;
 
@@ -268,6 +268,17 @@ fn cmd_connect(
     }
 
     // -----------------------------------------------------------------------
+    // Latency measurement (Eddie: Jobs/Latency.cs)
+    //
+    // Ping each server's first IPv4 entry IP before the reconnection loop.
+    // Results feed into score_with_ping() for Eddie-compatible server scoring.
+    // -----------------------------------------------------------------------
+
+    println!("Measuring server latencies...");
+    let ping_results = pinger::measure_all(&filtered_servers);
+    println!("Pinged {} servers.", ping_results.latencies.len());
+
+    // -----------------------------------------------------------------------
     // Reconnection loop (Eddie: Session.cs outer `for (; CancelRequested == false;)`)
     //
     // The --server flag forces a specific server only on the FIRST attempt.
@@ -285,11 +296,12 @@ fn cmd_connect(
             break;
         }
 
-        // 6. Select server (penalty-aware, from filtered list)
+        // 6. Select server (penalty-aware + ping-aware, from filtered list)
         let server_ref = server::select_server_with_penalties(
             &filtered_servers,
             forced_server,
             &penalties,
+            &ping_results,
         )?;
         println!(
             "Selected server: {} ({}, {})",
@@ -473,15 +485,18 @@ fn cmd_connect(
             println!("DNS configured: {}, {}", wg_key.wg_dns_ipv4, wg_key.wg_dns_ipv6);
 
             // 10b. Verify tunnel is working (Eddie: Service.cs check/tun endpoint)
+            // check_domain comes from the provider manifest; default to "airvpn.org"
+            // until we parse it from the manifest/provider config.
+            let check_domain = "airvpn.org";
             println!("Verifying tunnel...");
-            match verify::check_tunnel(&server_ref.name, &wg_key.wg_ipv4) {
+            match verify::check_tunnel(&server_ref.name, &wg_key.wg_ipv4, check_domain) {
                 Ok(()) => println!("Tunnel verified."),
                 Err(e) => eprintln!("warning: tunnel verification failed: {:#}", e),
             }
 
             // 10c. Verify DNS goes through VPN (Eddie: Service.cs check/dns endpoint)
             println!("Verifying DNS...");
-            match verify::check_dns(&server_ref.name) {
+            match verify::check_dns(&server_ref.name, check_domain) {
                 Ok(()) => println!("DNS verified."),
                 Err(e) => eprintln!("warning: DNS verification failed: {:#}", e),
             }

@@ -5,6 +5,7 @@ pub mod dns;
 pub mod ipv6;
 pub mod manifest;
 pub mod netlock;
+pub mod pinger;
 pub mod profile;
 pub mod recovery;
 pub mod server;

@@ -4,6 +4,7 @@ use std::time::Instant;
 use anyhow::{bail, Context};
 
 use crate::manifest::Server;
+use crate::pinger::PingResults;
 
 // ---------------------------------------------------------------------------
 // Eddie-compatible scoring (ConnectionInfo.cs Score(), LoadPerc(), UsersPerc())
@@ -96,8 +97,8 @@ fn users_perc(server: &Server) -> i64 {
 /// Calculate server score (lower = better), matching Eddie's `ConnectionInfo.Score()`.
 ///
 /// Special values:
-/// - `warning_closed` non-empty → 99998 (Error-level warning in Eddie)
-/// - `warning_open` non-empty → 99997 (Warning-level warning in Eddie)
+/// - `warning_closed` non-empty -> 99998 (Error-level warning in Eddie)
+/// - `warning_open` non-empty -> 99997 (Warning-level warning in Eddie)
 ///
 /// Normal computation (Speed scoreType, no ping):
 /// ```text
@@ -105,24 +106,64 @@ fn users_perc(server: &Server) -> i64 {
 /// ```
 /// With Speed factors (all 1.0):
 /// - PenalityB = 0 (base score excludes penalty; see `score_with_penalty()`)
-/// - PingB = 0 (no ping data)
+/// - PingB = 0 (no ping data; see `score_with_ping()` for ping-aware scoring)
 /// - LoadB = LoadPerc * 1
 /// - ScoreB = ScoreBase * 1
 /// - UsersB = UsersPerc * 1
 ///
 /// Result is truncated to i64 to match Eddie's `(int)(sum)` cast.
+///
+/// NOTE: This treats ping as 0 (not measured). For ping-aware scoring, use
+/// `score_with_ping()` which applies the Eddie sentinel (Ping==-1 -> 99995).
 pub fn score(server: &Server) -> i64 {
-    // warning_closed → Error in Eddie → HasWarningsErrors() → 99998
+    // warning_closed -> Error in Eddie -> HasWarningsErrors() -> 99998
     if !server.warning_closed.is_empty() {
         return 99998;
     }
-    // warning_open → Warning in Eddie → HasWarnings() → 99997
+    // warning_open -> Warning in Eddie -> HasWarnings() -> 99997
     if !server.warning_open.is_empty() {
         return 99997;
     }
 
     let penality_b = 0; // Base score excludes penalty; use score_with_penalty() for penalty-aware scoring
-    let ping_b = 0; // Ping * 1; no ping data, use 0
+    let ping_b = 0; // No ping data; use score_with_ping() for ping-aware scoring
+
+    let load = load_perc(server);
+    let users = users_perc(server);
+    let score_base = server.scorebase;
+
+    // Speed scoreType (Eddie default: servers.scoretype="Speed")
+    // All factors are 1.0 in speed mode
+    let load_b = load;
+    let score_b = score_base;
+    let users_b = users;
+
+    (penality_b + ping_b + load_b + score_b + users_b) as i64
+}
+
+/// Calculate server score with ICMP ping latency, matching Eddie's
+/// `ConnectionInfo.Score()` with the Ping field populated.
+///
+/// Eddie behavior (ConnectionInfo.cs line 219-246):
+/// - `ping_ms == -1` (not measured) -> return 99995 (sentinel)
+/// - Otherwise: `PingB = ping_ms * ping_factor(1)` added to score sum
+pub fn score_with_ping(server: &Server, ping_ms: i64) -> i64 {
+    // warning_closed -> Error in Eddie -> HasWarningsErrors() -> 99998
+    if !server.warning_closed.is_empty() {
+        return 99998;
+    }
+    // warning_open -> Warning in Eddie -> HasWarnings() -> 99997
+    if !server.warning_open.is_empty() {
+        return 99997;
+    }
+
+    // Eddie: Ping == -1 means not yet measured -> return 99995
+    if ping_ms == -1 {
+        return 99995;
+    }
+
+    let penality_b = 0; // Base score excludes penalty; use score_with_penalty() for penalty-aware scoring
+    let ping_b = ping_ms; // Eddie: Ping * ping_factor where ping_factor defaults to 1
 
     let load = load_perc(server);
     let users = users_perc(server);
@@ -140,11 +181,11 @@ pub fn score(server: &Server) -> i64 {
 /// Compute server score including penalty, matching Eddie's `Score()` with
 /// `Penality * penality_factor` (default factor = 1000).
 ///
-/// Sentinel values (99995+) from warnings are not modified — a closed server
-/// stays closed regardless of penalties.
-pub fn score_with_penalty(server: &Server, penalties: &ServerPenalties) -> i64 {
-    let base = score(server);
-    // Don't inflate sentinel values (warnings/errors)
+/// Sentinel values (99995+) from warnings/unmeasured ping are not modified --
+/// a closed server stays closed regardless of penalties.
+pub fn score_with_penalty(server: &Server, penalties: &ServerPenalties, ping_ms: i64) -> i64 {
+    let base = score_with_ping(server, ping_ms);
+    // Don't inflate sentinel values (warnings/errors/unmeasured ping)
     if base >= 99995 {
         return base;
     }
@@ -224,21 +265,23 @@ pub fn select_server<'a>(
         .context("no servers available")
 }
 
-/// Select best server with penalty-aware scoring.
+/// Select best server with penalty-aware and ping-aware scoring.
 ///
-/// Like `select_server`, but uses `score_with_penalty` so that recently-failed
-/// servers sort lower, causing automatic rotation to a different server.
-/// If `server_name` is `Some`, find by exact name match (bypasses penalties).
+/// Like `select_server`, but uses `score_with_penalty` (which incorporates
+/// ping latency) so that recently-failed and high-latency servers sort lower,
+/// causing automatic rotation to a different server.
+/// If `server_name` is `Some`, find by exact name match (bypasses scoring).
 pub fn select_server_with_penalties<'a>(
     servers: &'a [Server],
     server_name: Option<&str>,
     penalties: &ServerPenalties,
+    pings: &PingResults,
 ) -> anyhow::Result<&'a Server> {
     if servers.is_empty() {
         bail!("no servers available");
     }
 
-    // Explicit server name bypasses penalty scoring (user knows what they want)
+    // Explicit server name bypasses penalty/ping scoring (user knows what they want)
     if let Some(name) = server_name {
         return servers
             .iter()
@@ -246,11 +289,13 @@ pub fn select_server_with_penalties<'a>(
             .with_context(|| format!("server '{name}' not found"));
     }
 
-    // Score all servers with penalties and pick the lowest.
+    // Score all servers with penalties + ping and pick the lowest.
     servers
         .iter()
         .min_by(|a, b| {
-            score_with_penalty(a, penalties).cmp(&score_with_penalty(b, penalties))
+            let sa = score_with_penalty(a, penalties, pings.get(&a.name));
+            let sb = score_with_penalty(b, penalties, pings.get(&b.name));
+            sa.cmp(&sb)
         })
         .context("no servers available")
 }
@@ -471,26 +516,67 @@ mod tests {
         let s = make_server("Alpha", 500_000, 1000, 50, 250, 10, "", "");
         let mut penalties = ServerPenalties::new();
         penalties.penalize("Alpha", 30);
-        // Base score = 30 (from test_score_normal_server)
+        // Base score with ping=10ms: 10 + 0 + 10 + 20 = 40
         // Penalty contribution = 30 * 1000 = 30000
-        assert_eq!(score_with_penalty(&s, &penalties), 30030);
+        assert_eq!(score_with_penalty(&s, &penalties, 10), 30040);
     }
 
     #[test]
     fn test_score_with_penalty_no_penalty() {
         let s = make_server("Alpha", 500_000, 1000, 50, 250, 10, "", "");
         let penalties = ServerPenalties::new();
-        // No penalty → same as base score
-        assert_eq!(score_with_penalty(&s, &penalties), score(&s));
+        // No penalty, ping=10 -> same as score_with_ping
+        assert_eq!(score_with_penalty(&s, &penalties, 10), score_with_ping(&s, 10));
+    }
+
+    #[test]
+    fn test_score_with_penalty_unmeasured_ping() {
+        // ping == -1 -> sentinel 99995; penalty should NOT inflate it
+        let s = make_server("Alpha", 500_000, 1000, 50, 250, 10, "", "");
+        let mut penalties = ServerPenalties::new();
+        penalties.penalize("Alpha", 30);
+        assert_eq!(score_with_penalty(&s, &penalties, -1), 99995);
     }
 
     #[test]
     fn test_score_with_penalty_sentinel_unchanged() {
-        // warning_closed → base score 99998; penalty should NOT inflate it
+        // warning_closed -> base score 99998; penalty should NOT inflate it
         let s = make_server("Closed", 500_000, 1000, 50, 250, 10, "", "maintenance");
         let mut penalties = ServerPenalties::new();
         penalties.penalize("Closed", 30);
-        assert_eq!(score_with_penalty(&s, &penalties), 99998);
+        assert_eq!(score_with_penalty(&s, &penalties, 10), 99998);
+    }
+
+    // -------------------------------------------------------------------
+    // Ping scoring tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_score_with_ping_unmeasured() {
+        let s = make_server("Alpha", 500_000, 1000, 50, 250, 10, "", "");
+        assert_eq!(score_with_ping(&s, -1), 99995);
+    }
+
+    #[test]
+    fn test_score_with_ping_measured() {
+        // Base score without ping = 30 (LoadB=0 + ScoreB=10 + UsersB=20)
+        // With ping=15ms: PingB=15, total = 15 + 0 + 10 + 20 = 45
+        let s = make_server("Alpha", 500_000, 1000, 50, 250, 10, "", "");
+        assert_eq!(score_with_ping(&s, 15), 45);
+    }
+
+    #[test]
+    fn test_score_with_ping_zero() {
+        // ping=0ms (localhost-like): same as base score without ping
+        let s = make_server("Alpha", 500_000, 1000, 50, 250, 10, "", "");
+        assert_eq!(score_with_ping(&s, 0), score(&s));
+    }
+
+    #[test]
+    fn test_score_with_ping_warning_overrides() {
+        let s = make_server("Closed", 500_000, 1000, 50, 250, 10, "", "maintenance");
+        // Warning sentinel should take precedence over ping
+        assert_eq!(score_with_ping(&s, 10), 99998);
     }
 
     #[test]
@@ -502,13 +588,18 @@ mod tests {
             make_server("Second", 50_000_000, 1000, 200, 250, 0, "", ""),
         ];
         let mut penalties = ServerPenalties::new();
-        // Without penalty, "Best" wins
-        let selected = select_server_with_penalties(&servers, None, &penalties).unwrap();
+        // Ping results: both measured with same low ping
+        let mut pings = PingResults::new();
+        pings.latencies.insert("Best".to_string(), 5);
+        pings.latencies.insert("Second".to_string(), 5);
+
+        // Without penalty, "Best" wins (score 35 vs 165)
+        let selected = select_server_with_penalties(&servers, None, &penalties, &pings).unwrap();
         assert_eq!(selected.name, "Best");
 
-        // Penalize "Best" — now "Second" should win (30 + 30*1000 = 30030 > 160)
+        // Penalize "Best" -- now "Second" should win (35 + 30*1000 = 30035 > 165)
         penalties.penalize("Best", 30);
-        let selected = select_server_with_penalties(&servers, None, &penalties).unwrap();
+        let selected = select_server_with_penalties(&servers, None, &penalties, &pings).unwrap();
         assert_eq!(selected.name, "Second");
     }
 
@@ -520,10 +611,41 @@ mod tests {
         ];
         let mut penalties = ServerPenalties::new();
         penalties.penalize("Alpha", 30);
+        let pings = PingResults::new();
         // Explicit name should still find Alpha despite penalty
         let selected =
-            select_server_with_penalties(&servers, Some("Alpha"), &penalties).unwrap();
+            select_server_with_penalties(&servers, Some("Alpha"), &penalties, &pings).unwrap();
         assert_eq!(selected.name, "Alpha");
+    }
+
+    #[test]
+    fn test_select_server_with_ping_prefers_lower_latency() {
+        let servers = vec![
+            make_server("Far", 500_000, 1000, 50, 250, 10, "", ""),
+            make_server("Near", 500_000, 1000, 50, 250, 10, "", ""),
+        ];
+        let penalties = ServerPenalties::new();
+        let mut pings = PingResults::new();
+        pings.latencies.insert("Far".to_string(), 200);
+        pings.latencies.insert("Near".to_string(), 5);
+
+        let selected = select_server_with_penalties(&servers, None, &penalties, &pings).unwrap();
+        assert_eq!(selected.name, "Near");
+    }
+
+    #[test]
+    fn test_select_server_unmeasured_ping_sorted_last() {
+        let servers = vec![
+            make_server("Unmeasured", 500_000, 1000, 50, 250, 10, "", ""),
+            make_server("Measured", 500_000, 1000, 50, 250, 10, "", ""),
+        ];
+        let penalties = ServerPenalties::new();
+        let mut pings = PingResults::new();
+        // Only "Measured" has a ping result; "Unmeasured" defaults to -1
+        pings.latencies.insert("Measured".to_string(), 50);
+
+        let selected = select_server_with_penalties(&servers, None, &penalties, &pings).unwrap();
+        assert_eq!(selected.name, "Measured");
     }
 
     // -------------------------------------------------------------------
