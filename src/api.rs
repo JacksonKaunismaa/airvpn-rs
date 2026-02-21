@@ -71,6 +71,19 @@ pub fn fetch_user(username: &str, password: &str) -> Result<String> {
     fetch_encrypted(&params)
 }
 
+/// Pre-connection authorization (act=connect).
+///
+/// Eddie sends this before launching the WireGuard tunnel.
+/// The server may use it to allocate resources or verify authorization.
+///
+/// Reference: Eddie src/Lib.Core/Session.cs:174
+pub fn fetch_connect(username: &str, password: &str, server_name: &str) -> Result<String> {
+    let mut params = base_params(username, password);
+    params.insert(0, ("act".into(), "connect".into()));
+    params.insert(1, ("server".into(), server_name.into()));
+    fetch_encrypted(&params)
+}
+
 /// Normalize CPU architecture to match Eddie's naming convention.
 ///
 /// Eddie sends "x64" (not "x86_64") and "arm64" (not "aarch64").

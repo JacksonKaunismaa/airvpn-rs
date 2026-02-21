@@ -34,6 +34,11 @@ pub fn resolve_credentials(
     cli_username: Option<&str>,
     cli_password: Option<&str>,
 ) -> Result<(String, String)> {
+    // Error if only one CLI flag provided
+    if cli_username.is_some() != cli_password.is_some() {
+        bail!("both --username and --password must be provided together");
+    }
+
     // 1. CLI flags take priority
     if let (Some(user), Some(pass)) = (cli_username, cli_password) {
         return Ok((user.to_string(), pass.to_string()));
@@ -104,7 +109,16 @@ pub fn save_credentials(username: &str, password: &str) -> Result<()> {
 
     let path = profile_path();
     let format = default_format();
-    let id = generate_id();
+
+    // Reuse existing profile ID to avoid orphaning keyring entries
+    let id = if path.exists() {
+        match crate::profile::load_profile(&path, || Ok(String::new())) {
+            Ok((_fmt, existing_id, _data)) => existing_id,
+            Err(_) => generate_id(),
+        }
+    } else {
+        generate_id()
+    };
 
     // For V2S, generate a random password for the keyring
     // For V2N, password is ignored (uses constant)

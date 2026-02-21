@@ -25,6 +25,7 @@ pub struct NetlockConfig {
     pub allow_lan: bool,
     pub allow_dhcp: bool,
     pub allow_ping: bool,
+    pub allow_ipv4ipv6translation: bool,
     pub allowed_ips: Vec<String>,
 }
 
@@ -98,6 +99,12 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
         r.push_str("    ip6 saddr ff02::1:2 counter accept\n");
         // Eddie: ip6 filter INPUT ip6 saddr ff05::1:3 counter accept
         r.push_str("    ip6 saddr ff05::1:3 counter accept\n");
+    }
+
+    // IPv4/IPv6 translation (NAT64 — RFC 6052/8215)
+    if config.allow_ipv4ipv6translation {
+        r.push_str("    ip6 saddr 64:ff9b::/96 ip6 daddr 64:ff9b::/96 counter accept\n");
+        r.push_str("    ip6 saddr 64:ff9b:1::/48 ip6 daddr 64:ff9b:1::/48 counter accept\n");
     }
 
     // 4. LAN rules (Eddie: netlock.allow_private)
@@ -212,6 +219,12 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
         r.push_str("    ip6 daddr ff02::1:2 counter accept\n");
         // Eddie: ip6 filter OUTPUT ip6 daddr ff05::1:3 counter accept
         r.push_str("    ip6 daddr ff05::1:3 counter accept\n");
+    }
+
+    // IPv4/IPv6 translation (NAT64 — RFC 6052/8215)
+    if config.allow_ipv4ipv6translation {
+        r.push_str("    ip6 daddr 64:ff9b::/96 counter accept\n");
+        r.push_str("    ip6 daddr 64:ff9b:1::/48 counter accept\n");
     }
 
     // 4. LAN rules (Eddie: netlock.allow_private)
@@ -518,6 +531,7 @@ mod tests {
             allow_lan: false,
             allow_dhcp: true,
             allow_ping: true,
+            allow_ipv4ipv6translation: false,
             allowed_ips: vec![],
         }
     }
@@ -575,6 +589,7 @@ mod tests {
             allow_lan: false,
             allow_dhcp: false,
             allow_ping: false,
+            allow_ipv4ipv6translation: false,
             allowed_ips: vec![
                 "185.236.200.1".to_string(),
                 "2001:db8::1".to_string(),
@@ -642,6 +657,7 @@ mod tests {
             allow_lan: true,
             allow_dhcp: false,
             allow_ping: false,
+            allow_ipv4ipv6translation: false,
             allowed_ips: vec![],
         };
         let ruleset = generate_ruleset(&config);
@@ -678,6 +694,7 @@ mod tests {
             allow_lan: false,
             allow_dhcp: false,
             allow_ping: false,
+            allow_ipv4ipv6translation: false,
             allowed_ips: vec![],
         };
         let ruleset = generate_ruleset(&config);
@@ -769,6 +786,7 @@ mod tests {
             allow_lan: true,
             allow_dhcp: true,
             allow_ping: true,
+            allow_ipv4ipv6translation: false,
             allowed_ips: vec!["1.2.3.4".to_string()],
         };
         let ruleset = generate_ruleset(&config);

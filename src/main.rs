@@ -136,6 +136,10 @@ fn cmd_connect(
         server_ref.name, server_ref.location, server_ref.country_code
     );
 
+    // 5b. Pre-connection authorization
+    println!("Authorizing connection...");
+    let _ = api::fetch_connect(&username, &password, &server_ref.name);
+
     // 6. Select WireGuard mode (first available)
     let mode = manifest
         .modes
@@ -162,6 +166,7 @@ fn cmd_connect(
             allow_lan,
             allow_dhcp: true,
             allow_ping: true,
+            allow_ipv4ipv6translation: true,
             allowed_ips,
         };
         netlock::activate(&lock_config)?;
@@ -250,6 +255,25 @@ fn cmd_connect(
 
 fn cmd_disconnect() -> anyhow::Result<()> {
     let state = recovery::load()?.ok_or_else(|| anyhow::anyhow!("No active connection found"))?;
+
+    // If the connect process is still running, signal it to shut down gracefully
+    if recovery::is_pid_alive(state.pid) && state.pid != std::process::id() {
+        eprintln!("Signaling PID {} to disconnect...", state.pid);
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(state.pid as i32),
+            nix::sys::signal::Signal::SIGTERM,
+        );
+        // Wait up to 5 seconds for graceful shutdown
+        for _ in 0..50 {
+            if !recovery::is_pid_alive(state.pid) {
+                println!("Disconnected.");
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        eprintln!("PID {} did not exit, forcing cleanup...", state.pid);
+    }
+
     cmd_disconnect_internal(&state.wg_config_path, &state.wg_interface, state.lock_active)
 }
 

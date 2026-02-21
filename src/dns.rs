@@ -55,17 +55,20 @@ fn is_systemd_resolved_active() -> bool {
 /// Restarts common DNS cache services and flushes systemd-resolved.
 /// Eddie default: "nscd;dnsmasq;named;bind9"
 pub fn flush() {
-    // Flush systemd-resolved cache
-    if is_systemd_resolved_active() {
-        let _ = Command::new("resolvectl")
-            .arg("flush-caches")
-            .output();
-    }
-
-    // Restart common DNS cache services (best-effort, most won't be running)
+    // Restart common DNS cache services (best-effort, most won't be running).
+    // Must happen BEFORE the resolvectl flush — Eddie does services first,
+    // then flush.  A restart re-populates the service's cache, so flushing
+    // before the restart is wasted work.
     for service in &["nscd", "dnsmasq", "named", "bind9"] {
         let _ = Command::new("systemctl")
             .args(["restart", service])
+            .output();
+    }
+
+    // Flush systemd-resolved cache (after service restarts)
+    if is_systemd_resolved_active() {
+        let _ = Command::new("resolvectl")
+            .arg("flush-caches")
             .output();
     }
 }

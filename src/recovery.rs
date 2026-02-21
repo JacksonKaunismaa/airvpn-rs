@@ -65,6 +65,13 @@ pub fn save(state: &State) -> Result<()> {
     let path = state_path();
     let json = serde_json::to_string_pretty(state).context("failed to serialize state")?;
     fs::write(&path, json).with_context(|| format!("failed to write state file: {}", path.display()))?;
+    // Restrict state file to owner-only (contains paths to private key material)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to set state file permissions: {}", path.display()))?;
+    }
     Ok(())
 }
 
@@ -92,7 +99,7 @@ pub fn remove() -> Result<()> {
 }
 
 /// Check if a PID is still alive (using kill(pid, 0) signal probe).
-fn is_pid_alive(pid: u32) -> bool {
+pub fn is_pid_alive(pid: u32) -> bool {
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
 
