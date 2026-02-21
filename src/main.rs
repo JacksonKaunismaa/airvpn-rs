@@ -638,7 +638,7 @@ fn cmd_disconnect() -> anyhow::Result<()> {
     cmd_disconnect_internal(&state.wg_config_path, &state.wg_interface, state.lock_active, &state.blocked_ipv6_ifaces)
 }
 
-fn cmd_disconnect_internal(config_path: &str, _iface: &str, lock_active: bool, blocked_ipv6: &[String]) -> anyhow::Result<()> {
+fn cmd_disconnect_internal(config_path: &str, iface: &str, lock_active: bool, blocked_ipv6: &[String]) -> anyhow::Result<()> {
     // Same order as Eddie:
     // 1. wg-quick down
     let _ = wireguard::disconnect(config_path);
@@ -646,7 +646,13 @@ fn cmd_disconnect_internal(config_path: &str, _iface: &str, lock_active: bool, b
     ipv6::restore(blocked_ipv6);
     // 3. Restore DNS
     let _ = dns::deactivate();
-    // 4. Remove netlock
+    // 4. Remove interface-specific nft rules before deactivating table
+    if lock_active {
+        if !iface.is_empty() {
+            let _ = netlock::deallow_interface(iface);
+        }
+    }
+    // 5. Remove netlock
     if lock_active {
         let _ = netlock::deactivate();
     }

@@ -453,6 +453,12 @@ pub fn parse_user(xml: &str) -> anyhow::Result<UserInfo> {
                 match e.name().as_ref() {
                     b"user" => {
                         in_user = true;
+                        // Check for server message (Eddie: Engine.cs auth failure handling)
+                        if let Some(msg) = attr_opt(e, b"message") {
+                            if !msg.is_empty() {
+                                bail!("server message: {}", msg);
+                            }
+                        }
                         login = attr_opt(e, b"login").unwrap_or_default();
                         wg_public_key = attr_opt(e, b"wg_public_key").unwrap_or_default();
                         keys.clear();

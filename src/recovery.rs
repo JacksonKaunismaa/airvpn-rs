@@ -171,6 +171,16 @@ fn recover_from_state(state: &State) -> Result<()> {
         }
     }
 
+    // 1b. Clean up any orphaned WireGuard config files (contain private keys)
+    if let Ok(entries) = std::fs::read_dir("/tmp") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("avpn-") && name.ends_with(".conf") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
     // 2. Restore IPv6 on previously blocked interfaces
     if !state.blocked_ipv6_ifaces.is_empty() {
         ipv6::restore(&state.blocked_ipv6_ifaces);

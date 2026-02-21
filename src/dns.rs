@@ -16,6 +16,14 @@ use anyhow::{Context, Result};
 
 const BACKUP_PATH: &str = "/etc/resolv.conf.airvpn-rs";
 
+/// Clear the immutable flag on a file (if set).
+/// Eddie: impl.cpp uses FS_IOC_SETFLAGS ioctl. We use chattr for simplicity.
+fn clear_immutable(path: &Path) {
+    let _ = Command::new("chattr")
+        .args(["-i", &path.to_string_lossy()])
+        .output();
+}
+
 /// Build the expected resolv.conf content for VPN DNS.
 ///
 /// Matches Eddie's format: header comment block + nameserver lines.
@@ -207,6 +215,9 @@ pub fn activate(dns_ipv4: &str, dns_ipv6: &str, iface: &str) -> Result<()> {
     let resolv_path = Path::new("/etc/resolv.conf");
     let backup_path = Path::new(BACKUP_PATH);
 
+    // Clear immutable flag before modifying (Fedora/RHEL set this on resolv.conf)
+    clear_immutable(resolv_path);
+
     if resolv_path.exists() && !backup_path.exists() {
         fs::rename(resolv_path, backup_path).context("failed to backup /etc/resolv.conf")?;
     }
@@ -243,6 +254,9 @@ pub fn deactivate() -> Result<()> {
     let backup_path = Path::new(BACKUP_PATH);
 
     if backup_path.exists() {
+        // Clear immutable flag before modifying (Fedora/RHEL set this on resolv.conf)
+        clear_immutable(resolv_path);
+
         // Remove symlink before rename to avoid EXDEV (cross-filesystem rename)
         if resolv_path.is_symlink() {
             let _ = fs::remove_file(resolv_path);
@@ -318,6 +332,9 @@ pub fn check_and_reapply(dns_ipv4: &str, dns_ipv6: &str) -> Result<bool> {
             fs::read_to_string(resolv_path).context("failed to read /etc/resolv.conf")?;
 
         if current != expected {
+            // Clear immutable flag before modifying (Fedora/RHEL set this on resolv.conf)
+            clear_immutable(resolv_path);
+
             // If resolv.conf became a symlink (e.g., NetworkManager recreated it),
             // remove the symlink before writing to avoid corrupting the target
             if resolv_path.is_symlink() {
