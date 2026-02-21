@@ -66,17 +66,28 @@ pub fn fetch_user(username: &str, password: &str) -> Result<String> {
     fetch_encrypted(&params)
 }
 
+/// Normalize CPU architecture to match Eddie's naming convention.
+///
+/// Eddie sends "x64" (not "x86_64") and "arm64" (not "aarch64").
+/// The AirVPN server may reject requests with raw `std::env::consts::ARCH`.
+fn normalize_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        "arm" => "armv7l",
+        other => other,
+    }
+}
+
 /// Common parameters sent with every API call (matching Eddie's FetchUrls).
 fn base_params(username: &str, password: &str) -> Vec<(String, String)> {
+    let arch = normalize_arch();
     vec![
         ("login".into(), username.into()),
         ("password".into(), password.into()),
         ("software".into(), SOFTWARE_ID.into()),
-        ("arch".into(), std::env::consts::ARCH.into()),
-        (
-            "system".into(),
-            format!("linux_{}", std::env::consts::ARCH),
-        ),
+        ("arch".into(), arch.into()),
+        ("system".into(), format!("linux_{}", arch)),
         ("version".into(), "296".into()),
     ]
 }
@@ -141,6 +152,33 @@ fn fetch_encrypted(params: &[(String, String)]) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_arch_current_platform() {
+        let arch = normalize_arch();
+        // On x86_64 linux (CI / dev), this should return "x64"
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(arch, "x64");
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(arch, "arm64");
+        // On any platform, it should be non-empty
+        assert!(!arch.is_empty());
+    }
+
+    #[test]
+    fn test_base_params_uses_normalized_arch() {
+        let params = base_params("u", "p");
+        let arch_val = params.iter().find(|(k, _)| k == "arch").unwrap();
+        let system_val = params.iter().find(|(k, _)| k == "system").unwrap();
+        // arch should NOT be raw "x86_64" on x86_64
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(arch_val.1, "x64");
+            assert_eq!(system_val.1, "linux_x64");
+        }
+    }
+
     #[test]
     #[ignore] // Requires real AirVPN credentials
     fn test_fetch_manifest_real() {

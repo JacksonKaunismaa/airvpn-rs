@@ -13,11 +13,23 @@ use crate::manifest::{Mode, Server, UserInfo, WireGuardKey};
 /// Generate a WireGuard config from manifest data.
 ///
 /// The config format matches what wg-quick expects. The endpoint IP is
-/// selected from `server.ips_entry` using `mode.entry_index`.
-pub fn generate_config(key: &WireGuardKey, server: &Server, mode: &Mode, user: &UserInfo) -> String {
-    let endpoint_ip = &server.ips_entry[mode.entry_index];
+/// selected from `server.ips_entry` using `mode.entry_index`, falling back
+/// to the first entry IP if entry_index is out of bounds.
+///
+/// IPv6 endpoint IPs are wrapped in brackets per WireGuard convention.
+pub fn generate_config(key: &WireGuardKey, server: &Server, mode: &Mode, user: &UserInfo) -> Result<String> {
+    let endpoint_ip = server.ips_entry.get(mode.entry_index)
+        .or_else(|| server.ips_entry.first())
+        .ok_or_else(|| anyhow::anyhow!("server {} has no entry IPs", server.name))?;
 
-    format!(
+    // IPv6 addresses (containing ':') must be wrapped in brackets for the endpoint
+    let endpoint = if endpoint_ip.contains(':') {
+        format!("[{}]:{}", endpoint_ip, mode.port)
+    } else {
+        format!("{}:{}", endpoint_ip, mode.port)
+    };
+
+    Ok(format!(
         "\
 [Interface]
 PrivateKey = {}
@@ -27,7 +39,7 @@ MTU = 1320
 [Peer]
 PublicKey = {}
 PresharedKey = {}
-Endpoint = {}:{}
+Endpoint = {}
 AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 15
 ",
@@ -36,9 +48,8 @@ PersistentKeepalive = 15
         key.wg_ipv6,
         user.wg_public_key,
         key.wg_preshared,
-        endpoint_ip,
-        mode.port,
-    )
+        endpoint,
+    ))
 }
 
 /// Write config to a tmpfile, run `wg-quick up`, return (config_path, interface_name).
@@ -166,7 +177,7 @@ mod tests {
         let mode = test_mode();
         let user = test_user();
 
-        let config = generate_config(&key, &server, &mode, &user);
+        let config = generate_config(&key, &server, &mode, &user).unwrap();
 
         // Check [Interface] section
         assert!(config.contains("[Interface]"));
@@ -199,10 +210,92 @@ mod tests {
             entry_index: 1,
         };
 
-        let config = generate_config(&key, &server, &mode, &user);
+        let config = generate_config(&key, &server, &mode, &user).unwrap();
         assert!(
             config.contains("Endpoint = 185.32.12.2:1637"),
             "should use second entry IP when entry_index=1"
+        );
+    }
+
+    #[test]
+    fn test_generate_config_entry_index_out_of_bounds_falls_back() {
+        let key = test_key();
+        let server = test_server();
+        let user = test_user();
+
+        // entry_index=99 is out of bounds — should fall back to first IP
+        let mode = Mode {
+            title: "WireGuard UDP 1637".to_string(),
+            protocol: "UDP".to_string(),
+            port: 1637,
+            entry_index: 99,
+        };
+
+        let config = generate_config(&key, &server, &mode, &user).unwrap();
+        assert!(
+            config.contains("Endpoint = 185.32.12.1:1637"),
+            "should fall back to first entry IP when entry_index is out of bounds"
+        );
+    }
+
+    #[test]
+    fn test_generate_config_no_entry_ips_errors() {
+        let key = test_key();
+        let user = test_user();
+        let mode = test_mode();
+
+        let server = Server {
+            name: "EmptyServer".to_string(),
+            group: "eu-it".to_string(),
+            ips_entry: vec![],
+            ips_exit: vec![],
+            country_code: "IT".to_string(),
+            location: "Milan".to_string(),
+            scorebase: 0,
+            bandwidth: 0,
+            bandwidth_max: 0,
+            users: 0,
+            users_max: 0,
+            support_ipv4: true,
+            support_ipv6: true,
+            warning_open: String::new(),
+            warning_closed: String::new(),
+        };
+
+        let result = generate_config(&key, &server, &mode, &user);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no entry IPs"));
+    }
+
+    #[test]
+    fn test_generate_config_ipv6_endpoint_brackets() {
+        let key = test_key();
+        let user = test_user();
+        let mode = test_mode();
+
+        let server = Server {
+            name: "IPv6Server".to_string(),
+            group: "eu-de".to_string(),
+            ips_entry: vec!["fd00::1".to_string()],
+            ips_exit: vec!["fd00::10".to_string()],
+            country_code: "DE".to_string(),
+            location: "Berlin".to_string(),
+            scorebase: 0,
+            bandwidth: 500_000,
+            bandwidth_max: 1_000_000,
+            users: 10,
+            users_max: 250,
+            support_ipv4: true,
+            support_ipv6: true,
+            warning_open: String::new(),
+            warning_closed: String::new(),
+        };
+
+        let config = generate_config(&key, &server, &mode, &user).unwrap();
+        assert!(
+            config.contains("Endpoint = [fd00::1]:1637"),
+            "IPv6 endpoint should be wrapped in brackets, got: {}",
+            config
         );
     }
 
@@ -219,7 +312,7 @@ mod tests {
             entry_index: 0,
         };
 
-        let config = generate_config(&key, &server, &mode, &user);
+        let config = generate_config(&key, &server, &mode, &user).unwrap();
         assert!(config.contains("Endpoint = 185.32.12.1:443"));
     }
 
@@ -230,7 +323,7 @@ mod tests {
         let mode = test_mode();
         let user = test_user();
 
-        let config = generate_config(&key, &server, &mode, &user);
+        let config = generate_config(&key, &server, &mode, &user).unwrap();
 
         let interface_pos = config.find("[Interface]").expect("[Interface]");
         let peer_pos = config.find("[Peer]").expect("[Peer]");

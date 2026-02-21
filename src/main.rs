@@ -24,6 +24,12 @@ enum Commands {
         /// Allow LAN traffic through lock
         #[arg(long)]
         allow_lan: bool,
+        /// AirVPN username (overrides saved credentials)
+        #[arg(long)]
+        username: Option<String>,
+        /// AirVPN password (overrides saved credentials)
+        #[arg(long)]
+        password: Option<String>,
     },
     /// Disconnect from AirVPN
     Disconnect,
@@ -37,6 +43,12 @@ enum Commands {
         /// Dump raw manifest XML instead of table
         #[arg(long)]
         debug: bool,
+        /// AirVPN username (overrides saved credentials)
+        #[arg(long)]
+        username: Option<String>,
+        /// AirVPN password (overrides saved credentials)
+        #[arg(long)]
+        password: Option<String>,
     },
     /// Clean up stale state after crash
     Recover,
@@ -49,24 +61,59 @@ fn main() -> anyhow::Result<()> {
             server,
             no_lock,
             allow_lan,
-        } => cmd_connect(server, no_lock, allow_lan),
+            username,
+            password,
+        } => cmd_connect(server, no_lock, allow_lan, username, password),
         Commands::Disconnect => cmd_disconnect(),
         Commands::Status => cmd_status(),
-        Commands::Servers { sort, debug } => cmd_servers(&sort, debug),
+        Commands::Servers { sort, debug, username, password } => cmd_servers(&sort, debug, username, password),
         Commands::Recover => cmd_recover(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pre-flight checks
+// ---------------------------------------------------------------------------
+
+/// Verify system prerequisites before connecting.
+///
+/// Checks that we're running as root (needed for nft and wg-quick) and that
+/// required binaries are in PATH.
+fn preflight_checks() -> anyhow::Result<()> {
+    if !nix::unistd::geteuid().is_root() {
+        anyhow::bail!("must run as root (need nft + wg-quick access)");
+    }
+    if std::process::Command::new("wg-quick").arg("--help").output().is_err() {
+        anyhow::bail!("wg-quick not found in PATH");
+    }
+    if std::process::Command::new("nft").arg("--version").output().is_err() {
+        anyhow::bail!("nft not found in PATH");
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Connect
 // ---------------------------------------------------------------------------
 
-fn cmd_connect(server_name: Option<String>, no_lock: bool, allow_lan: bool) -> anyhow::Result<()> {
+fn cmd_connect(
+    server_name: Option<String>,
+    no_lock: bool,
+    allow_lan: bool,
+    cli_username: Option<String>,
+    cli_password: Option<String>,
+) -> anyhow::Result<()> {
+    // 0. Pre-flight checks (root, wg-quick, nft)
+    preflight_checks()?;
+
     // 1. Check for stale state / running instance
     recovery::check_and_recover()?;
 
     // 2. Resolve credentials
-    let (username, password) = config::resolve_credentials(None, None)?;
+    let (username, password) = config::resolve_credentials(
+        cli_username.as_deref(),
+        cli_password.as_deref(),
+    )?;
 
     // 3. Fetch manifest + user data (two separate API calls)
     println!("Fetching server list...");
@@ -122,11 +169,8 @@ fn cmd_connect(server_name: Option<String>, no_lock: bool, allow_lan: bool) -> a
     }
 
     // 9. Generate WireGuard config and connect
-    println!(
-        "Connecting to {}:{}...",
-        server_ref.ips_entry[mode.entry_index], mode.port
-    );
-    let wg_config = wireguard::generate_config(wg_key, server_ref, mode, &user_info);
+    let wg_config = wireguard::generate_config(wg_key, server_ref, mode, &user_info)?;
+    println!("Connecting to {} via mode {}...", server_ref.name, mode.title);
     let (config_path, iface) = wireguard::connect(&wg_config)?;
     println!("WireGuard interface: {}", iface);
 
@@ -236,8 +280,16 @@ fn cmd_status() -> anyhow::Result<()> {
 // Servers
 // ---------------------------------------------------------------------------
 
-fn cmd_servers(sort: &str, debug: bool) -> anyhow::Result<()> {
-    let (username, password) = config::resolve_credentials(None, None)?;
+fn cmd_servers(
+    sort: &str,
+    debug: bool,
+    cli_username: Option<String>,
+    cli_password: Option<String>,
+) -> anyhow::Result<()> {
+    let (username, password) = config::resolve_credentials(
+        cli_username.as_deref(),
+        cli_password.as_deref(),
+    )?;
     let xml = api::fetch_manifest(&username, &password)?;
 
     if debug {
