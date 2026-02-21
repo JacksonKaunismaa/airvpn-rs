@@ -8,6 +8,7 @@ use quick_xml::reader::Reader;
 // Types
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 pub struct Manifest {
     pub servers: Vec<Server>,
     pub modes: Vec<Mode>,
@@ -35,6 +36,7 @@ pub struct Server {
     pub warning_closed: String,
 }
 
+#[derive(Debug)]
 pub struct Mode {
     pub title: String,
     pub protocol: String,
@@ -42,12 +44,14 @@ pub struct Mode {
     pub entry_index: usize,
 }
 
+#[derive(Debug)]
 pub struct UserInfo {
     pub login: String,
     pub wg_public_key: String,
     pub keys: Vec<WireGuardKey>,
 }
 
+#[derive(Debug)]
 pub struct WireGuardKey {
     pub name: String,
     pub wg_private_key: String,
@@ -121,13 +125,40 @@ fn elem_name(e: &quick_xml::events::BytesStart<'_>) -> String {
     String::from_utf8_lossy(e.name().as_ref()).into_owned()
 }
 
-/// Split a semicolon-separated IP list into a Vec, filtering empty strings.
+/// Split a comma-separated IP list into a Vec, filtering empty strings.
 fn split_ips(s: &str) -> Vec<String> {
-    s.split(';')
+    s.split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect()
+}
+
+/// Check if the API response root element has an `error` attribute and bail if so.
+///
+/// Eddie checks `xmlDoc.DocumentElement.Attributes["error"]` before parsing.
+/// This catches server-side errors (invalid credentials, expired sessions, etc.)
+/// before we waste time parsing the rest.
+fn check_api_error(xml: &str) -> anyhow::Result<()> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                if let Some(err_msg) = attr_opt(e, b"error") {
+                    if !err_msg.is_empty() {
+                        bail!("{}", err_msg);
+                    }
+                }
+                // Only check the first element (root)
+                return Ok(());
+            }
+            Ok(Event::Eof) => return Ok(()),
+            Err(e) => bail!("XML parse error: {e}"),
+            _ => {} // skip declarations, comments, etc.
+        }
+    }
 }
 
 fn parse_bool(s: &str) -> bool {
@@ -193,6 +224,8 @@ fn resolve_server(raw: RawServerAttrs, groups: &HashMap<String, ServerGroupAttrs
 // ---------------------------------------------------------------------------
 
 pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
+    check_api_error(xml)?;
+
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
 
@@ -305,6 +338,8 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
 /// The root element is `<user login="..." wg_public_key="...">` with
 /// `<keys><key .../></keys>` children containing WireGuard device keys.
 pub fn parse_user(xml: &str) -> anyhow::Result<UserInfo> {
+    check_api_error(xml)?;
+
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
 
@@ -389,7 +424,7 @@ mod tests {
 
   <servers>
     <server name="Alchiba" group="eu-it"
-            ips_entry="185.32.12.1;185.32.12.2" ips_exit="185.32.12.10"
+            ips_entry="185.32.12.1,185.32.12.2" ips_exit="185.32.12.10"
             country_code="IT" location="Milan"
             scorebase="0" bw="500000" bw_max="1000000"
             users="42" users_max="250"
@@ -534,12 +569,12 @@ mod tests {
     }
 
     #[test]
-    fn test_ips_entry_semicolon_split() {
+    fn test_ips_entry_comma_split() {
         let xml = r#"<?xml version="1.0" encoding="utf-8"?>
 <manifest time="1708444800">
   <servers>
     <server name="Vega" group="us-east"
-            ips_entry="1.2.3.4;5.6.7.8" ips_exit="9.10.11.12;13.14.15.16"
+            ips_entry="1.2.3.4,5.6.7.8" ips_exit="9.10.11.12,13.14.15.16"
             country_code="US" location="New York"
             scorebase="0" bw="1000000" bw_max="5000000"
             users="10" users_max="100"
@@ -589,6 +624,28 @@ mod tests {
         assert_eq!(key.wg_dns_ipv4, "10.128.0.1");
         assert_eq!(key.wg_dns_ipv6, "fd7d:76ee:3c49:9950::1");
         assert_eq!(key.wg_preshared, "PresharedKeyBase64==");
+    }
+
+    #[test]
+    fn test_parse_manifest_error() {
+        let xml = r#"<manifest error="Invalid credentials"/>"#;
+        let err = parse_manifest(xml).unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid credentials"),
+            "error message should contain 'Invalid credentials', got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_user_error() {
+        let xml = r#"<user error="Session expired"/>"#;
+        let err = parse_user(xml).unwrap_err();
+        assert!(
+            err.to_string().contains("Session expired"),
+            "error message should contain 'Session expired', got: {}",
+            err
+        );
     }
 
     #[test]

@@ -22,19 +22,18 @@ pub fn generate_config(key: &WireGuardKey, server: &Server, mode: &Mode, user: &
 [Interface]
 PrivateKey = {}
 Address = {}/32, {}/128
-DNS = {}, {}
+MTU = 1320
 
 [Peer]
 PublicKey = {}
 PresharedKey = {}
 Endpoint = {}:{}
 AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 15
 ",
         key.wg_private_key,
         key.wg_ipv4,
         key.wg_ipv6,
-        key.wg_dns_ipv4,
-        key.wg_dns_ipv6,
         user.wg_public_key,
         key.wg_preshared,
         endpoint_ip,
@@ -49,7 +48,7 @@ AllowedIPs = 0.0.0.0/0, ::/0
 pub fn connect(config: &str) -> Result<(String, String)> {
     // Write config to a temporary file with a recognizable prefix
     let tmpfile = tempfile::Builder::new()
-        .prefix("airvpn-rs-")
+        .prefix("avpn-")
         .suffix(".conf")
         .tempfile()
         .context("failed to create temporary WireGuard config file")?;
@@ -173,7 +172,9 @@ mod tests {
         assert!(config.contains("[Interface]"));
         assert!(config.contains("PrivateKey = PrivateKeyBase64=="));
         assert!(config.contains("Address = 10.128.0.42/32, fd7d:76ee:3c49:9950::42/128"));
-        assert!(config.contains("DNS = 10.128.0.1, fd7d:76ee:3c49:9950::1"));
+        assert!(config.contains("MTU = 1320"));
+        // DNS is NOT in config — managed by dns.rs to avoid double-configuration
+        assert!(!config.contains("DNS ="), "DNS line should not be in WireGuard config (managed by dns.rs)");
 
         // Check [Peer] section
         assert!(config.contains("[Peer]"));
@@ -181,6 +182,7 @@ mod tests {
         assert!(config.contains("PresharedKey = PresharedKeyBase64=="));
         assert!(config.contains("Endpoint = 185.32.12.1:1637"));
         assert!(config.contains("AllowedIPs = 0.0.0.0/0, ::/0"));
+        assert!(config.contains("PersistentKeepalive = 15"));
     }
 
     #[test]
