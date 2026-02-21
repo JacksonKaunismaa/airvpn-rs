@@ -10,17 +10,18 @@ use anyhow::{Context, Result};
 use reqwest::blocking::Client;
 use std::time::Duration;
 
-const CHECK_DOMAIN: &str = "airvpn.org";
 const MAX_RETRIES: u32 = 5;
 
 /// Verify the tunnel is working by checking exit IP.
 ///
-/// Makes an HTTPS request through the tunnel to AirVPN's check endpoint
+/// Makes an HTTPS request through the tunnel to the provider's check endpoint
 /// and verifies the returned IP is our assigned VPN IP.
 ///
 /// Eddie: `checkUrl = checkProtocol + "://" + serverName + "_exit." + checkDomain + "/check/tun/"`
 /// then asserts the returned `"ip"` is in the VPN IP pool.
-pub fn check_tunnel(server_name: &str, expected_ipv4: &str) -> Result<()> {
+///
+/// `check_domain` comes from the provider manifest (e.g. "airvpn.org").
+pub fn check_tunnel(server_name: &str, expected_ipv4: &str, check_domain: &str) -> Result<()> {
     let client = Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -29,7 +30,7 @@ pub fn check_tunnel(server_name: &str, expected_ipv4: &str) -> Result<()> {
     let url = format!(
         "https://{}_exit.{}/check/tun/",
         server_name.to_lowercase(),
-        CHECK_DOMAIN
+        check_domain
     );
 
     for attempt in 1..=MAX_RETRIES {
@@ -94,12 +95,11 @@ pub fn check_tunnel(server_name: &str, expected_ipv4: &str) -> Result<()> {
 ///
 /// Eddie's protocol:
 /// 1. Generate a random token (hash)
-/// 2. Resolve `<hash>.{check_dns_query_template}` via system DNS (which should go through VPN)
+/// 2. Resolve `<hash>.{check_domain}` via system DNS (which should go through VPN)
 /// 3. GET `https://<server>_exit.<domain>/check/dns/` and verify the server saw that hash
 ///
-/// The DNS query template from Eddie's manifest is `{hash}.{check_domain}`, but we use
-/// the standard AirVPN pattern: `<hash>.airvpn.org`.
-pub fn check_dns(server_name: &str) -> Result<()> {
+/// `check_domain` comes from the provider manifest (e.g. "airvpn.org").
+pub fn check_dns(server_name: &str, check_domain: &str) -> Result<()> {
     let client = Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -108,7 +108,7 @@ pub fn check_dns(server_name: &str) -> Result<()> {
     let check_url = format!(
         "https://{}_exit.{}/check/dns/",
         server_name.to_lowercase(),
-        CHECK_DOMAIN
+        check_domain
     );
 
     for attempt in 1..=MAX_RETRIES {
@@ -119,8 +119,8 @@ pub fn check_dns(server_name: &str) -> Result<()> {
         // Generate random token (Eddie: RandomGenerator.GetRandomToken())
         let hash = generate_random_token();
 
-        // Resolve <hash>.airvpn.org via system DNS (goes through VPN tunnel)
-        let dns_host = format!("{}.{}", hash, CHECK_DOMAIN);
+        // Resolve <hash>.<check_domain> via system DNS (goes through VPN tunnel)
+        let dns_host = format!("{}.{}", hash, check_domain);
         // We only need to trigger the DNS query -- the result doesn't matter.
         // The VPN server logs the hash from the query it receives.
         let _ = std::net::ToSocketAddrs::to_socket_addrs(&mut (dns_host.as_str(), 80));

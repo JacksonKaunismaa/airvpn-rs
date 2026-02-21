@@ -138,7 +138,23 @@ fn configure_systemd_resolved_all(dns_ipv4: &str, dns_ipv6: &str, vpn_iface: &st
                 anyhow::bail!("resolvectl default-route on {} failed: {}", iface, stderr);
             }
         } else {
-            // Non-VPN interface: set default-route=false to prevent DNS leak.
+            // Non-VPN interface: back up current default-route state, then set false.
+            // Eddie: backs up /run/systemd/resolve/netif/<index> to
+            // /etc/systemd_resolve_netif_<iface>.eddievpn before modifying.
+            let backup_path = Path::new("/etc").join(format!("systemd_resolve_{}.airvpn-rs", iface));
+            if !backup_path.exists() {
+                let output = Command::new("resolvectl")
+                    .args(["default-route", iface.as_str()])
+                    .output();
+                if let Ok(o) = output {
+                    if o.status.success() {
+                        let state = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                        let _ = fs::write(&backup_path, &state);
+                    }
+                }
+            }
+
+            // Set default-route=false to prevent DNS leak.
             // Non-fatal — interface may not support it (e.g. virtual bridges).
             let output = Command::new("resolvectl")
                 .args(["default-route", iface.as_str(), "false"])
@@ -220,6 +236,30 @@ pub fn deactivate() -> Result<()> {
 
         // Atomic rename replaces dest on Linux — no gap where resolv.conf is missing
         fs::rename(backup_path, resolv_path).context("failed to restore resolv.conf from backup")?;
+    }
+
+    // Restore per-interface systemd-resolved settings from backups.
+    // Eddie: reads /etc/systemd_resolve_netif_<iface>.eddievpn, restores default_route
+    // via resolvectl, then deletes the backup file.
+    if let Ok(entries) = fs::read_dir("/etc") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("systemd_resolve_") && name.ends_with(".airvpn-rs") {
+                let iface = name
+                    .strip_prefix("systemd_resolve_")
+                    .and_then(|s| s.strip_suffix(".airvpn-rs"))
+                    .unwrap_or("");
+                if !iface.is_empty() {
+                    if let Ok(state) = fs::read_to_string(entry.path()) {
+                        let val = if state.contains("yes") { "true" } else { "false" };
+                        let _ = Command::new("resolvectl")
+                            .args(["default-route", iface, val])
+                            .output();
+                    }
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
     }
 
     // Restart systemd-resolved if active so it picks up the restored resolv.conf
