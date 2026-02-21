@@ -18,6 +18,16 @@ use crate::manifest::{Mode, Server, UserInfo, WireGuardKey};
 ///
 /// IPv6 endpoint IPs are wrapped in brackets per WireGuard convention.
 pub fn generate_config(key: &WireGuardKey, server: &Server, mode: &Mode, user: &UserInfo) -> Result<String> {
+    if key.wg_private_key.is_empty() {
+        anyhow::bail!("missing WireGuard private key from API response");
+    }
+    if user.wg_public_key.is_empty() {
+        anyhow::bail!("missing WireGuard server public key from API response");
+    }
+    if mode.port == 0 {
+        anyhow::bail!("WireGuard mode has no port configured");
+    }
+
     let endpoint_ip = server.ips_entry.get(mode.entry_index)
         .or_else(|| server.ips_entry.first())
         .ok_or_else(|| anyhow::anyhow!("server {} has no entry IPs", server.name))?;

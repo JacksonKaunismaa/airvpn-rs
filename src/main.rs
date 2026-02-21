@@ -2,7 +2,6 @@ use airvpn::{api, config, dns, ipv6, manifest, netlock, recovery, server, wiregu
 
 use std::sync::atomic::Ordering;
 
-use anyhow::Context;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -107,6 +106,24 @@ fn cmd_connect(
     // 0. Pre-flight checks (root, wg-quick, nft)
     preflight_checks()?;
 
+    // Unconditional cleanup: restore orphaned DNS backup from SIGKILL (Eddie: OnRecoveryAlways)
+    let dns_backup = std::path::Path::new("/etc/resolv.conf.airvpn-rs");
+    if dns_backup.exists() {
+        // Only restore if no airvpn process is running
+        if recovery::load().ok().flatten().map_or(true, |s| !recovery::is_pid_alive(s.pid)) {
+            eprintln!("Restoring orphaned DNS backup...");
+            let _ = dns::deactivate();
+        }
+    }
+
+    // Unconditional cleanup: remove orphaned nftables table (Eddie: OnRecoveryAlways)
+    if netlock::is_active() {
+        if recovery::load().ok().flatten().map_or(true, |s| !recovery::is_pid_alive(s.pid)) {
+            eprintln!("Removing orphaned nftables table...");
+            let _ = netlock::deactivate();
+        }
+    }
+
     // 1. Check for stale state / running instance
     recovery::check_and_recover()?;
 
@@ -155,10 +172,11 @@ fn cmd_connect(
         server_ref.name, server_ref.location, server_ref.country_code
     );
 
-    // 5b. Pre-connection authorization
+    // 5b. Pre-connection authorization (non-fatal — Eddie: "If failed, continue anyway")
     println!("Authorizing connection...");
-    api::fetch_connect_with_key(&username, &password, &server_ref.name, rsa_mod, rsa_exp)
-        .context("pre-connection authorization failed")?;
+    if let Err(e) = api::fetch_connect_with_key(&username, &password, &server_ref.name, rsa_mod, rsa_exp) {
+        eprintln!("warning: pre-connection authorization failed: {:#}", e);
+    }
 
     // 6. Select WireGuard mode (first available)
     let mode = manifest
@@ -207,6 +225,15 @@ fn cmd_connect(
     if !blocked_ipv6_ifaces.is_empty() {
         println!("IPv6 disabled on {} interfaces", blocked_ipv6_ifaces.len());
     }
+    recovery::save(&recovery::State {
+        lock_active: !no_lock,
+        wg_interface: String::new(),
+        wg_config_path: String::new(),
+        dns_ipv4: String::new(),
+        dns_ipv6: String::new(),
+        pid: std::process::id(),
+        blocked_ipv6_ifaces: blocked_ipv6_ifaces.clone(),
+    })?;
 
     // 9. Generate WireGuard config and connect
     let wg_config = wireguard::generate_config(wg_key, server_ref, mode, &user_info)?;

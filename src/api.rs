@@ -52,10 +52,7 @@ const SOFTWARE_ID: &str = "EddieDesktop_2.24.6";
 pub fn fetch_manifest(username: &str, password: &str) -> Result<String> {
     let mut params = base_params(username, password);
     params.insert(0, ("act".into(), "manifest".into()));
-    params.insert(1, ("ts".into(), std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs().to_string())
-        .unwrap_or_else(|_| "0".into())));
+    params.insert(1, ("ts".into(), "0".into()));
     // Bootstrap: always use hardcoded key (no rotation available yet)
     fetch_encrypted(&params, None, None)
 }
@@ -151,6 +148,7 @@ fn fetch_encrypted(
 
     let client = Client::builder()
         .timeout(Duration::from_secs(10))
+        .user_agent("Eddie/2.24.6")
         .build()
         .context("failed to build HTTP client")?;
 

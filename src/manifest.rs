@@ -314,7 +314,7 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
                                     .unwrap_or_default()
                                     .parse()
                                     .unwrap_or(0),
-                                entry_index: attr_opt(e, b"entry")
+                                entry_index: attr_opt(e, b"entry_index")
                                     .unwrap_or_default()
                                     .parse()
                                     .unwrap_or(0),
@@ -535,11 +535,11 @@ mod tests {
 
   <modes>
     <mode title="WireGuard UDP 1637" type="wireguard"
-          protocol="UDP" port="1637" entry="0" />
+          protocol="UDP" port="1637" entry_index="0" />
     <mode title="OpenVPN UDP 443" type="openvpn"
-          protocol="UDP" port="443" entry="0" />
+          protocol="UDP" port="443" entry_index="0" />
     <mode title="OpenVPN TCP 443" type="openvpn"
-          protocol="TCP" port="443" entry="0" />
+          protocol="TCP" port="443" entry_index="0" />
   </modes>
 
   <urls>
@@ -625,7 +625,7 @@ mod tests {
 
   <modes>
     <mode title="WireGuard UDP 1637" type="wireguard"
-          protocol="UDP" port="1637" entry="0" />
+          protocol="UDP" port="1637" entry_index="0" />
   </modes>
 
   <urls />
@@ -666,7 +666,7 @@ mod tests {
   <servers_groups />
   <modes>
     <mode title="WireGuard UDP 1637" type="wireguard"
-          protocol="UDP" port="1637" entry="0" />
+          protocol="UDP" port="1637" entry_index="0" />
   </modes>
   <urls />
 </manifest>"#;
@@ -745,7 +745,7 @@ mod tests {
   <servers_groups />
   <modes>
     <mode title="WireGuard UDP 1637" type="wireguard"
-          protocol="UDP" port="1637" entry="0" />
+          protocol="UDP" port="1637" entry_index="0" />
   </modes>
   <urls />
 </manifest>"#;

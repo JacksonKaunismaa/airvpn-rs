@@ -336,7 +336,13 @@ pub fn activate(config: &NetlockConfig) -> Result<()> {
 }
 
 /// Deactivate the network lock: delete our dedicated table.
+///
+/// Idempotent — returns Ok(()) if the table doesn't exist.
 pub fn deactivate() -> Result<()> {
+    if !is_active() {
+        return Ok(());
+    }
+
     let output = Command::new("nft")
         .args(["delete", "table", "inet", TABLE_NAME])
         .output()

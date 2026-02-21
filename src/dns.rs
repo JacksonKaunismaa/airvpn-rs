@@ -171,6 +171,11 @@ pub fn deactivate() -> Result<()> {
     let backup_path = Path::new(BACKUP_PATH);
 
     if backup_path.exists() {
+        // Remove symlink before rename to avoid EXDEV (cross-filesystem rename)
+        if resolv_path.is_symlink() {
+            let _ = fs::remove_file(resolv_path);
+        }
+
         // Atomic rename replaces dest on Linux — no gap where resolv.conf is missing
         fs::rename(backup_path, resolv_path).context("failed to restore resolv.conf from backup")?;
     }
@@ -221,6 +226,7 @@ pub fn check_and_reapply(dns_ipv4: &str, dns_ipv6: &str) -> Result<bool> {
                 .context("failed to set /etc/resolv.conf permissions")?;
         }
 
+        flush();
         Ok(true)
     } else {
         Ok(false)

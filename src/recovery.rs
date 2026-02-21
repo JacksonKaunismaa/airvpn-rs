@@ -257,6 +257,16 @@ pub fn setup_signal_handler() -> Result<Arc<AtomicBool>> {
             ),
         )
         .context("failed to install SIGTERM handler")?;
+
+        nix::sys::signal::sigaction(
+            nix::sys::signal::Signal::SIGHUP,
+            &nix::sys::signal::SigAction::new(
+                nix::sys::signal::SigHandler::Handler(signal_handler),
+                nix::sys::signal::SaFlags::SA_RESTART,
+                nix::sys::signal::SigSet::empty(),
+            ),
+        )
+        .context("failed to install SIGHUP handler")?;
     }
 
     // Store the flag in a global so the C-style handler can access it
