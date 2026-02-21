@@ -31,10 +31,10 @@ impl PingResults {
 /// Ping a single IP address, return latency in ms or None on failure.
 ///
 /// Uses the system `ping` command with 1 packet, 3s timeout (Eddie default:
-/// `pinger.timeout = 3000`).
+/// `pinger.timeout = 3000` i.e. 3000ms).
 fn ping_ip(ip: &str) -> Option<u64> {
     let output = Command::new("ping")
-        .args(["-c", "1", "-W", "5", "-q", ip])
+        .args(["-c", "1", "-W", "3", "-q", ip])
         .output()
         .ok()?;
 

@@ -21,17 +21,21 @@ const MAX_RETRIES: u32 = 5;
 /// then asserts the returned `"ip"` is in the VPN IP pool.
 ///
 /// `check_domain` comes from the provider manifest (e.g. "airvpn.org").
-pub fn check_tunnel(server_name: &str, expected_ipv4: &str, check_domain: &str) -> Result<()> {
+pub fn check_tunnel(server_name: &str, expected_ipv4: &str, check_domain: &str, exit_ip: &str) -> Result<()> {
+    let check_host = format!("{}_exit.{}", server_name.to_lowercase(), check_domain);
+
+    // Eddie: ForceResolve = checkDomain + ":" + IpsExit.OnlyIPv4.First.Address
+    // Bypass DNS for the check domain by resolving directly to the exit IP.
     let client = Client::builder()
         .timeout(Duration::from_secs(10))
+        .resolve(
+            &check_host,
+            format!("{}:443", exit_ip).parse().map_err(|e| anyhow::anyhow!("invalid exit IP '{}': {}", exit_ip, e))?,
+        )
         .build()
         .context("failed to build HTTP client for tunnel check")?;
 
-    let url = format!(
-        "https://{}_exit.{}/check/tun/",
-        server_name.to_lowercase(),
-        check_domain
-    );
+    let url = format!("https://{}/check/tun/", check_host);
 
     for attempt in 1..=MAX_RETRIES {
         // Eddie: Thread.Sleep(t * 1000) — increasing delay, 0 on first attempt
@@ -99,17 +103,21 @@ pub fn check_tunnel(server_name: &str, expected_ipv4: &str, check_domain: &str) 
 /// 3. GET `https://<server>_exit.<domain>/check/dns/` and verify the server saw that hash
 ///
 /// `check_domain` comes from the provider manifest (e.g. "airvpn.org").
-pub fn check_dns(server_name: &str, check_domain: &str) -> Result<()> {
+pub fn check_dns(server_name: &str, check_domain: &str, exit_ip: &str) -> Result<()> {
+    let check_host = format!("{}_exit.{}", server_name.to_lowercase(), check_domain);
+
+    // Eddie: ForceResolve = checkDomain + ":" + IpsExit.OnlyIPv4.First
+    // Bypass DNS for the check endpoint by resolving directly to the exit IP.
     let client = Client::builder()
         .timeout(Duration::from_secs(10))
+        .resolve(
+            &check_host,
+            format!("{}:443", exit_ip).parse().map_err(|e| anyhow::anyhow!("invalid exit IP '{}': {}", exit_ip, e))?,
+        )
         .build()
         .context("failed to build HTTP client for DNS check")?;
 
-    let check_url = format!(
-        "https://{}_exit.{}/check/dns/",
-        server_name.to_lowercase(),
-        check_domain
-    );
+    let check_url = format!("https://{}/check/dns/", check_host);
 
     for attempt in 1..=MAX_RETRIES {
         if attempt > 1 {

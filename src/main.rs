@@ -410,6 +410,7 @@ fn cmd_connect(
                 allow_ipv4ipv6translation: true,
                 allowed_ips_incoming: vec![],
                 allowed_ips_outgoing: allowed_ips,
+                incoming_policy_accept: false,
             };
             netlock::activate(&lock_config)?;
             recovery::save(&recovery::State {
@@ -515,15 +516,16 @@ fn cmd_connect(
             // check_domain comes from the provider manifest; default to "airvpn.org"
             // until we parse it from the manifest/provider config.
             let check_domain = "airvpn.org";
+            let exit_ip = server_ref.ips_exit.first().map(|s| s.as_str()).unwrap_or("");
             println!("Verifying tunnel...");
-            match verify::check_tunnel(&server_ref.name, &wg_key.wg_ipv4, check_domain) {
+            match verify::check_tunnel(&server_ref.name, &wg_key.wg_ipv4, check_domain, exit_ip) {
                 Ok(()) => println!("Tunnel verified."),
                 Err(e) => eprintln!("warning: tunnel verification failed: {:#}", e),
             }
 
             // 10c. Verify DNS goes through VPN (Eddie: Service.cs check/dns endpoint)
             println!("Verifying DNS...");
-            match verify::check_dns(&server_ref.name, check_domain) {
+            match verify::check_dns(&server_ref.name, check_domain, exit_ip) {
                 Ok(()) => println!("DNS verified."),
                 Err(e) => eprintln!("warning: DNS verification failed: {:#}", e),
             }

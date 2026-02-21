@@ -35,6 +35,12 @@ pub struct NetlockConfig {
     pub allow_ipv4ipv6translation: bool,
     pub allowed_ips_incoming: Vec<String>,
     pub allowed_ips_outgoing: Vec<String>,
+    /// Whether incoming policy is accept (true) or drop (false, default).
+    /// Eddie: `netlock.incoming == "allow"` → "accept" policy.
+    /// When false (block/block mode), the OUTPUT conntrack rule is omitted
+    /// to avoid interfering with WireGuard keepalive packets.
+    /// Reference: NetworkLockNftables.cs line 274
+    pub incoming_policy_accept: bool,
 }
 
 /// Compute SHA-256 hex digest of a string (matching Eddie's Crypto.Manager.HashSHA256).
@@ -271,9 +277,14 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
         r.push_str("    meta l4proto ipv6-icmp counter accept\n");
     }
 
-    // 6. Conntrack: allow established/related (output)
-    //    (Eddie: ip filter OUTPUT ct state related,established + ip6 filter OUTPUT ct state related,established)
-    r.push_str("    ct state related,established counter accept\n");
+    // 6. Conntrack in OUTPUT: only when incoming policy is accept (Eddie behavior).
+    //    In block/block mode (default), this is omitted to avoid interfering with
+    //    WireGuard keepalive packets.
+    //    Eddie: NetworkLockNftables.cs line 272-278 — `if (defaultPolicyInput == "ACCEPT")`
+    //    Note: Eddie uses `ct state established` (not `related,established`) here.
+    if config.incoming_policy_accept {
+        r.push_str("    ct state established counter accept\n");
+    }
 
     // 7a. Allowlist incoming IPs — response-only (ct state established)
     //     Eddie: foreach ipsAllowlistIncoming → daddr + ct state established, suffix _2
@@ -598,6 +609,7 @@ mod tests {
             allow_ipv4ipv6translation: false,
             allowed_ips_incoming: vec![],
             allowed_ips_outgoing: vec![],
+            incoming_policy_accept: false,
         }
     }
 
@@ -630,9 +642,9 @@ mod tests {
         // IPv6 anti-spoof
         assert!(ruleset.contains("iifname != \"lo\" ip6 saddr ::1 counter reject"));
 
-        // Conntrack in both input and output
+        // Conntrack only in input (OUTPUT conntrack omitted when incoming_policy_accept=false)
         let ct_count = ruleset.matches("ct state related,established counter accept").count();
-        assert_eq!(ct_count, 2, "should have conntrack rule in both input and output");
+        assert_eq!(ct_count, 1, "should have conntrack rule only in input when incoming_policy_accept=false");
 
         // Final sentinel rules
         assert!(ruleset.contains("airvpn_filter_input_latest_rule"));
@@ -663,6 +675,7 @@ mod tests {
                 "10.128.0.0/24".to_string(),
                 "203.0.113.5".to_string(),
             ],
+            incoming_policy_accept: false,
         };
         let ruleset = generate_ruleset(&config);
 
@@ -778,6 +791,7 @@ mod tests {
             allow_ipv4ipv6translation: false,
             allowed_ips_incoming: vec![],
             allowed_ips_outgoing: vec![],
+            incoming_policy_accept: false,
         };
         let ruleset = generate_ruleset(&config);
 
@@ -816,6 +830,7 @@ mod tests {
             allow_ipv4ipv6translation: false,
             allowed_ips_incoming: vec![],
             allowed_ips_outgoing: vec![],
+            incoming_policy_accept: false,
         };
         let ruleset = generate_ruleset(&config);
 
@@ -909,6 +924,7 @@ mod tests {
             allow_ipv4ipv6translation: false,
             allowed_ips_incoming: vec!["1.2.3.4".to_string()],
             allowed_ips_outgoing: vec![],
+            incoming_policy_accept: false,
         };
         let ruleset = generate_ruleset(&config);
 
