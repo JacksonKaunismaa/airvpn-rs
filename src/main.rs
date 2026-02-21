@@ -182,6 +182,19 @@ fn cmd_connect(
         }
     }
 
+    // Unconditional cleanup: remove orphaned WireGuard config files (private key material)
+    if let Ok(entries) = std::fs::read_dir("/tmp") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("avpn-") && name.ends_with(".conf") {
+                // Only clean up if no airvpn process is running
+                if recovery::load().ok().flatten().map_or(true, |s| !recovery::is_pid_alive(s.pid)) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
     // 1. Check for stale state / running instance
     recovery::check_and_recover()?;
 
@@ -308,6 +321,11 @@ fn cmd_connect(
             server_ref.name, server_ref.location, server_ref.country_code
         );
 
+        // Validate server supports required protocols
+        if !server_ref.support_ipv4 {
+            eprintln!("warning: server {} does not advertise IPv4 support", server_ref.name);
+        }
+
         // 6b. Pre-connection authorization (Eddie: Session.cs:173-218)
         let reset_from_auth = match api::fetch_connect_with_key(
             &username,
@@ -427,12 +445,13 @@ fn cmd_connect(
             Ok(result) => result,
             Err(e) => {
                 eprintln!("WireGuard connection failed: {:#}", e);
-                // Restore IPv6 before removing netlock
-                ipv6::restore(&blocked_ipv6_ifaces);
+                // Deactivate netlock first, then restore IPv6 (avoid window where
+                // IPv6 is live but firewall rules have stale state)
                 if !no_lock {
                     eprintln!("Removing network lock...");
                     let _ = netlock::deactivate();
                 }
+                ipv6::restore(&blocked_ipv6_ifaces);
                 let _ = recovery::remove();
                 // Treat as Error (penalize + rotate)
                 penalties.penalize(&server_ref.name, 30);
@@ -460,12 +479,12 @@ fn cmd_connect(
         println!("Waiting for handshake...");
         if let Err(e) = wireguard::wait_for_handshake(&iface, 50) {
             eprintln!("Handshake failed: {:#}", e);
-            // Order: WG down -> IPv6 restore -> netlock deactivate
+            // Order: WG down -> netlock deactivate -> IPv6 restore
             let _ = wireguard::disconnect(&config_path);
-            ipv6::restore(&blocked_ipv6_ifaces);
             if !no_lock {
                 let _ = netlock::deactivate();
             }
+            ipv6::restore(&blocked_ipv6_ifaces);
             let _ = recovery::remove();
             // Treat as Error (penalize + rotate)
             penalties.penalize(&server_ref.name, 30);
@@ -639,25 +658,25 @@ fn cmd_disconnect() -> anyhow::Result<()> {
 }
 
 fn cmd_disconnect_internal(config_path: &str, iface: &str, lock_active: bool, blocked_ipv6: &[String]) -> anyhow::Result<()> {
-    // Same order as Eddie:
-    // 1. wg-quick down
-    let _ = wireguard::disconnect(config_path);
-    // 2. Restore IPv6
-    ipv6::restore(blocked_ipv6);
-    // 3. Restore DNS
-    let _ = dns::deactivate();
-    dns::flush();
-    // 4. Remove interface-specific nft rules before deactivating table
+    // 1. Remove interface-specific nft rules before deactivating table
     if lock_active {
         if !iface.is_empty() {
             let _ = netlock::deallow_interface(iface);
         }
     }
-    // 5. Remove netlock
+    // 2. wg-quick down
+    let _ = wireguard::disconnect(config_path);
+    // 3. Restore DNS
+    let _ = dns::deactivate();
+    dns::flush();
+    // 4. Remove netlock
     if lock_active {
         let _ = netlock::deactivate();
     }
-    // 5. Remove state
+    // 5. Restore IPv6 (AFTER netlock is gone — avoids window where IPv6 is live
+    //    but firewall rules have stale state)
+    ipv6::restore(blocked_ipv6);
+    // 6. Remove state
     let _ = recovery::remove();
     println!("Disconnected.");
     Ok(())
