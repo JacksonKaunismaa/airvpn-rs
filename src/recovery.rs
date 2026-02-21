@@ -68,13 +68,17 @@ pub fn save(state: &State) -> Result<()> {
     {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
+        let f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
             .open(&path)
             .with_context(|| format!("failed to create state file: {}", path.display()))?;
+        // Advisory lock to prevent concurrent writes from racing
+        let mut f = nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusive)
+            .map_err(|(_, errno)| errno)
+            .with_context(|| format!("failed to lock state file: {}", path.display()))?;
         f.write_all(json.as_bytes())
             .with_context(|| format!("failed to write state file: {}", path.display()))?;
     }

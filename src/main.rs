@@ -110,6 +110,11 @@ fn cmd_connect(
     // 1. Check for stale state / running instance
     recovery::check_and_recover()?;
 
+    // 1b. Install signal handler EARLY — before any infrastructure changes
+    // so Ctrl+C / SIGTERM during netlock/WireGuard/DNS setup sets the flag
+    // instead of killing the process with no cleanup.
+    let shutdown = recovery::setup_signal_handler()?;
+
     // 2. Resolve credentials
     let (username, password) = config::resolve_credentials(
         cli_username.as_deref(),
@@ -186,7 +191,19 @@ fn cmd_connect(
     // 9. Generate WireGuard config and connect
     let wg_config = wireguard::generate_config(wg_key, server_ref, mode, &user_info)?;
     println!("Connecting to {} via mode {}...", server_ref.name, mode.title);
-    let (config_path, iface) = wireguard::connect(&wg_config)?;
+    let (config_path, iface) = match wireguard::connect(&wg_config) {
+        Ok(result) => result,
+        Err(e) => {
+            // Clean up netlock before bailing — otherwise the firewall
+            // stays active and blocks all traffic
+            if !no_lock {
+                eprintln!("WireGuard connection failed, removing network lock...");
+                let _ = netlock::deactivate();
+            }
+            let _ = recovery::remove();
+            return Err(e.context("WireGuard connection failed"));
+        }
+    };
     recovery::save(&recovery::State {
         lock_active: !no_lock,
         wg_interface: iface.clone(),
@@ -217,9 +234,6 @@ fn cmd_connect(
         dns_ipv6: wg_key.wg_dns_ipv6.clone(),
         pid: std::process::id(),
     })?;
-
-    // 14. Set up signal handler
-    let shutdown = recovery::setup_signal_handler()?;
 
     println!(
         "\nConnected to {} via {}. Press Ctrl+C to disconnect.",
