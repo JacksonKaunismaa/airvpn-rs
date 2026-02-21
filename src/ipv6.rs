@@ -25,7 +25,7 @@ pub fn block_all() -> Vec<String> {
         let name = entry.file_name().to_string_lossy().to_string();
 
         // Skip special interfaces (matching Eddie)
-        if matches!(name.as_str(), "all" | "lo" | "lo0") {
+        if matches!(name.as_str(), "all" | "default" | "lo" | "lo0") {
             continue;
         }
 

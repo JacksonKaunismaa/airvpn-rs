@@ -59,7 +59,7 @@ impl ServerPenalties {
             .or_insert((0, Instant::now()));
         // Accumulate (Eddie: Penality += amount)
         entry.0 += amount;
-        entry.1 = Instant::now();
+        // Don't update timestamp — decay continues from first penalty (matches Eddie)
     }
 
     /// Get active penalty for a server with linear decay.

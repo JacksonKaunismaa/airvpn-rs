@@ -34,7 +34,7 @@ impl PingResults {
 /// `pinger.timeout = 3000`).
 fn ping_ip(ip: &str) -> Option<u64> {
     let output = Command::new("ping")
-        .args(["-c", "1", "-W", "3", "-q", ip])
+        .args(["-c", "1", "-W", "5", "-q", ip])
         .output()
         .ok()?;
 

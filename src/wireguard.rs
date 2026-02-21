@@ -117,6 +117,14 @@ pub fn connect(config: &str) -> Result<(String, String)> {
         .map(|s| s.to_string_lossy().to_string())
         .context("failed to derive interface name from config path")?;
 
+    // Pre-cleanup: if interface already exists from a crash, remove it
+    if is_connected(&iface) {
+        eprintln!("Cleaning up stale WireGuard interface {}...", iface);
+        let _ = Command::new("ip")
+            .args(["link", "delete", &iface])
+            .output();
+    }
+
     let output = Command::new("wg-quick")
         .args(["up", &config_path])
         .output()
