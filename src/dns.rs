@@ -154,6 +154,20 @@ fn configure_systemd_resolved_all(dns_ipv4: &str, dns_ipv6: &str, vpn_iface: &st
                 }
             }
 
+            // Non-VPN interface: set VPN DNS + default-route=false.
+            // Eddie sets VPN DNS on EVERY interface (impl.cpp lines 270-288),
+            // not just the VPN one. If an app queries a specific non-VPN interface
+            // directly, it would use that interface's original DNS → leak.
+            // Setting VPN DNS here prevents that.
+            let mut dns_args = vec!["dns", iface.as_str()];
+            if !dns_ipv4.is_empty() {
+                dns_args.push(dns_ipv4);
+            }
+            if !dns_ipv6.is_empty() {
+                dns_args.push(dns_ipv6);
+            }
+            let _ = Command::new("resolvectl").args(&dns_args).output();
+
             // Set default-route=false to prevent DNS leak.
             // Non-fatal — interface may not support it (e.g. virtual bridges).
             let output = Command::new("resolvectl")
@@ -276,43 +290,78 @@ pub fn deactivate() -> Result<()> {
 }
 
 /// Check if current resolv.conf matches our expected content, re-apply if drifted.
+/// Also checks systemd-resolved per-interface settings for drift.
 ///
 /// Eddie's DnsSwitchCheck pattern: NetworkManager and other services can revert
-/// resolv.conf behind our back. This function is called periodically to detect
-/// and fix drift.
+/// resolv.conf behind our back, and can also revert per-interface systemd-resolved
+/// settings. This function is called periodically to detect and fix both kinds of drift.
 ///
-/// Returns Ok(true) if resolv.conf was re-applied, Ok(false) if no drift detected.
+/// Returns Ok(true) if any DNS settings were re-applied, Ok(false) if no drift detected.
 pub fn check_and_reapply(dns_ipv4: &str, dns_ipv6: &str) -> Result<bool> {
+    let mut reapplied = false;
+
+    // Check resolv.conf drift
     let resolv_path = Path::new("/etc/resolv.conf");
 
-    if !resolv_path.exists() {
-        return Ok(false);
+    if resolv_path.exists() {
+        let expected = build_resolv_conf(dns_ipv4, dns_ipv6);
+        let current =
+            fs::read_to_string(resolv_path).context("failed to read /etc/resolv.conf")?;
+
+        if current != expected {
+            // If resolv.conf became a symlink (e.g., NetworkManager recreated it),
+            // remove the symlink before writing to avoid corrupting the target
+            if resolv_path.is_symlink() {
+                let _ = fs::remove_file(resolv_path);
+            }
+
+            fs::write(resolv_path, &expected).context("failed to re-apply /etc/resolv.conf")?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(resolv_path, fs::Permissions::from_mode(0o644))
+                    .context("failed to set /etc/resolv.conf permissions")?;
+            }
+
+            flush();
+            reapplied = true;
+        }
     }
 
-    let expected = build_resolv_conf(dns_ipv4, dns_ipv6);
-    let current = fs::read_to_string(resolv_path).context("failed to read /etc/resolv.conf")?;
-
-    if current != expected {
-        // If resolv.conf became a symlink (e.g., NetworkManager recreated it),
-        // remove the symlink before writing to avoid corrupting the target
-        if resolv_path.is_symlink() {
-            let _ = fs::remove_file(resolv_path);
+    // Also re-check systemd-resolved settings (NetworkManager can revert per-interface DNS).
+    // Eddie checks ALL interfaces on every DnsSwitchCheck cycle (impl.cpp uses the same
+    // code path for both initial setup and periodic checking via the `check` parameter).
+    if is_systemd_resolved_active() {
+        let ifaces = list_interfaces();
+        for iface in &ifaces {
+            // Check if default-route was reverted to true on a non-VPN interface
+            let output = Command::new("resolvectl")
+                .args(["default-route", iface.as_str()])
+                .output();
+            if let Ok(o) = output {
+                let state = String::from_utf8_lossy(&o.stdout);
+                // If a non-VPN interface has default-route=yes, it was reverted
+                if state.contains("yes") {
+                    // Re-apply DNS and default-route=false
+                    let mut dns_args = vec!["dns", iface.as_str()];
+                    if !dns_ipv4.is_empty() {
+                        dns_args.push(dns_ipv4);
+                    }
+                    if !dns_ipv6.is_empty() {
+                        dns_args.push(dns_ipv6);
+                    }
+                    let _ = Command::new("resolvectl").args(&dns_args).output();
+                    let _ = Command::new("resolvectl")
+                        .args(["default-route", iface.as_str(), "false"])
+                        .output();
+                    reapplied = true;
+                }
+            }
         }
-
-        fs::write(resolv_path, &expected).context("failed to re-apply /etc/resolv.conf")?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(resolv_path, fs::Permissions::from_mode(0o644))
-                .context("failed to set /etc/resolv.conf permissions")?;
-        }
-
-        flush();
-        Ok(true)
-    } else {
-        Ok(false)
     }
+
+    Ok(reapplied)
 }
 
 // =============================================================================

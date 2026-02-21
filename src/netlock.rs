@@ -275,7 +275,7 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
                 let comment =
                     format!("eddie_ip_{}", sha256_hex(&format!("ipv4_out_{}_1", cidr)));
                 r.push_str(&format!(
-                    "    ip daddr {} ct state established counter accept comment \"{}\"\n",
+                    "    ip daddr {} counter accept comment \"{}\"\n",
                     cidr, comment
                 ));
             }
@@ -283,7 +283,7 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
                 let comment =
                     format!("eddie_ip_{}", sha256_hex(&format!("ipv6_out_{}_1", cidr)));
                 r.push_str(&format!(
-                    "    ip6 daddr {} ct state established counter accept comment \"{}\"\n",
+                    "    ip6 daddr {} counter accept comment \"{}\"\n",
                     cidr, comment
                 ));
             }
@@ -648,7 +648,7 @@ mod tests {
         );
         assert!(
             ruleset.contains(&format!(
-                "ip daddr 185.236.200.1/32 ct state established counter accept comment \"{}\"",
+                "ip daddr 185.236.200.1/32 counter accept comment \"{}\"",
                 expected_v4_out_comment
             )),
             "should contain IPv4 outgoing allowlist rule with comment"
@@ -674,7 +674,7 @@ mod tests {
         );
         assert!(
             ruleset.contains(&format!(
-                "ip daddr 10.128.0.0/24 ct state established counter accept comment \"{}\"",
+                "ip daddr 10.128.0.0/24 counter accept comment \"{}\"",
                 expected_cidr_out_comment
             )),
             "should preserve existing CIDR prefix"

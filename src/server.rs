@@ -25,16 +25,21 @@ use crate::pinger::PingResults;
 // ---------------------------------------------------------------------------
 // Penalty tracking (Eddie: ConnectionInfo.Penality + advanced.penality_on_error)
 //
-// When a connection fails (ResetLevel::Error), the server receives a penalty
-// that decays over time. Penalized servers sort lower in selection, causing
-// automatic server rotation on reconnection.
+// When a connection fails (ResetLevel::Error), the server receives an additive
+// penalty (Eddie default: 30 via advanced.penality_on_error). Penalties
+// accumulate: multiple failures add up. Decay is linear — the penalty
+// decrements by 1 every 60 seconds (Eddie: Jobs/Penalities.cs).
+// A single penalty of 30 takes 30 minutes to fully decay.
+// Penalized servers sort lower in selection, causing automatic server rotation
+// on reconnection.
 // ---------------------------------------------------------------------------
 
-/// Tracks per-server penalties with time-based expiry.
+/// Tracks per-server penalties with time-based linear decay.
 ///
 /// Eddie stores `Penality` as a raw int on `ConnectionInfo` and multiplies by
-/// `penality_factor` (default 1000) in `Score()`. We store the penalty duration
-/// and application time, expiring penalties after `duration_secs` elapses.
+/// `penality_factor` (default 1000) in `Score()`. Penalties accumulate
+/// additively (`Penality += amount`) and decay by 1 every 60 seconds
+/// (Eddie: `Jobs/Penalities.cs` runs every 60s, decrements by 1).
 pub struct ServerPenalties {
     penalties: HashMap<String, (i64, Instant)>,
 }
@@ -46,21 +51,26 @@ impl ServerPenalties {
         }
     }
 
-    /// Apply a penalty to a server.
-    ///
-    /// `duration_secs` is how long the penalty stays active (Eddie default: 30s
-    /// via `advanced.penality_on_error`).
-    pub fn penalize(&mut self, server_name: &str, duration_secs: i64) {
-        self.penalties
-            .insert(server_name.to_string(), (duration_secs, Instant::now()));
+    /// Apply a penalty to a server (Eddie: additive, default 30 per failure).
+    pub fn penalize(&mut self, server_name: &str, amount: i64) {
+        let entry = self
+            .penalties
+            .entry(server_name.to_string())
+            .or_insert((0, Instant::now()));
+        // Accumulate (Eddie: Penality += amount)
+        entry.0 += amount;
+        entry.1 = Instant::now();
     }
 
-    /// Get active penalty for a server (0 if expired or none).
+    /// Get active penalty for a server with linear decay.
+    /// Eddie: penalty decrements by 1 every 60 seconds.
     pub fn get(&self, server_name: &str) -> i64 {
         match self.penalties.get(server_name) {
-            Some((penalty, when)) => {
-                if when.elapsed().as_secs() < *penalty as u64 {
-                    *penalty
+            Some((base_penalty, when)) => {
+                let elapsed_minutes = when.elapsed().as_secs() / 60;
+                let decayed = base_penalty - elapsed_minutes as i64;
+                if decayed > 0 {
+                    decayed
                 } else {
                     0
                 }
