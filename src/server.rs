@@ -11,10 +11,11 @@ use crate::manifest::Server;
 //   ScoreBase:           raw score from manifest (lower = better)
 //   Users / UsersMax:    current / max user counts
 //
-// We use "latency" scoreType since we don't have ping data:
-//   ScoreBase /= 500, LoadPerc /= 10, UsersPerc /= 10
+// We use "Speed" scoreType (Eddie default: servers.scoretype="Speed"):
+//   All factors are 1.0 (ScoreBase *= 1, LoadPerc *= 1, UsersPerc *= 1)
 // Penality is always 0 (we don't track it).
 // Ping is always 0 (no ping data; we skip Eddie's Ping==-1 → 99995 path).
+// Result is truncated to i64 to match Eddie's `(int)(sum)` cast.
 // ---------------------------------------------------------------------------
 
 /// Compute load as a percentage, matching Eddie's `LoadPerc()`.
@@ -47,40 +48,42 @@ fn users_perc(server: &Server) -> i64 {
 /// - `warning_closed` non-empty → 99998 (Error-level warning in Eddie)
 /// - `warning_open` non-empty → 99997 (Warning-level warning in Eddie)
 ///
-/// Normal computation (latency scoreType, no ping):
+/// Normal computation (Speed scoreType, no ping):
 /// ```text
 /// Score = PenalityB + PingB + LoadB + ScoreB + UsersB
 /// ```
-/// With latency factors applied:
+/// With Speed factors (all 1.0):
 /// - PenalityB = 0 (penality always 0)
 /// - PingB = 0 (no ping data)
-/// - LoadB = LoadPerc / 10
-/// - ScoreB = ScoreBase / 500
-/// - UsersB = UsersPerc / 10
-pub fn score(server: &Server) -> f64 {
+/// - LoadB = LoadPerc * 1
+/// - ScoreB = ScoreBase * 1
+/// - UsersB = UsersPerc * 1
+///
+/// Result is truncated to i64 to match Eddie's `(int)(sum)` cast.
+pub fn score(server: &Server) -> i64 {
     // warning_closed → Error in Eddie → HasWarningsErrors() → 99998
     if !server.warning_closed.is_empty() {
-        return 99998.0;
+        return 99998;
     }
     // warning_open → Warning in Eddie → HasWarnings() → 99997
     if !server.warning_open.is_empty() {
-        return 99997.0;
+        return 99997;
     }
 
-    let penality_b = 0.0; // Penality * 1000; penality always 0
-    let ping_b = 0.0; // Ping * 1; no ping data, use 0
+    let penality_b = 0; // Penality * 1000; penality always 0
+    let ping_b = 0; // Ping * 1; no ping data, use 0
 
-    let load = load_perc(server) as f64;
-    let users = users_perc(server) as f64;
-    let score_base = server.scorebase as f64;
+    let load = load_perc(server);
+    let users = users_perc(server);
+    let score_base = server.scorebase;
 
-    // Latency scoreType factors (from Eddie provider defaults):
-    //   latency_factor = 500, latency_load_factor = 10, latency_users_factor = 10
-    let load_b = load / 10.0;
-    let score_b = score_base / 500.0;
-    let users_b = users / 10.0;
+    // Speed scoreType (Eddie default: servers.scoretype="Speed")
+    // All factors are 1.0 in speed mode
+    let load_b = load;
+    let score_b = score_base;
+    let users_b = users;
 
-    penality_b + ping_b + load_b + score_b + users_b
+    (penality_b + ping_b + load_b + score_b + users_b) as i64
 }
 
 /// Select best server: filter, score, sort, pick first.
@@ -103,11 +106,7 @@ pub fn select_server<'a>(
     // Score all servers and pick the one with the lowest score.
     servers
         .iter()
-        .min_by(|a, b| {
-            score(a)
-                .partial_cmp(&score(b))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+        .min_by(|a, b| score(a).cmp(&score(b)))
         .context("no servers available")
 }
 
@@ -162,18 +161,13 @@ mod tests {
         // UsersPerc:
         //   users_perc = (50 * 100) / 250 = 20
         //
-        // Latency mode:
-        //   LoadB = 0 / 10 = 0.0
-        //   ScoreB = 10 / 500 = 0.02
-        //   UsersB = 20 / 10 = 2.0
+        // Speed mode (all factors 1.0):
+        //   LoadB = 0, ScoreB = 10, UsersB = 20
         //
-        // Score = 0 + 0 + 0.0 + 0.02 + 2.0 = 2.02
+        // Score = 0 + 0 + 0 + 10 + 20 = 30
         let s = make_server("Alpha", 500_000, 1000, 50, 250, 10, "", "");
         let sc = score(&s);
-        assert!(
-            (sc - 2.02).abs() < 1e-9,
-            "expected 2.02, got {sc}"
-        );
+        assert_eq!(sc, 30);
     }
 
     #[test]
@@ -188,65 +182,52 @@ mod tests {
         // UsersPerc:
         //   users_perc = (200 * 100) / 250 = 80
         //
-        // Latency mode:
-        //   LoadB = 80 / 10 = 8.0
-        //   ScoreB = 0 / 500 = 0.0
-        //   UsersB = 80 / 10 = 8.0
+        // Speed mode (all factors 1.0):
+        //   LoadB = 80, ScoreB = 0, UsersB = 80
         //
-        // Score = 0 + 0 + 8.0 + 0.0 + 8.0 = 16.0
+        // Score = 0 + 0 + 80 + 0 + 80 = 160
         let s = make_server("Bravo", 50_000_000, 1000, 200, 250, 0, "", "");
         let sc = score(&s);
-        assert!(
-            (sc - 16.0).abs() < 1e-9,
-            "expected 16.0, got {sc}"
-        );
+        assert_eq!(sc, 160);
     }
 
     #[test]
     fn test_score_warning_closed() {
         let s = make_server("Closed", 500_000, 1000, 50, 250, 10, "", "Server maintenance");
-        assert!((score(&s) - 99998.0).abs() < 1e-9);
+        assert_eq!(score(&s), 99998);
     }
 
     #[test]
     fn test_score_warning_open() {
         let s = make_server("Open", 500_000, 1000, 50, 250, 10, "Degraded performance", "");
-        assert!((score(&s) - 99997.0).abs() < 1e-9);
+        assert_eq!(score(&s), 99997);
     }
 
     #[test]
     fn test_score_both_warnings_closed_takes_priority() {
         // When both are set, warning_closed (Error) is checked first → 99998
         let s = make_server("Both", 500_000, 1000, 50, 250, 10, "warning", "closed");
-        assert!((score(&s) - 99998.0).abs() < 1e-9);
+        assert_eq!(score(&s), 99998);
     }
 
     #[test]
     fn test_score_zero_bandwidth_max() {
         // BandwidthMax == 0 → LoadPerc returns 100
         // UsersPerc = (50 * 100) / 250 = 20
-        // LoadB = 100/10 = 10.0, ScoreB = 0/500 = 0.0, UsersB = 20/10 = 2.0
-        // Score = 12.0
+        // Speed mode: LoadB = 100, ScoreB = 0, UsersB = 20
+        // Score = 0 + 0 + 100 + 0 + 20 = 120
         let s = make_server("Zero", 500_000, 0, 50, 250, 0, "", "");
-        assert!(
-            (score(&s) - 12.0).abs() < 1e-9,
-            "expected 12.0, got {}",
-            score(&s)
-        );
+        assert_eq!(score(&s), 120);
     }
 
     #[test]
     fn test_score_zero_users_max() {
         // UsersMax == 0 → UsersPerc returns 100
         // LoadPerc: bw_cur = 2*(500000*8)/1000000 = 8, (8*100)/1000 = 0
-        // LoadB = 0/10 = 0.0, ScoreB = 0/500 = 0.0, UsersB = 100/10 = 10.0
-        // Score = 10.0
+        // Speed mode: LoadB = 0, ScoreB = 0, UsersB = 100
+        // Score = 0 + 0 + 0 + 0 + 100 = 100
         let s = make_server("NoMax", 500_000, 1000, 50, 0, 0, "", "");
-        assert!(
-            (score(&s) - 10.0).abs() < 1e-9,
-            "expected 10.0, got {}",
-            score(&s)
-        );
+        assert_eq!(score(&s), 100);
     }
 
     #[test]
@@ -262,9 +243,9 @@ mod tests {
     #[test]
     fn test_select_server_picks_lowest_score() {
         let servers = vec![
-            // Score: LoadB=8.0 + ScoreB=0.02 + UsersB=8.0 = 16.02
+            // Score: LoadB=80 + ScoreB=10 + UsersB=80 = 170
             make_server("Worse", 50_000_000, 1000, 200, 250, 10, "", ""),
-            // Score: LoadB=0 + ScoreB=0.02 + UsersB=2.0 = 2.02
+            // Score: LoadB=0 + ScoreB=10 + UsersB=20 = 30
             make_server("Better", 500_000, 1000, 50, 250, 10, "", ""),
         ];
         let selected = select_server(&servers, None).unwrap();

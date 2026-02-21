@@ -110,6 +110,18 @@ fn recover_from_state(state: &State) -> Result<()> {
         if let Err(e) = wireguard::disconnect(&state.wg_config_path) {
             eprintln!("warning: failed to disconnect WireGuard: {}", e);
         }
+    } else if !state.wg_interface.is_empty() {
+        // Config path unknown (crash before state update) — delete interface directly
+        if let Err(e) = std::process::Command::new("ip")
+            .args(["link", "delete", &state.wg_interface])
+            .output()
+            .and_then(|o| if o.status.success() { Ok(()) } else {
+                Err(std::io::Error::new(std::io::ErrorKind::Other,
+                    String::from_utf8_lossy(&o.stderr).to_string()))
+            })
+        {
+            eprintln!("warning: failed to delete WireGuard interface {}: {}", state.wg_interface, e);
+        }
     }
 
     // 2. Restore DNS

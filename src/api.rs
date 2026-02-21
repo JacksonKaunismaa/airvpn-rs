@@ -24,6 +24,8 @@ pub const BOOTSTRAP_IPS: &[&str] = &[
     "http://54.93.175.114",
     "http://82.196.3.205",
     "http://63.33.116.50",
+    "http://[2a03:b0c0:0:1010::9b:c001]",
+    "http://bootme.org",
 ];
 
 /// AirVPN's RSA-4096 public key modulus (base64).
@@ -35,7 +37,7 @@ pub const RSA_MODULUS_B64: &str = "wuQXz7eZeEBwaaRsVK8iEHpueXoKyQzW8sr8qMUkZIcKt
 pub const RSA_EXPONENT_B64: &str = "AQAB";
 
 /// Software identifier sent in API requests.
-const SOFTWARE_ID: &str = "AirvpnRust_0.1.0";
+const SOFTWARE_ID: &str = "EddieDesktop_2.24.6";
 
 // ---------------------------------------------------------------------------
 // Manifest fetch
@@ -50,7 +52,10 @@ const SOFTWARE_ID: &str = "AirvpnRust_0.1.0";
 pub fn fetch_manifest(username: &str, password: &str) -> Result<String> {
     let mut params = base_params(username, password);
     params.insert(0, ("act".into(), "manifest".into()));
-    params.insert(1, ("ts".into(), "0".into()));
+    params.insert(1, ("ts".into(), std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_else(|_| "0".into())));
     fetch_encrypted(&params)
 }
 
@@ -101,7 +106,7 @@ fn fetch_encrypted(params: &[(String, String)]) -> Result<String> {
         .context("failed to build API envelope")?;
 
     let client = Client::builder()
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(10))
         .build()
         .context("failed to build HTTP client")?;
 

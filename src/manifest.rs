@@ -209,9 +209,9 @@ fn resolve_server(raw: RawServerAttrs, groups: &HashMap<String, ServerGroupAttrs
         location,
         scorebase: parse_i64(&scorebase),
         bandwidth: parse_i64(&bw),
-        bandwidth_max: parse_i64(&bw_max),
+        bandwidth_max: { let v = parse_i64(&bw_max); if v == 0 { 1 } else { v } },
         users: parse_i64(&users),
-        users_max: parse_i64(&users_max),
+        users_max: { let v = parse_i64(&users_max); if v == 0 { 100 } else { v } },
         support_ipv4: parse_bool(&support_ipv4),
         support_ipv6: parse_bool(&support_ipv6),
         warning_open,
@@ -292,7 +292,7 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
                                     .unwrap_or_default()
                                     .parse()
                                     .unwrap_or(0),
-                                entry_index: attr_opt(e, b"entry_index")
+                                entry_index: attr_opt(e, b"entry")
                                     .unwrap_or_default()
                                     .parse()
                                     .unwrap_or(0),
@@ -454,11 +454,11 @@ mod tests {
 
   <modes>
     <mode title="WireGuard UDP 1637" type="wireguard"
-          protocol="UDP" port="1637" entry_index="0" />
+          protocol="UDP" port="1637" entry="0" />
     <mode title="OpenVPN UDP 443" type="openvpn"
-          protocol="UDP" port="443" entry_index="0" />
+          protocol="UDP" port="443" entry="0" />
     <mode title="OpenVPN TCP 443" type="openvpn"
-          protocol="TCP" port="443" entry_index="0" />
+          protocol="TCP" port="443" entry="0" />
   </modes>
 
   <urls>
@@ -544,7 +544,7 @@ mod tests {
 
   <modes>
     <mode title="WireGuard UDP 1637" type="wireguard"
-          protocol="UDP" port="1637" entry_index="0" />
+          protocol="UDP" port="1637" entry="0" />
   </modes>
 
   <urls />
@@ -585,7 +585,7 @@ mod tests {
   <servers_groups />
   <modes>
     <mode title="WireGuard UDP 1637" type="wireguard"
-          protocol="UDP" port="1637" entry_index="0" />
+          protocol="UDP" port="1637" entry="0" />
   </modes>
   <urls />
 </manifest>"#;

@@ -50,6 +50,26 @@ fn is_systemd_resolved_active() -> bool {
         .unwrap_or(false)
 }
 
+/// Flush DNS caches (matching Eddie's dns-flush handler).
+///
+/// Restarts common DNS cache services and flushes systemd-resolved.
+/// Eddie default: "nscd;dnsmasq;named;bind9"
+pub fn flush() {
+    // Flush systemd-resolved cache
+    if is_systemd_resolved_active() {
+        let _ = Command::new("resolvectl")
+            .arg("flush-caches")
+            .output();
+    }
+
+    // Restart common DNS cache services (best-effort, most won't be running)
+    for service in &["nscd", "dnsmasq", "named", "bind9"] {
+        let _ = Command::new("systemctl")
+            .args(["restart", service])
+            .output();
+    }
+}
+
 /// Configure systemd-resolved for VPN DNS on the given interface.
 ///
 /// Eddie sets DNS and default-route on the VPN interface so that
@@ -110,6 +130,8 @@ pub fn activate(dns_ipv4: &str, dns_ipv6: &str, iface: &str) -> Result<()> {
             .context("failed to set /etc/resolv.conf permissions")?;
     }
 
+    flush();
+
     Ok(())
 }
 
@@ -121,10 +143,7 @@ pub fn deactivate() -> Result<()> {
     let backup_path = Path::new(BACKUP_PATH);
 
     if backup_path.exists() {
-        // Remove the VPN resolv.conf, restore backup
-        if resolv_path.exists() {
-            fs::remove_file(resolv_path).context("failed to remove VPN resolv.conf")?;
-        }
+        // Atomic rename replaces dest on Linux — no gap where resolv.conf is missing
         fs::rename(backup_path, resolv_path).context("failed to restore resolv.conf from backup")?;
     }
 
@@ -135,6 +154,8 @@ pub fn deactivate() -> Result<()> {
             .args(["restart", "systemd-resolved"])
             .output();
     }
+
+    flush();
 
     Ok(())
 }

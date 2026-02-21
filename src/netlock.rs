@@ -123,7 +123,7 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
 
     // 6. IPv6 RH0 drop — disable processing of routing header type 0 (ping-pong attack)
     //    (Eddie: ip6 filter INPUT rt type 0 counter drop)
-    r.push_str("    ip6 nexthdr routing rt type 0 counter drop\n");
+    r.push_str("    rt type 0 counter drop\n");
 
     // 7. IPv6 NDP — required for IPv6 address allocation (hoplimit 255)
     //    (Eddie: 4 separate rules for router-advert, neighbor-solicit, neighbor-advert, redirect)
@@ -150,7 +150,7 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
         match classify_ip(&cidr) {
             Some(IpVersion::V4) => {
                 let comment =
-                    format!("airvpn_ip_{}", sha256_hex(&format!("ipv4_in_{}_1", cidr)));
+                    format!("eddie_ip_{}", sha256_hex(&format!("ipv4_in_{}_1", cidr)));
                 r.push_str(&format!(
                     "    ip saddr {} counter accept comment \"{}\"\n",
                     cidr, comment
@@ -158,7 +158,7 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
             }
             Some(IpVersion::V6) => {
                 let comment =
-                    format!("airvpn_ip_{}", sha256_hex(&format!("ipv6_in_{}_1", cidr)));
+                    format!("eddie_ip_{}", sha256_hex(&format!("ipv6_in_{}_1", cidr)));
                 r.push_str(&format!(
                     "    ip6 saddr {} counter accept comment \"{}\"\n",
                     cidr, comment
@@ -183,7 +183,7 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
     ));
 
     // 1. IPv6 RH0 drop
-    r.push_str("    ip6 nexthdr routing rt type 0 counter drop\n");
+    r.push_str("    rt type 0 counter drop\n");
 
     // Final drop (handle for interface insertion)
     r.push_str("    counter drop comment \"airvpn_filter_forward_latest_rule\"\n");
@@ -202,7 +202,7 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
     r.push_str("    oifname \"lo\" counter accept\n");
 
     // 2. IPv6 RH0 drop (Eddie puts this before DHCP/LAN in output)
-    r.push_str("    ip6 nexthdr routing rt type 0 counter drop\n");
+    r.push_str("    rt type 0 counter drop\n");
 
     // 3. DHCP rules
     if config.allow_dhcp {
@@ -260,7 +260,7 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
         match classify_ip(&cidr) {
             Some(IpVersion::V4) => {
                 let comment =
-                    format!("airvpn_ip_{}", sha256_hex(&format!("ipv4_out_{}_1", cidr)));
+                    format!("eddie_ip_{}", sha256_hex(&format!("ipv4_out_{}_1", cidr)));
                 r.push_str(&format!(
                     "    ip daddr {} counter accept comment \"{}\"\n",
                     cidr, comment
@@ -268,7 +268,7 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
             }
             Some(IpVersion::V6) => {
                 let comment =
-                    format!("airvpn_ip_{}", sha256_hex(&format!("ipv6_out_{}_1", cidr)));
+                    format!("eddie_ip_{}", sha256_hex(&format!("ipv6_out_{}_1", cidr)));
                 r.push_str(&format!(
                     "    ip6 daddr {} counter accept comment \"{}\"\n",
                     cidr, comment
@@ -585,7 +585,7 @@ mod tests {
 
         // IPv4 incoming allowlist with SHA256 comment
         let expected_v4_in_comment = format!(
-            "airvpn_ip_{}",
+            "eddie_ip_{}",
             sha256_hex("ipv4_in_185.236.200.1/32_1")
         );
         assert!(
@@ -598,7 +598,7 @@ mod tests {
 
         // IPv4 outgoing allowlist with SHA256 comment
         let expected_v4_out_comment = format!(
-            "airvpn_ip_{}",
+            "eddie_ip_{}",
             sha256_hex("ipv4_out_185.236.200.1/32_1")
         );
         assert!(
@@ -611,7 +611,7 @@ mod tests {
 
         // IPv6 allowlist
         let expected_v6_in_comment = format!(
-            "airvpn_ip_{}",
+            "eddie_ip_{}",
             sha256_hex("ipv6_in_2001:db8::1/128_1")
         );
         assert!(
@@ -624,7 +624,7 @@ mod tests {
 
         // CIDR passthrough (already has /24)
         let expected_cidr_out_comment = format!(
-            "airvpn_ip_{}",
+            "eddie_ip_{}",
             sha256_hex("ipv4_out_10.128.0.0/24_1")
         );
         assert!(
@@ -737,7 +737,7 @@ mod tests {
 
         // RH0 drop in input, forward, and output chains
         let rh0_count = ruleset
-            .matches("ip6 nexthdr routing rt type 0 counter drop")
+            .matches("rt type 0 counter drop")
             .count();
         assert_eq!(
             rh0_count, 3,
@@ -787,7 +787,7 @@ mod tests {
         let pos_dhcp = input_section.find("ip saddr 255.255.255.255").expect("dhcp");
         let pos_lan = input_section.find("ip saddr 192.168.0.0/16 ip daddr 192.168.0.0/16").expect("lan");
         let pos_ping = input_section.find("icmp type echo-request").expect("ping");
-        let pos_rh0 = input_section.find("ip6 nexthdr routing rt type 0").expect("rh0");
+        let pos_rh0 = input_section.find("rt type 0 counter drop").expect("rh0");
         let pos_ndp = input_section.find("icmpv6 type nd-router-advert").expect("ndp");
         let pos_ct = input_section.find("ct state related,established").expect("ct");
         let pos_allowlist = input_section.find("ip saddr 1.2.3.4/32").expect("allowlist");

@@ -235,7 +235,7 @@ fn cmd_connect(
         // Periodic DNS re-check (matching Eddie's DnsSwitchCheck)
         let _ = dns::check_and_reapply(&wg_key.wg_dns_ipv4, &wg_key.wg_dns_ipv6);
 
-        std::thread::sleep(std::time::Duration::from_secs(5));
+        std::thread::sleep(std::time::Duration::from_secs(1));
     }
 
     // Clean disconnect
@@ -320,11 +320,7 @@ fn cmd_servers(
 
     let mut servers: Vec<&manifest::Server> = manifest.servers.iter().collect();
     match sort {
-        "score" => servers.sort_by(|a, b| {
-            server::score(a)
-                .partial_cmp(&server::score(b))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        }),
+        "score" => servers.sort_by(|a, b| server::score(a).cmp(&server::score(b))),
         "load" => servers.sort_by(|a, b| {
             let load_a = if a.bandwidth_max == 0 {
                 100
@@ -344,11 +340,7 @@ fn cmd_servers(
         "name" => servers.sort_by(|a, b| a.name.cmp(&b.name)),
         _ => {
             eprintln!("Unknown sort key '{}', defaulting to score", sort);
-            servers.sort_by(|a, b| {
-                server::score(a)
-                    .partial_cmp(&server::score(b))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            servers.sort_by(|a, b| server::score(a).cmp(&server::score(b)));
         }
     }
 
@@ -366,7 +358,7 @@ fn cmd_servers(
             (bw_cur * 100) / s.bandwidth_max
         };
         println!(
-            "{:<20} {:<6} {:<12} {:>6} {:>5}% {:>8.1}",
+            "{:<20} {:<6} {:<12} {:>6} {:>5}% {:>8}",
             s.name,
             s.country_code,
             s.location,
@@ -392,24 +384,31 @@ fn cmd_recover() -> anyhow::Result<()> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Extract the IP address from a URL like "http://63.33.78.166".
+/// Extract the host (IP or hostname) from a URL like "http://63.33.78.166"
+/// or "http://[2a03:b0c0::1]" or "http://bootme.org".
 ///
-/// Strips the scheme and any trailing path/port to get the bare IP.
+/// Handles IPv6 bracket notation: returns the bare address without brackets.
 fn extract_ip_from_url(url: &str) -> Option<String> {
     let without_scheme = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))
         .unwrap_or(url);
-    // Take everything before the first '/' or ':' (port)
-    let ip = without_scheme
+    // Handle IPv6 bracket notation: [addr] or [addr]:port
+    if without_scheme.starts_with('[') {
+        let end = without_scheme.find(']')?;
+        let addr = &without_scheme[1..end];
+        return if addr.is_empty() { None } else { Some(addr.to_string()) };
+    }
+    // IPv4 or hostname: take everything before the first '/' or ':' (port)
+    let host = without_scheme
         .split('/')
         .next()?
         .split(':')
         .next()?;
-    if ip.is_empty() {
+    if host.is_empty() {
         None
     } else {
-        Some(ip.to_string())
+        Some(host.to_string())
     }
 }
 
@@ -462,16 +461,31 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_ip_from_url_ipv6_brackets() {
+        assert_eq!(
+            extract_ip_from_url("http://[2a03:b0c0:0:1010::9b:c001]"),
+            Some("2a03:b0c0:0:1010::9b:c001".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_ip_from_url_hostname() {
+        assert_eq!(
+            extract_ip_from_url("http://bootme.org"),
+            Some("bootme.org".to_string())
+        );
+    }
+
+    #[test]
     fn test_extract_ip_from_bootstrap_ips() {
         // Verify it works on every actual BOOTSTRAP_IPS entry
         for url in api::BOOTSTRAP_IPS {
-            let ip = extract_ip_from_url(url);
-            assert!(ip.is_some(), "failed to extract IP from {}", url);
-            let ip = ip.unwrap();
+            let host = extract_ip_from_url(url);
+            assert!(host.is_some(), "failed to extract host from {}", url);
+            let host = host.unwrap();
             assert!(
-                ip.parse::<std::net::Ipv4Addr>().is_ok(),
-                "extracted '{}' from '{}' is not a valid IPv4 address",
-                ip,
+                !host.is_empty(),
+                "extracted empty host from '{}'",
                 url
             );
         }
