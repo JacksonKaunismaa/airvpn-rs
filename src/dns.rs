@@ -51,8 +51,12 @@ fn is_immutable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Set the immutable flag on a file.
-fn set_immutable(path: &Path) {
+/// Restore the immutable flag on a file.
+///
+/// Only used in deactivate() to restore the original immutable state. We NEVER
+/// proactively set immutable on resolv.conf — Eddie explicitly considers that a
+/// bug (Platform.cs:591-599 CompatibilityAfterProfile).
+fn restore_immutable(path: &Path) {
     let _ = Command::new("chattr")
         .args(["+i", &path.to_string_lossy()])
         .output();
@@ -331,7 +335,7 @@ pub fn deactivate() -> Result<()> {
 
     // Restore immutable flag if it was set before we activated
     if RESOLV_WAS_IMMUTABLE.load(Ordering::Relaxed) {
-        set_immutable(resolv_path);
+        restore_immutable(resolv_path);
     }
 
     // Restore per-interface systemd-resolved settings from backups.

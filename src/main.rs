@@ -479,7 +479,77 @@ fn cmd_connect(
             warn!("server {} does not advertise IPv4 support", server_ref.name);
         }
 
-        // 6b. Pre-connection authorization (Eddie: Session.cs:173-218)
+        // 7. Activate network lock BEFORE auth (Eddie: Session.cs:57-64 —
+        // netlock activates at session start, before server selection or auth.
+        // NetworkLockManager.cs:132-135 resolves hostnames before lock).
+        // Bootstrap IPs are allowlisted so the auth API call works through the lock.
+        if !no_lock {
+            info!("Activating network lock...");
+            let mut allowed_ips: Vec<String> = server_ref.ips_entry.clone();
+            // Also whitelist API bootstrap IPs (extract bare IP from URLs like "http://1.2.3.4")
+            for url in api::BOOTSTRAP_IPS {
+                if let Some(host) = extract_ip_from_url(url) {
+                    allowed_ips.push(host);
+                }
+            }
+            // Also whitelist manifest bootstrap URLs (Eddie merges these into the URL list)
+            for url in &manifest.bootstrap_urls {
+                if let Some(host) = extract_ip_from_url(url) {
+                    allowed_ips.push(host);
+                }
+            }
+            // Resolve hostnames to IPs before netlock activation (Eddie:
+            // NetworkLockManager.cs:132-135 "resolve hostnames before a possible
+            // lock of DNS server"). Entries that parse as IPs are kept as-is;
+            // hostnames are resolved via DNS and replaced with the resolved IPs.
+            let mut resolved_ips: Vec<String> = Vec::new();
+            for entry in &allowed_ips {
+                if entry.parse::<std::net::IpAddr>().is_ok() {
+                    resolved_ips.push(entry.clone());
+                } else {
+                    // Not a valid IP — try resolving as hostname
+                    let addrs = resolve_bootstrap_host(entry);
+                    if addrs.is_empty() {
+                        warn!("dropping unresolvable bootstrap host from allowlist: {}", entry);
+                    } else {
+                        debug!("resolved bootstrap host {} -> {:?}", entry, addrs);
+                        resolved_ips.extend(addrs);
+                    }
+                }
+            }
+            let allowed_ips = resolved_ips;
+            let lock_config = netlock::NetlockConfig {
+                allow_lan,
+                allow_dhcp: true,
+                allow_ping: true,
+                allow_ipv4ipv6translation: true,
+                allowed_ips_incoming: vec![],
+                allowed_ips_outgoing: allowed_ips,
+                incoming_policy_accept: false,
+            };
+            netlock::activate(&lock_config)?;
+            recovery::save(&recovery::State {
+                lock_active: true,
+                wg_interface: String::new(),
+                wg_config_path: String::new(),
+                dns_ipv4: String::new(),
+                dns_ipv6: String::new(),
+                pid: std::process::id(),
+                blocked_ipv6_ifaces: vec![],
+                endpoint_ip: String::new(),
+                nonce,
+            })?;
+            info!("Network lock active (dedicated nftables table)");
+            debug!(
+                "Network lock: {} outgoing IPs whitelisted, allow_lan={}",
+                lock_config.allowed_ips_outgoing.len(),
+                lock_config.allow_lan,
+            );
+        }
+
+        // 7b. Pre-connection authorization (Eddie: Session.cs:173-218)
+        // Netlock is already active with bootstrap IPs allowlisted, so the
+        // auth API call works through the lock.
         let reset_from_auth = match api::fetch_connect_with_urls(
             &username,
             &password,
@@ -510,10 +580,9 @@ fn cmd_connect(
             }
         };
 
-        // Handle auth-level reset before establishing infrastructure.
-        // On reconnection (2nd+ iteration), netlock and IPv6 blocking are still
-        // active from the previous iteration.  Any bail!() must clean up first
-        // to avoid locking the user out of network connectivity.
+        // Handle auth-level reset. Netlock and IPv6 blocking are active at this
+        // point (netlock was activated above, IPv6 blocking before the loop).
+        // Any bail!() must clean up first to avoid locking the user out.
         if let Some(level) = reset_from_auth {
             match level {
                 ResetLevel::Fatal => {
@@ -548,51 +617,6 @@ fn cmd_connect(
                 }
                 _ => {} // None/Switch don't occur from auth
             }
-        }
-
-        // 7. Activate network lock (BEFORE connecting -- this is critical)
-        if !no_lock {
-            info!("Activating network lock...");
-            let mut allowed_ips: Vec<String> = server_ref.ips_entry.clone();
-            // Also whitelist API bootstrap IPs (extract bare IP from URLs like "http://1.2.3.4")
-            for url in api::BOOTSTRAP_IPS {
-                if let Some(ip) = extract_ip_from_url(url) {
-                    allowed_ips.push(ip);
-                }
-            }
-            // Also whitelist manifest bootstrap URLs (Eddie merges these into the URL list)
-            for url in &manifest.bootstrap_urls {
-                if let Some(ip) = extract_ip_from_url(url) {
-                    allowed_ips.push(ip);
-                }
-            }
-            let lock_config = netlock::NetlockConfig {
-                allow_lan,
-                allow_dhcp: true,
-                allow_ping: true,
-                allow_ipv4ipv6translation: true,
-                allowed_ips_incoming: vec![],
-                allowed_ips_outgoing: allowed_ips,
-                incoming_policy_accept: false,
-            };
-            netlock::activate(&lock_config)?;
-            recovery::save(&recovery::State {
-                lock_active: true,
-                wg_interface: String::new(),
-                wg_config_path: String::new(),
-                dns_ipv4: String::new(),
-                dns_ipv6: String::new(),
-                pid: std::process::id(),
-                blocked_ipv6_ifaces: vec![],
-                endpoint_ip: String::new(),
-                nonce,
-            })?;
-            info!("Network lock active (dedicated nftables table)");
-            debug!(
-                "Network lock: {} outgoing IPs whitelisted, allow_lan={}",
-                lock_config.allowed_ips_outgoing.len(),
-                lock_config.allow_lan,
-            );
         }
 
         // 7b. Save recovery state with blocked IPv6 interfaces (computed before loop)
@@ -1119,6 +1143,24 @@ fn extract_ip_from_url(url: &str) -> Option<String> {
         None
     } else {
         Some(host.to_string())
+    }
+}
+
+/// Resolve a hostname to IP addresses via DNS.
+///
+/// Eddie resolves all bootstrap hostnames to IPs before activating netlock
+/// (NetworkLockManager.cs:132-135) so that hostname-based bootstrap URLs
+/// (e.g. "bootme.org") are properly allowlisted in the firewall rules.
+/// Without this, classify_ip() silently skips hostnames and the auth API
+/// call fails through the lock.
+fn resolve_bootstrap_host(host: &str) -> Vec<String> {
+    use std::net::ToSocketAddrs;
+    match (host, 443).to_socket_addrs() {
+        Ok(addrs) => addrs.map(|a| a.ip().to_string()).collect(),
+        Err(e) => {
+            warn!("failed to resolve bootstrap host {}: {}", host, e);
+            vec![]
+        }
     }
 }
 
