@@ -964,6 +964,12 @@ fn cmd_connect(
                 break ResetLevel::Error;
             }
 
+            // Check kill switch is still active
+            if !no_lock && !netlock::is_active() {
+                error!("Kill switch nftables table deleted externally! Triggering reconnection to restore it.");
+                break ResetLevel::Error;
+            }
+
             // Periodic DNS re-check (matching Eddie's DnsSwitchCheck)
             match dns::check_and_reapply(&wg_key.wg_dns_ipv4, &wg_key.wg_dns_ipv6, &iface) {
                 Ok(_) => { dns_fail_count = 0; }
