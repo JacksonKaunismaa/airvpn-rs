@@ -618,7 +618,7 @@ AllowedIPs = 0.0.0.0/0
     // connect() will fail because the endpoint is unreachable / keys are fake,
     // but we can check the file was created with correct permissions.
     // The function cleans up the config file on failure.
-    let result = wireguard::connect(config);
+    let result = wireguard::connect(config, "192.0.2.1");
 
     // connect() should fail (no real server), but we need to verify the file
     // handling behavior. The config file should be cleaned up after failure.
@@ -666,6 +666,7 @@ fn test_recovery_save_load_remove() {
         dns_ipv6: "fd99::1".to_string(),
         pid: std::process::id(),
         blocked_ipv6_ifaces: vec!["eth0".to_string()],
+        endpoint_ip: String::new(),
     };
 
     // Save
@@ -708,6 +709,7 @@ fn test_recovery_atomic_write() {
         dns_ipv6: "fd99::2".to_string(),
         pid: std::process::id(),
         blocked_ipv6_ifaces: vec![],
+        endpoint_ip: String::new(),
     };
 
     recovery::save(&state).expect("save state");

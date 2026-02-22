@@ -22,6 +22,11 @@ fn ensure_cidr(ip: &str, default_suffix: &str) -> String {
 
 /// Generate a WireGuard config from manifest data.
 ///
+/// Returns `(config_string, endpoint_ip)`. The endpoint IP is needed by
+/// `connect()` to set up a host route through the original default gateway,
+/// preventing a routing loop when policy routing sends all traffic through
+/// the VPN.
+///
 /// The config format matches what wg-quick expects. IPv4 entry IPs are
 /// preferred over IPv6 (matching Eddie's default `network.entry.iplayer =
 /// "ipv4-ipv6"`), since we block IPv6 on all interfaces during connection.
@@ -30,7 +35,7 @@ fn ensure_cidr(ip: &str, default_suffix: &str) -> String {
 /// the other version.
 ///
 /// IPv6 endpoint IPs are wrapped in brackets per WireGuard convention.
-pub fn generate_config(key: &WireGuardKey, server: &Server, mode: &Mode, user: &UserInfo) -> Result<String> {
+pub fn generate_config(key: &WireGuardKey, server: &Server, mode: &Mode, user: &UserInfo) -> Result<(String, String)> {
     if key.wg_private_key.is_empty() {
         anyhow::bail!("missing WireGuard private key from API response");
     }
@@ -85,7 +90,7 @@ PersistentKeepalive = 15
         endpoint,
     ));
 
-    Ok(format!(
+    let config = format!(
         "\
 [Interface]
 PrivateKey = {}
@@ -98,14 +103,21 @@ Table = off
         ensure_cidr(&key.wg_ipv4, "/32"),
         ensure_cidr(&key.wg_ipv6, "/128"),
         peer_section,
-    ))
+    );
+
+    Ok((config, endpoint_ip.to_string()))
 }
 
 /// Write config to a tmpfile, run `wg-quick up`, return (config_path, interface_name).
 ///
 /// The interface name is derived by wg-quick from the config filename
 /// (basename without .conf extension).
-pub fn connect(config: &str) -> Result<(String, String)> {
+///
+/// `endpoint_ip` is the VPN server's entry IP (from `generate_config`).
+/// It's needed to create a host route through the original default gateway
+/// so the encrypted WireGuard packets can reach the server without being
+/// caught by our policy routing rules.
+pub fn connect(config: &str, endpoint_ip: &str) -> Result<(String, String)> {
     // Write config to a temporary file with a recognizable prefix
     let tmpfile = tempfile::Builder::new()
         .prefix("avpn-")
@@ -165,9 +177,36 @@ pub fn connect(config: &str) -> Result<(String, String)> {
 
     // With Table = off, wg-quick skips routing. We add our own default route
     // through the WireGuard interface, similar to how Eddie manages routing directly.
-    setup_routing(&iface)?;
+    if let Err(e) = setup_routing(&iface, endpoint_ip) {
+        // Clean up WireGuard interface if routing setup fails
+        let _ = Command::new("wg-quick").args(["down", &config_path]).output();
+        let _ = std::fs::remove_file(&config_path);
+        return Err(e);
+    }
 
     Ok((config_path, iface))
+}
+
+/// Get the current IPv4 default gateway from the main routing table.
+///
+/// Parses `ip -4 route show default` output which looks like:
+///   default via 192.168.1.1 dev eth0 proto dhcp metric 100
+fn get_default_gateway() -> Result<String> {
+    let output = Command::new("ip")
+        .args(["-4", "route", "show", "default"])
+        .output()
+        .context("failed to execute: ip -4 route show default")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Parse "default via <gateway> ..."
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 3 && parts[0] == "default" && parts[1] == "via" {
+            return Ok(parts[2].to_string());
+        }
+    }
+
+    anyhow::bail!("no IPv4 default gateway found (is the network up?)")
 }
 
 /// Set up routing for the VPN tunnel.
@@ -175,9 +214,56 @@ pub fn connect(config: &str) -> Result<(String, String)> {
 /// Since we use `Table = off` (to avoid wg-quick's nft rules conflicting with
 /// our netlock), we need to add routes ourselves. This is closer to what Eddie
 /// does (Eddie manages routing via ip commands, not wg-quick).
-fn setup_routing(iface: &str) -> Result<()> {
-    // Add default routes through the WireGuard interface using a separate table
-    // (table 51820, matching wg-quick's convention)
+///
+/// The sequence is critical to avoid a routing loop:
+/// 1. Set fwmark on WireGuard interface so its encrypted packets use the main
+///    routing table (not table 51820). This matches what wg-quick does when
+///    `Table` is not `off`.
+/// 2. Save the original default gateway before any route changes.
+/// 3. Add a host route for the VPN endpoint through the original gateway so
+///    encrypted packets can reach the server.
+/// 4. Add default route through VPN interface in table 51820.
+/// 5. Add policy rule: unmarked traffic uses table 51820.
+/// 6. Suppress default route from main table to prevent leaks.
+fn setup_routing(iface: &str, endpoint_ip: &str) -> Result<()> {
+    // 1. Set fwmark on WireGuard interface — MUST be first, before any policy
+    //    routing rules. Without this, WireGuard's own encrypted packets (going
+    //    to the real VPN server) would be routed through table 51820 (i.e.,
+    //    back through the VPN interface), creating a routing loop.
+    let output = Command::new("wg")
+        .args(["set", iface, "fwmark", "51820"])
+        .output()
+        .context("failed to execute: wg set fwmark")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("wg set {} fwmark 51820 failed: {}", iface, stderr.trim());
+    }
+
+    // 2. Save original default gateway before any route changes
+    let original_gw = get_default_gateway()?;
+
+    // 3. Add host route for VPN endpoint through original gateway.
+    //    This ensures encrypted WireGuard packets reach the server even after
+    //    our policy routing redirects everything else through the tunnel.
+    let endpoint_route = format!("{}/32", endpoint_ip);
+    let output = Command::new("ip")
+        .args(["-4", "route", "add", &endpoint_route, "via", &original_gw])
+        .output()
+        .with_context(|| format!("failed to add host route for endpoint {}", endpoint_ip))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Non-fatal if route already exists (e.g., reconnection to same server)
+        if !stderr.contains("File exists") {
+            anyhow::bail!(
+                "ip route add {}/32 via {} failed: {}",
+                endpoint_ip,
+                original_gw,
+                stderr.trim()
+            );
+        }
+    }
+
+    // 4-6. Add default routes and policy rules through the VPN interface
     let commands = [
         // IPv4 default route through VPN
         vec!["ip", "-4", "route", "add", "0.0.0.0/0", "dev", iface, "table", "51820"],
@@ -207,24 +293,40 @@ fn setup_routing(iface: &str) -> Result<()> {
 }
 
 /// Tear down VPN routing (reverse of setup_routing).
-fn teardown_routing(_iface: &str) {
+///
+/// `endpoint_ip` is used to remove the host route added during setup.
+/// If empty, the host route removal is skipped (best-effort cleanup).
+fn teardown_routing(_iface: &str, endpoint_ip: &str) {
+    // Remove policy rules first (reverse order of setup)
     let commands = [
-        vec!["ip", "-4", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
-        vec!["ip", "-6", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
         vec!["ip", "-4", "rule", "delete", "table", "main", "suppress_prefixlength", "0"],
         vec!["ip", "-6", "rule", "delete", "table", "main", "suppress_prefixlength", "0"],
+        vec!["ip", "-4", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
+        vec!["ip", "-6", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
     ];
     for cmd in &commands {
         let _ = Command::new(cmd[0]).args(&cmd[1..]).output();
     }
+
+    // Remove endpoint host route (best-effort — may already be gone if interface was deleted)
+    if !endpoint_ip.is_empty() {
+        let endpoint_route = format!("{}/32", endpoint_ip);
+        let _ = Command::new("ip")
+            .args(["-4", "route", "delete", &endpoint_route])
+            .output();
+    }
 }
 
 /// Run `wg-quick down` to disconnect the WireGuard tunnel.
-pub fn disconnect(config_path: &str) -> Result<()> {
+///
+/// `endpoint_ip` is the VPN server's entry IP, needed to clean up the host
+/// route added during `setup_routing`. Pass an empty string if unknown
+/// (best-effort cleanup will skip the host route removal).
+pub fn disconnect(config_path: &str, endpoint_ip: &str) -> Result<()> {
     // Tear down routing rules before wg-quick removes the interface
     // (derive interface name from config path)
     if let Some(iface) = Path::new(config_path).file_stem().map(|s| s.to_string_lossy().to_string()) {
-        teardown_routing(&iface);
+        teardown_routing(&iface, endpoint_ip);
     }
 
     let output = Command::new("wg-quick")
@@ -384,7 +486,10 @@ mod tests {
         let mode = test_mode();
         let user = test_user();
 
-        let config = generate_config(&key, &server, &mode, &user).unwrap();
+        let (config, endpoint_ip) = generate_config(&key, &server, &mode, &user).unwrap();
+
+        // Verify returned endpoint IP matches what's in the config
+        assert_eq!(endpoint_ip, "185.32.12.1", "returned endpoint IP should match config");
 
         // Check [Interface] section
         assert!(config.contains("[Interface]"));
@@ -412,7 +517,7 @@ mod tests {
         let mode = test_mode();
         let user = test_user();
 
-        let config = generate_config(&key, &server, &mode, &user).unwrap();
+        let (config, _endpoint_ip) = generate_config(&key, &server, &mode, &user).unwrap();
         assert!(
             !config.contains("PresharedKey"),
             "empty preshared key should not produce PresharedKey line"
@@ -433,7 +538,7 @@ mod tests {
             entry_index: 1,
         };
 
-        let config = generate_config(&key, &server, &mode, &user).unwrap();
+        let (config, _endpoint_ip) = generate_config(&key, &server, &mode, &user).unwrap();
         assert!(
             config.contains("Endpoint = 185.32.12.2:1637"),
             "should use second entry IP when entry_index=1"
@@ -454,7 +559,7 @@ mod tests {
             entry_index: 99,
         };
 
-        let config = generate_config(&key, &server, &mode, &user).unwrap();
+        let (config, _endpoint_ip) = generate_config(&key, &server, &mode, &user).unwrap();
         assert!(
             config.contains("Endpoint = 185.32.12.1:1637"),
             "should fall back to first entry IP when entry_index is out of bounds"
@@ -514,7 +619,7 @@ mod tests {
             warning_closed: String::new(),
         };
 
-        let config = generate_config(&key, &server, &mode, &user).unwrap();
+        let (config, _endpoint_ip) = generate_config(&key, &server, &mode, &user).unwrap();
         assert!(
             config.contains("Endpoint = [fd00::1]:1637"),
             "IPv6 endpoint should be wrapped in brackets, got: {}",
@@ -535,7 +640,7 @@ mod tests {
             entry_index: 0,
         };
 
-        let config = generate_config(&key, &server, &mode, &user).unwrap();
+        let (config, _endpoint_ip) = generate_config(&key, &server, &mode, &user).unwrap();
         assert!(config.contains("Endpoint = 185.32.12.1:443"));
     }
 
@@ -546,7 +651,7 @@ mod tests {
         let mode = test_mode();
         let user = test_user();
 
-        let config = generate_config(&key, &server, &mode, &user).unwrap();
+        let (config, _endpoint_ip) = generate_config(&key, &server, &mode, &user).unwrap();
 
         let interface_pos = config.find("[Interface]").expect("[Interface]");
         let peer_pos = config.find("[Peer]").expect("[Peer]");
@@ -594,7 +699,7 @@ mod tests {
             warning_closed: String::new(),
         };
 
-        let config = generate_config(&key, &server, &mode, &user).unwrap();
+        let (config, _endpoint_ip) = generate_config(&key, &server, &mode, &user).unwrap();
         assert!(
             config.contains("Endpoint = 203.0.113.1:1637"),
             "should prefer IPv4 even when IPv6 is listed first, got: {}",
@@ -633,7 +738,7 @@ mod tests {
             warning_closed: String::new(),
         };
 
-        let config = generate_config(&key, &server, &mode, &user).unwrap();
+        let (config, _endpoint_ip) = generate_config(&key, &server, &mode, &user).unwrap();
         assert!(
             config.contains("Endpoint = [2001:db8::1]:1637"),
             "should fall back to IPv6 when no IPv4 available, got: {}",
@@ -674,7 +779,7 @@ mod tests {
             warning_closed: String::new(),
         };
 
-        let config = generate_config(&key, &server, &mode, &user).unwrap();
+        let (config, _endpoint_ip) = generate_config(&key, &server, &mode, &user).unwrap();
         assert!(
             config.contains("Endpoint = [2001:db8::2]:1637"),
             "should use IPv6 at entry_index=1 when no IPv4, got: {}",

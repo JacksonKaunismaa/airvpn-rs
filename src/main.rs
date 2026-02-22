@@ -48,6 +48,9 @@ enum Commands {
         /// Skip server latency measurement (faster startup, uses score without ping)
         #[arg(long)]
         skip_ping: bool,
+        /// Skip post-connection tunnel and DNS verification
+        #[arg(long)]
+        no_verify: bool,
     },
     /// Disconnect from AirVPN
     Disconnect,
@@ -90,6 +93,7 @@ fn main() -> anyhow::Result<()> {
             allow_country,
             deny_country,
             skip_ping,
+            no_verify,
         } => cmd_connect(
             server,
             no_lock,
@@ -102,6 +106,7 @@ fn main() -> anyhow::Result<()> {
             allow_country,
             deny_country,
             skip_ping,
+            no_verify,
         ),
         Commands::Disconnect => cmd_disconnect(),
         Commands::Status => cmd_status(),
@@ -169,6 +174,7 @@ fn cmd_connect(
     allow_country: Vec<String>,
     deny_country: Vec<String>,
     skip_ping: bool,
+    no_verify: bool,
 ) -> anyhow::Result<()> {
     // 0. Pre-flight checks (root, wg-quick, nft)
     preflight_checks()?;
@@ -436,6 +442,7 @@ fn cmd_connect(
                 dns_ipv6: String::new(),
                 pid: std::process::id(),
                 blocked_ipv6_ifaces: vec![],
+                endpoint_ip: String::new(),
             })?;
             println!("Network lock active (dedicated nftables table)");
         }
@@ -453,12 +460,13 @@ fn cmd_connect(
             dns_ipv6: String::new(),
             pid: std::process::id(),
             blocked_ipv6_ifaces: blocked_ipv6_ifaces.clone(),
+            endpoint_ip: String::new(),
         })?;
 
         // 8. Generate WireGuard config and connect
-        let wg_config = wireguard::generate_config(wg_key, server_ref, mode, &user_info)?;
+        let (wg_config, endpoint_ip) = wireguard::generate_config(wg_key, server_ref, mode, &user_info)?;
         println!("Connecting to {} via mode {}...", server_ref.name, mode.title);
-        let (config_path, iface) = match wireguard::connect(&wg_config) {
+        let (config_path, iface) = match wireguard::connect(&wg_config, &endpoint_ip) {
             Ok(result) => result,
             Err(e) => {
                 eprintln!("WireGuard connection failed: {:#}", e);
@@ -489,6 +497,7 @@ fn cmd_connect(
             dns_ipv6: String::new(),
             pid: std::process::id(),
             blocked_ipv6_ifaces: blocked_ipv6_ifaces.clone(),
+            endpoint_ip: endpoint_ip.clone(),
         })?;
         println!("WireGuard interface: {}", iface);
 
@@ -497,7 +506,7 @@ fn cmd_connect(
         if let Err(e) = wireguard::wait_for_handshake(&iface, 50) {
             eprintln!("Handshake failed: {:#}", e);
             // Order: WG down -> netlock deactivate -> IPv6 restore
-            let _ = wireguard::disconnect(&config_path);
+            let _ = wireguard::disconnect(&config_path, &endpoint_ip);
             if !no_lock {
                 let _ = netlock::deactivate();
             }
@@ -517,8 +526,6 @@ fn cmd_connect(
 
         // 9-12: Remaining setup — if any step fails, clean up and treat as fatal
         // (DNS/netlock setup failures are not transient server issues).
-        // Verification steps (10b, 10c) are best-effort with timeouts and
-        // respect the shutdown flag so Ctrl+C remains responsive.
         if let Err(e) = (|| -> anyhow::Result<()> {
             // 9. Allow VPN interface in netlock
             if !no_lock {
@@ -534,32 +541,6 @@ fn cmd_connect(
             dns::activate(&wg_key.wg_dns_ipv4, &wg_key.wg_dns_ipv6, &iface)?;
             println!("DNS configured: {}, {}", wg_key.wg_dns_ipv4, wg_key.wg_dns_ipv6);
 
-            // 10b. Verify tunnel is working (Eddie: Service.cs check/tun endpoint)
-            // check_domain comes from the provider manifest; default to "airvpn.org"
-            // until we parse it from the manifest/provider config.
-            //
-            // Verification is best-effort: time-bounded (10s) and non-fatal.
-            // If shutdown is requested, skip verification entirely.
-            let check_domain = "airvpn.org";
-            let exit_ip = server_ref.ips_exit.first().map(|s| s.as_str()).unwrap_or("");
-
-            if !shutdown.load(Ordering::Relaxed) {
-                println!("Verifying tunnel...");
-                match verify::check_tunnel(&server_ref.name, &wg_key.wg_ipv4, check_domain, exit_ip) {
-                    Ok(()) => println!("Tunnel verified."),
-                    Err(e) => eprintln!("warning: tunnel verification failed: {:#}", e),
-                }
-            }
-
-            // 10c. Verify DNS goes through VPN (Eddie: Service.cs check/dns endpoint)
-            if !shutdown.load(Ordering::Relaxed) {
-                println!("Verifying DNS...");
-                match verify::check_dns(&server_ref.name, check_domain, exit_ip) {
-                    Ok(()) => println!("DNS verified."),
-                    Err(e) => eprintln!("warning: DNS verification failed: {:#}", e),
-                }
-            }
-
             // 11. Save credentials (non-fatal — don't kill connection over keyring issues)
             if let Err(e) = config::save_credentials(&username, &password) {
                 eprintln!("warning: failed to save credentials: {:#}", e);
@@ -574,6 +555,7 @@ fn cmd_connect(
                 dns_ipv6: wg_key.wg_dns_ipv6.clone(),
                 pid: std::process::id(),
                 blocked_ipv6_ifaces: blocked_ipv6_ifaces.clone(),
+                endpoint_ip: endpoint_ip.clone(),
             })?;
 
             Ok(())
@@ -583,13 +565,58 @@ fn cmd_connect(
             // the shutdown flag and disconnect cleanly.
             if shutdown.load(Ordering::Relaxed) {
                 eprintln!("Setup interrupted by shutdown signal, disconnecting...");
-                let _ = cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces);
+                let _ = cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces, &endpoint_ip);
                 break;
             }
             eprintln!("Setup failed after WireGuard connected: {:#}", e);
             eprintln!("Cleaning up...");
-            let _ = cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces);
+            let _ = cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces, &endpoint_ip);
             return Err(e);
+        }
+
+        // 10b-10c: Post-connection verification (Eddie: Service.cs check/tun + check/dns)
+        //
+        // Verification failures are treated as connection failures and trigger
+        // reconnection (matching Eddie's behavior). Use --no-verify to skip
+        // during testing.
+        if !no_verify && !shutdown.load(Ordering::Relaxed) {
+            let check_domain = "airvpn.org";
+            let exit_ip = server_ref.ips_exit.first().map(|s| s.as_str()).unwrap_or("");
+            let mut verify_failed = false;
+
+            // 10b. Verify tunnel is working
+            println!("Verifying tunnel...");
+            match verify::check_tunnel(&server_ref.name, &wg_key.wg_ipv4, check_domain, exit_ip) {
+                Ok(()) => println!("Tunnel verified."),
+                Err(e) => {
+                    eprintln!("Tunnel verification failed: {:#}", e);
+                    verify_failed = true;
+                }
+            }
+
+            // 10c. Verify DNS goes through VPN
+            if !verify_failed && !shutdown.load(Ordering::Relaxed) {
+                println!("Verifying DNS...");
+                match verify::check_dns(&server_ref.name, check_domain, exit_ip) {
+                    Ok(()) => println!("DNS verified."),
+                    Err(e) => {
+                        eprintln!("DNS verification failed: {:#}", e);
+                        verify_failed = true;
+                    }
+                }
+            }
+
+            if verify_failed && !shutdown.load(Ordering::Relaxed) {
+                eprintln!("Verification failed — treating as connection failure, reconnecting...");
+                let _ = cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces, &endpoint_ip);
+                penalties.penalize(&server_ref.name, 30);
+                forced_server = Option::None;
+                if no_reconnect {
+                    anyhow::bail!("Verification failed (--no-reconnect)");
+                }
+                interruptible_sleep(&shutdown, 3);
+                continue;
+            }
         }
 
         println!(
@@ -629,7 +656,7 @@ fn cmd_connect(
         };
 
         // Clean disconnect for this iteration
-        cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces)?;
+        cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces, &endpoint_ip)?;
 
         // Handle reset level (Eddie: Session.cs phase 6 cleanup + wait)
         match reset_level {
@@ -695,18 +722,18 @@ fn cmd_disconnect() -> anyhow::Result<()> {
         eprintln!("PID {} did not exit, forcing cleanup...", state.pid);
     }
 
-    cmd_disconnect_internal(&state.wg_config_path, &state.wg_interface, state.lock_active, &state.blocked_ipv6_ifaces)
+    cmd_disconnect_internal(&state.wg_config_path, &state.wg_interface, state.lock_active, &state.blocked_ipv6_ifaces, &state.endpoint_ip)
 }
 
-fn cmd_disconnect_internal(config_path: &str, iface: &str, lock_active: bool, blocked_ipv6: &[String]) -> anyhow::Result<()> {
+fn cmd_disconnect_internal(config_path: &str, iface: &str, lock_active: bool, blocked_ipv6: &[String], endpoint_ip: &str) -> anyhow::Result<()> {
     // 1. Remove interface-specific nft rules before deactivating table
     if lock_active {
         if !iface.is_empty() {
             let _ = netlock::deallow_interface(iface);
         }
     }
-    // 2. wg-quick down
-    let _ = wireguard::disconnect(config_path);
+    // 2. wg-quick down (also tears down routing + endpoint host route)
+    let _ = wireguard::disconnect(config_path, endpoint_ip);
     // 3. Restore DNS
     let _ = dns::deactivate();
     dns::flush();

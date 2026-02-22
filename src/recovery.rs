@@ -37,6 +37,9 @@ pub struct State {
     pub pid: u32,
     #[serde(default)]
     pub blocked_ipv6_ifaces: Vec<String>,
+    /// VPN server endpoint IP — needed to clean up the host route on disconnect/recovery.
+    #[serde(default)]
+    pub endpoint_ip: String,
 }
 
 /// Determine the state file path. Prefers /run/airvpn-rs/ but falls back
@@ -156,7 +159,11 @@ fn recover_from_state(state: &State) -> Result<()> {
 
     // 1. Disconnect WireGuard
     if !state.wg_config_path.is_empty() {
-        if let Err(e) = wireguard::disconnect(&state.wg_config_path) {
+        // Recovery doesn't know the endpoint IP — pass empty for best-effort cleanup.
+        // The policy rules and routes in table 51820 are still cleaned up; only the
+        // endpoint host route removal is skipped (it'll be removed when the interface
+        // goes down anyway since the route's nexthop becomes unreachable).
+        if let Err(e) = wireguard::disconnect(&state.wg_config_path, &state.endpoint_ip) {
             eprintln!("warning: failed to disconnect WireGuard: {}", e);
             cleanup_failed = true;
         }
@@ -202,13 +209,21 @@ fn recover_from_state(state: &State) -> Result<()> {
     // (e.g., config_path was empty or interface already gone), rules may linger.
     // These are idempotent deletes — they silently fail if rules don't exist.
     let routing_cleanups: &[&[&str]] = &[
-        &["ip", "-4", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
-        &["ip", "-6", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
         &["ip", "-4", "rule", "delete", "table", "main", "suppress_prefixlength", "0"],
         &["ip", "-6", "rule", "delete", "table", "main", "suppress_prefixlength", "0"],
+        &["ip", "-4", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
+        &["ip", "-6", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
     ];
     for cmd in routing_cleanups {
         let _ = std::process::Command::new(cmd[0]).args(&cmd[1..]).output();
+    }
+
+    // Also clean up endpoint host route if we know the endpoint IP
+    if !state.endpoint_ip.is_empty() {
+        let endpoint_route = format!("{}/32", state.endpoint_ip);
+        let _ = std::process::Command::new("ip")
+            .args(["-4", "route", "delete", &endpoint_route])
+            .output();
     }
 
     // 4. Deactivate network lock if it was active (last — prevents traffic leaks)
@@ -347,6 +362,7 @@ mod tests {
             dns_ipv6: "fd7d:76ee:3c49:9950::1".to_string(),
             pid: 12345,
             blocked_ipv6_ifaces: vec!["eth0".to_string(), "wlan0".to_string()],
+            endpoint_ip: String::new(),
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -371,6 +387,7 @@ mod tests {
             dns_ipv6: "fd00::1".to_string(),
             pid: 99999,
             blocked_ipv6_ifaces: vec![],
+            endpoint_ip: String::new(),
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -427,6 +444,7 @@ mod tests {
             dns_ipv6: "fd00::1".to_string(),
             pid: 12345,
             blocked_ipv6_ifaces: vec!["eth0".to_string(), "wlan0".to_string()],
+            endpoint_ip: String::new(),
         };
         let json = serde_json::to_string(&state).unwrap();
         let parsed: State = serde_json::from_str(&json).unwrap();
