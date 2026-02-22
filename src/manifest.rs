@@ -30,6 +30,11 @@ pub struct Manifest {
     /// Parsed from `check_domain` attribute on the `<manifest>` root element.
     /// Eddie: Service.cs `_checkDomain` field.
     pub check_domain: String,
+    /// Template for DNS verification query, with `{hash}` placeholder.
+    /// Parsed from `check_dns_query` attribute on the `<manifest>` root element.
+    /// Eddie: Service.cs line 501 — `GetKeyValue("check_dns_query", "")`.
+    /// Example value: `{hash}.airvpn.org`
+    pub check_dns_query: String,
 }
 
 // UserInfo and WireGuardKey are parsed separately via parse_user() from the act=user response.
@@ -253,6 +258,7 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
     let mut messages: Vec<Message> = Vec::new();
     let mut force_reauth_ts: i64 = 0;
     let mut check_domain = String::new();
+    let mut check_dns_query = String::new();
 
     // RSA key rotation: parsed from <manifest> attributes or nested <rsa> element
     let mut rsa_modulus: Option<String> = None;
@@ -359,6 +365,13 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
                                 check_domain = cd;
                             }
                         }
+                        // DNS check query template (e.g. "{hash}.airvpn.org")
+                        // Eddie: Service.cs line 501 — GetKeyValue("check_dns_query", "")
+                        if let Some(dq) = attr_opt(e, b"check_dns_query") {
+                            if !dq.is_empty() {
+                                check_dns_query = dq;
+                            }
+                        }
                         // RSA key rotation: attributes on the root <manifest> element
                         if let Some(m) = attr_opt(e, b"auth_rsa_modulus") {
                             if !m.is_empty() {
@@ -420,6 +433,7 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
         force_reauth_ts,
         messages,
         check_domain,
+        check_dns_query,
     })
 }
 
@@ -519,7 +533,7 @@ mod tests {
     use super::*;
 
     const FULL_MANIFEST: &str = r#"<?xml version="1.0" encoding="utf-8"?>
-<manifest time="1708444800" next_update="3600" force_reauth_ts="0" check_domain="airvpn.org">
+<manifest time="1708444800" next_update="3600" force_reauth_ts="0" check_domain="airvpn.org" check_dns_query="{hash}.airvpn.org">
   <rsa><RSAParameters><Modulus>base64modulus==</Modulus><Exponent>AQAB</Exponent></RSAParameters></rsa>
 
   <servers>
@@ -755,6 +769,12 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_manifest_check_dns_query() {
+        let manifest = parse_manifest(FULL_MANIFEST).expect("failed to parse manifest");
+        assert_eq!(manifest.check_dns_query, "{hash}.airvpn.org");
+    }
+
+    #[test]
     fn test_parse_manifest_check_domain_absent() {
         let xml = r#"<?xml version="1.0" encoding="utf-8"?>
 <manifest time="1708444800">
@@ -765,6 +785,7 @@ mod tests {
 </manifest>"#;
         let manifest = parse_manifest(xml).expect("failed to parse manifest");
         assert_eq!(manifest.check_domain, "", "absent check_domain should be empty string");
+        assert_eq!(manifest.check_dns_query, "", "absent check_dns_query should be empty string");
     }
 
     #[test]

@@ -2,7 +2,11 @@
 //!
 //! Eddie verifies the tunnel actually works after handshake by:
 //! 1. HTTP GET to check endpoint, verifying exit IP matches VPN pool
-//! 2. DNS resolution challenge to verify DNS goes through VPN
+//! 2. DNS resolution challenge to verify DNS goes through VPN:
+//!    - Generate random hash token
+//!    - Substitute into `check_dns_query` template from manifest (e.g. `{hash}.airvpn.org`)
+//!    - Resolve via system DNS (goes through VPN's DNS post-connection)
+//!    - GET `/check/dns/` endpoint and verify server saw the hash
 //!
 //! Both checks are best-effort with a hard 10-second overall timeout.
 //! If they fail or time out, the caller should log a warning and continue.
@@ -163,24 +167,34 @@ fn check_tunnel_inner(server_name: &str, expected_ipv4: &str, check_domain: &str
 
 /// Verify DNS is routed through the VPN tunnel.
 ///
-/// Eddie's protocol:
+/// Eddie's protocol (Service.cs lines 497-536):
 /// 1. Generate a random token (hash)
-/// 2. Resolve `<hash>.{check_domain}` via system DNS (which should go through VPN)
-/// 3. GET `https://<server>_exit.<domain>/check/dns/` and verify the server saw that hash
+/// 2. Substitute the hash into the `check_dns_query` template from the manifest
+///    (e.g. `{hash}.airvpn.org` becomes `a1b2c3d4.airvpn.org`)
+/// 3. Resolve that domain via system DNS — which, post-connection, goes through
+///    the VPN's DNS server. The server logs the hash from the query.
+/// 4. GET `https://<server>_exit.<check_domain>/check/dns/` and verify the
+///    server's `dns` field matches our hash.
 ///
 /// Returns `Ok(())` on success, `Err` on timeout or verification failure.
 /// The caller should treat errors as non-fatal warnings.
 ///
 /// `check_domain` comes from the provider manifest (e.g. "airservers.org:89").
-pub fn check_dns(server_name: &str, check_domain: &str, exit_ip: &str) -> Result<()> {
+/// `check_dns_query` is the DNS query template (e.g. "{hash}.airvpn.org").
+pub fn check_dns(server_name: &str, check_domain: &str, exit_ip: &str, check_dns_query: &str) -> Result<()> {
+    if check_dns_query.is_empty() {
+        anyhow::bail!("DNS check skipped: manifest has no check_dns_query template");
+    }
+
     let server_name = server_name.to_string();
     let check_domain = check_domain.to_string();
     let exit_ip = exit_ip.to_string();
+    let check_dns_query = check_dns_query.to_string();
 
     let (tx, rx) = mpsc::channel();
 
     std::thread::spawn(move || {
-        let result = check_dns_inner(&server_name, &check_domain, &exit_ip);
+        let result = check_dns_inner(&server_name, &check_domain, &exit_ip, &check_dns_query);
         let _ = tx.send(result);
     });
 
@@ -196,7 +210,7 @@ pub fn check_dns(server_name: &str, check_domain: &str, exit_ip: &str) -> Result
 }
 
 /// Inner DNS check logic, run inside a thread with a hard timeout.
-fn check_dns_inner(server_name: &str, check_domain: &str, exit_ip: &str) -> Result<()> {
+fn check_dns_inner(server_name: &str, check_domain: &str, exit_ip: &str, check_dns_query: &str) -> Result<()> {
     // Split "airservers.org:89" into ("airservers.org", 89)
     let (domain, port) = split_domain_port(check_domain);
 
@@ -218,7 +232,7 @@ fn check_dns_inner(server_name: &str, check_domain: &str, exit_ip: &str) -> Resu
         .context("failed to build HTTP client for DNS check")?;
 
     let check_url = format!("https://{}:{}/check/dns/", check_hostname, port);
-    debug!("DNS check URL: {}", check_url);
+    debug!("DNS check URL: {}, query_template={}", check_url, check_dns_query);
 
     // Track last error for the final bail message.
     let mut last_error: Option<String> = None;
@@ -232,11 +246,16 @@ fn check_dns_inner(server_name: &str, check_domain: &str, exit_ip: &str) -> Resu
         // Generate random token (Eddie: RandomGenerator.GetRandomToken())
         let hash = generate_random_token();
 
-        // Resolve <hash>.<domain> via system DNS (goes through VPN tunnel).
-        // Use just the domain part, NOT the port — DNS names don't have ports.
-        // We only need to trigger the DNS query -- the result doesn't matter.
-        // The VPN server logs the hash from the query it receives.
-        let dns_host = format!("{}.{}", hash, domain);
+        // Eddie: Service.cs line 501-503
+        //   string dnsQuery = GetKeyValue("check_dns_query", "");
+        //   string dnsHost = dnsQuery.Replace("{hash}", hash);
+        //   IpAddresses result = DnsManager.ResolveDNS(dnsHost, true);
+        //
+        // Substitute hash into the template (e.g. "{hash}.airvpn.org" -> "a1b2c3.airvpn.org")
+        // then resolve via system DNS. Post-connection, system DNS points at the VPN's DNS
+        // server, which logs the hash from the query it receives.
+        let dns_host = check_dns_query.replace("{hash}", &hash);
+        debug!("DNS check attempt {}: resolving {} (hash={})", attempt, dns_host, hash);
         let _ = std::net::ToSocketAddrs::to_socket_addrs(&mut (dns_host.as_str(), 80));
 
         // Small delay to let the server process the DNS query
@@ -389,7 +408,7 @@ mod tests {
     fn test_check_dns_timeout_on_bad_ip() {
         // With a non-routable exit IP, the check should time out (not hang).
         let start = std::time::Instant::now();
-        let result = check_dns("TestServer", "example.invalid", "192.0.2.1");
+        let result = check_dns("TestServer", "example.invalid", "192.0.2.1", "{hash}.example.invalid");
         let elapsed = start.elapsed();
         assert!(result.is_err());
         // Must complete within VERIFY_TIMEOUT + small margin (not hang forever)
@@ -401,10 +420,18 @@ mod tests {
     fn test_check_dns_timeout_on_bad_ip_with_port() {
         // Same as above but with a port in check_domain.
         let start = std::time::Instant::now();
-        let result = check_dns("TestServer", "example.invalid:89", "192.0.2.1");
+        let result = check_dns("TestServer", "example.invalid:89", "192.0.2.1", "{hash}.example.invalid");
         let elapsed = start.elapsed();
         assert!(result.is_err());
         assert!(elapsed < VERIFY_TIMEOUT + Duration::from_secs(2),
             "DNS check took {:?}, expected < {:?}", elapsed, VERIFY_TIMEOUT + Duration::from_secs(2));
+    }
+
+    #[test]
+    fn test_check_dns_empty_query_template() {
+        // Empty check_dns_query should bail immediately, not hang.
+        let result = check_dns("TestServer", "example.invalid", "192.0.2.1", "");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no check_dns_query"));
     }
 }
