@@ -119,8 +119,18 @@ pub fn save(state: &State) -> Result<()> {
 pub fn load() -> Result<Option<State>> {
     match find_state_file() {
         Some(path) => {
-            let json = fs::read_to_string(&path)
-                .with_context(|| format!("failed to read state file: {}", path.display()))?;
+            let json = match fs::read_to_string(&path) {
+                Ok(j) => j,
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    // State file exists but we can't read it (e.g., root-owned,
+                    // running as non-root). Treat as "not our state file."
+                    warn!("state file exists but not readable (permission denied): {}", path.display());
+                    return Ok(None);
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("failed to read state file: {}: {}", path.display(), e));
+                }
+            };
             match serde_json::from_str::<State>(&json) {
                 Ok(state) => Ok(Some(state)),
                 Err(e) => {
@@ -475,13 +485,13 @@ mod tests {
     }
 
     #[test]
-    fn test_load_no_state_file() {
-        // If no state file exists at either location, load should return None.
-        // This test depends on the test environment not having stale state files,
-        // which is a reasonable assumption.
-        // We can't reliably test this without mocking filesystem access,
-        // so we just verify the function doesn't panic.
+    fn test_load_does_not_panic() {
+        // load() reads from hardcoded paths (/run/airvpn-rs/state.json,
+        // /tmp/airvpn-rs-state.json). We can't control whether these exist
+        // (a real test run as root may leave them), so we only verify:
+        // 1. load() doesn't panic
+        // 2. It returns Ok (either Some or None depending on disk state)
         let result = load();
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "load() should not error: {:?}", result);
     }
 }
