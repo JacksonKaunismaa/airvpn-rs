@@ -46,6 +46,11 @@ pub struct State {
     /// belongs to the same process instance.
     #[serde(default)]
     pub nonce: u64,
+    /// Whether /etc/resolv.conf had the immutable flag before we modified it.
+    /// Persisted so the flag can be restored on reconnection or crash recovery
+    /// (the AtomicBool in dns.rs is lost on process restart).
+    #[serde(default)]
+    pub resolv_was_immutable: bool,
 }
 
 /// Validate a network interface name: alphanumeric + dash + underscore, max 15 chars.
@@ -142,7 +147,7 @@ fn find_state_file() -> Option<PathBuf> {
 /// Save current connection state.
 pub fn save(state: &State) -> Result<()> {
     debug!(
-        "Saving recovery state: lock={}, iface={}, dns={}/{}, pid={}, ipv6_blocked={}, endpoint={}, nonce={}",
+        "Saving recovery state: lock={}, iface={}, dns={}/{}, pid={}, ipv6_blocked={}, endpoint={}, nonce={}, resolv_immutable={}",
         state.lock_active,
         state.wg_interface,
         state.dns_ipv4,
@@ -151,6 +156,7 @@ pub fn save(state: &State) -> Result<()> {
         state.blocked_ipv6_ifaces.len(),
         state.endpoint_ip,
         state.nonce,
+        state.resolv_was_immutable,
     );
     ensure_state_dir()?;
     let path = state_path();
@@ -335,7 +341,8 @@ fn recover_from_state(state: &State) -> Result<()> {
         info!("restored IPv6 on {} interfaces", state.blocked_ipv6_ifaces.len());
     }
 
-    // 3. Restore DNS
+    // 3. Restore DNS (restore immutable flag knowledge from persisted state first)
+    dns::set_was_immutable(state.resolv_was_immutable);
     if let Err(e) = dns::deactivate() {
         warn!("failed to restore DNS: {}", e);
         cleanup_failed = true;
@@ -524,6 +531,7 @@ mod tests {
             blocked_ipv6_ifaces: vec!["eth0".to_string(), "wlan0".to_string()],
             endpoint_ip: String::new(),
             nonce: 42424242,
+            resolv_was_immutable: true,
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -537,6 +545,7 @@ mod tests {
         assert_eq!(parsed.pid, state.pid);
         assert_eq!(parsed.blocked_ipv6_ifaces, state.blocked_ipv6_ifaces);
         assert_eq!(parsed.nonce, state.nonce);
+        assert_eq!(parsed.resolv_was_immutable, state.resolv_was_immutable);
     }
 
     #[test]
@@ -551,6 +560,7 @@ mod tests {
             blocked_ipv6_ifaces: vec![],
             endpoint_ip: String::new(),
             nonce: 123456789,
+            resolv_was_immutable: false,
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -564,6 +574,7 @@ mod tests {
         assert!(json.contains("\"pid\": 99999"));
         assert!(json.contains("\"blocked_ipv6_ifaces\""));
         assert!(json.contains("\"nonce\": 123456789"));
+        assert!(json.contains("\"resolv_was_immutable\": false"));
     }
 
     #[test]
@@ -580,6 +591,7 @@ mod tests {
         let state: State = serde_json::from_str(json).unwrap();
         assert!(state.blocked_ipv6_ifaces.is_empty());
         assert_eq!(state.nonce, 0, "old format without nonce should default to 0");
+        assert!(!state.resolv_was_immutable, "old format without resolv_was_immutable should default to false");
     }
 
     #[test]
@@ -611,6 +623,7 @@ mod tests {
             blocked_ipv6_ifaces: vec!["eth0".to_string(), "wlan0".to_string()],
             endpoint_ip: String::new(),
             nonce: 0,
+            resolv_was_immutable: false,
         };
         let json = serde_json::to_string(&state).unwrap();
         let parsed: State = serde_json::from_str(&json).unwrap();
@@ -648,6 +661,7 @@ mod tests {
             blocked_ipv6_ifaces: vec!["eth0".to_string()],
             endpoint_ip: "1.2.3.4".to_string(),
             nonce: 42,
+            resolv_was_immutable: false,
         };
         assert!(validate_state(&state));
     }
@@ -664,6 +678,7 @@ mod tests {
             blocked_ipv6_ifaces: vec![],
             endpoint_ip: String::new(),
             nonce: 0,
+            resolv_was_immutable: false,
         };
         assert!(!validate_state(&state));
     }
@@ -680,6 +695,7 @@ mod tests {
             blocked_ipv6_ifaces: vec![],
             endpoint_ip: String::new(),
             nonce: 0,
+            resolv_was_immutable: false,
         };
         assert!(!validate_state(&state));
     }
@@ -696,6 +712,7 @@ mod tests {
             blocked_ipv6_ifaces: vec!["../../../etc".to_string()],
             endpoint_ip: String::new(),
             nonce: 0,
+            resolv_was_immutable: false,
         };
         assert!(!validate_state(&state));
     }
@@ -713,6 +730,7 @@ mod tests {
             blocked_ipv6_ifaces: vec![],
             endpoint_ip: String::new(),
             nonce: 0,
+            resolv_was_immutable: false,
         };
         assert!(validate_state(&state));
     }
@@ -736,6 +754,7 @@ mod tests {
             blocked_ipv6_ifaces: vec![],
             endpoint_ip: String::new(),
             nonce: 0,
+            resolv_was_immutable: false,
         };
         assert!(!validate_state(&state));
     }
@@ -752,6 +771,7 @@ mod tests {
             blocked_ipv6_ifaces: vec![],
             endpoint_ip: String::new(),
             nonce: 0,
+            resolv_was_immutable: false,
         };
         assert!(!validate_state(&state));
     }
@@ -768,6 +788,7 @@ mod tests {
             blocked_ipv6_ifaces: vec![],
             endpoint_ip: String::new(),
             nonce: 42,
+            resolv_was_immutable: false,
         };
         assert!(validate_state(&state));
     }

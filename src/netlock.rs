@@ -140,8 +140,10 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
     if config.allow_ping {
         // Eddie: ip filter INPUT icmp type echo-request counter accept
         r.push_str("    icmp type echo-request counter accept\n");
-        // Eddie: ip6 filter INPUT meta l4proto ipv6-icmp counter accept
-        r.push_str("    meta l4proto ipv6-icmp counter accept\n");
+        // ICMPv6: only allow safe diagnostic types (not all ICMPv6 — broad accept
+        // would permit tunneling via unused types like mobile/experimental).
+        // NDP types are handled separately below with hoplimit 255 restriction.
+        r.push_str("    icmpv6 type { echo-request, echo-reply, destination-unreachable, packet-too-big, time-exceeded, parameter-problem } counter accept\n");
     }
 
     // 6. IPv6 RH0 drop — disable processing of routing header type 0 (ping-pong attack)
@@ -275,8 +277,8 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
     if config.allow_ping {
         // Eddie: ip filter OUTPUT icmp type echo-reply counter accept
         r.push_str("    icmp type echo-reply counter accept\n");
-        // Eddie: ip6 filter OUTPUT meta l4proto ipv6-icmp counter accept
-        r.push_str("    meta l4proto ipv6-icmp counter accept\n");
+        // ICMPv6: only allow safe diagnostic types (matching INPUT restrictions).
+        r.push_str("    icmpv6 type { echo-request, echo-reply, destination-unreachable, packet-too-big, time-exceeded, parameter-problem } counter accept\n");
     }
 
     // 6. Conntrack in OUTPUT: only when incoming policy is accept (Eddie behavior).

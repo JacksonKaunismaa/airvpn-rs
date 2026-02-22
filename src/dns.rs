@@ -18,6 +18,18 @@ use log::{info, warn};
 
 static RESOLV_WAS_IMMUTABLE: AtomicBool = AtomicBool::new(false);
 
+/// Return whether resolv.conf was immutable before we modified it.
+/// Used by main.rs to persist this flag in recovery state.
+pub fn was_immutable() -> bool {
+    RESOLV_WAS_IMMUTABLE.load(Ordering::Relaxed)
+}
+
+/// Restore the RESOLV_WAS_IMMUTABLE flag from persisted recovery state.
+/// Called on recovery/reconnection so deactivate() knows to restore the flag.
+pub fn set_was_immutable(val: bool) {
+    RESOLV_WAS_IMMUTABLE.store(val, Ordering::Relaxed);
+}
+
 const BACKUP_PATH: &str = "/etc/resolv.conf.airvpn-rs";
 
 /// Clear the immutable flag on a file (if set).

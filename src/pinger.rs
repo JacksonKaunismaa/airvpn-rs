@@ -92,12 +92,80 @@ mod tests {
         pr.latencies.insert("FailedServer".to_string(), -1);
         assert_eq!(pr.get("FailedServer"), -1);
     }
+
+    #[test]
+    fn test_median_ping_all_success() {
+        // Three successful pings: 10, 20, 15 → sorted: 10, 15, 20 → median = 15
+        let rounds = vec![Some(10), Some(20), Some(15)];
+        assert_eq!(median_ping(&rounds), Some(15));
+    }
+
+    #[test]
+    fn test_median_ping_one_failure() {
+        // Two successes + one failure → use median of successes
+        let rounds = vec![Some(10), None, Some(30)];
+        assert_eq!(median_ping(&rounds), Some(30));
+    }
+
+    #[test]
+    fn test_median_ping_two_failures() {
+        // Two failures → too unreliable, return None
+        let rounds = vec![None, Some(10), None];
+        assert_eq!(median_ping(&rounds), None);
+    }
+
+    #[test]
+    fn test_median_ping_all_failures() {
+        let rounds = vec![None, None, None];
+        assert_eq!(median_ping(&rounds), None);
+    }
+
+    #[test]
+    fn test_median_ping_identical_values() {
+        let rounds = vec![Some(42), Some(42), Some(42)];
+        assert_eq!(median_ping(&rounds), Some(42));
+    }
+
+    #[test]
+    fn test_median_ping_sorted_already() {
+        let rounds = vec![Some(1), Some(2), Some(3)];
+        assert_eq!(median_ping(&rounds), Some(2));
+    }
+
+    #[test]
+    fn test_median_ping_reverse_sorted() {
+        let rounds = vec![Some(100), Some(50), Some(10)];
+        assert_eq!(median_ping(&rounds), Some(50));
+    }
+}
+
+/// Number of ping rounds per server for median calculation.
+/// Multiple rounds resist ICMP spoofing — a single spoofed reply can't
+/// dominate the median.
+const PING_ROUNDS: usize = 3;
+
+/// Compute the median of successful pings. If the majority failed, returns None.
+///
+/// Rules:
+/// - If 2 or more pings failed (out of 3), return None (too unreliable).
+/// - Otherwise sort the successful values and return the middle one.
+fn median_ping(results: &[Option<u64>]) -> Option<u64> {
+    let mut successes: Vec<u64> = results.iter().filter_map(|r| *r).collect();
+    let fail_count = results.len() - successes.len();
+    if fail_count >= 2 {
+        return None;
+    }
+    successes.sort_unstable();
+    if successes.is_empty() {
+        return None;
+    }
+    Some(successes[successes.len() / 2])
 }
 
 /// Measure latency for all servers (pings first IPv4 entry IP of each).
 ///
-/// This is a simplified version of Eddie's Latency job -- single ping per server,
-/// no concurrency, no rolling average (since we only measure once before connecting).
+/// Each server is pinged [PING_ROUNDS] times and the median is used to resist
+/// ICMP spoofing. If the majority of pings fail, the server is marked as -1.
 ///
 /// Eddie pings `IpsEntry.FirstPreferIPv4` (Latency.cs line 75).
 pub fn measure_all(servers: &[crate::manifest::Server]) -> PingResults {
@@ -119,7 +187,8 @@ pub fn measure_all(servers: &[crate::manifest::Server]) -> PingResults {
                 results.latencies.insert(server.name.clone(), -1);
                 continue;
             }
-            match ping_ip(ip) {
+            let rounds: Vec<Option<u64>> = (0..PING_ROUNDS).map(|_| ping_ip(ip)).collect();
+            match median_ping(&rounds) {
                 Some(ms) => {
                     results.latencies.insert(server.name.clone(), ms as i64);
                 }

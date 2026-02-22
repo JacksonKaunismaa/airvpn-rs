@@ -378,17 +378,16 @@ fn cmd_connect(
     let user_info = manifest::parse_user(&user_xml)?;
     debug!("User info: login={}, {} WireGuard keys", user_info.login, user_info.keys.len());
 
-    // 4. Select WireGuard mode (first available) — invariant across reconnections
-    let mode = manifest
-        .modes
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("No WireGuard modes available"))?;
+    // Mode and key selection moved inside the loop (after manifest re-fetch)
+    // since user_info and manifest can be refreshed on reconnection.
 
-    // 5. Get WireGuard key (first/default) — invariant across reconnections
-    let wg_key = user_info
-        .keys
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("No WireGuard keys in user data"))?;
+    // Validate initial manifest has modes and keys before entering the loop.
+    if manifest.modes.is_empty() {
+        anyhow::bail!("No WireGuard modes available");
+    }
+    if user_info.keys.is_empty() {
+        anyhow::bail!("No WireGuard keys in user data");
+    }
 
     // -----------------------------------------------------------------------
     // Server filtering (Eddie: GetConnections allow/deny filtering)
@@ -449,6 +448,15 @@ fn cmd_connect(
 
     let mut penalties = server::ServerPenalties::new();
     let mut forced_server: Option<&str> = server_name.as_deref();
+    let mut first_iteration = true;
+    let mut consecutive_failures: u32 = 0;
+
+    // Mutable copies of manifest data that can be refreshed on reconnection.
+    // The initial fetch (above) populates these; subsequent loop iterations
+    // may update them with fresher server load/status data.
+    let mut filtered_servers = filtered_servers;
+    let mut manifest = manifest;
+    let mut user_info = user_info;
 
     // 7b. Block IPv6 on all interfaces ONCE before the main loop
     // (Eddie default: network.ipv6.mode="in-block").
@@ -467,6 +475,74 @@ fn cmd_connect(
             info!("Shutdown requested before connection attempt.");
             break;
         }
+
+        // Re-fetch manifest on reconnection (2nd+ iteration) to get current
+        // server load/status. Eddie refreshes periodically; we refresh on each
+        // reconnection attempt since the server landscape may have changed.
+        // Non-fatal: if the re-fetch fails (e.g. network disrupted during
+        // reconnection), we fall back to the existing manifest data.
+        if !first_iteration {
+            info!("Re-fetching manifest for updated server data...");
+            match api::fetch_manifest(&username, &password) {
+                Ok(new_xml) => match manifest::parse_manifest(&new_xml) {
+                    Ok(new_manifest) => {
+                        // Re-apply server filters to the fresh manifest
+                        let new_filtered: Vec<manifest::Server> = server::filter_servers(
+                            &new_manifest.servers,
+                            &allow_server,
+                            &deny_server,
+                            &allow_country,
+                            &deny_country,
+                        )
+                        .into_iter()
+                        .cloned()
+                        .collect();
+                        if new_filtered.is_empty() {
+                            warn!("Re-fetched manifest has no servers matching filters, keeping previous data");
+                        } else {
+                            info!(
+                                "Manifest refreshed: {} servers ({} after filters)",
+                                new_manifest.servers.len(),
+                                new_filtered.len(),
+                            );
+                            filtered_servers = new_filtered;
+                            manifest = new_manifest;
+                        }
+                    }
+                    Err(e) => warn!("Failed to parse re-fetched manifest, using stale data: {:#}", e),
+                },
+                Err(e) => warn!("Failed to re-fetch manifest, using stale data: {:#}", e),
+            }
+            // Also refresh user data (WireGuard keys may have changed)
+            match api::fetch_user_with_urls(&username, &password, &manifest.bootstrap_urls) {
+                Ok(new_user_xml) => match manifest::parse_user(&new_user_xml) {
+                    Ok(new_user) => {
+                        user_info = new_user;
+                    }
+                    Err(e) => warn!("Failed to parse re-fetched user data, using stale data: {:#}", e),
+                },
+                Err(e) => warn!("Failed to re-fetch user data, using stale data: {:#}", e),
+            }
+        }
+        first_iteration = false;
+
+        // Select WireGuard mode and key from (possibly refreshed) manifest/user data.
+        let mode = match manifest.modes.first() {
+            Some(m) => m,
+            None => {
+                warn!("Refreshed manifest has no WireGuard modes, cannot connect");
+                interruptible_sleep(&shutdown, 10);
+                continue;
+            }
+        };
+        let wg_key = match user_info.keys.first() {
+            Some(k) => k,
+            None => {
+                warn!("Refreshed user data has no WireGuard keys, cannot connect");
+                interruptible_sleep(&shutdown, 10);
+                continue;
+            }
+        };
 
         // 6. Select server (penalty-aware + ping-aware, from filtered list)
         let server_ref = server::select_server_with_penalties(
@@ -558,6 +634,7 @@ fn cmd_connect(
                 blocked_ipv6_ifaces: blocked_ipv6_ifaces.clone(),
                 endpoint_ip: String::new(),
                 nonce,
+                resolv_was_immutable: dns::was_immutable(),
             })?;
             info!("Network lock active (dedicated nftables table)");
             debug!(
@@ -650,6 +727,7 @@ fn cmd_connect(
             blocked_ipv6_ifaces: blocked_ipv6_ifaces.clone(),
             endpoint_ip: String::new(),
             nonce,
+            resolv_was_immutable: dns::was_immutable(),
         })?;
 
         // 8. Generate WireGuard config and connect
@@ -665,7 +743,10 @@ fn cmd_connect(
         );
         info!("Connecting to {} via mode {}...", server_ref.name, mode.title);
         let (config_path, iface) = match wireguard::connect(&wg_config, &endpoint_ip) {
-            Ok(result) => result,
+            Ok(result) => {
+                consecutive_failures = 0;
+                result
+            }
             Err(e) => {
                 error!("WireGuard connection failed: {:#}", e);
                 // Keep netlock and IPv6 blocking active across reconnection
@@ -682,8 +763,10 @@ fn cmd_connect(
                     let _ = recovery::remove();
                     return Err(e.context("WireGuard connection failed"));
                 }
-                warn!("Reconnecting in 3s (penalized {})...", server_ref.name);
-                interruptible_sleep(&shutdown, 3);
+                consecutive_failures += 1;
+                let backoff_secs = std::cmp::min(3u64.saturating_mul(2u64.saturating_pow(consecutive_failures.saturating_sub(1).min(6))), 300);
+                warn!("Reconnecting in {}s (penalized {})...", backoff_secs, server_ref.name);
+                interruptible_sleep(&shutdown, backoff_secs);
                 continue;
             }
         };
@@ -697,6 +780,7 @@ fn cmd_connect(
             blocked_ipv6_ifaces: blocked_ipv6_ifaces.clone(),
             endpoint_ip: endpoint_ip.clone(),
             nonce,
+            resolv_was_immutable: dns::was_immutable(),
         })?;
         info!("WireGuard interface: {}", iface);
 
@@ -718,8 +802,10 @@ fn cmd_connect(
                 let _ = recovery::remove();
                 return Err(e);
             }
-            warn!("Reconnecting in 3s (penalized {})...", server_ref.name);
-            interruptible_sleep(&shutdown, 3);
+            consecutive_failures += 1;
+            let backoff_secs = std::cmp::min(3u64.saturating_mul(2u64.saturating_pow(consecutive_failures.saturating_sub(1).min(6))), 300);
+            warn!("Reconnecting in {}s (penalized {})...", backoff_secs, server_ref.name);
+            interruptible_sleep(&shutdown, backoff_secs);
             continue;
         }
         info!("Handshake established.");
@@ -758,6 +844,7 @@ fn cmd_connect(
                 blocked_ipv6_ifaces: blocked_ipv6_ifaces.clone(),
                 endpoint_ip: endpoint_ip.clone(),
                 nonce,
+                resolv_was_immutable: dns::was_immutable(),
             })?;
 
             Ok(())
@@ -826,7 +913,9 @@ fn cmd_connect(
                     let _ = recovery::remove();
                     anyhow::bail!("Verification failed (--no-reconnect)");
                 }
-                interruptible_sleep(&shutdown, 3);
+                consecutive_failures += 1;
+                let backoff_secs = std::cmp::min(3u64.saturating_mul(2u64.saturating_pow(consecutive_failures.saturating_sub(1).min(6))), 300);
+                interruptible_sleep(&shutdown, backoff_secs);
                 continue;
             }
         }
@@ -899,11 +988,13 @@ fn cmd_connect(
                 let _ = partial_disconnect(&config_path, &iface, !no_lock, &endpoint_ip);
                 penalties.penalize(&server_ref.name, 30);
                 forced_server = Option::None; // clear forced server for rotation
+                consecutive_failures += 1;
+                let backoff_secs = std::cmp::min(3u64.saturating_mul(2u64.saturating_pow(consecutive_failures.saturating_sub(1).min(6))), 300);
                 warn!(
-                    "Connection lost. Reconnecting in 3s (penalized {})...",
-                    server_ref.name
+                    "Connection lost. Reconnecting in {}s (penalized {})...",
+                    backoff_secs, server_ref.name
                 );
-                interruptible_sleep(&shutdown, 3);
+                interruptible_sleep(&shutdown, backoff_secs);
             }
             ResetLevel::Retry => {
                 if no_reconnect {

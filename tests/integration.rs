@@ -668,6 +668,7 @@ fn test_recovery_save_load_remove() {
         blocked_ipv6_ifaces: vec!["eth0".to_string()],
         endpoint_ip: String::new(),
         nonce: 12345,
+        resolv_was_immutable: false,
     };
 
     // Save
@@ -712,6 +713,7 @@ fn test_recovery_atomic_write() {
         blocked_ipv6_ifaces: vec![],
         endpoint_ip: String::new(),
         nonce: 67890,
+        resolv_was_immutable: false,
     };
 
     recovery::save(&state).expect("save state");
