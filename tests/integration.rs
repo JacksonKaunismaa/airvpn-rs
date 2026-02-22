@@ -275,10 +275,10 @@ fn test_netlock_ruleset_loaded_correctly() {
     assert!(stdout.contains("chain forward"), "should have forward chain");
     assert!(stdout.contains("chain output"), "should have output chain");
 
-    // Verify priority
+    // Verify priority (nft displays -300 as "raw" in listing)
     assert!(
-        stdout.contains("priority -300"),
-        "chains should have priority -300"
+        stdout.contains("priority raw") || stdout.contains("priority -300"),
+        "chains should have priority -300 (displayed as 'raw')"
     );
 
     // Verify policy
