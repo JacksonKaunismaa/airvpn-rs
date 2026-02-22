@@ -89,8 +89,8 @@ fn load_perc(server: &Server) -> i64 {
     if server.bandwidth_max == 0 {
         return 100;
     }
-    let bw_cur = 2 * (server.bandwidth * 8) / (1_000 * 1_000);
-    (bw_cur * 100) / server.bandwidth_max
+    let bw_cur = 2_i64.saturating_mul(server.bandwidth.saturating_mul(8)) / (1_000 * 1_000);
+    bw_cur.saturating_mul(100) / server.bandwidth_max
 }
 
 /// Compute user load as a percentage, matching Eddie's `UsersPerc()`.

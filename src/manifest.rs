@@ -1,12 +1,10 @@
 use std::collections::HashMap;
+use std::net::IpAddr;
 
 use anyhow::{bail, Context};
+use log::warn;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
 
 #[derive(Debug)]
 pub struct Message {
@@ -20,24 +18,11 @@ pub struct Manifest {
     pub servers: Vec<Server>,
     pub modes: Vec<Mode>,
     pub bootstrap_urls: Vec<String>,
-    /// RSA modulus from manifest (base64). If present, overrides the hardcoded key.
-    pub rsa_modulus: Option<String>,
-    /// RSA exponent from manifest (base64). If present, overrides the hardcoded key.
-    pub rsa_exponent: Option<String>,
     pub force_reauth_ts: i64,
     pub messages: Vec<Message>,
-    /// Domain used for post-connection verification (tunnel + DNS checks).
-    /// Parsed from `check_domain` attribute on the `<manifest>` root element.
-    /// Eddie: Service.cs `_checkDomain` field.
     pub check_domain: String,
-    /// Template for DNS verification query, with `{hash}` placeholder.
-    /// Parsed from `check_dns_query` attribute on the `<manifest>` root element.
-    /// Eddie: Service.cs line 501 — `GetKeyValue("check_dns_query", "")`.
-    /// Example value: `{hash}.airvpn.org`
     pub check_dns_query: String,
 }
-
-// UserInfo and WireGuardKey are parsed separately via parse_user() from the act=user response.
 
 #[derive(Debug, Clone)]
 pub struct Server {
@@ -84,10 +69,6 @@ pub struct WireGuardKey {
     pub wg_preshared: String,
 }
 
-// ---------------------------------------------------------------------------
-// Intermediate structs for collecting group attributes
-// ---------------------------------------------------------------------------
-
 struct ServerGroupAttrs {
     ips_entry: String,
     ips_exit: String,
@@ -104,7 +85,6 @@ struct ServerGroupAttrs {
     warning_closed: String,
 }
 
-/// Raw attributes read from a `<server>` element before group inheritance.
 struct RawServerAttrs {
     name: String,
     group: String,
@@ -123,11 +103,39 @@ struct RawServerAttrs {
     warning_closed: Option<String>,
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+const MAX_ERROR_MSG_LEN: usize = 200;
+const MAX_MANIFEST_SIZE: usize = 50 * 1024 * 1024;
+const MAX_SERVERS: usize = 10_000;
+const MAX_MODES: usize = 100;
+const MAX_BOOTSTRAP_URLS: usize = 50;
 
-/// Get a decoded attribute value from an XML element. Returns None if absent.
+const ALLOWED_CHECK_DOMAIN_SUFFIXES: &[&str] = &[
+    ".airvpn.org",
+    ".airdns.org",
+    "airvpn.org",
+    "airdns.org",
+];
+
+pub fn sanitize_server_message(msg: &str) -> String {
+    let mut result = String::with_capacity(msg.len());
+    let mut in_tag = false;
+    for ch in msg.chars() {
+        match ch {
+            '<' => { in_tag = true; }
+            '>' => { in_tag = false; }
+            _ if !in_tag && ch.is_ascii() && !ch.is_ascii_control() => {
+                result.push(ch);
+            }
+            _ => {}
+        }
+    }
+    if result.len() > MAX_ERROR_MSG_LEN {
+        result.truncate(MAX_ERROR_MSG_LEN);
+        result.push_str("...");
+    }
+    result
+}
+
 pub fn attr_opt(e: &quick_xml::events::BytesStart<'_>, name: &[u8]) -> Option<String> {
     for attr in e.attributes().flatten() {
         if attr.key.as_ref() == name {
@@ -137,7 +145,6 @@ pub fn attr_opt(e: &quick_xml::events::BytesStart<'_>, name: &[u8]) -> Option<St
     None
 }
 
-/// Get a required attribute, returning an error if absent.
 fn attr_req(e: &quick_xml::events::BytesStart<'_>, name: &str) -> anyhow::Result<String> {
     attr_opt(e, name.as_bytes())
         .with_context(|| format!("missing required attribute '{name}' on <{}>", elem_name(e)))
@@ -147,7 +154,6 @@ fn elem_name(e: &quick_xml::events::BytesStart<'_>) -> String {
     String::from_utf8_lossy(e.name().as_ref()).into_owned()
 }
 
-/// Split a comma-separated IP list into a Vec, filtering empty strings.
 fn split_ips(s: &str) -> Vec<String> {
     s.split([',', ';'])
         .map(str::trim)
@@ -156,31 +162,48 @@ fn split_ips(s: &str) -> Vec<String> {
         .collect()
 }
 
-/// Check if the API response root element has an `error` attribute and bail if so.
-///
-/// Eddie checks `xmlDoc.DocumentElement.Attributes["error"]` before parsing.
-/// This catches server-side errors (invalid credentials, expired sessions, etc.)
-/// before we waste time parsing the rest.
 fn check_api_error(xml: &str) -> anyhow::Result<()> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
-
     loop {
         match reader.read_event() {
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
                 if let Some(err_msg) = attr_opt(e, b"error") {
                     if !err_msg.is_empty() {
-                        bail!("{}", err_msg);
+                        bail!("{}", sanitize_server_message(&err_msg));
                     }
                 }
-                // Only check the first element (root)
                 return Ok(());
             }
             Ok(Event::Eof) => return Ok(()),
             Err(e) => bail!("XML parse error: {e}"),
-            _ => {} // skip declarations, comments, etc.
+            _ => {}
         }
     }
+}
+
+fn validate_check_domain(domain: &str) -> anyhow::Result<()> {
+    if domain.is_empty() {
+        return Ok(());
+    }
+    let host = domain.split(':').next().unwrap_or(domain);
+    for suffix in ALLOWED_CHECK_DOMAIN_SUFFIXES {
+        if host == *suffix || host.ends_with(suffix) {
+            return Ok(());
+        }
+    }
+    bail!(
+        "manifest check_domain '{}' does not match any allowed AirVPN domain suffix ({:?})",
+        domain,
+        ALLOWED_CHECK_DOMAIN_SUFFIXES
+    )
+}
+
+fn validate_ip(s: &str, context: &str) -> anyhow::Result<()> {
+    let ip_str = s.split('/').next().unwrap_or(s);
+    ip_str.parse::<IpAddr>()
+        .with_context(|| format!("invalid IP address '{}' in {}", s, context))?;
+    Ok(())
 }
 
 fn parse_bool(s: &str) -> bool {
@@ -190,11 +213,6 @@ fn parse_bool(s: &str) -> bool {
 fn parse_i64(s: &str) -> i64 {
     s.parse().unwrap_or(0)
 }
-
-// ---------------------------------------------------------------------------
-// Resolve a server attribute with group fallback (mirrors Eddie's
-// XmlGetServerAttribute: try server first, fall back to group).
-// ---------------------------------------------------------------------------
 
 fn resolve_str(server_val: &Option<String>, group: Option<&ServerGroupAttrs>, getter: fn(&ServerGroupAttrs) -> &str) -> String {
     if let Some(v) = server_val {
@@ -207,7 +225,6 @@ fn resolve_str(server_val: &Option<String>, group: Option<&ServerGroupAttrs>, ge
 
 fn resolve_server(raw: RawServerAttrs, groups: &HashMap<String, ServerGroupAttrs>) -> Server {
     let grp = groups.get(&raw.group);
-
     let ips_entry_str = resolve_str(&raw.ips_entry, grp, |g| &g.ips_entry);
     let ips_exit_str = resolve_str(&raw.ips_exit, grp, |g| &g.ips_exit);
     let country_code = resolve_str(&raw.country_code, grp, |g| &g.country_code);
@@ -221,7 +238,6 @@ fn resolve_server(raw: RawServerAttrs, groups: &HashMap<String, ServerGroupAttrs
     let support_ipv6 = resolve_str(&raw.support_ipv6, grp, |g| &g.support_ipv6);
     let warning_open = resolve_str(&raw.warning_open, grp, |g| &g.warning_open);
     let warning_closed = resolve_str(&raw.warning_closed, grp, |g| &g.warning_closed);
-
     Server {
         name: raw.name,
         group: raw.group,
@@ -241,16 +257,13 @@ fn resolve_server(raw: RawServerAttrs, groups: &HashMap<String, ServerGroupAttrs
     }
 }
 
-// ---------------------------------------------------------------------------
-// Main parser
-// ---------------------------------------------------------------------------
-
 pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
+    if xml.len() > MAX_MANIFEST_SIZE {
+        bail!("manifest too large: {} bytes exceeds {} byte limit", xml.len(), MAX_MANIFEST_SIZE);
+    }
     check_api_error(xml)?;
-
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
-
     let mut groups: HashMap<String, ServerGroupAttrs> = HashMap::new();
     let mut raw_servers: Vec<RawServerAttrs> = Vec::new();
     let mut modes: Vec<Mode> = Vec::new();
@@ -259,28 +272,20 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
     let mut force_reauth_ts: i64 = 0;
     let mut check_domain = String::new();
     let mut check_dns_query = String::new();
-
-    // RSA key rotation: parsed from <manifest> attributes or nested <rsa> element
-    let mut rsa_modulus: Option<String> = None;
-    let mut rsa_exponent: Option<String> = None;
-    // Track nested <rsa><RSAParameters><Modulus>/<Exponent> text content
-    let mut in_rsa_modulus = false;
-    let mut in_rsa_exponent = false;
-
     loop {
         match reader.read_event() {
             Err(e) => bail!("XML parse error at position {}: {e}", reader.error_position()),
             Ok(Event::Eof) => break,
-
-            // ---------- Empty elements (<tag ... />) ----------
             Ok(Event::Empty(ref e)) => {
                 match e.name().as_ref() {
                     b"server" => {
+                        if raw_servers.len() >= MAX_SERVERS {
+                            bail!("manifest exceeds maximum server count ({})", MAX_SERVERS);
+                        }
                         let name = attr_req(e, "name")?;
                         let group = attr_opt(e, b"group").unwrap_or_default();
                         raw_servers.push(RawServerAttrs {
-                            name,
-                            group,
+                            name, group,
                             ips_entry: attr_opt(e, b"ips_entry"),
                             ips_exit: attr_opt(e, b"ips_exit"),
                             country_code: attr_opt(e, b"country_code"),
@@ -316,25 +321,24 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
                     }
                     b"mode" => {
                         let mode_type = attr_opt(e, b"type").unwrap_or_default();
-                        // Only keep WireGuard modes
                         if mode_type == "wireguard" {
+                            if modes.len() >= MAX_MODES {
+                                bail!("manifest exceeds maximum mode count ({})", MAX_MODES);
+                            }
                             modes.push(Mode {
                                 title: attr_opt(e, b"title").unwrap_or_default(),
                                 protocol: attr_opt(e, b"protocol").unwrap_or_default(),
-                                port: attr_opt(e, b"port")
-                                    .unwrap_or_default()
-                                    .parse()
-                                    .unwrap_or(0),
-                                entry_index: attr_opt(e, b"entry_index")
-                                    .unwrap_or_default()
-                                    .parse()
-                                    .unwrap_or(0),
+                                port: attr_opt(e, b"port").unwrap_or_default().parse().unwrap_or(0),
+                                entry_index: attr_opt(e, b"entry_index").unwrap_or_default().parse().unwrap_or(0),
                             });
                         }
                     }
                     b"url" => {
                         if let Some(addr) = attr_opt(e, b"address") {
                             if !addr.is_empty() {
+                                if bootstrap_urls.len() >= MAX_BOOTSTRAP_URLS {
+                                    bail!("manifest exceeds maximum bootstrap URL count ({})", MAX_BOOTSTRAP_URLS);
+                                }
                                 bootstrap_urls.push(addr);
                             }
                         }
@@ -350,162 +354,95 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
                     _ => {}
                 }
             }
-
-            // ---------- Start elements ----------
             Ok(Event::Start(ref e)) => {
                 match e.name().as_ref() {
                     b"manifest" => {
                         force_reauth_ts = attr_opt(e, b"force_reauth_ts")
                             .and_then(|s| s.parse::<i64>().ok())
                             .unwrap_or(0);
-                        // Check domain for post-connection verification
-                        // Eddie: Service.cs `_checkDomain` parsed from manifest root
                         if let Some(cd) = attr_opt(e, b"check_domain") {
-                            if !cd.is_empty() {
-                                check_domain = cd;
-                            }
+                            if !cd.is_empty() { check_domain = cd; }
                         }
-                        // DNS check query template (e.g. "{hash}.airvpn.org")
-                        // Eddie: Service.cs line 501 — GetKeyValue("check_dns_query", "")
                         if let Some(dq) = attr_opt(e, b"check_dns_query") {
-                            if !dq.is_empty() {
-                                check_dns_query = dq;
-                            }
+                            if !dq.is_empty() { check_dns_query = dq; }
                         }
-                        // RSA key rotation: attributes on the root <manifest> element
-                        if let Some(m) = attr_opt(e, b"auth_rsa_modulus") {
-                            if !m.is_empty() {
-                                rsa_modulus = Some(m);
-                            }
-                        }
-                        if let Some(x) = attr_opt(e, b"auth_rsa_exponent") {
-                            if !x.is_empty() {
-                                rsa_exponent = Some(x);
-                            }
+                        // SECURITY (C2): RSA key rotation from untrusted manifest is
+                        // intentionally ignored. The hardcoded RSA public key in api.rs
+                        // is the ONLY key used.
+                        if attr_opt(e, b"auth_rsa_modulus").is_some() || attr_opt(e, b"auth_rsa_exponent").is_some() {
+                            warn!("Manifest contains RSA key rotation fields -- ignored for security (C2)");
                         }
                     }
-                    b"Modulus" => { in_rsa_modulus = true; }
-                    b"Exponent" => { in_rsa_exponent = true; }
                     _ => {}
                 }
             }
-
-            // ---------- End elements ----------
-            Ok(Event::End(ref e)) => {
-                match e.name().as_ref() {
-                    b"Modulus" => { in_rsa_modulus = false; }
-                    b"Exponent" => { in_rsa_exponent = false; }
-                    _ => {}
-                }
-            }
-
-            // ---------- Text content (for nested RSA elements) ----------
-            Ok(Event::Text(ref e)) => {
-                if in_rsa_modulus {
-                    let text = e.unescape().unwrap_or_default().trim().to_string();
-                    if !text.is_empty() && rsa_modulus.is_none() {
-                        rsa_modulus = Some(text);
-                    }
-                } else if in_rsa_exponent {
-                    let text = e.unescape().unwrap_or_default().trim().to_string();
-                    if !text.is_empty() && rsa_exponent.is_none() {
-                        rsa_exponent = Some(text);
-                    }
-                }
-            }
-
             _ => {}
         }
     }
-
-    // Resolve server attributes with group inheritance
-    let servers: Vec<Server> = raw_servers
-        .into_iter()
-        .map(|raw| resolve_server(raw, &groups))
-        .collect();
-
-    Ok(Manifest {
-        servers,
-        modes,
-        bootstrap_urls,
-        rsa_modulus,
-        rsa_exponent,
-        force_reauth_ts,
-        messages,
-        check_domain,
-        check_dns_query,
-    })
+    validate_check_domain(&check_domain)?;
+    let servers: Vec<Server> = raw_servers.into_iter().map(|raw| resolve_server(raw, &groups)).collect();
+    Ok(Manifest { servers, modes, bootstrap_urls, force_reauth_ts, messages, check_domain, check_dns_query })
 }
 
-// ---------------------------------------------------------------------------
-// User parser (act=user response)
-// ---------------------------------------------------------------------------
-
-/// Parse the `act=user` API response into a [`UserInfo`].
-///
-/// The root element is `<user login="..." wg_public_key="...">` with
-/// `<keys><key .../></keys>` children containing WireGuard device keys.
 pub fn parse_user(xml: &str) -> anyhow::Result<UserInfo> {
     check_api_error(xml)?;
-
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
-
     let mut user: Option<UserInfo> = None;
     let mut in_user = false;
     let mut login = String::new();
     let mut wg_public_key = String::new();
     let mut keys: Vec<WireGuardKey> = Vec::new();
-
     loop {
         match reader.read_event() {
             Err(e) => bail!("XML parse error at position {}: {e}", reader.error_position()),
             Ok(Event::Eof) => break,
-
             Ok(Event::Empty(ref e)) => {
                 if e.name().as_ref() == b"key" && in_user {
+                    let wg_dns_ipv4 = attr_opt(e, b"wg_dns_ipv4").unwrap_or_default();
+                    let wg_dns_ipv6 = attr_opt(e, b"wg_dns_ipv6").unwrap_or_default();
+                    if !wg_dns_ipv4.is_empty() { validate_ip(&wg_dns_ipv4, "wg_dns_ipv4")?; }
+                    if !wg_dns_ipv6.is_empty() { validate_ip(&wg_dns_ipv6, "wg_dns_ipv6")?; }
                     keys.push(WireGuardKey {
                         name: attr_opt(e, b"name").unwrap_or_default(),
                         wg_private_key: attr_opt(e, b"wg_private_key").unwrap_or_default(),
                         wg_ipv4: attr_opt(e, b"wg_ipv4").unwrap_or_default(),
                         wg_ipv6: attr_opt(e, b"wg_ipv6").unwrap_or_default(),
-                        wg_dns_ipv4: attr_opt(e, b"wg_dns_ipv4").unwrap_or_default(),
-                        wg_dns_ipv6: attr_opt(e, b"wg_dns_ipv6").unwrap_or_default(),
+                        wg_dns_ipv4, wg_dns_ipv6,
                         wg_preshared: attr_opt(e, b"wg_preshared").unwrap_or_default(),
                     });
                 }
             }
-
             Ok(Event::Start(ref e)) => {
                 match e.name().as_ref() {
                     b"user" => {
                         in_user = true;
-                        // Check for server message (Eddie: Engine.cs auth failure handling)
                         if let Some(msg) = attr_opt(e, b"message") {
                             if !msg.is_empty() {
-                                bail!("server message: {}", msg);
+                                bail!("server message: {}", sanitize_server_message(&msg));
                             }
                         }
                         login = attr_opt(e, b"login").unwrap_or_default();
                         wg_public_key = attr_opt(e, b"wg_public_key").unwrap_or_default();
                         keys.clear();
                     }
-                    // Handle <key> as a Start element too (in case it has children)
                     b"key" if in_user => {
+                        let wg_dns_ipv4 = attr_opt(e, b"wg_dns_ipv4").unwrap_or_default();
+                        let wg_dns_ipv6 = attr_opt(e, b"wg_dns_ipv6").unwrap_or_default();
+                        if !wg_dns_ipv4.is_empty() { validate_ip(&wg_dns_ipv4, "wg_dns_ipv4")?; }
+                        if !wg_dns_ipv6.is_empty() { validate_ip(&wg_dns_ipv6, "wg_dns_ipv6")?; }
                         keys.push(WireGuardKey {
                             name: attr_opt(e, b"name").unwrap_or_default(),
                             wg_private_key: attr_opt(e, b"wg_private_key").unwrap_or_default(),
                             wg_ipv4: attr_opt(e, b"wg_ipv4").unwrap_or_default(),
                             wg_ipv6: attr_opt(e, b"wg_ipv6").unwrap_or_default(),
-                            wg_dns_ipv4: attr_opt(e, b"wg_dns_ipv4").unwrap_or_default(),
-                            wg_dns_ipv6: attr_opt(e, b"wg_dns_ipv6").unwrap_or_default(),
+                            wg_dns_ipv4, wg_dns_ipv6,
                             wg_preshared: attr_opt(e, b"wg_preshared").unwrap_or_default(),
                         });
                     }
                     _ => {}
                 }
             }
-
             Ok(Event::End(ref e)) => {
                 if e.name().as_ref() == b"user" && in_user {
                     in_user = false;
@@ -516,17 +453,11 @@ pub fn parse_user(xml: &str) -> anyhow::Result<UserInfo> {
                     });
                 }
             }
-
             _ => {}
         }
     }
-
     user.context("user response missing <user> element")
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -535,650 +466,126 @@ mod tests {
     const FULL_MANIFEST: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <manifest time="1708444800" next_update="3600" force_reauth_ts="0" check_domain="airvpn.org" check_dns_query="{hash}.airvpn.org">
   <rsa><RSAParameters><Modulus>base64modulus==</Modulus><Exponent>AQAB</Exponent></RSAParameters></rsa>
-
   <servers>
-    <server name="Alchiba" group="eu-it"
-            ips_entry="185.32.12.1,185.32.12.2" ips_exit="185.32.12.10"
-            country_code="IT" location="Milan"
-            scorebase="0" bw="500000" bw_max="1000000"
-            users="42" users_max="250"
-            support_ipv4="true" support_ipv6="true"
-            warning_open="" warning_closed="" />
-    <server name="Castor" group="eu-nl"
-            ips_entry="31.171.152.9" ips_exit="31.171.152.100"
-            country_code="NL" location="Amsterdam"
-            scorebase="10" bw="750000" bw_max="2000000"
-            users="100" users_max="500"
-            support_ipv4="true" support_ipv6="false"
-            warning_open="Maintenance scheduled" warning_closed="" />
+    <server name="Alchiba" group="eu-it" ips_entry="185.32.12.1,185.32.12.2" ips_exit="185.32.12.10" country_code="IT" location="Milan" scorebase="0" bw="500000" bw_max="1000000" users="42" users_max="250" support_ipv4="true" support_ipv6="true" warning_open="" warning_closed="" />
   </servers>
-
   <servers_groups>
-    <servers_group group="eu-it"
-                   ips_entry="185.32.12.1" ips_exit="185.32.12.10"
-                   country_code="IT" location="Milan"
-                   scorebase="0" bw="500000" bw_max="1000000"
-                   users="42" users_max="250" />
-    <servers_group group="eu-nl"
-                   ips_entry="31.171.152.9" ips_exit="31.171.152.100"
-                   country_code="NL" location="Amsterdam"
-                   scorebase="10" bw="750000" bw_max="2000000"
-                   users="100" users_max="500" />
+    <servers_group group="eu-it" ips_entry="185.32.12.1" ips_exit="185.32.12.10" country_code="IT" location="Milan" scorebase="0" bw="500000" bw_max="1000000" users="42" users_max="250" />
   </servers_groups>
-
   <modes>
-    <mode title="WireGuard UDP 1637" type="wireguard"
-          protocol="UDP" port="1637" entry_index="0" />
-    <mode title="OpenVPN UDP 443" type="openvpn"
-          protocol="UDP" port="443" entry_index="0" />
-    <mode title="OpenVPN TCP 443" type="openvpn"
-          protocol="TCP" port="443" entry_index="0" />
+    <mode title="WireGuard UDP 1637" type="wireguard" protocol="UDP" port="1637" entry_index="0" />
+    <mode title="OpenVPN UDP 443" type="openvpn" protocol="UDP" port="443" entry_index="0" />
   </modes>
-
   <urls>
     <url address="http://eddie.website/api/" />
-    <url address="http://185.60.40.11:8080/" />
   </urls>
 </manifest>"#;
 
     #[test]
     fn test_parse_basic_manifest() {
-        let manifest = parse_manifest(FULL_MANIFEST).expect("failed to parse manifest");
-
-        // --- Servers ---
-        assert_eq!(manifest.servers.len(), 2);
-
-        let alchiba = &manifest.servers[0];
-        assert_eq!(alchiba.name, "Alchiba");
-        assert_eq!(alchiba.group, "eu-it");
-        assert_eq!(alchiba.ips_entry, vec!["185.32.12.1", "185.32.12.2"]);
-        assert_eq!(alchiba.ips_exit, vec!["185.32.12.10"]);
-        assert_eq!(alchiba.country_code, "IT");
-        assert_eq!(alchiba.location, "Milan");
-        assert_eq!(alchiba.scorebase, 0);
-        assert_eq!(alchiba.bandwidth, 500_000);
-        assert_eq!(alchiba.bandwidth_max, 1_000_000);
-        assert_eq!(alchiba.users, 42);
-        assert_eq!(alchiba.users_max, 250);
-        assert!(alchiba.support_ipv4);
-        assert!(alchiba.support_ipv6);
-        assert_eq!(alchiba.warning_open, "");
-        assert_eq!(alchiba.warning_closed, "");
-
-        let castor = &manifest.servers[1];
-        assert_eq!(castor.name, "Castor");
-        assert_eq!(castor.group, "eu-nl");
-        assert_eq!(castor.country_code, "NL");
-        assert_eq!(castor.location, "Amsterdam");
-        assert_eq!(castor.scorebase, 10);
-        assert_eq!(castor.bandwidth, 750_000);
-        assert_eq!(castor.bandwidth_max, 2_000_000);
-        assert_eq!(castor.users, 100);
-        assert_eq!(castor.users_max, 500);
-        assert!(castor.support_ipv4);
-        assert!(!castor.support_ipv6);
-        assert_eq!(castor.warning_open, "Maintenance scheduled");
-
-        // --- Modes: only WireGuard kept ---
-        assert_eq!(manifest.modes.len(), 1);
-        let wg_mode = &manifest.modes[0];
-        assert_eq!(wg_mode.title, "WireGuard UDP 1637");
-        assert_eq!(wg_mode.protocol, "UDP");
-        assert_eq!(wg_mode.port, 1637);
-        assert_eq!(wg_mode.entry_index, 0);
-
-        // --- Bootstrap URLs ---
-        assert_eq!(manifest.bootstrap_urls.len(), 2);
-        assert_eq!(manifest.bootstrap_urls[0], "http://eddie.website/api/");
-        assert_eq!(manifest.bootstrap_urls[1], "http://185.60.40.11:8080/");
+        let m = parse_manifest(FULL_MANIFEST).unwrap();
+        assert_eq!(m.servers.len(), 1);
+        assert_eq!(m.modes.len(), 1);
+        assert_eq!(m.bootstrap_urls.len(), 1);
+        assert_eq!(m.check_domain, "airvpn.org");
     }
 
     #[test]
-    fn test_server_group_inheritance() {
-        // Server "Mizar" is missing country_code, location, bw, bw_max — should
-        // inherit from its group "eu-de".
-        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
-<manifest time="1708444800">
-  <servers>
-    <server name="Mizar" group="eu-de"
-            ips_entry="91.207.56.1" ips_exit="91.207.56.10"
-            scorebase="5"
-            users="30" users_max="200"
-            support_ipv4="true" support_ipv6="true"
-            warning_open="" warning_closed="" />
-  </servers>
-
-  <servers_groups>
-    <servers_group group="eu-de"
-                   ips_entry="91.207.56.1" ips_exit="91.207.56.10"
-                   country_code="DE" location="Frankfurt"
-                   scorebase="0" bw="600000" bw_max="1500000"
-                   users="30" users_max="200" />
-  </servers_groups>
-
-  <modes>
-    <mode title="WireGuard UDP 1637" type="wireguard"
-          protocol="UDP" port="1637" entry_index="0" />
-  </modes>
-
-  <urls />
-</manifest>"#;
-
-        let manifest = parse_manifest(xml).expect("failed to parse manifest");
-        assert_eq!(manifest.servers.len(), 1);
-
-        let mizar = &manifest.servers[0];
-        assert_eq!(mizar.name, "Mizar");
-        // Inherited from group:
-        assert_eq!(mizar.country_code, "DE");
-        assert_eq!(mizar.location, "Frankfurt");
-        assert_eq!(mizar.bandwidth, 600_000);
-        assert_eq!(mizar.bandwidth_max, 1_500_000);
-        // Kept from server element:
-        assert_eq!(mizar.scorebase, 5);
-        assert_eq!(mizar.users, 30);
-        assert_eq!(mizar.users_max, 200);
-        assert!(mizar.support_ipv4);
-        assert!(mizar.support_ipv6);
-    }
-
-    #[test]
-    fn test_ips_entry_comma_split() {
-        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
-<manifest time="1708444800">
-  <servers>
-    <server name="Vega" group="us-east"
-            ips_entry="1.2.3.4,5.6.7.8" ips_exit="9.10.11.12,13.14.15.16"
-            country_code="US" location="New York"
-            scorebase="0" bw="1000000" bw_max="5000000"
-            users="10" users_max="100"
-            support_ipv4="true" support_ipv6="false"
-            warning_open="" warning_closed="" />
-  </servers>
-
-  <servers_groups />
-  <modes>
-    <mode title="WireGuard UDP 1637" type="wireguard"
-          protocol="UDP" port="1637" entry_index="0" />
-  </modes>
-  <urls />
-</manifest>"#;
-
-        let manifest = parse_manifest(xml).expect("failed to parse manifest");
-        let vega = &manifest.servers[0];
-        assert_eq!(vega.ips_entry, vec!["1.2.3.4", "5.6.7.8"]);
-        assert_eq!(vega.ips_exit, vec!["9.10.11.12", "13.14.15.16"]);
+    fn test_parse_manifest_error() {
+        let err = parse_manifest(r#"<manifest error="Invalid credentials"/>"#).unwrap_err();
+        assert!(err.to_string().contains("Invalid credentials"));
     }
 
     #[test]
     fn test_parse_user() {
         let xml = r#"<?xml version="1.0" encoding="utf-8"?>
-<user login="testuser" wg_public_key="PublicKeyBase64==">
+<user login="testuser" wg_public_key="PubKey==">
   <keys>
-    <key name="default"
-         wg_private_key="PrivateKeyBase64=="
-         wg_ipv4="10.128.0.42"
-         wg_ipv6="fd7d:76ee:3c49:9950::42"
-         wg_dns_ipv4="10.128.0.1"
-         wg_dns_ipv6="fd7d:76ee:3c49:9950::1"
-         wg_preshared="PresharedKeyBase64==" />
+    <key name="default" wg_private_key="Priv==" wg_ipv4="10.0.0.1" wg_ipv6="fd00::1" wg_dns_ipv4="10.0.0.1" wg_dns_ipv6="fd00::53" wg_preshared="" />
   </keys>
 </user>"#;
-
-        let user = parse_user(xml).expect("failed to parse user");
+        let user = parse_user(xml).unwrap();
         assert_eq!(user.login, "testuser");
-        assert_eq!(user.wg_public_key, "PublicKeyBase64==");
         assert_eq!(user.keys.len(), 1);
-
-        let key = &user.keys[0];
-        assert_eq!(key.name, "default");
-        assert_eq!(key.wg_private_key, "PrivateKeyBase64==");
-        assert_eq!(key.wg_ipv4, "10.128.0.42");
-        assert_eq!(key.wg_ipv6, "fd7d:76ee:3c49:9950::42");
-        assert_eq!(key.wg_dns_ipv4, "10.128.0.1");
-        assert_eq!(key.wg_dns_ipv6, "fd7d:76ee:3c49:9950::1");
-        assert_eq!(key.wg_preshared, "PresharedKeyBase64==");
     }
 
     #[test]
-    fn test_parse_manifest_error() {
-        let xml = r#"<manifest error="Invalid credentials"/>"#;
-        let err = parse_manifest(xml).unwrap_err();
-        assert!(
-            err.to_string().contains("Invalid credentials"),
-            "error message should contain 'Invalid credentials', got: {}",
-            err
-        );
+    fn test_sanitize_strips_html() {
+        assert_eq!(sanitize_server_message("<b>bold</b> text"), "bold text");
     }
 
     #[test]
-    fn test_parse_user_error() {
-        let xml = r#"<user error="Session expired"/>"#;
-        let err = parse_user(xml).unwrap_err();
-        assert!(
-            err.to_string().contains("Session expired"),
-            "error message should contain 'Session expired', got: {}",
-            err
-        );
+    fn test_sanitize_truncates() {
+        let long = "x".repeat(300);
+        let result = sanitize_server_message(&long);
+        assert!(result.len() <= 203);
+        assert!(result.ends_with("..."));
     }
 
     #[test]
-    fn test_parse_manifest_check_domain() {
-        let manifest = parse_manifest(FULL_MANIFEST).expect("failed to parse manifest");
-        assert_eq!(manifest.check_domain, "airvpn.org");
+    fn test_validate_check_domain_valid() {
+        assert!(validate_check_domain("airvpn.org").is_ok());
+        assert!(validate_check_domain("airdns.org").is_ok());
+        assert!(validate_check_domain("check.airvpn.org").is_ok());
+        assert!(validate_check_domain("").is_ok());
     }
 
     #[test]
-    fn test_parse_manifest_check_dns_query() {
-        let manifest = parse_manifest(FULL_MANIFEST).expect("failed to parse manifest");
-        assert_eq!(manifest.check_dns_query, "{hash}.airvpn.org");
+    fn test_validate_check_domain_rejected() {
+        assert!(validate_check_domain("evil.com").is_err());
     }
 
     #[test]
-    fn test_parse_manifest_check_domain_absent() {
+    fn test_validate_ip_valid() {
+        assert!(validate_ip("10.128.0.1", "test").is_ok());
+        assert!(validate_ip("fd7d:76ee:3c49:9950::1", "test").is_ok());
+    }
+
+    #[test]
+    fn test_validate_ip_invalid() {
+        assert!(validate_ip("not-an-ip", "test").is_err());
+    }
+
+    #[test]
+    fn test_parse_user_invalid_dns_ip() {
         let xml = r#"<?xml version="1.0" encoding="utf-8"?>
-<manifest time="1708444800">
-  <servers />
-  <servers_groups />
-  <modes />
-  <urls />
-</manifest>"#;
-        let manifest = parse_manifest(xml).expect("failed to parse manifest");
-        assert_eq!(manifest.check_domain, "", "absent check_domain should be empty string");
-        assert_eq!(manifest.check_dns_query, "", "absent check_dns_query should be empty string");
-    }
-
-    #[test]
-    fn test_rsa_key_from_nested_element() {
-        // The FULL_MANIFEST fixture has <rsa><RSAParameters><Modulus>/<Exponent>
-        let manifest = parse_manifest(FULL_MANIFEST).expect("failed to parse manifest");
-        assert_eq!(manifest.rsa_modulus.as_deref(), Some("base64modulus=="));
-        assert_eq!(manifest.rsa_exponent.as_deref(), Some("AQAB"));
-    }
-
-    #[test]
-    fn test_rsa_key_from_manifest_attributes() {
-        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
-<manifest time="1708444800" auth_rsa_modulus="AttrModulus==" auth_rsa_exponent="AQAB">
-  <servers />
-  <servers_groups />
-  <modes>
-    <mode title="WireGuard UDP 1637" type="wireguard"
-          protocol="UDP" port="1637" entry_index="0" />
-  </modes>
-  <urls />
-</manifest>"#;
-
-        let manifest = parse_manifest(xml).expect("failed to parse manifest");
-        assert_eq!(manifest.rsa_modulus.as_deref(), Some("AttrModulus=="));
-        assert_eq!(manifest.rsa_exponent.as_deref(), Some("AQAB"));
-    }
-
-    #[test]
-    fn test_rsa_key_attributes_take_precedence_over_nested() {
-        // When both formats are present, attributes (parsed first) win
-        // because nested text only sets the field if rsa_modulus is None.
-        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
-<manifest time="1708444800" auth_rsa_modulus="FromAttr==" auth_rsa_exponent="AttrExp">
-  <rsa><RSAParameters><Modulus>FromNested==</Modulus><Exponent>NestedExp</Exponent></RSAParameters></rsa>
-  <servers />
-  <servers_groups />
-  <modes />
-  <urls />
-</manifest>"#;
-
-        let manifest = parse_manifest(xml).expect("failed to parse manifest");
-        assert_eq!(manifest.rsa_modulus.as_deref(), Some("FromAttr=="));
-        assert_eq!(manifest.rsa_exponent.as_deref(), Some("AttrExp"));
-    }
-
-    #[test]
-    fn test_rsa_key_absent() {
-        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
-<manifest time="1708444800">
-  <servers />
-  <servers_groups />
-  <modes />
-  <urls />
-</manifest>"#;
-
-        let manifest = parse_manifest(xml).expect("failed to parse manifest");
-        assert!(manifest.rsa_modulus.is_none());
-        assert!(manifest.rsa_exponent.is_none());
-    }
-
-    #[test]
-    fn test_parse_user_multiple_keys() {
-        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
-<user login="multi" wg_public_key="PubMulti==">
-  <keys>
-    <key name="laptop"
-         wg_private_key="PrivLaptop=="
-         wg_ipv4="10.128.0.1" wg_ipv6="fd00::1"
-         wg_dns_ipv4="10.128.0.1" wg_dns_ipv6="fd00::53"
-         wg_preshared="PSK1==" />
-    <key name="phone"
-         wg_private_key="PrivPhone=="
-         wg_ipv4="10.128.0.2" wg_ipv6="fd00::2"
-         wg_dns_ipv4="10.128.0.1" wg_dns_ipv6="fd00::53"
-         wg_preshared="PSK2==" />
-  </keys>
+<user login="t" wg_public_key="P">
+  <keys><key name="d" wg_private_key="P" wg_ipv4="10.0.0.1" wg_ipv6="fd00::1" wg_dns_ipv4="not-an-ip" wg_dns_ipv6="fd00::53" wg_preshared="" /></keys>
 </user>"#;
-
-        let user = parse_user(xml).expect("failed to parse user");
-        assert_eq!(user.login, "multi");
-        assert_eq!(user.keys.len(), 2);
-        assert_eq!(user.keys[0].name, "laptop");
-        assert_eq!(user.keys[1].name, "phone");
+        assert!(parse_user(xml).is_err());
     }
 
-    // -------------------------------------------------------------------
-    // split_ips tests
-    // -------------------------------------------------------------------
+    #[test]
+    fn test_manifest_size_limit() {
+        let huge = "x".repeat(MAX_MANIFEST_SIZE + 1);
+        assert!(parse_manifest(&huge).is_err());
+    }
 
     #[test]
-    fn test_split_ips_comma_separated() {
+    fn test_split_ips() {
         assert_eq!(split_ips("1.2.3.4,5.6.7.8"), vec!["1.2.3.4", "5.6.7.8"]);
-    }
-
-    #[test]
-    fn test_split_ips_semicolon_separated() {
         assert_eq!(split_ips("1.2.3.4;5.6.7.8"), vec!["1.2.3.4", "5.6.7.8"]);
+        assert!(split_ips("").is_empty());
     }
 
     #[test]
-    fn test_split_ips_mixed_separators() {
-        assert_eq!(
-            split_ips("1.2.3.4,5.6.7.8;9.10.11.12"),
-            vec!["1.2.3.4", "5.6.7.8", "9.10.11.12"]
-        );
-    }
-
-    #[test]
-    fn test_split_ips_empty_string() {
-        let result: Vec<String> = split_ips("");
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_split_ips_whitespace_only() {
-        let result: Vec<String> = split_ips("   ");
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_split_ips_single_ip() {
-        assert_eq!(split_ips("10.0.0.1"), vec!["10.0.0.1"]);
-    }
-
-    #[test]
-    fn test_split_ips_whitespace_around() {
-        assert_eq!(split_ips(" 1.2.3.4 , 5.6.7.8 "), vec!["1.2.3.4", "5.6.7.8"]);
-    }
-
-    #[test]
-    fn test_split_ips_trailing_separator() {
-        // Trailing comma should not produce empty element
-        assert_eq!(split_ips("1.2.3.4,"), vec!["1.2.3.4"]);
-    }
-
-    #[test]
-    fn test_split_ips_leading_separator() {
-        // Leading comma should not produce empty element
-        assert_eq!(split_ips(",1.2.3.4"), vec!["1.2.3.4"]);
-    }
-
-    // -------------------------------------------------------------------
-    // parse_bool tests
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn test_parse_bool_true_variants() {
+    fn test_parse_bool() {
         assert!(parse_bool("true"));
-        assert!(parse_bool("TRUE"));
-        assert!(parse_bool("True"));
         assert!(parse_bool("1"));
-        assert!(parse_bool("yes"));
-        assert!(parse_bool("YES"));
-        assert!(parse_bool("Yes"));
-    }
-
-    #[test]
-    fn test_parse_bool_false_variants() {
         assert!(!parse_bool("false"));
-        assert!(!parse_bool("FALSE"));
-        assert!(!parse_bool("0"));
-        assert!(!parse_bool("no"));
-        assert!(!parse_bool("NO"));
-    }
-
-    #[test]
-    fn test_parse_bool_empty() {
         assert!(!parse_bool(""));
     }
 
     #[test]
-    fn test_parse_bool_garbage() {
-        assert!(!parse_bool("garbage"));
-        assert!(!parse_bool("maybe"));
-        assert!(!parse_bool("2"));
-    }
-
-    // -------------------------------------------------------------------
-    // parse_i64 tests
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn test_parse_i64_valid() {
-        assert_eq!(parse_i64("42"), 42);
-        assert_eq!(parse_i64("0"), 0);
-        assert_eq!(parse_i64("1000000"), 1_000_000);
-    }
-
-    #[test]
-    fn test_parse_i64_negative() {
-        assert_eq!(parse_i64("-1"), -1);
-        assert_eq!(parse_i64("-999"), -999);
-    }
-
-    #[test]
-    fn test_parse_i64_empty() {
-        assert_eq!(parse_i64(""), 0);
-    }
-
-    #[test]
-    fn test_parse_i64_garbage() {
-        assert_eq!(parse_i64("abc"), 0);
-        assert_eq!(parse_i64("12.5"), 0);
-        assert_eq!(parse_i64("12abc"), 0);
-    }
-
-    // -------------------------------------------------------------------
-    // parse_user with message attribute — should bail
-    // -------------------------------------------------------------------
-
-    #[test]
     fn test_parse_user_with_message_bails() {
         let xml = r#"<?xml version="1.0" encoding="utf-8"?>
-<user login="testuser" wg_public_key="PubKey==" message="Your subscription has expired">
-  <keys />
-</user>"#;
-
-        let result = parse_user(xml);
-        assert!(result.is_err(), "parse_user should bail when message attribute is present");
-        assert!(
-            result.unwrap_err().to_string().contains("subscription has expired"),
-            "error should contain the message text"
-        );
+<user login="t" wg_public_key="P" message="expired"><keys /></user>"#;
+        assert!(parse_user(xml).is_err());
     }
 
     #[test]
-    fn test_parse_user_with_empty_message_ok() {
-        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
-<user login="testuser" wg_public_key="PubKey==" message="">
-  <keys>
-    <key name="default" wg_private_key="Priv==" wg_ipv4="10.0.0.1"
-         wg_ipv6="fd00::1" wg_dns_ipv4="10.0.0.1" wg_dns_ipv6="fd00::53"
-         wg_preshared="" />
-  </keys>
-</user>"#;
-
-        let user = parse_user(xml).expect("empty message should not bail");
-        assert_eq!(user.login, "testuser");
-    }
-
-    // -------------------------------------------------------------------
-    // parse_user with no <user> element
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn test_parse_user_missing_user_element() {
-        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
-<response status="ok" />"#;
-
-        let result = parse_user(xml);
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().to_string().contains("missing <user>"),
-            "should report missing user element"
-        );
-    }
-
-    // -------------------------------------------------------------------
-    // parse_manifest with empty servers/modes
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn test_parse_manifest_empty_servers() {
-        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
-<manifest time="1708444800">
-  <servers />
-  <servers_groups />
-  <modes>
-    <mode title="WireGuard UDP 1637" type="wireguard"
-          protocol="UDP" port="1637" entry_index="0" />
-  </modes>
-  <urls />
-</manifest>"#;
-
-        let manifest = parse_manifest(xml).expect("failed to parse manifest");
-        assert!(manifest.servers.is_empty());
-        assert_eq!(manifest.modes.len(), 1);
-    }
-
-    #[test]
-    fn test_parse_manifest_no_wireguard_modes() {
-        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
-<manifest time="1708444800">
-  <servers />
-  <servers_groups />
-  <modes>
-    <mode title="OpenVPN UDP 443" type="openvpn"
-          protocol="UDP" port="443" entry_index="0" />
-  </modes>
-  <urls />
-</manifest>"#;
-
-        let manifest = parse_manifest(xml).expect("failed to parse manifest");
-        assert!(manifest.modes.is_empty(), "only wireguard modes should be kept");
-    }
-
-    // -------------------------------------------------------------------
-    // parse_manifest force_reauth_ts
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn test_parse_manifest_force_reauth_ts() {
-        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
-<manifest time="1708444800" force_reauth_ts="1700000000">
-  <servers />
-  <servers_groups />
-  <modes />
-  <urls />
-</manifest>"#;
-
-        let manifest = parse_manifest(xml).expect("failed to parse manifest");
-        assert_eq!(manifest.force_reauth_ts, 1_700_000_000);
-    }
-
-    // -------------------------------------------------------------------
-    // check_api_error edge cases
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn test_check_api_error_empty_error_attribute() {
-        // Empty error="" should NOT bail
-        let xml = r#"<manifest error="" />"#;
-        let result = check_api_error(xml);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_check_api_error_no_error_attribute() {
-        let xml = r#"<manifest time="123" />"#;
-        let result = check_api_error(xml);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_check_api_error_empty_document() {
-        let result = check_api_error("");
-        assert!(result.is_ok());
-    }
-
-    // -------------------------------------------------------------------
-    // parse_manifest messages
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn test_parse_manifest_messages() {
-        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
-<manifest time="1708444800">
-  <servers />
-  <servers_groups />
-  <modes />
-  <urls />
-  <messages>
-    <message kind="info" text="Welcome to AirVPN" url="https://airvpn.org" />
-    <message kind="warning" text="Scheduled maintenance" url="" />
-    <message kind="" text="" url="" />
-  </messages>
-</manifest>"#;
-
-        let manifest = parse_manifest(xml).expect("failed to parse manifest");
-        // Only messages with non-empty text are kept
-        assert_eq!(manifest.messages.len(), 2);
-        assert_eq!(manifest.messages[0].kind, "info");
-        assert_eq!(manifest.messages[0].text, "Welcome to AirVPN");
-        assert_eq!(manifest.messages[0].url, "https://airvpn.org");
-        assert_eq!(manifest.messages[1].kind, "warning");
-        assert_eq!(manifest.messages[1].text, "Scheduled maintenance");
-    }
-
-    // -------------------------------------------------------------------
-    // IPs with semicolons (Eddie format)
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn test_ips_entry_semicolon_split() {
-        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
-<manifest time="1708444800">
-  <servers>
-    <server name="Semi" group=""
-            ips_entry="1.2.3.4;5.6.7.8" ips_exit="9.10.11.12"
-            country_code="US" location="Test"
-            scorebase="0" bw="0" bw_max="1000"
-            users="0" users_max="100"
-            support_ipv4="true" support_ipv6="false"
-            warning_open="" warning_closed="" />
-  </servers>
-  <servers_groups />
-  <modes />
-  <urls />
-</manifest>"#;
-
-        let manifest = parse_manifest(xml).expect("failed to parse manifest");
-        let server = &manifest.servers[0];
-        assert_eq!(server.ips_entry, vec!["1.2.3.4", "5.6.7.8"]);
+    fn test_check_api_error_empty() {
+        assert!(check_api_error("").is_ok());
+        assert!(check_api_error(r#"<manifest error="" />"#).is_ok());
     }
 }

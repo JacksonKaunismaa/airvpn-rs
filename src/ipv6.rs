@@ -12,9 +12,20 @@ use std::path::Path;
 /// Disable IPv6 on all non-loopback interfaces.
 ///
 /// Returns the list of interfaces that were blocked (for restore on disconnect).
+///
+/// Also sets the "default" sysctl so that newly created interfaces (including
+/// the WireGuard interface) inherit `disable_ipv6=1`. This must happen BEFORE
+/// the WG interface is created. The caller is responsible for explicitly
+/// re-enabling IPv6 on the WG interface after creation if needed.
 pub fn block_all() -> Vec<String> {
     let mut blocked = Vec::new();
     let conf_dir = Path::new("/proc/sys/net/ipv6/conf");
+
+    // First, set "default" so any interface created after this point
+    // (including the WireGuard interface) inherits disable_ipv6=1.
+    // This closes the window where a new interface could leak IPv6 traffic.
+    let default_disable = conf_dir.join("default").join("disable_ipv6");
+    let _ = fs::write(&default_disable, "1");
 
     let entries = match fs::read_dir(conf_dir) {
         Ok(e) => e,
@@ -24,9 +35,7 @@ pub fn block_all() -> Vec<String> {
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
 
-        // Skip special interfaces (matching Eddie) + "default" which is a template
-        // for newly created interfaces. If we disable IPv6 on "default", our WireGuard
-        // interface inherits disable_ipv6=1 and wg-quick fails to add IPv6 addresses.
+        // Skip special interfaces (matching Eddie) and "default" (already handled above)
         if matches!(name.as_str(), "all" | "default" | "lo" | "lo0") {
             continue;
         }
@@ -51,11 +60,18 @@ pub fn block_all() -> Vec<String> {
 
 /// Restore IPv6 on previously blocked interfaces.
 ///
+/// Also restores the "default" sysctl template so newly created interfaces
+/// get IPv6 enabled again.
+///
 /// After restoring tracked interfaces, also scans for any transient interfaces
 /// (USB ethernet, WiFi reconnect, Docker, etc.) that were created during the
 /// VPN session and inherited `disable_ipv6=1` from the `default` sysctl template.
 pub fn restore(interfaces: &[String]) {
     let conf_dir = Path::new("/proc/sys/net/ipv6/conf");
+
+    // Restore the "default" template first so new interfaces get IPv6 enabled
+    let default_disable = conf_dir.join("default").join("disable_ipv6");
+    let _ = fs::write(&default_disable, "0");
 
     // Restore tracked interfaces
     for name in interfaces {

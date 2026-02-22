@@ -92,14 +92,13 @@ fn check_tunnel_inner(server_name: &str, expected_ipv4: &str, check_domain: &str
 
     // Eddie: ForceResolve = checkDomain + ":" + IpsExit.OnlyIPv4.First.Address
     // Bypass DNS for the check domain by resolving directly to the exit IP.
-    // Accept invalid certs: check servers may use self-signed or AirVPN-internal certs.
+    // SECURITY (H4): Use system CA bundle for TLS verification.
     let resolve_addr = format!("{}:{}", exit_ip, port)
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid exit IP '{}' or port {}: {}", exit_ip, port, e))?;
 
     let client = Client::builder()
         .timeout(HTTP_TIMEOUT)
-        .danger_accept_invalid_certs(true)
         .resolve(&check_hostname, resolve_addr)
         .build()
         .context("failed to build HTTP client for tunnel check")?;
@@ -219,14 +218,13 @@ fn check_dns_inner(server_name: &str, check_domain: &str, exit_ip: &str, check_d
 
     // Eddie: ForceResolve = checkDomain + ":" + IpsExit.OnlyIPv4.First
     // Bypass DNS for the check endpoint by resolving directly to the exit IP.
-    // Accept invalid certs: check servers may use self-signed or AirVPN-internal certs.
+    // SECURITY (H4): Use system CA bundle for TLS verification.
     let resolve_addr = format!("{}:{}", exit_ip, port)
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid exit IP '{}' or port {}: {}", exit_ip, port, e))?;
 
     let client = Client::builder()
         .timeout(HTTP_TIMEOUT)
-        .danger_accept_invalid_certs(true)
         .resolve(&check_hostname, resolve_addr)
         .build()
         .context("failed to build HTTP client for DNS check")?;

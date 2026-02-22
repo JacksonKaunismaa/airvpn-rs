@@ -14,11 +14,19 @@ use crate::profile::{default_format, generate_id, load_profile, save_profile, Pr
 const PROFILE_PATH: &str = "~/.config/airvpn-rs/default.profile";
 
 /// Expand `~` to the user's home directory.
+///
+/// When running as root (uid 0), uses /root instead of trusting `$HOME`,
+/// which can be spoofed by a non-root user via `sudo -E` or `env HOME=...`.
 fn expand_tilde(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
+        let home = if nix::unistd::getuid().is_root() {
+            PathBuf::from("/root")
+        } else if let Some(h) = std::env::var_os("HOME") {
+            PathBuf::from(h)
+        } else {
+            return PathBuf::from(path);
+        };
+        return home.join(rest);
     }
     PathBuf::from(path)
 }
@@ -35,9 +43,9 @@ pub fn resolve_credentials(
     cli_username: Option<&str>,
     cli_password: Option<&str>,
 ) -> Result<(String, String)> {
-    // Error if only one CLI flag provided
+    // Error if only one of username/password provided via CLI/stdin
     if cli_username.is_some() != cli_password.is_some() {
-        bail!("both --username and --password must be provided together");
+        bail!("--username and password (via --password-stdin or profile) must be provided together");
     }
 
     // 1. CLI flags take priority
@@ -222,7 +230,7 @@ mod tests {
         let result = resolve_credentials(Some("alice"), None);
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().to_string().contains("both --username and --password"),
+            result.unwrap_err().to_string().contains("--username and password"),
             "should mention both flags are required"
         );
     }
@@ -232,7 +240,7 @@ mod tests {
         let result = resolve_credentials(None, Some("s3cret"));
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().to_string().contains("both --username and --password"),
+            result.unwrap_err().to_string().contains("--username and password"),
             "should mention both flags are required"
         );
     }

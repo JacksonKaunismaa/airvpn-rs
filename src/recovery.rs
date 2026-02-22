@@ -25,9 +25,8 @@ use log::{debug, info, warn};
 
 use crate::{dns, ipv6, netlock, wireguard};
 
-const PRIMARY_STATE_DIR: &str = "/run/airvpn-rs";
-const PRIMARY_STATE_FILE: &str = "/run/airvpn-rs/state.json";
-const FALLBACK_STATE_FILE: &str = "/tmp/airvpn-rs-state.json";
+const STATE_DIR: &str = "/run/airvpn-rs";
+const STATE_FILE: &str = "/run/airvpn-rs/state.json";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct State {
@@ -42,28 +41,86 @@ pub struct State {
     /// VPN server endpoint IP — needed to clean up the host route on disconnect/recovery.
     #[serde(default)]
     pub endpoint_ip: String,
+    /// Random nonce to detect PID reuse (TOCTOU race). Written by the process that
+    /// created the state file; verified in `is_pid_alive` to ensure the PID still
+    /// belongs to the same process instance.
+    #[serde(default)]
+    pub nonce: u64,
 }
 
-/// Determine the state file path. Prefers /run/airvpn-rs/ but falls back
-/// to /tmp/ if /run is not writable.
+/// Validate a network interface name: alphanumeric + dash + underscore, max 15 chars.
+fn is_valid_interface_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 15
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Validate deserialized state content to reject tampered/corrupted state files.
+fn validate_state(state: &State) -> bool {
+    // Validate interface name if present
+    if !state.wg_interface.is_empty() && !is_valid_interface_name(&state.wg_interface) {
+        warn!("state validation failed: invalid wg_interface {:?}", state.wg_interface);
+        return false;
+    }
+
+    // Validate blocked IPv6 interface names
+    for iface in &state.blocked_ipv6_ifaces {
+        if !is_valid_interface_name(iface) {
+            warn!("state validation failed: invalid blocked_ipv6_iface {:?}", iface);
+            return false;
+        }
+    }
+
+    // Validate IPs if present
+    if !state.dns_ipv4.is_empty() && state.dns_ipv4.parse::<std::net::IpAddr>().is_err() {
+        warn!("state validation failed: invalid dns_ipv4 {:?}", state.dns_ipv4);
+        return false;
+    }
+    if !state.dns_ipv6.is_empty() && state.dns_ipv6.parse::<std::net::IpAddr>().is_err() {
+        warn!("state validation failed: invalid dns_ipv6 {:?}", state.dns_ipv6);
+        return false;
+    }
+    if !state.endpoint_ip.is_empty() && state.endpoint_ip.parse::<std::net::IpAddr>().is_err() {
+        warn!("state validation failed: invalid endpoint_ip {:?}", state.endpoint_ip);
+        return false;
+    }
+
+    true
+}
+
+/// Generate a random nonce for PID-reuse detection.
+pub fn generate_nonce() -> u64 {
+    rand::Rng::gen(&mut rand::thread_rng())
+}
+
+/// Ensure the state directory exists with mode 0o700.
+fn ensure_state_dir() -> Result<()> {
+    let dir = Path::new(STATE_DIR);
+    if !dir.exists() {
+        fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create state directory: {}", STATE_DIR))?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to set permissions on {}", STATE_DIR))?;
+    }
+    Ok(())
+}
+
+/// Get the state file path. Only uses /run/airvpn-rs/ (no /tmp fallback).
 fn state_path() -> PathBuf {
-    let dir = Path::new(PRIMARY_STATE_DIR);
-    if dir.exists() || fs::create_dir_all(dir).is_ok() {
-        PathBuf::from(PRIMARY_STATE_FILE)
-    } else {
-        PathBuf::from(FALLBACK_STATE_FILE)
-    }
+    PathBuf::from(STATE_FILE)
 }
 
-/// Find an existing state file (check both locations).
+/// Find the state file if it exists.
 fn find_state_file() -> Option<PathBuf> {
-    let primary = PathBuf::from(PRIMARY_STATE_FILE);
-    if primary.exists() {
-        return Some(primary);
-    }
-    let fallback = PathBuf::from(FALLBACK_STATE_FILE);
-    if fallback.exists() {
-        return Some(fallback);
+    let path = PathBuf::from(STATE_FILE);
+    if path.exists() {
+        return Some(path);
     }
     None
 }
@@ -71,7 +128,7 @@ fn find_state_file() -> Option<PathBuf> {
 /// Save current connection state.
 pub fn save(state: &State) -> Result<()> {
     debug!(
-        "Saving recovery state: lock={}, iface={}, dns={}/{}, pid={}, ipv6_blocked={}, endpoint={}",
+        "Saving recovery state: lock={}, iface={}, dns={}/{}, pid={}, ipv6_blocked={}, endpoint={}, nonce={}",
         state.lock_active,
         state.wg_interface,
         state.dns_ipv4,
@@ -79,12 +136,14 @@ pub fn save(state: &State) -> Result<()> {
         state.pid,
         state.blocked_ipv6_ifaces.len(),
         state.endpoint_ip,
+        state.nonce,
     );
+    ensure_state_dir()?;
     let path = state_path();
     let json = serde_json::to_string_pretty(state).context("failed to serialize state")?;
 
     // Write to temp file then atomic rename (crash-safe)
-    let dir = path.parent().unwrap_or(std::path::Path::new("/tmp"));
+    let dir = path.parent().unwrap_or(Path::new(STATE_DIR));
 
     #[cfg(unix)]
     {
@@ -132,7 +191,14 @@ pub fn load() -> Result<Option<State>> {
                 }
             };
             match serde_json::from_str::<State>(&json) {
-                Ok(state) => Ok(Some(state)),
+                Ok(state) => {
+                    if !validate_state(&state) {
+                        warn!("state file failed validation, removing it");
+                        let _ = fs::remove_file(&path);
+                        return Ok(None);
+                    }
+                    Ok(Some(state))
+                }
                 Err(e) => {
                     warn!("corrupt state file ({}), removing it", e);
                     let _ = fs::remove_file(&path);
@@ -153,7 +219,16 @@ pub fn remove() -> Result<()> {
     Ok(())
 }
 
-/// Check if a PID is still alive (using kill(pid, 0) signal probe).
+/// Check if a PID is still alive, with nonce verification to defeat PID reuse.
+///
+/// Three checks, in order:
+/// 1. kill(pid, 0) — is the process alive at all?
+/// 2. /proc/PID/comm == "airvpn" — is it our binary?
+/// 3. Nonce from state file matches — is it the same instance?
+///
+/// The nonce check defeats the TOCTOU race where a PID is recycled between
+/// checks: even if a new process happens to be named "airvpn" (unlikely but
+/// possible), it won't have the same nonce in its state file.
 pub fn is_pid_alive(pid: u32) -> bool {
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
@@ -167,6 +242,29 @@ pub fn is_pid_alive(pid: u32) -> bool {
     match std::fs::read_to_string(&comm_path) {
         Ok(name) => name.trim() == "airvpn",
         Err(_) => false, // Can't verify — assume dead
+    }
+}
+
+/// Check if a PID is alive AND owns the current state file (nonce-verified).
+///
+/// This is the preferred check that uses the nonce to defeat PID reuse.
+/// Falls back to basic `is_pid_alive()` if the state has no nonce (old format).
+pub fn is_pid_alive_with_nonce(pid: u32, expected_nonce: u64) -> bool {
+    if !is_pid_alive(pid) {
+        return false;
+    }
+
+    // If no nonce was set (old state file format), fall back to basic PID check
+    if expected_nonce == 0 {
+        return true;
+    }
+
+    // Verify the nonce in the current state file matches what we expect.
+    // If the PID was recycled and a new airvpn instance wrote a new state file,
+    // its nonce will differ.
+    match load() {
+        Ok(Some(current_state)) => current_state.nonce == expected_nonce && current_state.pid == pid,
+        _ => false, // Can't read state — assume dead
     }
 }
 
@@ -205,6 +303,15 @@ fn recover_from_state(state: &State) -> Result<()> {
     }
 
     // 1b. Clean up any orphaned WireGuard config files (contain private keys)
+    if let Ok(entries) = std::fs::read_dir(STATE_DIR) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("avpn-") && name.ends_with(".conf") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    // Also clean up legacy /tmp location from older versions
     if let Ok(entries) = std::fs::read_dir("/tmp") {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
@@ -229,7 +336,7 @@ fn recover_from_state(state: &State) -> Result<()> {
     // 3b. Clean up routing policy rules (table 51820) that setup_routing adds.
     // wireguard::disconnect calls teardown_routing, but if disconnect failed
     // (e.g., config_path was empty or interface already gone), rules may linger.
-    // These are idempotent deletes — they silently fail if rules don't exist.
+    // Loop each deletion until it fails, to clean up any duplicate rules.
     let routing_cleanups: &[&[&str]] = &[
         &["ip", "-4", "rule", "delete", "table", "main", "suppress_prefixlength", "0"],
         &["ip", "-6", "rule", "delete", "table", "main", "suppress_prefixlength", "0"],
@@ -237,14 +344,22 @@ fn recover_from_state(state: &State) -> Result<()> {
         &["ip", "-6", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
     ];
     for cmd in routing_cleanups {
-        let _ = std::process::Command::new(cmd[0]).args(&cmd[1..]).output();
+        loop {
+            match std::process::Command::new(cmd[0]).args(&cmd[1..]).output() {
+                Ok(output) if output.status.success() => continue,
+                _ => break,
+            }
+        }
     }
 
     // Also clean up endpoint host route if we know the endpoint IP
     if !state.endpoint_ip.is_empty() {
-        let endpoint_route = format!("{}/32", state.endpoint_ip);
+        let is_ipv6 = state.endpoint_ip.contains(':');
+        let cidr_suffix = if is_ipv6 { "/128" } else { "/32" };
+        let ip_version = if is_ipv6 { "-6" } else { "-4" };
+        let endpoint_route = format!("{}{}", state.endpoint_ip, cidr_suffix);
         let _ = std::process::Command::new("ip")
-            .args(["-4", "route", "delete", &endpoint_route])
+            .args([ip_version, "route", "delete", &endpoint_route])
             .output();
     }
 
@@ -381,13 +496,14 @@ mod tests {
     fn test_state_serialization_roundtrip() {
         let state = State {
             lock_active: true,
-            wg_interface: "airvpn-rs-abc123".to_string(),
-            wg_config_path: "/tmp/airvpn-rs-abc123.conf".to_string(),
+            wg_interface: "avpn-abc123".to_string(),
+            wg_config_path: "/run/airvpn-rs/avpn-abc123.conf".to_string(),
             dns_ipv4: "10.128.0.1".to_string(),
             dns_ipv6: "fd7d:76ee:3c49:9950::1".to_string(),
             pid: 12345,
             blocked_ipv6_ifaces: vec!["eth0".to_string(), "wlan0".to_string()],
             endpoint_ip: String::new(),
+            nonce: 42424242,
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -400,6 +516,7 @@ mod tests {
         assert_eq!(parsed.dns_ipv6, state.dns_ipv6);
         assert_eq!(parsed.pid, state.pid);
         assert_eq!(parsed.blocked_ipv6_ifaces, state.blocked_ipv6_ifaces);
+        assert_eq!(parsed.nonce, state.nonce);
     }
 
     #[test]
@@ -407,12 +524,13 @@ mod tests {
         let state = State {
             lock_active: false,
             wg_interface: "wg0".to_string(),
-            wg_config_path: "/tmp/wg0.conf".to_string(),
+            wg_config_path: "/run/airvpn-rs/wg0.conf".to_string(),
             dns_ipv4: "10.0.0.1".to_string(),
             dns_ipv6: "fd00::1".to_string(),
             pid: 99999,
             blocked_ipv6_ifaces: vec![],
             endpoint_ip: String::new(),
+            nonce: 123456789,
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -420,11 +538,12 @@ mod tests {
         // Verify JSON contains expected fields
         assert!(json.contains("\"lock_active\": false"));
         assert!(json.contains("\"wg_interface\": \"wg0\""));
-        assert!(json.contains("\"wg_config_path\": \"/tmp/wg0.conf\""));
+        assert!(json.contains("\"wg_config_path\": \"/run/airvpn-rs/wg0.conf\""));
         assert!(json.contains("\"dns_ipv4\": \"10.0.0.1\""));
         assert!(json.contains("\"dns_ipv6\": \"fd00::1\""));
         assert!(json.contains("\"pid\": 99999"));
         assert!(json.contains("\"blocked_ipv6_ifaces\""));
+        assert!(json.contains("\"nonce\": 123456789"));
     }
 
     #[test]
@@ -433,13 +552,14 @@ mod tests {
         let json = r#"{
             "lock_active": true,
             "wg_interface": "wg0",
-            "wg_config_path": "/tmp/wg0.conf",
+            "wg_config_path": "/run/airvpn-rs/wg0.conf",
             "dns_ipv4": "10.0.0.1",
             "dns_ipv6": "fd00::1",
             "pid": 12345
         }"#;
         let state: State = serde_json::from_str(json).unwrap();
         assert!(state.blocked_ipv6_ifaces.is_empty());
+        assert_eq!(state.nonce, 0, "old format without nonce should default to 0");
     }
 
     #[test]
@@ -464,12 +584,13 @@ mod tests {
         let state = State {
             lock_active: true,
             wg_interface: "wg0".to_string(),
-            wg_config_path: "/tmp/wg0.conf".to_string(),
+            wg_config_path: "/run/airvpn-rs/wg0.conf".to_string(),
             dns_ipv4: "10.0.0.1".to_string(),
             dns_ipv6: "fd00::1".to_string(),
             pid: 12345,
             blocked_ipv6_ifaces: vec!["eth0".to_string(), "wlan0".to_string()],
             endpoint_ip: String::new(),
+            nonce: 0,
         };
         let json = serde_json::to_string(&state).unwrap();
         let parsed: State = serde_json::from_str(&json).unwrap();
@@ -479,19 +600,107 @@ mod tests {
     #[test]
     fn test_state_empty_blocked_ipv6_default() {
         // Old state files without blocked_ipv6_ifaces should deserialize with empty vec
-        let json = r#"{"lock_active":true,"wg_interface":"wg0","wg_config_path":"/tmp/wg0.conf","dns_ipv4":"10.0.0.1","dns_ipv6":"fd00::1","pid":12345}"#;
+        let json = r#"{"lock_active":true,"wg_interface":"wg0","wg_config_path":"/run/airvpn-rs/wg0.conf","dns_ipv4":"10.0.0.1","dns_ipv6":"fd00::1","pid":12345}"#;
         let state: State = serde_json::from_str(json).unwrap();
         assert!(state.blocked_ipv6_ifaces.is_empty());
     }
 
     #[test]
     fn test_load_does_not_panic() {
-        // load() reads from hardcoded paths (/run/airvpn-rs/state.json,
-        // /tmp/airvpn-rs-state.json). We can't control whether these exist
-        // (a real test run as root may leave them), so we only verify:
+        // load() reads from /run/airvpn-rs/state.json.
+        // We can't control whether it exists (a real test run as root may
+        // leave it), so we only verify:
         // 1. load() doesn't panic
         // 2. It returns Ok (either Some or None depending on disk state)
         let result = load();
         assert!(result.is_ok(), "load() should not error: {:?}", result);
+    }
+
+    #[test]
+    fn test_validate_state_valid() {
+        let state = State {
+            lock_active: true,
+            wg_interface: "avpn-abc123".to_string(),
+            wg_config_path: "/run/airvpn-rs/avpn-abc123.conf".to_string(),
+            dns_ipv4: "10.0.0.1".to_string(),
+            dns_ipv6: "fd00::1".to_string(),
+            pid: 12345,
+            blocked_ipv6_ifaces: vec!["eth0".to_string()],
+            endpoint_ip: "1.2.3.4".to_string(),
+            nonce: 42,
+        };
+        assert!(validate_state(&state));
+    }
+
+    #[test]
+    fn test_validate_state_invalid_interface() {
+        let state = State {
+            lock_active: true,
+            wg_interface: "../../../etc/passwd".to_string(),
+            wg_config_path: String::new(),
+            dns_ipv4: String::new(),
+            dns_ipv6: String::new(),
+            pid: 12345,
+            blocked_ipv6_ifaces: vec![],
+            endpoint_ip: String::new(),
+            nonce: 0,
+        };
+        assert!(!validate_state(&state));
+    }
+
+    #[test]
+    fn test_validate_state_invalid_ip() {
+        let state = State {
+            lock_active: true,
+            wg_interface: "wg0".to_string(),
+            wg_config_path: String::new(),
+            dns_ipv4: "not-an-ip".to_string(),
+            dns_ipv6: String::new(),
+            pid: 12345,
+            blocked_ipv6_ifaces: vec![],
+            endpoint_ip: String::new(),
+            nonce: 0,
+        };
+        assert!(!validate_state(&state));
+    }
+
+    #[test]
+    fn test_validate_state_invalid_blocked_iface() {
+        let state = State {
+            lock_active: true,
+            wg_interface: String::new(),
+            wg_config_path: String::new(),
+            dns_ipv4: String::new(),
+            dns_ipv6: String::new(),
+            pid: 12345,
+            blocked_ipv6_ifaces: vec!["../../../etc".to_string()],
+            endpoint_ip: String::new(),
+            nonce: 0,
+        };
+        assert!(!validate_state(&state));
+    }
+
+    #[test]
+    fn test_validate_state_empty_fields_valid() {
+        // Empty optional fields should pass validation
+        let state = State {
+            lock_active: false,
+            wg_interface: String::new(),
+            wg_config_path: String::new(),
+            dns_ipv4: String::new(),
+            dns_ipv6: String::new(),
+            pid: 0,
+            blocked_ipv6_ifaces: vec![],
+            endpoint_ip: String::new(),
+            nonce: 0,
+        };
+        assert!(validate_state(&state));
+    }
+
+    #[test]
+    fn test_generate_nonce_nonzero() {
+        // Generate a few nonces and verify they're not all zero
+        let nonces: Vec<u64> = (0..10).map(|_| generate_nonce()).collect();
+        assert!(nonces.iter().any(|n| *n != 0), "nonces should not all be zero");
     }
 }

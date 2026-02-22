@@ -7,9 +7,25 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use log::{debug, warn};
+use log::{debug, error, warn};
 
 use crate::manifest::{Mode, Server, UserInfo, WireGuardKey};
+
+/// Secure directory for WireGuard config files (mode 0o700).
+/// Avoids /tmp which is world-readable and vulnerable to symlink attacks.
+const WG_CONFIG_DIR: &str = "/run/airvpn-rs";
+
+/// Validate an interface name: alphanumeric + dash + underscore, max 15 chars.
+/// Matches the validation in netlock.rs to prevent path traversal and command injection.
+fn validate_interface_name(iface: &str) -> Result<()> {
+    if iface.is_empty()
+        || iface.len() > 15
+        || !iface.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        anyhow::bail!("invalid interface name: {:?}", iface);
+    }
+    Ok(())
+}
 
 /// Ensure an IP address has a CIDR suffix. If it already has one, return as-is.
 /// If not, append the default suffix.
@@ -120,15 +136,29 @@ Table = off
 /// caught by our policy routing rules.
 pub fn connect(config: &str, endpoint_ip: &str) -> Result<(String, String)> {
     debug!("WireGuard connect: endpoint_ip={}, config_len={} bytes", endpoint_ip, config.len());
-    // Write config to a temporary file with a recognizable prefix
+
+    // Ensure secure config directory exists with mode 0o700
+    let config_dir = Path::new(WG_CONFIG_DIR);
+    if !config_dir.exists() {
+        std::fs::create_dir_all(config_dir)
+            .with_context(|| format!("failed to create config directory: {}", WG_CONFIG_DIR))?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(config_dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to set permissions on {}", WG_CONFIG_DIR))?;
+    }
+
+    // Write config to a temporary file in the secure directory with a recognizable prefix
     let tmpfile = tempfile::Builder::new()
         .prefix("avpn-")
         .suffix(".conf")
-        .tempfile()
-        .context("failed to create temporary WireGuard config file")?;
+        .tempfile_in(config_dir)
+        .context("failed to create WireGuard config file in /run/airvpn-rs/")?;
 
     // Persist the file so wg-quick can read it (NamedTempFile deletes on drop)
-    let (_, path) = tmpfile.keep().context("failed to persist temporary config file")?;
+    let (_, path) = tmpfile.keep().context("failed to persist config file")?;
     let config_path = path.to_string_lossy().to_string();
 
     #[cfg(unix)]
@@ -249,9 +279,12 @@ fn setup_routing(iface: &str, endpoint_ip: &str) -> Result<()> {
     // 3. Add host route for VPN endpoint through original gateway.
     //    This ensures encrypted WireGuard packets reach the server even after
     //    our policy routing redirects everything else through the tunnel.
-    let endpoint_route = format!("{}/32", endpoint_ip);
+    let is_ipv6_endpoint = endpoint_ip.contains(':');
+    let cidr_suffix = if is_ipv6_endpoint { "/128" } else { "/32" };
+    let ip_version = if is_ipv6_endpoint { "-6" } else { "-4" };
+    let endpoint_route = format!("{}{}", endpoint_ip, cidr_suffix);
     let output = Command::new("ip")
-        .args(["-4", "route", "add", &endpoint_route, "via", &original_gw])
+        .args([ip_version, "route", "add", &endpoint_route, "via", &original_gw])
         .output()
         .with_context(|| format!("failed to add host route for endpoint {}", endpoint_ip))?;
     if !output.status.success() {
@@ -259,29 +292,23 @@ fn setup_routing(iface: &str, endpoint_ip: &str) -> Result<()> {
         // Non-fatal if route already exists (e.g., reconnection to same server)
         if !stderr.contains("File exists") {
             anyhow::bail!(
-                "ip route add {}/32 via {} failed: {}",
-                endpoint_ip,
+                "ip route add {} via {} failed: {}",
+                endpoint_route,
                 original_gw,
                 stderr.trim()
             );
         }
     }
 
-    // 4-6. Add default routes and policy rules through the VPN interface
-    let commands = [
+    // 4-5. Add default routes through the VPN interface in table 51820
+    let route_commands = [
         // IPv4 default route through VPN
         vec!["ip", "-4", "route", "add", "0.0.0.0/0", "dev", iface, "table", "51820"],
         // IPv6 default route through VPN
         vec!["ip", "-6", "route", "add", "::/0", "dev", iface, "table", "51820"],
-        // Policy rules: use table 51820 for unmarked traffic
-        vec!["ip", "-4", "rule", "add", "not", "fwmark", "51820", "table", "51820"],
-        vec!["ip", "-6", "rule", "add", "not", "fwmark", "51820", "table", "51820"],
-        // Suppress default route from main table to prevent leaks
-        vec!["ip", "-4", "rule", "add", "table", "main", "suppress_prefixlength", "0"],
-        vec!["ip", "-6", "rule", "add", "table", "main", "suppress_prefixlength", "0"],
     ];
 
-    for cmd in &commands {
+    for cmd in &route_commands {
         debug!("Routing command: {}", cmd.join(" "));
         let output = Command::new(cmd[0])
             .args(&cmd[1..])
@@ -289,7 +316,59 @@ fn setup_routing(iface: &str, endpoint_ip: &str) -> Result<()> {
             .with_context(|| format!("failed to execute: {}", cmd.join(" ")))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // Non-fatal: some rules may already exist or IPv6 may be disabled
+            // Non-fatal: routes may already exist or IPv6 may be disabled
+            warn!("routing: {} -- {}", cmd.join(" "), stderr.trim());
+        }
+    }
+
+    // 6. IPv4 fwmark policy rule — CRITICAL for VPN security.
+    //    Without this rule, all non-VPN traffic bypasses the tunnel.
+    {
+        let cmd = vec!["ip", "-4", "rule", "add", "not", "fwmark", "51820", "table", "51820"];
+        debug!("Routing command (critical): {}", cmd.join(" "));
+        let output = Command::new(cmd[0])
+            .args(&cmd[1..])
+            .output()
+            .with_context(|| format!("failed to execute: {}", cmd.join(" ")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            error!("FATAL: IPv4 fwmark policy rule failed — all traffic would bypass VPN: {}", stderr.trim());
+            anyhow::bail!(
+                "IPv4 fwmark policy rule failed (traffic would leak): {}",
+                stderr.trim()
+            );
+        }
+    }
+
+    // IPv6 fwmark policy rule — non-fatal since IPv6 may not be available
+    {
+        let cmd = vec!["ip", "-6", "rule", "add", "not", "fwmark", "51820", "table", "51820"];
+        debug!("Routing command: {}", cmd.join(" "));
+        let output = Command::new(cmd[0])
+            .args(&cmd[1..])
+            .output()
+            .with_context(|| format!("failed to execute: {}", cmd.join(" ")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!("IPv6 fwmark policy rule failed (IPv6 may not be available): {}", stderr.trim());
+        }
+    }
+
+    // 7. Suppress default route from main table to prevent leaks
+    let suppress_commands = [
+        vec!["ip", "-4", "rule", "add", "table", "main", "suppress_prefixlength", "0"],
+        vec!["ip", "-6", "rule", "add", "table", "main", "suppress_prefixlength", "0"],
+    ];
+
+    for cmd in &suppress_commands {
+        debug!("Routing command: {}", cmd.join(" "));
+        let output = Command::new(cmd[0])
+            .args(&cmd[1..])
+            .output()
+            .with_context(|| format!("failed to execute: {}", cmd.join(" ")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Non-fatal: may already exist or IPv6 may be disabled
             warn!("routing: {} -- {}", cmd.join(" "), stderr.trim());
         }
     }
@@ -302,22 +381,33 @@ fn setup_routing(iface: &str, endpoint_ip: &str) -> Result<()> {
 /// `endpoint_ip` is used to remove the host route added during setup.
 /// If empty, the host route removal is skipped (best-effort cleanup).
 fn teardown_routing(_iface: &str, endpoint_ip: &str) {
-    // Remove policy rules first (reverse order of setup)
-    let commands = [
-        vec!["ip", "-4", "rule", "delete", "table", "main", "suppress_prefixlength", "0"],
-        vec!["ip", "-6", "rule", "delete", "table", "main", "suppress_prefixlength", "0"],
-        vec!["ip", "-4", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
-        vec!["ip", "-6", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
+    // Remove policy rules first (reverse order of setup).
+    // Run each deletion in a loop until it fails, to clean up any duplicate rules
+    // that may have been added from prior runs or crashes.
+    let commands: &[&[&str]] = &[
+        &["ip", "-4", "rule", "delete", "table", "main", "suppress_prefixlength", "0"],
+        &["ip", "-6", "rule", "delete", "table", "main", "suppress_prefixlength", "0"],
+        &["ip", "-4", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
+        &["ip", "-6", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
     ];
-    for cmd in &commands {
-        let _ = Command::new(cmd[0]).args(&cmd[1..]).output();
+    for cmd in commands {
+        // Loop until the rule no longer exists (command fails)
+        loop {
+            match Command::new(cmd[0]).args(&cmd[1..]).output() {
+                Ok(output) if output.status.success() => continue,
+                _ => break,
+            }
+        }
     }
 
     // Remove endpoint host route (best-effort — may already be gone if interface was deleted)
     if !endpoint_ip.is_empty() {
-        let endpoint_route = format!("{}/32", endpoint_ip);
+        let is_ipv6 = endpoint_ip.contains(':');
+        let cidr_suffix = if is_ipv6 { "/128" } else { "/32" };
+        let ip_version = if is_ipv6 { "-6" } else { "-4" };
+        let endpoint_route = format!("{}{}", endpoint_ip, cidr_suffix);
         let _ = Command::new("ip")
-            .args(["-4", "route", "delete", &endpoint_route])
+            .args([ip_version, "route", "delete", &endpoint_route])
             .output();
     }
 }
@@ -352,7 +442,13 @@ pub fn disconnect(config_path: &str, endpoint_ip: &str) -> Result<()> {
 }
 
 /// Check if a WireGuard interface exists by looking for it in /sys/class/net.
+///
+/// Validates the interface name first to prevent path traversal attacks
+/// (e.g., `../../etc/passwd` resolving to an existing file).
 pub fn is_connected(iface: &str) -> bool {
+    if validate_interface_name(iface).is_err() {
+        return false;
+    }
     Path::new(&format!("/sys/class/net/{}", iface)).exists()
 }
 
@@ -669,8 +765,8 @@ mod tests {
 
     #[test]
     fn test_is_connected_nonexistent_iface() {
-        // A random interface name should not exist
-        assert!(!is_connected("airvpn-rs-nonexistent-test-12345"));
+        // A random but valid interface name (max 15 chars) should not exist
+        assert!(!is_connected("avpn-noexist"));
     }
 
     // -------------------------------------------------------------------
@@ -870,17 +966,40 @@ mod tests {
 
     #[test]
     fn test_is_connected_empty_string() {
-        // Empty interface name — /sys/class/net/ is a directory, exists() returns true
-        // but that's the directory itself, not an interface. This is fine as a degenerate case.
-        // The important thing is it doesn't panic.
-        let _ = is_connected("");
+        // Empty interface name fails validation and returns false
+        assert!(!is_connected(""));
     }
 
     #[test]
     fn test_is_connected_special_chars() {
-        // Interface names with special chars should not panic
-        // Note: path traversal like "../../../etc/passwd" may resolve to an
-        // existing file, so use a name that can't resolve to anything real
+        // Interface names with special chars fail validation and return false
         assert!(!is_connected("avpn!@#$%^&*()test"));
+    }
+
+    #[test]
+    fn test_is_connected_path_traversal() {
+        // Path traversal attempts should be rejected by validation
+        assert!(!is_connected("../../../etc"));
+    }
+
+    #[test]
+    fn test_is_connected_too_long() {
+        // Names longer than 15 chars fail validation
+        assert!(!is_connected("avpn-toolongname1234"));
+    }
+
+    #[test]
+    fn test_validate_interface_name_valid() {
+        assert!(validate_interface_name("avpn-abc123").is_ok());
+        assert!(validate_interface_name("wg0").is_ok());
+        assert!(validate_interface_name("eth_0").is_ok());
+    }
+
+    #[test]
+    fn test_validate_interface_name_invalid() {
+        assert!(validate_interface_name("").is_err());
+        assert!(validate_interface_name("../etc/passwd").is_err());
+        assert!(validate_interface_name("a-very-long-interface-name").is_err());
+        assert!(validate_interface_name("wg 0").is_err());
     }
 }

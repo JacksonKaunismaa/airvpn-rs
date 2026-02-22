@@ -661,12 +661,13 @@ fn test_recovery_save_load_remove() {
     let state = State {
         lock_active: true,
         wg_interface: "test-iface-0".to_string(),
-        wg_config_path: "/tmp/test-iface-0.conf".to_string(),
+        wg_config_path: "/run/airvpn-rs/test-iface-0.conf".to_string(),
         dns_ipv4: "10.99.99.1".to_string(),
         dns_ipv6: "fd99::1".to_string(),
         pid: std::process::id(),
         blocked_ipv6_ifaces: vec!["eth0".to_string()],
         endpoint_ip: String::new(),
+        nonce: 12345,
     };
 
     // Save
@@ -704,12 +705,13 @@ fn test_recovery_atomic_write() {
     let state = State {
         lock_active: false,
         wg_interface: "test-iface-1".to_string(),
-        wg_config_path: "/tmp/test-iface-1.conf".to_string(),
+        wg_config_path: "/run/airvpn-rs/test-iface-1.conf".to_string(),
         dns_ipv4: "10.99.99.2".to_string(),
         dns_ipv6: "fd99::2".to_string(),
         pid: std::process::id(),
         blocked_ipv6_ifaces: vec![],
         endpoint_ip: String::new(),
+        nonce: 67890,
     };
 
     recovery::save(&state).expect("save state");

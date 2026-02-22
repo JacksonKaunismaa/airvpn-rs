@@ -31,9 +31,9 @@ enum Commands {
         /// AirVPN username (overrides saved credentials)
         #[arg(long)]
         username: Option<String>,
-        /// AirVPN password (overrides saved credentials)
+        /// Read password from stdin (one line, for scripted use)
         #[arg(long)]
-        password: Option<String>,
+        password_stdin: bool,
         /// Only connect to these servers (repeatable)
         #[arg(long)]
         allow_server: Vec<String>,
@@ -68,9 +68,9 @@ enum Commands {
         /// AirVPN username (overrides saved credentials)
         #[arg(long)]
         username: Option<String>,
-        /// AirVPN password (overrides saved credentials)
+        /// Read password from stdin (one line, for scripted use)
         #[arg(long)]
-        password: Option<String>,
+        password_stdin: bool,
         /// Skip server latency measurement (faster startup, uses score without ping)
         #[arg(long)]
         skip_ping: bool,
@@ -81,9 +81,27 @@ enum Commands {
 
 fn init_logging() {
     use simplelog::*;
+    use std::os::unix::fs::OpenOptionsExt;
 
-    let log_path = std::env::var("AIRVPN_LOG")
-        .unwrap_or_else(|_| "/tmp/airvpn-rs.log".to_string());
+    let log_path = std::env::var("AIRVPN_LOG").unwrap_or_default();
+    // Prefer /var/log (root-owned, standard location), fall back to /tmp
+    let log_path = if !log_path.is_empty() {
+        log_path
+    } else {
+        let preferred = "/var/log/airvpn-rs.log";
+        // Test if we can open/create the preferred path
+        if std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(preferred)
+            .is_ok()
+        {
+            preferred.to_string()
+        } else {
+            "/tmp/airvpn-rs.log".to_string()
+        }
+    };
 
     let mut loggers: Vec<Box<dyn SharedLogger>> = vec![
         // stderr: INFO level, no timestamps (clean user-facing output)
@@ -99,10 +117,11 @@ fn init_logging() {
         ),
     ];
 
-    // File logger: DEBUG level with timestamps
+    // File logger: DEBUG level with timestamps — mode 0o600 (owner-only read/write)
     match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(&log_path)
     {
         Ok(file) => {
@@ -127,6 +146,7 @@ fn init_logging() {
 
 fn main() -> anyhow::Result<()> {
     init_logging();
+    api::verify_rsa_key_integrity();
     let cli = Cli::parse();
     match cli.command {
         Commands::Connect {
@@ -135,7 +155,7 @@ fn main() -> anyhow::Result<()> {
             allow_lan,
             no_reconnect,
             username,
-            password,
+            password_stdin,
             allow_server,
             deny_server,
             allow_country,
@@ -148,7 +168,7 @@ fn main() -> anyhow::Result<()> {
             allow_lan,
             no_reconnect,
             username,
-            password,
+            password_stdin,
             allow_server,
             deny_server,
             allow_country,
@@ -158,7 +178,7 @@ fn main() -> anyhow::Result<()> {
         ),
         Commands::Disconnect => cmd_disconnect(),
         Commands::Status => cmd_status(),
-        Commands::Servers { sort, debug, username, password, skip_ping } => cmd_servers(&sort, debug, username, password, skip_ping),
+        Commands::Servers { sort, debug, username, password_stdin, skip_ping } => cmd_servers(&sort, debug, username, password_stdin, skip_ping),
         Commands::Recover => cmd_recover(),
     }
 }
@@ -216,7 +236,7 @@ fn cmd_connect(
     allow_lan: bool,
     no_reconnect: bool,
     cli_username: Option<String>,
-    cli_password: Option<String>,
+    password_stdin: bool,
     allow_server: Vec<String>,
     deny_server: Vec<String>,
     allow_country: Vec<String>,
@@ -265,11 +285,24 @@ fn cmd_connect(
     // so Ctrl+C / SIGTERM during netlock/WireGuard/DNS setup sets the flag
     // instead of killing the process with no cleanup.
     let shutdown = recovery::setup_signal_handler()?;
+    let nonce = recovery::generate_nonce();
 
-    // 2. Resolve credentials
+    // 2. Resolve credentials (password via profile, interactive prompt, or --password-stdin)
+    let stdin_password = if password_stdin {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)
+            .map_err(|e| anyhow::anyhow!("failed to read password from stdin: {}", e))?;
+        let trimmed = line.trim_end_matches('\n').trim_end_matches('\r').to_string();
+        if trimmed.is_empty() {
+            anyhow::bail!("--password-stdin: received empty password");
+        }
+        Some(trimmed)
+    } else {
+        None
+    };
     let (username, password) = config::resolve_credentials(
         cli_username.as_deref(),
-        cli_password.as_deref(),
+        stdin_password.as_deref(),
     )?;
 
     // 3. Fetch manifest + user data (two separate API calls)
@@ -284,12 +317,11 @@ fn cmd_connect(
         manifest.modes.len()
     );
     debug!(
-        "Manifest parse results: {} servers, {} modes, {} bootstrap URLs, check_domain={:?}, rsa_key_rotated={}",
+        "Manifest parse results: {} servers, {} modes, {} bootstrap URLs, check_domain={:?}",
         manifest.servers.len(),
         manifest.modes.len(),
         manifest.bootstrap_urls.len(),
         manifest.check_domain,
-        manifest.rsa_modulus.is_some(),
     );
 
     // Display any service messages from AirVPN
@@ -301,13 +333,9 @@ fn cmd_connect(
         }
     }
 
-    // Use rotated RSA key from manifest if provided
-    let rsa_mod = manifest.rsa_modulus.as_deref();
-    let rsa_exp = manifest.rsa_exponent.as_deref();
-
     info!("Fetching user data...");
     debug!("API request: act=user (credentials redacted)");
-    let user_xml = api::fetch_user_with_key(&username, &password, rsa_mod, rsa_exp, &manifest.bootstrap_urls)?;
+    let user_xml = api::fetch_user_with_urls(&username, &password, &manifest.bootstrap_urls)?;
     debug!("User XML response: {} bytes", user_xml.len());
     let user_info = manifest::parse_user(&user_xml)?;
     debug!("User info: login={}, {} WireGuard keys", user_info.login, user_info.keys.len());
@@ -423,12 +451,10 @@ fn cmd_connect(
         }
 
         // 6b. Pre-connection authorization (Eddie: Session.cs:173-218)
-        let reset_from_auth = match api::fetch_connect_with_key(
+        let reset_from_auth = match api::fetch_connect_with_urls(
             &username,
             &password,
             &server_ref.name,
-            rsa_mod,
-            rsa_exp,
             &manifest.bootstrap_urls,
         ) {
             Ok(api::ConnectDirective::Ok) => {
@@ -518,6 +544,7 @@ fn cmd_connect(
                 pid: std::process::id(),
                 blocked_ipv6_ifaces: vec![],
                 endpoint_ip: String::new(),
+                nonce,
             })?;
             info!("Network lock active (dedicated nftables table)");
             debug!(
@@ -541,6 +568,7 @@ fn cmd_connect(
             pid: std::process::id(),
             blocked_ipv6_ifaces: blocked_ipv6_ifaces.clone(),
             endpoint_ip: String::new(),
+            nonce,
         })?;
 
         // 8. Generate WireGuard config and connect
@@ -559,18 +587,18 @@ fn cmd_connect(
             Ok(result) => result,
             Err(e) => {
                 error!("WireGuard connection failed: {:#}", e);
-                // Deactivate netlock first, then restore IPv6 (avoid window where
-                // IPv6 is live but firewall rules have stale state)
-                if !no_lock {
-                    warn!("Removing network lock...");
-                    let _ = netlock::deactivate();
-                }
-                ipv6::restore(&blocked_ipv6_ifaces);
-                let _ = recovery::remove();
-                // Treat as Error (penalize + rotate)
+                // Keep netlock and IPv6 blocking active across reconnection
+                // attempts (Eddie pattern: lock persists until explicit disconnect).
+                // Only deactivate on --no-reconnect exit.
                 penalties.penalize(&server_ref.name, 30);
                 forced_server = Option::None;
                 if no_reconnect {
+                    // Tearing down — full cleanup
+                    if !no_lock {
+                        let _ = netlock::deactivate();
+                    }
+                    ipv6::restore(&blocked_ipv6_ifaces);
+                    let _ = recovery::remove();
                     return Err(e.context("WireGuard connection failed"));
                 }
                 warn!("Reconnecting in 3s (penalized {})...", server_ref.name);
@@ -587,6 +615,7 @@ fn cmd_connect(
             pid: std::process::id(),
             blocked_ipv6_ifaces: blocked_ipv6_ifaces.clone(),
             endpoint_ip: endpoint_ip.clone(),
+            nonce,
         })?;
         info!("WireGuard interface: {}", iface);
 
@@ -594,17 +623,18 @@ fn cmd_connect(
         info!("Waiting for handshake...");
         if let Err(e) = wireguard::wait_for_handshake(&iface, 50) {
             error!("Handshake failed: {:#}", e);
-            // Order: WG down -> netlock deactivate -> IPv6 restore
+            // Tear down WireGuard interface but keep netlock and IPv6 blocking
+            // active across reconnection (Eddie pattern).
             let _ = wireguard::disconnect(&config_path, &endpoint_ip);
-            if !no_lock {
-                let _ = netlock::deactivate();
-            }
-            ipv6::restore(&blocked_ipv6_ifaces);
-            let _ = recovery::remove();
-            // Treat as Error (penalize + rotate)
             penalties.penalize(&server_ref.name, 30);
             forced_server = Option::None;
             if no_reconnect {
+                // Tearing down — full cleanup
+                if !no_lock {
+                    let _ = netlock::deactivate();
+                }
+                ipv6::restore(&blocked_ipv6_ifaces);
+                let _ = recovery::remove();
                 return Err(e);
             }
             warn!("Reconnecting in 3s (penalized {})...", server_ref.name);
@@ -646,6 +676,7 @@ fn cmd_connect(
                 pid: std::process::id(),
                 blocked_ipv6_ifaces: blocked_ipv6_ifaces.clone(),
                 endpoint_ip: endpoint_ip.clone(),
+                nonce,
             })?;
 
             Ok(())
@@ -872,12 +903,24 @@ fn cmd_servers(
     sort: &str,
     debug: bool,
     cli_username: Option<String>,
-    cli_password: Option<String>,
+    password_stdin: bool,
     _skip_ping: bool,
 ) -> anyhow::Result<()> {
+    let stdin_password = if password_stdin {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)
+            .map_err(|e| anyhow::anyhow!("failed to read password from stdin: {}", e))?;
+        let trimmed = line.trim_end_matches('\n').trim_end_matches('\r').to_string();
+        if trimmed.is_empty() {
+            anyhow::bail!("--password-stdin: received empty password");
+        }
+        Some(trimmed)
+    } else {
+        None
+    };
     let (username, password) = config::resolve_credentials(
         cli_username.as_deref(),
-        cli_password.as_deref(),
+        stdin_password.as_deref(),
     )?;
     let xml = api::fetch_manifest(&username, &password)?;
 
