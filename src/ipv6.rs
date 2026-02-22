@@ -24,8 +24,10 @@ pub fn block_all() -> Vec<String> {
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
 
-        // Skip special interfaces (matching Eddie)
-        if matches!(name.as_str(), "all" | "lo" | "lo0") {
+        // Skip special interfaces (matching Eddie) + "default" which is a template
+        // for newly created interfaces. If we disable IPv6 on "default", our WireGuard
+        // interface inherits disable_ipv6=1 and wg-quick fails to add IPv6 addresses.
+        if matches!(name.as_str(), "all" | "default" | "lo" | "lo0") {
             continue;
         }
 
