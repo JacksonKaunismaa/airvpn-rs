@@ -91,6 +91,7 @@ PersistentKeepalive = 15
 PrivateKey = {}
 Address = {}, {}
 MTU = 1320
+Table = off
 
 {}",
         key.wg_private_key,
@@ -162,11 +163,70 @@ pub fn connect(config: &str) -> Result<(String, String)> {
         anyhow::bail!("wg-quick up failed: {}", stderr);
     }
 
+    // With Table = off, wg-quick skips routing. We add our own default route
+    // through the WireGuard interface, similar to how Eddie manages routing directly.
+    setup_routing(&iface)?;
+
     Ok((config_path, iface))
+}
+
+/// Set up routing for the VPN tunnel.
+///
+/// Since we use `Table = off` (to avoid wg-quick's nft rules conflicting with
+/// our netlock), we need to add routes ourselves. This is closer to what Eddie
+/// does (Eddie manages routing via ip commands, not wg-quick).
+fn setup_routing(iface: &str) -> Result<()> {
+    // Add default routes through the WireGuard interface using a separate table
+    // (table 51820, matching wg-quick's convention)
+    let commands = [
+        // IPv4 default route through VPN
+        vec!["ip", "-4", "route", "add", "0.0.0.0/0", "dev", iface, "table", "51820"],
+        // IPv6 default route through VPN
+        vec!["ip", "-6", "route", "add", "::/0", "dev", iface, "table", "51820"],
+        // Policy rules: use table 51820 for unmarked traffic
+        vec!["ip", "-4", "rule", "add", "not", "fwmark", "51820", "table", "51820"],
+        vec!["ip", "-6", "rule", "add", "not", "fwmark", "51820", "table", "51820"],
+        // Suppress default route from main table to prevent leaks
+        vec!["ip", "-4", "rule", "add", "table", "main", "suppress_prefixlength", "0"],
+        vec!["ip", "-6", "rule", "add", "table", "main", "suppress_prefixlength", "0"],
+    ];
+
+    for cmd in &commands {
+        let output = Command::new(cmd[0])
+            .args(&cmd[1..])
+            .output()
+            .with_context(|| format!("failed to execute: {}", cmd.join(" ")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Non-fatal: some rules may already exist or IPv6 may be disabled
+            eprintln!("routing warning: {} — {}", cmd.join(" "), stderr.trim());
+        }
+    }
+
+    Ok(())
+}
+
+/// Tear down VPN routing (reverse of setup_routing).
+fn teardown_routing(_iface: &str) {
+    let commands = [
+        vec!["ip", "-4", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
+        vec!["ip", "-6", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
+        vec!["ip", "-4", "rule", "delete", "table", "main", "suppress_prefixlength", "0"],
+        vec!["ip", "-6", "rule", "delete", "table", "main", "suppress_prefixlength", "0"],
+    ];
+    for cmd in &commands {
+        let _ = Command::new(cmd[0]).args(&cmd[1..]).output();
+    }
 }
 
 /// Run `wg-quick down` to disconnect the WireGuard tunnel.
 pub fn disconnect(config_path: &str) -> Result<()> {
+    // Tear down routing rules before wg-quick removes the interface
+    // (derive interface name from config path)
+    if let Some(iface) = Path::new(config_path).file_stem().map(|s| s.to_string_lossy().to_string()) {
+        teardown_routing(&iface);
+    }
+
     let output = Command::new("wg-quick")
         .args(["down", config_path])
         .output()
@@ -331,6 +391,7 @@ mod tests {
         assert!(config.contains("PrivateKey = PrivateKeyBase64=="));
         assert!(config.contains("Address = 10.128.0.42/32, fd7d:76ee:3c49:9950::42/128"));
         assert!(config.contains("MTU = 1320"));
+        assert!(config.contains("Table = off"), "Table = off must be present to prevent wg-quick nft conflicts");
         // DNS is NOT in config — managed by dns.rs to avoid double-configuration
         assert!(!config.contains("DNS ="), "DNS line should not be in WireGuard config (managed by dns.rs)");
 

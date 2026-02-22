@@ -45,6 +45,9 @@ enum Commands {
         /// Never connect to servers in these countries (repeatable, 2-letter code)
         #[arg(long)]
         deny_country: Vec<String>,
+        /// Skip server latency measurement (faster startup, uses score without ping)
+        #[arg(long)]
+        skip_ping: bool,
     },
     /// Disconnect from AirVPN
     Disconnect,
@@ -64,6 +67,9 @@ enum Commands {
         /// AirVPN password (overrides saved credentials)
         #[arg(long)]
         password: Option<String>,
+        /// Skip server latency measurement (faster startup, uses score without ping)
+        #[arg(long)]
+        skip_ping: bool,
     },
     /// Clean up stale state after crash
     Recover,
@@ -83,6 +89,7 @@ fn main() -> anyhow::Result<()> {
             deny_server,
             allow_country,
             deny_country,
+            skip_ping,
         } => cmd_connect(
             server,
             no_lock,
@@ -94,10 +101,11 @@ fn main() -> anyhow::Result<()> {
             deny_server,
             allow_country,
             deny_country,
+            skip_ping,
         ),
         Commands::Disconnect => cmd_disconnect(),
         Commands::Status => cmd_status(),
-        Commands::Servers { sort, debug, username, password } => cmd_servers(&sort, debug, username, password),
+        Commands::Servers { sort, debug, username, password, skip_ping } => cmd_servers(&sort, debug, username, password, skip_ping),
         Commands::Recover => cmd_recover(),
     }
 }
@@ -160,6 +168,7 @@ fn cmd_connect(
     deny_server: Vec<String>,
     allow_country: Vec<String>,
     deny_country: Vec<String>,
+    skip_ping: bool,
 ) -> anyhow::Result<()> {
     // 0. Pre-flight checks (root, wg-quick, nft)
     preflight_checks()?;
@@ -287,9 +296,15 @@ fn cmd_connect(
     // Results feed into score_with_ping() for Eddie-compatible server scoring.
     // -----------------------------------------------------------------------
 
-    println!("Measuring server latencies...");
-    let ping_results = pinger::measure_all(&filtered_servers);
-    println!("Pinged {} servers.", ping_results.latencies.len());
+    let ping_results = if skip_ping {
+        println!("Skipping latency measurement (--skip-ping).");
+        pinger::PingResults::new()
+    } else {
+        println!("Measuring server latencies...");
+        let results = pinger::measure_all(&filtered_servers);
+        println!("Pinged {} servers.", results.latencies.len());
+        results
+    };
 
     // -----------------------------------------------------------------------
     // Reconnection loop (Eddie: Session.cs outer `for (; CancelRequested == false;)`)
@@ -716,6 +731,7 @@ fn cmd_servers(
     debug: bool,
     cli_username: Option<String>,
     cli_password: Option<String>,
+    _skip_ping: bool,
 ) -> anyhow::Result<()> {
     let (username, password) = config::resolve_credentials(
         cli_username.as_deref(),
