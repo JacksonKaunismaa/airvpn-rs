@@ -276,10 +276,10 @@ pub fn connect(config: &str, endpoint_ip: &str) -> Result<(String, String)> {
             .output();
     }
 
-    let output = Command::new("wg-quick")
-        .args(["up", &config_path])
+    let output = Command::new("timeout")
+        .args(["30", "wg-quick", "up", &config_path])
         .output()
-        .context("failed to execute wg-quick up")?;
+        .context("failed to execute wg-quick up (with 30s timeout)")?;
 
     if !output.status.success() {
         // Clean up config file containing private keys
@@ -292,7 +292,7 @@ pub fn connect(config: &str, endpoint_ip: &str) -> Result<(String, String)> {
     // through the WireGuard interface, similar to how Eddie manages routing directly.
     if let Err(e) = setup_routing(&iface, endpoint_ip) {
         // Clean up WireGuard interface if routing setup fails
-        let _ = Command::new("wg-quick").args(["down", &config_path]).output();
+        let _ = Command::new("timeout").args(["30", "wg-quick", "down", &config_path]).output();
         let _ = std::fs::remove_file(&config_path);
         return Err(e);
     }
@@ -560,10 +560,10 @@ pub fn disconnect(config_path: &str, endpoint_ip: &str) -> Result<()> {
         teardown_routing(&iface, endpoint_ip);
     }
 
-    let output = Command::new("wg-quick")
-        .args(["down", config_path])
+    let output = Command::new("timeout")
+        .args(["30", "wg-quick", "down", config_path])
         .output()
-        .context("failed to execute wg-quick down")?;
+        .context("failed to execute wg-quick down (with 30s timeout)")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

@@ -296,6 +296,21 @@ fn parse_i64(s: &str) -> i64 {
     s.parse().unwrap_or(0)
 }
 
+/// Parse an integer for score fields. Unparseable values default to i64::MAX
+/// so malicious/corrupt servers are penalized rather than favored (scorebase 0
+/// is the best possible score).
+fn parse_i64_score(s: &str) -> i64 {
+    match s.parse() {
+        Ok(v) => v,
+        Err(_) => {
+            if !s.is_empty() {
+                warn!("failed to parse manifest score integer: {:?}, defaulting to i64::MAX", s);
+            }
+            i64::MAX
+        }
+    }
+}
+
 fn resolve_str(server_val: &Option<String>, group: Option<&ServerGroupAttrs>, getter: fn(&ServerGroupAttrs) -> &str) -> String {
     if let Some(v) = server_val {
         if !v.is_empty() {
@@ -327,7 +342,7 @@ fn resolve_server(raw: RawServerAttrs, groups: &HashMap<String, ServerGroupAttrs
         ips_exit: split_ips(&ips_exit_str),
         country_code,
         location,
-        scorebase: parse_i64(&scorebase),
+        scorebase: parse_i64_score(&scorebase),
         bandwidth: parse_i64(&bw),
         bandwidth_max: { let v = parse_i64(&bw_max); if v == 0 { 1 } else { v } },
         users: parse_i64(&users),

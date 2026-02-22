@@ -51,14 +51,18 @@ impl ServerPenalties {
         }
     }
 
+    /// Maximum penalty value (2 hours of decay at 1/minute).
+    /// Prevents unbounded accumulation from repeated failures.
+    const MAX_PENALTY: i64 = 120;
+
     /// Apply a penalty to a server (Eddie: additive, default 30 per failure).
     pub fn penalize(&mut self, server_name: &str, amount: i64) {
         let entry = self
             .penalties
             .entry(server_name.to_string())
             .or_insert((0, Instant::now()));
-        // Accumulate (Eddie: Penality += amount)
-        entry.0 += amount;
+        // Accumulate with cap (Eddie: Penality += amount)
+        entry.0 = (entry.0 + amount).min(Self::MAX_PENALTY);
         // Don't update timestamp — decay continues from first penalty (matches Eddie)
     }
 
@@ -899,6 +903,21 @@ mod tests {
         penalties.penalize("Alpha", 30);
         // Penalty should accumulate: 30 + 30 = 60
         assert_eq!(penalties.get("Alpha"), 60);
+    }
+
+    #[test]
+    fn test_penalty_accumulation_capped_at_max() {
+        let mut penalties = ServerPenalties::new();
+        // Apply 5 penalties of 30 each: 150 total, but capped at MAX_PENALTY (120)
+        for _ in 0..5 {
+            penalties.penalize("Alpha", 30);
+        }
+        assert_eq!(
+            penalties.get("Alpha"),
+            ServerPenalties::MAX_PENALTY,
+            "penalty should be capped at MAX_PENALTY ({})",
+            ServerPenalties::MAX_PENALTY,
+        );
     }
 
     // -------------------------------------------------------------------

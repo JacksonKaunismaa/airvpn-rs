@@ -843,6 +843,7 @@ fn cmd_connect(
         );
 
         // 13. Monitor loop — determines ResetLevel when connection ends
+        let mut dns_fail_count: u32 = 0;
         let reset_level = loop {
             if shutdown.load(Ordering::Relaxed) {
                 info!("Disconnecting...");
@@ -862,7 +863,20 @@ fn cmd_connect(
             }
 
             // Periodic DNS re-check (matching Eddie's DnsSwitchCheck)
-            let _ = dns::check_and_reapply(&wg_key.wg_dns_ipv4, &wg_key.wg_dns_ipv6, &iface);
+            match dns::check_and_reapply(&wg_key.wg_dns_ipv4, &wg_key.wg_dns_ipv6, &iface) {
+                Ok(_) => { dns_fail_count = 0; }
+                Err(e) => {
+                    dns_fail_count += 1;
+                    warn!("DNS re-apply failed ({} consecutive): {:#}", dns_fail_count, e);
+                    if dns_fail_count >= 10 {
+                        error!(
+                            "DNS re-apply failed {} consecutive times, triggering reconnection",
+                            dns_fail_count,
+                        );
+                        break ResetLevel::Error;
+                    }
+                }
+            }
 
             std::thread::sleep(std::time::Duration::from_secs(1));
         };
