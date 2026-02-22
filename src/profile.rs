@@ -439,17 +439,21 @@ pub fn keyring_available() -> bool {
 }
 
 /// Read a password from the system keyring for the given profile ID.
+/// Uses `timeout` to prevent indefinite hangs if the keyring daemon is stuck
+/// (gnome-keyring issue #116). Matches Eddie's 10-second timeout.
 pub fn keyring_read(id: &str) -> Result<Option<String>> {
-    // Use secret-tool CLI which talks to Secret Service (libsecret)
-    let output = std::process::Command::new("secret-tool")
-        .args(["lookup", "application", "airvpn-rs", "profile-id", id])
+    let output = std::process::Command::new("timeout")
+        .args([
+            "10", "secret-tool", "lookup",
+            "application", "airvpn-rs", "profile-id", id,
+        ])
         .output()
         .context("failed to run secret-tool for keyring lookup")?;
 
     if output.status.success() {
         let password = String::from_utf8(output.stdout)
             .context("keyring value is not valid UTF-8")?
-            .trim_end()
+            .trim_end_matches('\n')
             .to_string();
         if password.is_empty() {
             Ok(None)
@@ -457,17 +461,20 @@ pub fn keyring_read(id: &str) -> Result<Option<String>> {
             Ok(Some(password))
         }
     } else {
-        // secret-tool returns non-zero if key not found
+        // secret-tool returns non-zero if key not found (or timeout kills it)
         Ok(None)
     }
 }
 
 /// Write a password to the system keyring for the given profile ID.
+/// Uses `timeout` to prevent indefinite hangs (gnome-keyring issue #116).
 pub fn keyring_write(id: &str, password: &str) -> Result<()> {
     use std::io::Write;
 
-    let mut child = std::process::Command::new("secret-tool")
+    let mut child = std::process::Command::new("timeout")
         .args([
+            "10",
+            "secret-tool",
             "store",
             "--label",
             "AirVPN-RS Profile",
@@ -504,8 +511,8 @@ pub fn keyring_write(id: &str, password: &str) -> Result<()> {
 
 /// Delete a password from the system keyring for the given profile ID.
 pub fn keyring_delete(id: &str) -> Result<()> {
-    let status = std::process::Command::new("secret-tool")
-        .args(["clear", "application", "airvpn-rs", "profile-id", id])
+    let status = std::process::Command::new("timeout")
+        .args(["10", "secret-tool", "clear", "application", "airvpn-rs", "profile-id", id])
         .status()
         .context("failed to run secret-tool for keyring delete")?;
 
