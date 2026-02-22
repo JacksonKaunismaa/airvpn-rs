@@ -11,8 +11,11 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
+
+static RESOLV_WAS_IMMUTABLE: AtomicBool = AtomicBool::new(false);
 
 const BACKUP_PATH: &str = "/etc/resolv.conf.airvpn-rs";
 
@@ -21,6 +24,25 @@ const BACKUP_PATH: &str = "/etc/resolv.conf.airvpn-rs";
 fn clear_immutable(path: &Path) {
     let _ = Command::new("chattr")
         .args(["-i", &path.to_string_lossy()])
+        .output();
+}
+
+/// Check if a file has the immutable flag set.
+fn is_immutable(path: &Path) -> bool {
+    Command::new("lsattr")
+        .arg(&path.to_string_lossy().to_string())
+        .output()
+        .map(|o| {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            stdout.contains('i')
+        })
+        .unwrap_or(false)
+}
+
+/// Set the immutable flag on a file.
+fn set_immutable(path: &Path) {
+    let _ = Command::new("chattr")
+        .args(["+i", &path.to_string_lossy()])
         .output();
 }
 
@@ -75,7 +97,7 @@ pub fn flush() {
     // before the restart is wasted work.
     for service in &["nscd", "dnsmasq", "named", "bind9"] {
         let _ = Command::new("systemctl")
-            .args(["restart", service])
+            .args(["try-restart", service])
             .output();
     }
 
@@ -234,6 +256,10 @@ pub fn activate(dns_ipv4: &str, dns_ipv6: &str, iface: &str) -> Result<()> {
     let resolv_path = Path::new("/etc/resolv.conf");
     let backup_path = Path::new(BACKUP_PATH);
 
+    // Save whether resolv.conf was immutable before we clear it, so we can
+    // restore the flag on deactivate.
+    RESOLV_WAS_IMMUTABLE.store(is_immutable(resolv_path), Ordering::Relaxed);
+
     // Clear immutable flag before modifying (Fedora/RHEL set this on resolv.conf)
     clear_immutable(resolv_path);
 
@@ -283,6 +309,17 @@ pub fn deactivate() -> Result<()> {
 
         // Atomic rename replaces dest on Linux — no gap where resolv.conf is missing
         fs::rename(backup_path, resolv_path).context("failed to restore resolv.conf from backup")?;
+    } else {
+        // No backup means resolv.conf didn't exist before — remove our VPN version
+        if resolv_path.exists() {
+            clear_immutable(resolv_path);
+            let _ = fs::remove_file(resolv_path);
+        }
+    }
+
+    // Restore immutable flag if it was set before we activated
+    if RESOLV_WAS_IMMUTABLE.load(Ordering::Relaxed) {
+        set_immutable(resolv_path);
     }
 
     // Restore per-interface systemd-resolved settings from backups.
@@ -316,6 +353,7 @@ pub fn deactivate() -> Result<()> {
                         // Restore DNS servers.
                         // resolvectl dns output format: "Link 2 (eth0): 8.8.8.8 8.8.4.4"
                         // Extract just the IP addresses from the saved line.
+                        let mut dns_restored = false;
                         if !dns_line.is_empty() {
                             let servers: Vec<&str> = dns_line
                                 .split_whitespace()
@@ -324,23 +362,40 @@ pub fn deactivate() -> Result<()> {
                             if !servers.is_empty() {
                                 let mut args = vec!["dns", iface];
                                 args.extend(servers);
-                                let _ = Command::new("resolvectl").args(&args).output();
+                                let result = Command::new("resolvectl").args(&args).output();
+                                if result.map(|o| o.status.success()).unwrap_or(false) {
+                                    dns_restored = true;
+                                }
                             }
                         }
 
-                        // Restore default-route.
-                        if !dr_line.is_empty() {
-                            let val = if dr_line.contains("yes") {
-                                "true"
-                            } else {
-                                "false"
-                            };
+                        // If the interface had no original DNS servers, revert it
+                        // instead of leaving VPN DNS in place.
+                        if !dns_restored {
                             let _ = Command::new("resolvectl")
-                                .args(["default-route", iface, val])
+                                .args(["revert", iface])
                                 .output();
                         }
 
-                        restored_ifaces.push(iface.to_string());
+                        // Restore default-route.
+                        // An unset default-route is different from explicitly false.
+                        // Only restore if the backup contains an explicit "yes" or "no";
+                        // otherwise let `resolvectl revert` (above) handle it.
+                        if dr_line.contains("yes") {
+                            let _ = Command::new("resolvectl")
+                                .args(["default-route", iface, "true"])
+                                .output();
+                        } else if dr_line.contains("no") {
+                            let _ = Command::new("resolvectl")
+                                .args(["default-route", iface, "false"])
+                                .output();
+                        }
+                        // else: was unset — resolvectl revert will handle it
+
+                        // Only mark as restored if DNS was actually put back.
+                        if dns_restored {
+                            restored_ifaces.push(iface.to_string());
+                        }
                     }
                     let _ = fs::remove_file(entry.path());
                 }

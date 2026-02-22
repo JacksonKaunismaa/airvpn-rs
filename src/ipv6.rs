@@ -48,12 +48,40 @@ pub fn block_all() -> Vec<String> {
 }
 
 /// Restore IPv6 on previously blocked interfaces.
+///
+/// After restoring tracked interfaces, also scans for any transient interfaces
+/// (USB ethernet, WiFi reconnect, Docker, etc.) that were created during the
+/// VPN session and inherited `disable_ipv6=1` from the `default` sysctl template.
 pub fn restore(interfaces: &[String]) {
     let conf_dir = Path::new("/proc/sys/net/ipv6/conf");
 
+    // Restore tracked interfaces
     for name in interfaces {
         let disable_path = conf_dir.join(name).join("disable_ipv6");
         let _ = fs::write(&disable_path, "0");
+    }
+
+    // Also restore any transient interfaces created during the session
+    // (they inherited disable_ipv6=1 from the "default" template)
+    if let Ok(entries) = fs::read_dir(conf_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if matches!(name.as_str(), "all" | "lo" | "lo0") {
+                continue;
+            }
+            // Skip already-restored interfaces
+            if interfaces.iter().any(|i| i == &name) {
+                continue;
+            }
+            let disable_path = conf_dir.join(&name).join("disable_ipv6");
+            let current = fs::read_to_string(&disable_path)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if current == "1" {
+                let _ = fs::write(&disable_path, "0");
+            }
+        }
     }
 }
 
