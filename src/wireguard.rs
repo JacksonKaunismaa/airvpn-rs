@@ -10,6 +10,16 @@ use anyhow::{Context, Result};
 
 use crate::manifest::{Mode, Server, UserInfo, WireGuardKey};
 
+/// Ensure an IP address has a CIDR suffix. If it already has one, return as-is.
+/// If not, append the default suffix.
+fn ensure_cidr(ip: &str, default_suffix: &str) -> String {
+    if ip.contains('/') {
+        ip.to_string()
+    } else {
+        format!("{}{}", ip, default_suffix)
+    }
+}
+
 /// Generate a WireGuard config from manifest data.
 ///
 /// The config format matches what wg-quick expects. IPv4 entry IPs are
@@ -79,13 +89,13 @@ PersistentKeepalive = 15
         "\
 [Interface]
 PrivateKey = {}
-Address = {}/32, {}/128
+Address = {}, {}
 MTU = 1320
 
 {}",
         key.wg_private_key,
-        key.wg_ipv4,
-        key.wg_ipv6,
+        ensure_cidr(&key.wg_ipv4, "/32"),
+        ensure_cidr(&key.wg_ipv6, "/128"),
         peer_section,
     ))
 }
