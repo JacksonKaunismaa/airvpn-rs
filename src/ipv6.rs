@@ -9,6 +9,8 @@
 use std::fs;
 use std::path::Path;
 
+use log::warn;
+
 /// Disable IPv6 on all non-loopback interfaces.
 ///
 /// Returns the list of interfaces that were blocked (for restore on disconnect).
@@ -76,6 +78,14 @@ pub fn restore(interfaces: &[String]) {
 
     // Restore only tracked interfaces
     for name in interfaces {
+        // Validate interface name to prevent path traversal
+        if name.is_empty()
+            || name.len() > 15
+            || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            warn!("skipping invalid interface name in restore: {:?}", name);
+            continue;
+        }
         let disable_path = conf_dir.join(name).join("disable_ipv6");
         let _ = fs::write(&disable_path, "0");
     }

@@ -357,12 +357,24 @@ fn recover_from_state(state: &State) -> Result<()> {
         &["ip", "-4", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
         &["ip", "-6", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
     ];
+    const MAX_RULE_DELETIONS: usize = 100;
     for cmd in routing_cleanups {
-        loop {
+        let mut deleted = 0;
+        for _ in 0..MAX_RULE_DELETIONS {
             match std::process::Command::new(cmd[0]).args(&cmd[1..]).output() {
-                Ok(output) if output.status.success() => continue,
+                Ok(output) if output.status.success() => {
+                    deleted += 1;
+                    continue;
+                }
                 _ => break,
             }
+        }
+        if deleted >= MAX_RULE_DELETIONS {
+            warn!(
+                "hit {} rule deletions for {:?} — possible infinite loop",
+                MAX_RULE_DELETIONS,
+                cmd.join(" ")
+            );
         }
     }
 

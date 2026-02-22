@@ -5,6 +5,7 @@ use anyhow::{bail, Context};
 use log::warn;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
+use zeroize::Zeroizing;
 
 #[derive(Debug)]
 pub struct Message {
@@ -61,12 +62,12 @@ pub struct UserInfo {
 #[derive(Debug)]
 pub struct WireGuardKey {
     pub name: String,
-    pub wg_private_key: String,
+    pub wg_private_key: Zeroizing<String>,
     pub wg_ipv4: String,
     pub wg_ipv6: String,
     pub wg_dns_ipv4: String,
     pub wg_dns_ipv6: String,
-    pub wg_preshared: String,
+    pub wg_preshared: Zeroizing<String>,
 }
 
 struct ServerGroupAttrs {
@@ -391,6 +392,10 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
         }
     }
     validate_check_domain(&check_domain)?;
+    if !check_dns_query.is_empty() {
+        let domain_part = check_dns_query.replace("{hash}.", "").replace("{hash}", "");
+        validate_check_domain(&domain_part).context("check_dns_query domain validation failed")?;
+    }
     let servers: Vec<Server> = raw_servers.into_iter().map(|raw| resolve_server(raw, &groups)).collect();
     Ok(Manifest { servers, modes, bootstrap_urls, force_reauth_ts, messages, check_domain, check_dns_query })
 }
@@ -416,11 +421,11 @@ pub fn parse_user(xml: &str) -> anyhow::Result<UserInfo> {
                     if !wg_dns_ipv6.is_empty() { validate_ip(&wg_dns_ipv6, "wg_dns_ipv6")?; }
                     keys.push(WireGuardKey {
                         name: attr_opt(e, b"name").unwrap_or_default(),
-                        wg_private_key: attr_opt(e, b"wg_private_key").unwrap_or_default(),
+                        wg_private_key: Zeroizing::new(attr_opt(e, b"wg_private_key").unwrap_or_default()),
                         wg_ipv4: attr_opt(e, b"wg_ipv4").unwrap_or_default(),
                         wg_ipv6: attr_opt(e, b"wg_ipv6").unwrap_or_default(),
                         wg_dns_ipv4, wg_dns_ipv6,
-                        wg_preshared: attr_opt(e, b"wg_preshared").unwrap_or_default(),
+                        wg_preshared: Zeroizing::new(attr_opt(e, b"wg_preshared").unwrap_or_default()),
                     });
                 }
             }
@@ -444,11 +449,11 @@ pub fn parse_user(xml: &str) -> anyhow::Result<UserInfo> {
                         if !wg_dns_ipv6.is_empty() { validate_ip(&wg_dns_ipv6, "wg_dns_ipv6")?; }
                         keys.push(WireGuardKey {
                             name: attr_opt(e, b"name").unwrap_or_default(),
-                            wg_private_key: attr_opt(e, b"wg_private_key").unwrap_or_default(),
+                            wg_private_key: Zeroizing::new(attr_opt(e, b"wg_private_key").unwrap_or_default()),
                             wg_ipv4: attr_opt(e, b"wg_ipv4").unwrap_or_default(),
                             wg_ipv6: attr_opt(e, b"wg_ipv6").unwrap_or_default(),
                             wg_dns_ipv4, wg_dns_ipv6,
-                            wg_preshared: attr_opt(e, b"wg_preshared").unwrap_or_default(),
+                            wg_preshared: Zeroizing::new(attr_opt(e, b"wg_preshared").unwrap_or_default()),
                         });
                     }
                     _ => {}

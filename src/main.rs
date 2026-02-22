@@ -426,6 +426,17 @@ fn cmd_connect(
     let mut penalties = server::ServerPenalties::new();
     let mut forced_server: Option<&str> = server_name.as_deref();
 
+    // 7b. Block IPv6 on all interfaces ONCE before the main loop
+    // (Eddie default: network.ipv6.mode="in-block").
+    // Done here rather than inside the loop because ipv6::block_all() returns
+    // an empty list when interfaces are already blocked. Calling it again on
+    // reconnection would overwrite the recovery state with an empty list,
+    // losing the original blocked interfaces needed for crash recovery.
+    let blocked_ipv6_ifaces = ipv6::block_all();
+    if !blocked_ipv6_ifaces.is_empty() {
+        info!("IPv6 disabled on {} interfaces", blocked_ipv6_ifaces.len());
+    }
+
     loop {
         // Check for shutdown before attempting connection
         if shutdown.load(Ordering::Relaxed) {
@@ -568,11 +579,7 @@ fn cmd_connect(
             );
         }
 
-        // 7b. Block IPv6 on all interfaces (Eddie default: network.ipv6.mode="in-block")
-        let blocked_ipv6_ifaces = ipv6::block_all();
-        if !blocked_ipv6_ifaces.is_empty() {
-            info!("IPv6 disabled on {} interfaces", blocked_ipv6_ifaces.len());
-        }
+        // 7b. Save recovery state with blocked IPv6 interfaces (computed before loop)
         recovery::save(&recovery::State {
             lock_active: !no_lock,
             wg_interface: String::new(),
@@ -883,12 +890,14 @@ fn cmd_disconnect() -> anyhow::Result<()> {
     cmd_disconnect_internal(&state.wg_config_path, &state.wg_interface, state.lock_active, &state.blocked_ipv6_ifaces, &state.endpoint_ip)
 }
 
-/// Partial disconnect: tear down WireGuard + DNS only, keeping netlock and IPv6
+/// Partial disconnect: tear down WireGuard only, keeping netlock, DNS, and IPv6
 /// blocking active. Used during reconnection to avoid a leak window.
 ///
-/// Matches the pattern used in the handshake-failure and WireGuard-connect-failure
-/// paths, which correctly keep the base netlock table and IPv6 blocking active
-/// across reconnection attempts.
+/// DNS is intentionally NOT deactivated here. Restoring the original resolv.conf
+/// during reconnection would leak DNS queries to the pre-VPN DNS server (e.g., a
+/// LAN router at 192.168.1.1 when --allow-lan is active). The VPN DNS config is
+/// left in place; dns::activate() will overwrite it when the next connection
+/// succeeds. DNS is only fully deactivated during cmd_disconnect_internal().
 fn partial_disconnect(config_path: &str, iface: &str, lock_active: bool, endpoint_ip: &str) -> anyhow::Result<()> {
     // 1. Remove interface-specific nft rules (but keep the base netlock table)
     if lock_active && !iface.is_empty() {
@@ -896,10 +905,9 @@ fn partial_disconnect(config_path: &str, iface: &str, lock_active: bool, endpoin
     }
     // 2. wg-quick down
     let _ = wireguard::disconnect(config_path, endpoint_ip);
-    // 3. Restore DNS
-    let _ = dns::deactivate();
-    dns::flush();
-    // NOTE: netlock base table and IPv6 blocking remain active — no leak window
+    // NOTE: DNS is intentionally kept active — deactivating would restore the
+    // original resolv.conf, leaking queries through --allow-lan LAN rules.
+    // netlock base table and IPv6 blocking also remain active — no leak window.
     Ok(())
 }
 

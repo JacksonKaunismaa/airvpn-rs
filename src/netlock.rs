@@ -12,7 +12,6 @@
 //! Reference: Eddie src/Lib.Platform.Linux/NetworkLockNftables.cs
 
 use anyhow::{Context, Result};
-use log::warn;
 use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::net::IpAddr;
@@ -349,21 +348,27 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
 }
 
 /// Activate the network lock: write ruleset to tmpfile and load via `nft -f`.
+///
+/// If the table already exists (e.g., reconnection), performs an atomic
+/// replacement by prepending `flush table inet airvpn_lock` to the ruleset
+/// and loading both in a single `nft -f` call. This avoids the leak window
+/// that would occur if we deleted the table first and then created a new one.
 pub fn activate(config: &NetlockConfig) -> Result<()> {
     let ruleset = generate_ruleset(config);
 
-    // Clean up stale table from previous crash before creating fresh one
-    if is_active() {
-        if let Err(e) = deactivate() {
-            warn!("failed to remove stale nftables table: {}", e);
-        }
-    }
+    // If the table already exists, prepend a flush command so the kernel
+    // processes flush + new rules atomically in a single nft -f transaction.
+    let content = if is_active() {
+        format!("flush table inet {}\n{}", TABLE_NAME, ruleset)
+    } else {
+        ruleset
+    };
 
     // Write to a temporary file
     let mut tmpfile =
         tempfile::NamedTempFile::new().context("failed to create temporary nftables file")?;
     tmpfile
-        .write_all(ruleset.as_bytes())
+        .write_all(content.as_bytes())
         .context("failed to write nftables ruleset to tmpfile")?;
     tmpfile
         .flush()

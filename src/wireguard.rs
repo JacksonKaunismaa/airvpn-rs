@@ -149,7 +149,7 @@ PublicKey = {}
     );
 
     if !key.wg_preshared.is_empty() {
-        peer_section.push_str(&format!("PresharedKey = {}\n", key.wg_preshared));
+        peer_section.push_str(&format!("PresharedKey = {}\n", &*key.wg_preshared));
     }
 
     peer_section.push_str(&format!(
@@ -170,7 +170,7 @@ MTU = 1320
 Table = off
 
 {}",
-        key.wg_private_key,
+        &*key.wg_private_key,
         ensure_cidr(&key.wg_ipv4, "/32"),
         ensure_cidr(&key.wg_ipv6, "/128"),
         peer_section,
@@ -541,6 +541,18 @@ fn teardown_routing(_iface: &str, endpoint_ip: &str) {
 /// (best-effort cleanup will skip the host route removal).
 pub fn disconnect(config_path: &str, endpoint_ip: &str) -> Result<()> {
     debug!("WireGuard disconnect: config_path={}, endpoint_ip={}", config_path, endpoint_ip);
+
+    // Validate config_path to prevent path traversal and command injection.
+    // Must be under /run/airvpn-rs/ with no parent-dir components.
+    if !config_path.is_empty() {
+        let path = std::path::Path::new(config_path);
+        if !config_path.starts_with("/run/airvpn-rs/")
+            || path.components().any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            anyhow::bail!("invalid config_path: must be under /run/airvpn-rs/");
+        }
+    }
+
     // Tear down routing rules before wg-quick removes the interface
     // (derive interface name from config path)
     if let Some(iface) = Path::new(config_path).file_stem().map(|s| s.to_string_lossy().to_string()) {
@@ -668,12 +680,12 @@ mod tests {
     fn test_key() -> WireGuardKey {
         WireGuardKey {
             name: "default".to_string(),
-            wg_private_key: TEST_PRIVATE_KEY.to_string(),
+            wg_private_key: zeroize::Zeroizing::new(TEST_PRIVATE_KEY.to_string()),
             wg_ipv4: "10.128.0.42".to_string(),
             wg_ipv6: "fd7d:76ee:3c49:9950::42".to_string(),
             wg_dns_ipv4: "10.128.0.1".to_string(),
             wg_dns_ipv6: "fd7d:76ee:3c49:9950::1".to_string(),
-            wg_preshared: TEST_PRESHARED_KEY.to_string(),
+            wg_preshared: zeroize::Zeroizing::new(TEST_PRESHARED_KEY.to_string()),
         }
     }
 
@@ -747,7 +759,7 @@ mod tests {
     #[test]
     fn test_generate_config_empty_preshared_key() {
         let mut key = test_key();
-        key.wg_preshared = String::new();
+        key.wg_preshared = zeroize::Zeroizing::new(String::new());
         let server = test_server();
         let mode = test_mode();
         let user = test_user();
@@ -1029,7 +1041,7 @@ mod tests {
     #[test]
     fn test_generate_config_empty_private_key_errors() {
         let mut key = test_key();
-        key.wg_private_key = String::new();
+        key.wg_private_key = zeroize::Zeroizing::new(String::new());
         let server = test_server();
         let mode = test_mode();
         let user = test_user();
@@ -1211,7 +1223,7 @@ mod tests {
     fn test_generate_config_rejects_injected_private_key() {
         let mut key = test_key();
         // Inject a newline into a 44-byte private key to try adding PostUp
-        key.wg_private_key = "AAAAAAAAAAAAAAAAA\nAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string();
+        key.wg_private_key = zeroize::Zeroizing::new("AAAAAAAAAAAAAAAAA\nAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string());
         assert_eq!(key.wg_private_key.len(), 44);
         let server = test_server();
         let mode = test_mode();
