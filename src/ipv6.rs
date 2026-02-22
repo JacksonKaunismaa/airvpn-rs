@@ -63,9 +63,10 @@ pub fn block_all() -> Vec<String> {
 /// Also restores the "default" sysctl template so newly created interfaces
 /// get IPv6 enabled again.
 ///
-/// After restoring tracked interfaces, also scans for any transient interfaces
-/// (USB ethernet, WiFi reconnect, Docker, etc.) that were created during the
-/// VPN session and inherited `disable_ipv6=1` from the `default` sysctl template.
+/// Only restores interfaces that were explicitly tracked in `block_all()`.
+/// We do NOT scan for untracked interfaces — re-enabling IPv6 on interfaces
+/// we didn't disable (e.g., Docker, user-configured) could break their
+/// intended configuration.
 pub fn restore(interfaces: &[String]) {
     let conf_dir = Path::new("/proc/sys/net/ipv6/conf");
 
@@ -73,33 +74,10 @@ pub fn restore(interfaces: &[String]) {
     let default_disable = conf_dir.join("default").join("disable_ipv6");
     let _ = fs::write(&default_disable, "0");
 
-    // Restore tracked interfaces
+    // Restore only tracked interfaces
     for name in interfaces {
         let disable_path = conf_dir.join(name).join("disable_ipv6");
         let _ = fs::write(&disable_path, "0");
-    }
-
-    // Also restore any transient interfaces created during the session
-    // (they inherited disable_ipv6=1 from the "default" template)
-    if let Ok(entries) = fs::read_dir(conf_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if matches!(name.as_str(), "all" | "lo" | "lo0") {
-                continue;
-            }
-            // Skip already-restored interfaces
-            if interfaces.iter().any(|i| i == &name) {
-                continue;
-            }
-            let disable_path = conf_dir.join(&name).join("disable_ipv6");
-            let current = fs::read_to_string(&disable_path)
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            if current == "1" {
-                let _ = fs::write(&disable_path, "0");
-            }
-        }
     }
 }
 

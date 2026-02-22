@@ -84,7 +84,8 @@ fn init_logging() {
     use std::os::unix::fs::OpenOptionsExt;
 
     let log_path = std::env::var("AIRVPN_LOG").unwrap_or_default();
-    // Prefer /var/log (root-owned, standard location), fall back to /tmp
+    // Prefer /var/log (root-owned, standard location), fall back to /run/airvpn-rs/
+    // (root-owned, restricted permissions). Never use /tmp — symlink attack vector.
     let log_path = if !log_path.is_empty() {
         log_path
     } else {
@@ -99,7 +100,20 @@ fn init_logging() {
         {
             preferred.to_string()
         } else {
-            "/tmp/airvpn-rs.log".to_string()
+            // Create /run/airvpn-rs/ with mode 0o700 (root-only) to prevent
+            // symlink attacks that /tmp would be vulnerable to.
+            let run_dir = std::path::Path::new("/run/airvpn-rs");
+            if !run_dir.exists() {
+                if let Err(e) = std::fs::create_dir(run_dir) {
+                    eprintln!("warning: could not create {}: {}", run_dir.display(), e);
+                } else {
+                    let _ = std::fs::set_permissions(
+                        run_dir,
+                        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+                    );
+                }
+            }
+            "/run/airvpn-rs/airvpn-rs.log".to_string()
         }
     };
 
@@ -731,10 +745,18 @@ fn cmd_connect(
 
             if verify_failed && !shutdown.load(Ordering::Relaxed) {
                 warn!("Verification failed, treating as connection failure, reconnecting...");
-                let _ = cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces, &endpoint_ip);
+                // Use partial_disconnect: tear down WG + DNS only, keep netlock
+                // and IPv6 blocking active to prevent leak window during reconnection.
+                let _ = partial_disconnect(&config_path, &iface, !no_lock, &endpoint_ip);
                 penalties.penalize(&server_ref.name, 30);
                 forced_server = Option::None;
                 if no_reconnect {
+                    // Full cleanup on exit — tear down netlock and IPv6 too
+                    if !no_lock {
+                        let _ = netlock::deactivate();
+                    }
+                    ipv6::restore(&blocked_ipv6_ifaces);
+                    let _ = recovery::remove();
                     anyhow::bail!("Verification failed (--no-reconnect)");
                 }
                 interruptible_sleep(&shutdown, 3);
@@ -773,22 +795,27 @@ fn cmd_connect(
             }
 
             // Periodic DNS re-check (matching Eddie's DnsSwitchCheck)
-            let _ = dns::check_and_reapply(&wg_key.wg_dns_ipv4, &wg_key.wg_dns_ipv6);
+            let _ = dns::check_and_reapply(&wg_key.wg_dns_ipv4, &wg_key.wg_dns_ipv6, &iface);
 
             std::thread::sleep(std::time::Duration::from_secs(1));
         };
 
-        // Clean disconnect for this iteration
-        cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces, &endpoint_ip)?;
-
         // Handle reset level (Eddie: Session.cs phase 6 cleanup + wait)
         match reset_level {
-            ResetLevel::None | ResetLevel::Fatal => break,
+            ResetLevel::None | ResetLevel::Fatal => {
+                // User-requested disconnect or fatal error — full cleanup
+                cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces, &endpoint_ip)?;
+                break;
+            }
             ResetLevel::Error => {
                 if no_reconnect {
+                    // Exiting — full cleanup
+                    cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces, &endpoint_ip)?;
                     warn!("Connection lost (--no-reconnect, exiting).");
                     break;
                 }
+                // Reconnecting — partial disconnect only (keep netlock + IPv6 blocking)
+                let _ = partial_disconnect(&config_path, &iface, !no_lock, &endpoint_ip);
                 penalties.penalize(&server_ref.name, 30);
                 forced_server = Option::None; // clear forced server for rotation
                 warn!(
@@ -799,17 +826,25 @@ fn cmd_connect(
             }
             ResetLevel::Retry => {
                 if no_reconnect {
+                    // Exiting — full cleanup
+                    cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces, &endpoint_ip)?;
                     warn!("Connection lost (--no-reconnect, exiting).");
                     break;
                 }
+                // Reconnecting — partial disconnect only (keep netlock + IPv6 blocking)
+                let _ = partial_disconnect(&config_path, &iface, !no_lock, &endpoint_ip);
                 warn!("Retrying same server in 1s...");
                 interruptible_sleep(&shutdown, 1);
             }
             ResetLevel::Switch => {
                 if no_reconnect {
+                    // Exiting — full cleanup
+                    cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces, &endpoint_ip)?;
                     warn!("Server switch requested (--no-reconnect, exiting).");
                     break;
                 }
+                // Reconnecting — partial disconnect only (keep netlock + IPv6 blocking)
+                let _ = partial_disconnect(&config_path, &iface, !no_lock, &endpoint_ip);
                 forced_server = Option::None;
                 info!("Switching server...");
             }
@@ -846,6 +881,26 @@ fn cmd_disconnect() -> anyhow::Result<()> {
     }
 
     cmd_disconnect_internal(&state.wg_config_path, &state.wg_interface, state.lock_active, &state.blocked_ipv6_ifaces, &state.endpoint_ip)
+}
+
+/// Partial disconnect: tear down WireGuard + DNS only, keeping netlock and IPv6
+/// blocking active. Used during reconnection to avoid a leak window.
+///
+/// Matches the pattern used in the handshake-failure and WireGuard-connect-failure
+/// paths, which correctly keep the base netlock table and IPv6 blocking active
+/// across reconnection attempts.
+fn partial_disconnect(config_path: &str, iface: &str, lock_active: bool, endpoint_ip: &str) -> anyhow::Result<()> {
+    // 1. Remove interface-specific nft rules (but keep the base netlock table)
+    if lock_active && !iface.is_empty() {
+        let _ = netlock::deallow_interface(iface);
+    }
+    // 2. wg-quick down
+    let _ = wireguard::disconnect(config_path, endpoint_ip);
+    // 3. Restore DNS
+    let _ = dns::deactivate();
+    dns::flush();
+    // NOTE: netlock base table and IPv6 blocking remain active — no leak window
+    Ok(())
 }
 
 fn cmd_disconnect_internal(config_path: &str, iface: &str, lock_active: bool, blocked_ipv6: &[String], endpoint_ip: &str) -> anyhow::Result<()> {

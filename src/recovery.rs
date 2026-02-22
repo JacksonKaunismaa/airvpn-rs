@@ -73,6 +73,20 @@ fn validate_state(state: &State) -> bool {
         }
     }
 
+    // Validate wg_config_path: must be under /run/airvpn-rs/ with no path traversal
+    if !state.wg_config_path.is_empty() {
+        let path = std::path::Path::new(&state.wg_config_path);
+        if !state.wg_config_path.starts_with("/run/airvpn-rs/")
+            || path.components().any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            warn!(
+                "state validation failed: invalid wg_config_path {:?}",
+                state.wg_config_path
+            );
+            return false;
+        }
+    }
+
     // Validate IPs if present
     if !state.dns_ipv4.is_empty() && state.dns_ipv4.parse::<std::net::IpAddr>().is_err() {
         warn!("state validation failed: invalid dns_ipv4 {:?}", state.dns_ipv4);
@@ -390,7 +404,7 @@ pub fn check_and_recover() -> Result<()> {
         None => return Ok(()), // No state file, nothing to recover
     };
 
-    if is_pid_alive(state.pid) {
+    if is_pid_alive_with_nonce(state.pid, state.nonce) {
         anyhow::bail!(
             "another airvpn-rs instance (PID {}) appears to be running",
             state.pid
@@ -702,5 +716,53 @@ mod tests {
         // Generate a few nonces and verify they're not all zero
         let nonces: Vec<u64> = (0..10).map(|_| generate_nonce()).collect();
         assert!(nonces.iter().any(|n| *n != 0), "nonces should not all be zero");
+    }
+
+    #[test]
+    fn test_validate_state_invalid_wg_config_path_traversal() {
+        let state = State {
+            lock_active: true,
+            wg_interface: String::new(),
+            wg_config_path: "/run/airvpn-rs/../../../etc/passwd".to_string(),
+            dns_ipv4: String::new(),
+            dns_ipv6: String::new(),
+            pid: 12345,
+            blocked_ipv6_ifaces: vec![],
+            endpoint_ip: String::new(),
+            nonce: 0,
+        };
+        assert!(!validate_state(&state));
+    }
+
+    #[test]
+    fn test_validate_state_invalid_wg_config_path_wrong_dir() {
+        let state = State {
+            lock_active: true,
+            wg_interface: String::new(),
+            wg_config_path: "/tmp/evil.conf".to_string(),
+            dns_ipv4: String::new(),
+            dns_ipv6: String::new(),
+            pid: 12345,
+            blocked_ipv6_ifaces: vec![],
+            endpoint_ip: String::new(),
+            nonce: 0,
+        };
+        assert!(!validate_state(&state));
+    }
+
+    #[test]
+    fn test_validate_state_valid_wg_config_path() {
+        let state = State {
+            lock_active: true,
+            wg_interface: "avpn-abc123".to_string(),
+            wg_config_path: "/run/airvpn-rs/avpn-abc123.conf".to_string(),
+            dns_ipv4: "10.0.0.1".to_string(),
+            dns_ipv6: String::new(),
+            pid: 12345,
+            blocked_ipv6_ifaces: vec![],
+            endpoint_ip: String::new(),
+            nonce: 42,
+        };
+        assert!(validate_state(&state));
     }
 }

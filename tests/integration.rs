@@ -443,7 +443,7 @@ fn test_dns_check_and_reapply() {
         .expect("overwrite resolv.conf with garbage");
 
     // check_and_reapply should detect drift and restore our DNS
-    let reapplied = dns::check_and_reapply(test_ipv4, test_ipv6).expect("check_and_reapply");
+    let reapplied = dns::check_and_reapply(test_ipv4, test_ipv6, test_iface).expect("check_and_reapply");
     assert!(reapplied, "should detect drift and reapply DNS");
 
     // Verify DNS was restored
@@ -455,7 +455,7 @@ fn test_dns_check_and_reapply() {
     );
 
     // check_and_reapply again should find no drift
-    let reapplied2 = dns::check_and_reapply(test_ipv4, test_ipv6).expect("second check_and_reapply");
+    let reapplied2 = dns::check_and_reapply(test_ipv4, test_ipv6, test_iface).expect("second check_and_reapply");
     assert!(!reapplied2, "should not reapply when DNS is correct");
 
     dns::deactivate().expect("dns deactivate");

@@ -9,6 +9,8 @@
 use std::collections::HashMap;
 use std::process::Command;
 
+use log::warn;
+
 /// Ping results for all servers.
 pub struct PingResults {
     /// Server name -> latency in ms (-1 = not measured/failed)
@@ -110,6 +112,13 @@ pub fn measure_all(servers: &[crate::manifest::Server]) -> PingResults {
             .or_else(|| server.ips_entry.first());
 
         if let Some(ip) = ip {
+            // Validate IP address before passing to ping command to prevent
+            // command injection via malicious manifest data.
+            if ip.parse::<std::net::IpAddr>().is_err() {
+                warn!("skipping invalid IP for server {}: {:?}", server.name, ip);
+                results.latencies.insert(server.name.clone(), -1);
+                continue;
+            }
             match ping_ip(ip) {
                 Some(ms) => {
                     results.latencies.insert(server.name.clone(), ms as i64);

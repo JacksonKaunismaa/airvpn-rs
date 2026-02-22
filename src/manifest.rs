@@ -109,12 +109,8 @@ const MAX_SERVERS: usize = 10_000;
 const MAX_MODES: usize = 100;
 const MAX_BOOTSTRAP_URLS: usize = 50;
 
-const ALLOWED_CHECK_DOMAIN_SUFFIXES: &[&str] = &[
-    ".airvpn.org",
-    ".airdns.org",
-    "airvpn.org",
-    "airdns.org",
-];
+const ALLOWED_EXACT_DOMAINS: &[&str] = &["airvpn.org", "airdns.org"];
+const ALLOWED_DOMAIN_SUFFIXES: &[&str] = &[".airvpn.org", ".airdns.org"];
 
 pub fn sanitize_server_message(msg: &str) -> String {
     let mut result = String::with_capacity(msg.len());
@@ -158,6 +154,17 @@ fn split_ips(s: &str) -> Vec<String> {
     s.split([',', ';'])
         .map(str::trim)
         .filter(|s| !s.is_empty())
+        .filter(|ip_str| {
+            // Strip CIDR prefix if present (e.g. "10.0.0.1/24" -> "10.0.0.1")
+            let bare = ip_str.split('/').next().unwrap_or(ip_str);
+            match bare.parse::<IpAddr>() {
+                Ok(_) => true,
+                Err(_) => {
+                    warn!("Skipping invalid IP '{}' in server entry/exit list", ip_str);
+                    false
+                }
+            }
+        })
         .map(String::from)
         .collect()
 }
@@ -186,17 +193,16 @@ fn validate_check_domain(domain: &str) -> anyhow::Result<()> {
     if domain.is_empty() {
         return Ok(());
     }
-    let host = domain.split(':').next().unwrap_or(domain);
-    for suffix in ALLOWED_CHECK_DOMAIN_SUFFIXES {
-        if host == *suffix || host.ends_with(suffix) {
-            return Ok(());
-        }
+    let host = domain.split(':').next().unwrap_or(domain).to_lowercase();
+    let valid = ALLOWED_EXACT_DOMAINS.iter().any(|d| host == *d)
+        || ALLOWED_DOMAIN_SUFFIXES.iter().any(|s| host.ends_with(s));
+    if !valid {
+        bail!(
+            "check_domain '{}' not in allowed domain list",
+            domain,
+        );
     }
-    bail!(
-        "manifest check_domain '{}' does not match any allowed AirVPN domain suffix ({:?})",
-        domain,
-        ALLOWED_CHECK_DOMAIN_SUFFIXES
-    )
+    Ok(())
 }
 
 fn validate_ip(s: &str, context: &str) -> anyhow::Result<()> {
@@ -339,13 +345,18 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
                                 if bootstrap_urls.len() >= MAX_BOOTSTRAP_URLS {
                                     bail!("manifest exceeds maximum bootstrap URL count ({})", MAX_BOOTSTRAP_URLS);
                                 }
-                                bootstrap_urls.push(addr);
+                                if !addr.starts_with("https://") {
+                                    warn!("Skipping non-HTTPS bootstrap URL: {}", sanitize_server_message(&addr));
+                                } else {
+                                    bootstrap_urls.push(addr);
+                                }
                             }
                         }
                     }
                     b"message" => {
                         let kind = attr_opt(e, b"kind").unwrap_or_default();
-                        let text = attr_opt(e, b"text").unwrap_or_default();
+                        let raw_text = attr_opt(e, b"text").unwrap_or_default();
+                        let text = sanitize_server_message(&raw_text);
                         let url = attr_opt(e, b"url").unwrap_or_default();
                         if !text.is_empty() {
                             messages.push(Message { kind, text, url });
@@ -477,7 +488,7 @@ mod tests {
     <mode title="OpenVPN UDP 443" type="openvpn" protocol="UDP" port="443" entry_index="0" />
   </modes>
   <urls>
-    <url address="http://eddie.website/api/" />
+    <url address="https://eddie.website/api/" />
   </urls>
 </manifest>"#;
 
@@ -533,6 +544,10 @@ mod tests {
     #[test]
     fn test_validate_check_domain_rejected() {
         assert!(validate_check_domain("evil.com").is_err());
+        // Must reject domains that share a suffix but aren't subdomains
+        assert!(validate_check_domain("evilairvpn.org").is_err());
+        assert!(validate_check_domain("evilairdns.org").is_err());
+        assert!(validate_check_domain("notairvpn.org").is_err());
     }
 
     #[test]
@@ -566,6 +581,44 @@ mod tests {
         assert_eq!(split_ips("1.2.3.4,5.6.7.8"), vec!["1.2.3.4", "5.6.7.8"]);
         assert_eq!(split_ips("1.2.3.4;5.6.7.8"), vec!["1.2.3.4", "5.6.7.8"]);
         assert!(split_ips("").is_empty());
+    }
+
+    #[test]
+    fn test_split_ips_filters_invalid() {
+        // Valid IPs kept, invalid ones dropped
+        assert_eq!(split_ips("1.2.3.4,not-an-ip,5.6.7.8"), vec!["1.2.3.4", "5.6.7.8"]);
+        // All invalid -> empty
+        assert!(split_ips("garbage,also-bad").is_empty());
+        // IPv6 works
+        assert_eq!(split_ips("fd00::1,1.2.3.4"), vec!["fd00::1", "1.2.3.4"]);
+    }
+
+    #[test]
+    fn test_bootstrap_url_requires_https() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<manifest time="0" next_update="0" force_reauth_ts="0" check_domain="" check_dns_query="">
+  <urls>
+    <url address="http://evil.example.com/api/" />
+    <url address="https://good.example.com/api/" />
+  </urls>
+</manifest>"#;
+        let m = parse_manifest(xml).unwrap();
+        assert_eq!(m.bootstrap_urls.len(), 1);
+        assert_eq!(m.bootstrap_urls[0], "https://good.example.com/api/");
+    }
+
+    #[test]
+    fn test_message_text_sanitized() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<manifest time="0" next_update="0" force_reauth_ts="0" check_domain="" check_dns_query="">
+  <message kind="info" text="Hello &lt;script&gt;alert(1)&lt;/script&gt; world" url="" />
+</manifest>"#;
+        let m = parse_manifest(xml).unwrap();
+        assert_eq!(m.messages.len(), 1);
+        // HTML tags should be stripped by sanitize_server_message
+        assert!(!m.messages[0].text.contains("<script>"));
+        assert!(m.messages[0].text.contains("Hello"));
+        assert!(m.messages[0].text.contains("world"));
     }
 
     #[test]

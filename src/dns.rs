@@ -34,8 +34,19 @@ fn is_immutable(path: &Path) -> bool {
         .arg(&path.to_string_lossy().to_string())
         .output()
         .map(|o| {
+            if !o.status.success() {
+                return false;
+            }
             let stdout = String::from_utf8_lossy(&o.stdout);
-            stdout.contains('i')
+            // lsattr output: "----i---------e-- /etc/resolv.conf"
+            // Only check the attribute flags field (first column before space)
+            // to avoid false positives from 'i' in the filename (e.g. "resolv").
+            stdout.lines().any(|line| {
+                line.split_whitespace()
+                    .next()
+                    .map(|attrs| attrs.contains('i'))
+                    .unwrap_or(false)
+            })
         })
         .unwrap_or(false)
 }
@@ -438,7 +449,7 @@ pub fn deactivate() -> Result<()> {
 /// settings. This function is called periodically to detect and fix both kinds of drift.
 ///
 /// Returns Ok(true) if any DNS settings were re-applied, Ok(false) if no drift detected.
-pub fn check_and_reapply(dns_ipv4: &str, dns_ipv6: &str) -> Result<bool> {
+pub fn check_and_reapply(dns_ipv4: &str, dns_ipv6: &str, vpn_iface: &str) -> Result<bool> {
     let mut reapplied = false;
 
     // Check resolv.conf drift
@@ -480,6 +491,12 @@ pub fn check_and_reapply(dns_ipv4: &str, dns_ipv6: &str) -> Result<bool> {
     if is_systemd_resolved_active() {
         let ifaces = list_interfaces();
         for iface in &ifaces {
+            // Skip the VPN interface — it must keep default-route=true so DNS
+            // routes through the tunnel. Only enforce default-route=false on
+            // non-VPN interfaces.
+            if iface == vpn_iface {
+                continue;
+            }
             // Check if default-route was reverted to true on a non-VPN interface
             let output = Command::new("resolvectl")
                 .args(["default-route", iface.as_str()])

@@ -32,6 +32,9 @@ rpassword = "7"
 # Keyring (v2s mode)
 secret-service = { version = "5", features = ["rt-async-io-crypto-rust"] }
 
+# Zeroize sensitive key material on drop
+zeroize = { version = "1", features = ["derive"] }
+
 # Hashing (netlock SHA-256 comment tags)
 hex = "0.4"
 

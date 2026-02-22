@@ -27,6 +27,50 @@ fn validate_interface_name(iface: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate a WireGuard key (private, public, or preshared).
+///
+/// WireGuard keys are 32 bytes encoded as base64, producing exactly 44 characters
+/// of [A-Za-z0-9+/=]. Rejects newlines, carriage returns, and non-printable
+/// characters to prevent config injection (e.g., injecting PostUp/PostDown lines).
+fn validate_wg_key(key: &str, name: &str) -> Result<()> {
+    if key.len() != 44 {
+        anyhow::bail!("{} has unexpected length {} (expected 44)", name, key.len());
+    }
+    if key
+        .chars()
+        .any(|c| c == '\n' || c == '\r' || !c.is_ascii_graphic())
+    {
+        anyhow::bail!("{} contains invalid characters", name);
+    }
+    // Strict base64 character set
+    if !key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
+    {
+        anyhow::bail!("{} contains non-base64 characters", name);
+    }
+    Ok(())
+}
+
+/// Validate a WireGuard IP address (IPv4 or IPv6, with optional CIDR suffix).
+///
+/// Strips any CIDR suffix before parsing. Rejects newlines, carriage returns,
+/// and non-printable characters to prevent config injection.
+fn validate_wg_ip(ip: &str, name: &str) -> Result<()> {
+    if ip
+        .chars()
+        .any(|c| c == '\n' || c == '\r' || !c.is_ascii_graphic())
+    {
+        anyhow::bail!("{} contains invalid characters", name);
+    }
+    // Strip CIDR suffix if present (e.g., "10.0.0.1/32" -> "10.0.0.1")
+    let addr_part = ip.split('/').next().unwrap_or(ip);
+    if addr_part.parse::<std::net::IpAddr>().is_err() {
+        anyhow::bail!("{} is not a valid IP address: {:?}", name, ip);
+    }
+    Ok(())
+}
+
 /// Ensure an IP address has a CIDR suffix. If it already has one, return as-is.
 /// If not, append the default suffix.
 fn ensure_cidr(ip: &str, default_suffix: &str) -> String {
@@ -62,6 +106,16 @@ pub fn generate_config(key: &WireGuardKey, server: &Server, mode: &Mode, user: &
     if mode.port == 0 {
         anyhow::bail!("WireGuard mode has no port configured");
     }
+
+    // Validate key values to prevent config injection via newlines or shell metacharacters.
+    // A malicious API response could inject PostUp/PostDown commands into the config.
+    validate_wg_key(&key.wg_private_key, "wg_private_key")?;
+    validate_wg_key(&user.wg_public_key, "wg_public_key")?;
+    if !key.wg_preshared.is_empty() {
+        validate_wg_key(&key.wg_preshared, "wg_preshared")?;
+    }
+    validate_wg_ip(&key.wg_ipv4, "wg_ipv4")?;
+    validate_wg_ip(&key.wg_ipv6, "wg_ipv6")?;
 
     // Prefer IPv4 entry IPs (matching Eddie's default network.entry.iplayer="ipv4-ipv6")
     // Since we block IPv6 on all interfaces, IPv6 entry IPs would fail
@@ -161,31 +215,57 @@ pub fn connect(config: &str, endpoint_ip: &str) -> Result<(String, String)> {
     let (_, path) = tmpfile.keep().context("failed to persist config file")?;
     let config_path = path.to_string_lossy().to_string();
 
+    // Helper to clean up the persisted config file (contains private key) on error.
+    // After tmpfile.keep() the file is no longer auto-deleted, so we must remove it
+    // explicitly if any subsequent operation fails.
+    let cleanup_config = |path: &str| {
+        let _ = std::fs::remove_file(path);
+    };
+
     #[cfg(unix)]
     {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
+        let mut f = match std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
             .open(&config_path)
-            .with_context(|| format!("failed to create WireGuard config: {}", config_path))?;
-        f.write_all(config.as_bytes())
-            .with_context(|| format!("failed to write WireGuard config: {}", config_path))?;
+        {
+            Ok(f) => f,
+            Err(e) => {
+                cleanup_config(&config_path);
+                return Err(anyhow::Error::new(e)
+                    .context(format!("failed to create WireGuard config: {}", config_path)));
+            }
+        };
+        if let Err(e) = f.write_all(config.as_bytes()) {
+            cleanup_config(&config_path);
+            return Err(anyhow::Error::new(e)
+                .context(format!("failed to write WireGuard config: {}", config_path)));
+        }
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(&config_path, config)
-            .with_context(|| format!("failed to write WireGuard config to {}", config_path))?;
+        if let Err(e) = std::fs::write(&config_path, config) {
+            cleanup_config(&config_path);
+            return Err(anyhow::Error::new(e)
+                .context(format!("failed to write WireGuard config to {}", config_path)));
+        }
     }
 
     // Interface name = basename without .conf
-    let iface = Path::new(&config_path)
+    let iface = match Path::new(&config_path)
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
-        .context("failed to derive interface name from config path")?;
+    {
+        Some(name) => name,
+        None => {
+            cleanup_config(&config_path);
+            anyhow::bail!("failed to derive interface name from config path");
+        }
+    };
 
     // Pre-cleanup: if interface already exists from a crash, remove it
     if is_connected(&iface) {
@@ -241,6 +321,28 @@ fn get_default_gateway() -> Result<String> {
     anyhow::bail!("no IPv4 default gateway found (is the network up?)")
 }
 
+/// Get the current IPv6 default gateway from the main routing table.
+///
+/// Parses `ip -6 route show default` output which looks like:
+///   default via fe80::1 dev eth0 proto ra metric 100
+fn get_default_gateway_v6() -> Result<String> {
+    let output = Command::new("ip")
+        .args(["-6", "route", "show", "default"])
+        .output()
+        .context("failed to execute: ip -6 route show default")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Parse "default via <gateway> ..."
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 3 && parts[0] == "default" && parts[1] == "via" {
+            return Ok(parts[2].to_string());
+        }
+    }
+
+    anyhow::bail!("no IPv6 default gateway found — cannot route to IPv6 VPN endpoint")
+}
+
 /// Set up routing for the VPN tunnel.
 ///
 /// Since we use `Table = off` (to avoid wg-quick's nft rules conflicting with
@@ -272,14 +374,20 @@ fn setup_routing(iface: &str, endpoint_ip: &str) -> Result<()> {
         anyhow::bail!("wg set {} fwmark 51820 failed: {}", iface, stderr.trim());
     }
 
-    // 2. Save original default gateway before any route changes
-    let original_gw = get_default_gateway()?;
-    debug!("Original default gateway: {}", original_gw);
+    // 2. Save original default gateway before any route changes.
+    //    Use the correct IP version gateway for the endpoint to avoid creating
+    //    invalid routes (e.g., IPv6 endpoint via IPv4 gateway).
+    let is_ipv6_endpoint = endpoint_ip.contains(':');
+    let original_gw = if is_ipv6_endpoint {
+        get_default_gateway_v6()?
+    } else {
+        get_default_gateway()?
+    };
+    debug!("Original default gateway ({}): {}", if is_ipv6_endpoint { "v6" } else { "v4" }, original_gw);
 
     // 3. Add host route for VPN endpoint through original gateway.
     //    This ensures encrypted WireGuard packets reach the server even after
     //    our policy routing redirects everything else through the tunnel.
-    let is_ipv6_endpoint = endpoint_ip.contains(':');
     let cidr_suffix = if is_ipv6_endpoint { "/128" } else { "/32" };
     let ip_version = if is_ipv6_endpoint { "-6" } else { "-4" };
     let endpoint_route = format!("{}{}", endpoint_ip, cidr_suffix);
@@ -390,13 +498,27 @@ fn teardown_routing(_iface: &str, endpoint_ip: &str) {
         &["ip", "-4", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
         &["ip", "-6", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
     ];
+    const MAX_RULE_DELETIONS: usize = 100;
     for cmd in commands {
-        // Loop until the rule no longer exists (command fails)
-        loop {
+        // Loop until the rule no longer exists (command fails).
+        // Bound to MAX_RULE_DELETIONS to prevent infinite loops if deletion
+        // keeps "succeeding" without actually removing the rule.
+        let mut deleted = 0;
+        for _ in 0..MAX_RULE_DELETIONS {
             match Command::new(cmd[0]).args(&cmd[1..]).output() {
-                Ok(output) if output.status.success() => continue,
+                Ok(output) if output.status.success() => {
+                    deleted += 1;
+                    continue;
+                }
                 _ => break,
             }
+        }
+        if deleted >= MAX_RULE_DELETIONS {
+            warn!(
+                "hit {} rule deletions for {:?} — possible infinite loop",
+                MAX_RULE_DELETIONS,
+                cmd.join(" ")
+            );
         }
     }
 
@@ -459,6 +581,10 @@ pub fn is_connected(iface: &str) -> bool {
 ///   <public_key>\t<unix_timestamp>\n
 /// A timestamp of 0 means no handshake yet.
 pub fn latest_handshake(iface: &str) -> Option<u64> {
+    if validate_interface_name(iface).is_err() {
+        return None;
+    }
+
     let output = Command::new("wg")
         .args(["show", iface, "latest-handshakes"])
         .output()
@@ -488,6 +614,8 @@ pub fn latest_handshake(iface: &str) -> Option<u64> {
 /// within the timeout, the tunnel is likely misconfigured (wrong key,
 /// blocked port, unreachable server).
 pub fn wait_for_handshake(iface: &str, timeout_secs: u64) -> Result<()> {
+    validate_interface_name(iface)?;
+
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(timeout_secs);
 
@@ -532,15 +660,20 @@ pub fn is_handshake_stale(iface: &str, max_age_secs: u64) -> bool {
 mod tests {
     use super::*;
 
+    // Valid 44-character base64 strings (WireGuard keys are 32 bytes = 44 base64 chars)
+    const TEST_PRIVATE_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    const TEST_PUBLIC_KEY: &str  = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=";
+    const TEST_PRESHARED_KEY: &str = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=";
+
     fn test_key() -> WireGuardKey {
         WireGuardKey {
             name: "default".to_string(),
-            wg_private_key: "PrivateKeyBase64==".to_string(),
+            wg_private_key: TEST_PRIVATE_KEY.to_string(),
             wg_ipv4: "10.128.0.42".to_string(),
             wg_ipv6: "fd7d:76ee:3c49:9950::42".to_string(),
             wg_dns_ipv4: "10.128.0.1".to_string(),
             wg_dns_ipv6: "fd7d:76ee:3c49:9950::1".to_string(),
-            wg_preshared: "PresharedKeyBase64==".to_string(),
+            wg_preshared: TEST_PRESHARED_KEY.to_string(),
         }
     }
 
@@ -576,7 +709,7 @@ mod tests {
     fn test_user() -> UserInfo {
         UserInfo {
             login: "testuser".to_string(),
-            wg_public_key: "PublicKeyBase64==".to_string(),
+            wg_public_key: TEST_PUBLIC_KEY.to_string(),
             keys: vec![test_key()],
         }
     }
@@ -595,7 +728,7 @@ mod tests {
 
         // Check [Interface] section
         assert!(config.contains("[Interface]"));
-        assert!(config.contains("PrivateKey = PrivateKeyBase64=="));
+        assert!(config.contains(&format!("PrivateKey = {}", TEST_PRIVATE_KEY)));
         assert!(config.contains("Address = 10.128.0.42/32, fd7d:76ee:3c49:9950::42/128"));
         assert!(config.contains("MTU = 1320"));
         assert!(config.contains("Table = off"), "Table = off must be present to prevent wg-quick nft conflicts");
@@ -604,8 +737,8 @@ mod tests {
 
         // Check [Peer] section
         assert!(config.contains("[Peer]"));
-        assert!(config.contains("PublicKey = PublicKeyBase64=="));
-        assert!(config.contains("PresharedKey = PresharedKeyBase64=="));
+        assert!(config.contains(&format!("PublicKey = {}", TEST_PUBLIC_KEY)));
+        assert!(config.contains(&format!("PresharedKey = {}", TEST_PRESHARED_KEY)));
         assert!(config.contains("Endpoint = 185.32.12.1:1637"));
         assert!(config.contains("AllowedIPs = 0.0.0.0/0, ::/0"));
         assert!(config.contains("PersistentKeepalive = 15"));
@@ -1001,5 +1134,128 @@ mod tests {
         assert!(validate_interface_name("../etc/passwd").is_err());
         assert!(validate_interface_name("a-very-long-interface-name").is_err());
         assert!(validate_interface_name("wg 0").is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // validate_wg_key — config injection prevention
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_wg_key_valid() {
+        assert!(validate_wg_key(TEST_PRIVATE_KEY, "test").is_ok());
+        assert!(validate_wg_key(TEST_PUBLIC_KEY, "test").is_ok());
+        assert!(validate_wg_key(TEST_PRESHARED_KEY, "test").is_ok());
+        // Key with mixed base64 characters including + and /
+        assert!(validate_wg_key("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh+/0123456=", "test").is_ok());
+    }
+
+    #[test]
+    fn test_validate_wg_key_wrong_length() {
+        assert!(validate_wg_key("tooshort", "test").is_err());
+        assert!(validate_wg_key("", "test").is_err());
+        // 45 chars — too long
+        assert!(validate_wg_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "test").is_err());
+    }
+
+    #[test]
+    fn test_validate_wg_key_newline_injection() {
+        // Contains a newline — the core injection attack vector.
+        // \n is 1 byte, so we craft a 44-byte string with an embedded newline.
+        let injected = "AAAAAAAAAAAAAAAAA\nAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        assert_eq!(injected.len(), 44);
+        assert!(validate_wg_key(injected, "test").is_err());
+    }
+
+    #[test]
+    fn test_validate_wg_key_carriage_return_injection() {
+        // Exactly 44 bytes with an embedded \r
+        let injected = "AAAAAAAAAAAAAAAAA\rAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        assert_eq!(injected.len(), 44);
+        assert!(validate_wg_key(injected, "test").is_err());
+    }
+
+    #[test]
+    fn test_validate_wg_key_non_base64_chars() {
+        // 44 chars, all printable, but contains non-base64 chars (spaces, dashes)
+        assert!(validate_wg_key("AAAA AAAA-AAAA_AAAA.AAAA!AAAA@AAAA#AAAA$AA=", "test").is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // validate_wg_ip — IP address validation
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_wg_ip_valid() {
+        assert!(validate_wg_ip("10.128.0.42", "test").is_ok());
+        assert!(validate_wg_ip("10.128.0.42/32", "test").is_ok());
+        assert!(validate_wg_ip("fd7d:76ee:3c49:9950::42", "test").is_ok());
+        assert!(validate_wg_ip("fd7d:76ee:3c49:9950::42/128", "test").is_ok());
+    }
+
+    #[test]
+    fn test_validate_wg_ip_invalid() {
+        assert!(validate_wg_ip("not-an-ip", "test").is_err());
+        assert!(validate_wg_ip("999.999.999.999", "test").is_err());
+    }
+
+    #[test]
+    fn test_validate_wg_ip_newline_injection() {
+        assert!(validate_wg_ip("10.0.0.1\nPostUp = evil", "test").is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // generate_config rejects injected keys
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_generate_config_rejects_injected_private_key() {
+        let mut key = test_key();
+        // Inject a newline into a 44-byte private key to try adding PostUp
+        key.wg_private_key = "AAAAAAAAAAAAAAAAA\nAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string();
+        assert_eq!(key.wg_private_key.len(), 44);
+        let server = test_server();
+        let mode = test_mode();
+        let user = test_user();
+
+        let result = generate_config(&key, &server, &mode, &user);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("invalid characters"),
+            "should reject key with newline injection, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_generate_config_rejects_injected_ip() {
+        let mut key = test_key();
+        key.wg_ipv4 = "10.0.0.1\nPostUp = evil".to_string();
+        let server = test_server();
+        let mode = test_mode();
+        let user = test_user();
+
+        let result = generate_config(&key, &server, &mode, &user);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("invalid characters"),
+            "should reject IP with newline injection"
+        );
+    }
+
+    #[test]
+    fn test_generate_config_rejects_invalid_ip() {
+        let mut key = test_key();
+        key.wg_ipv4 = "not-an-ip-address".to_string();
+        let server = test_server();
+        let mode = test_mode();
+        let user = test_user();
+
+        let result = generate_config(&key, &server, &mode, &user);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("not a valid IP"),
+            "should reject invalid IP address"
+        );
     }
 }

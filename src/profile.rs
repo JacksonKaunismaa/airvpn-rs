@@ -25,6 +25,7 @@ use rand::RngCore;
 use sha1::Sha1;
 use sha2::Sha256;
 use std::path::Path;
+use zeroize::Zeroizing;
 
 type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
@@ -97,9 +98,9 @@ impl ProfileFormat {
 
 /// Derive a key from password + salt using PBKDF2-HMAC-SHA1, matching Eddie's
 /// `Rfc2898DeriveBytes(password, salt, 10000, HashAlgorithmName.SHA1)`.
-fn pbkdf2_derive_key(password: &str, salt: &[u8]) -> [u8; KEY_BYTE_SIZE] {
-    let mut key = [0u8; KEY_BYTE_SIZE];
-    pbkdf2::pbkdf2::<Hmac<Sha1>>(password.as_bytes(), salt, PBKDF2_ITERATIONS, &mut key)
+fn pbkdf2_derive_key(password: &str, salt: &[u8]) -> Zeroizing<[u8; KEY_BYTE_SIZE]> {
+    let mut key = Zeroizing::new([0u8; KEY_BYTE_SIZE]);
+    pbkdf2::pbkdf2::<Hmac<Sha1>>(password.as_bytes(), salt, PBKDF2_ITERATIONS, &mut *key)
         .expect("HMAC can be initialized with any key length");
     key
 }
@@ -308,10 +309,21 @@ pub fn save_profile(
     file_data.extend_from_slice(id.as_bytes());
     file_data.extend_from_slice(&encrypted);
 
-    // Ensure parent directory exists
+    // Ensure parent directory exists with restrictive permissions
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create profile directory: {}", parent.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| {
+                    format!(
+                        "failed to set permissions on profile directory: {}",
+                        parent.display()
+                    )
+                })?;
+        }
     }
 
     // Write with correct permissions atomically (no world-readable window)

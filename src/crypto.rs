@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use rand::RngCore;
 use rsa::{BigUint, Pkcs1v15Encrypt, RsaPublicKey};
+use zeroize::Zeroizing;
 
 type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
@@ -126,9 +127,10 @@ pub fn rsa_encrypt(public_key: &RsaPublicKey, plaintext: &[u8]) -> Result<Vec<u8
 // ---------------------------------------------------------------------------
 
 /// Session key material returned alongside the envelope for response decryption.
+/// Key and IV are wrapped in `Zeroizing` to ensure they are zeroed on drop.
 pub struct SessionKey {
-    pub key: [u8; 32],
-    pub iv: [u8; 16],
+    pub key: Zeroizing<[u8; 32]>,
+    pub iv: Zeroizing<[u8; 16]>,
 }
 
 /// Build the encrypted API envelope matching Eddie's FetchUrl() protocol.
@@ -144,10 +146,10 @@ pub fn build_envelope(
     params: &[(String, String)],
 ) -> Result<(String, String, SessionKey)> {
     // 1. Generate random AES-256 key (32 bytes) + IV (16 bytes)
-    let mut key = [0u8; 32];
-    let mut iv = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut key);
-    rand::thread_rng().fill_bytes(&mut iv);
+    let mut key = Zeroizing::new([0u8; 32]);
+    let mut iv = Zeroizing::new([0u8; 16]);
+    rand::thread_rng().fill_bytes(&mut *key);
+    rand::thread_rng().fill_bytes(&mut *iv);
 
     // 2. Build session key envelope: assoc with "key" and "iv"
     let session_assoc = assoc_encode_bytes(&[("key", &key[..]), ("iv", &iv[..])]);
@@ -160,7 +162,7 @@ pub fn build_envelope(
     let d_plaintext = assoc_encode_strings(params);
 
     // 5. AES-CBC encrypt the request data
-    let d_encrypted = aes_cbc_encrypt(&d_plaintext, &key, &iv);
+    let d_encrypted = aes_cbc_encrypt(&d_plaintext, &*key, &*iv);
     let d_b64 = B64.encode(&d_encrypted);
 
     Ok((s_b64, d_b64, SessionKey { key, iv }))
