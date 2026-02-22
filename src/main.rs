@@ -346,7 +346,7 @@ fn cmd_connect(
     // 3. Fetch manifest + user data (two separate API calls)
     info!("Fetching server list...");
     debug!("API request: act=manifest (credentials redacted)");
-    let manifest_xml = api::fetch_manifest(&username, &password)?;
+    let manifest_xml = Zeroizing::new(api::fetch_manifest(&username, &password)?);
     debug!("Manifest XML response: {} bytes", manifest_xml.len());
     let manifest = manifest::parse_manifest(&manifest_xml)?;
     info!(
@@ -373,7 +373,7 @@ fn cmd_connect(
 
     info!("Fetching user data...");
     debug!("API request: act=user (credentials redacted)");
-    let user_xml = api::fetch_user_with_urls(&username, &password, &manifest.bootstrap_urls)?;
+    let user_xml = Zeroizing::new(api::fetch_user_with_urls(&username, &password, &manifest.bootstrap_urls)?);
     debug!("User XML response: {} bytes", user_xml.len());
     let user_info = manifest::parse_user(&user_xml)?;
     debug!("User info: login={}, {} WireGuard keys", user_info.login, user_info.keys.len());
@@ -483,7 +483,7 @@ fn cmd_connect(
         // reconnection), we fall back to the existing manifest data.
         if !first_iteration {
             info!("Re-fetching manifest for updated server data...");
-            match api::fetch_manifest(&username, &password) {
+            match api::fetch_manifest(&username, &password).map(Zeroizing::new) {
                 Ok(new_xml) => match manifest::parse_manifest(&new_xml) {
                     Ok(new_manifest) => {
                         // Re-apply server filters to the fresh manifest
@@ -514,7 +514,7 @@ fn cmd_connect(
                 Err(e) => warn!("Failed to re-fetch manifest, using stale data: {:#}", e),
             }
             // Also refresh user data (WireGuard keys may have changed)
-            match api::fetch_user_with_urls(&username, &password, &manifest.bootstrap_urls) {
+            match api::fetch_user_with_urls(&username, &password, &manifest.bootstrap_urls).map(Zeroizing::new) {
                 Ok(new_user_xml) => match manifest::parse_user(&new_user_xml) {
                     Ok(new_user) => {
                         user_info = new_user;
@@ -828,6 +828,11 @@ fn cmd_connect(
             dns::activate(&wg_key.wg_dns_ipv4, &wg_key.wg_dns_ipv6, &iface)?;
             info!("DNS configured: {}, {}", wg_key.wg_dns_ipv4, wg_key.wg_dns_ipv6);
 
+            // Client-side DNS verification: ensure resolv.conf contains only VPN DNS
+            if !dns::verify_resolv_conf(&wg_key.wg_dns_ipv4, &wg_key.wg_dns_ipv6, std::path::Path::new("/etc/resolv.conf")) {
+                warn!("resolv.conf contains non-VPN nameservers after DNS activation — potential DNS leak");
+            }
+
             // 11. Save credentials (non-fatal — don't kill connection over keyring issues)
             if let Err(e) = config::save_credentials(&username, &password) {
                 warn!("failed to save credentials: {:#}", e);
@@ -894,6 +899,14 @@ fn cmd_connect(
                         warn!("DNS verification failed: {:#}", e);
                         verify_failed = true;
                     }
+                }
+            }
+
+            // 10d. Client-side DNS verification: resolv.conf should only contain VPN DNS
+            if !verify_failed && !shutdown.load(Ordering::Relaxed) {
+                if !dns::verify_resolv_conf(&wg_key.wg_dns_ipv4, &wg_key.wg_dns_ipv6, std::path::Path::new("/etc/resolv.conf")) {
+                    warn!("resolv.conf contains non-VPN nameservers — potential DNS leak");
+                    verify_failed = true;
                 }
             }
 
@@ -965,6 +978,12 @@ fn cmd_connect(
                         break ResetLevel::Error;
                     }
                 }
+            }
+
+            // Client-side resolv.conf verification: catch DNS leaks that the
+            // server-side check cannot detect (non-VPN nameservers in resolv.conf).
+            if !dns::verify_resolv_conf(&wg_key.wg_dns_ipv4, &wg_key.wg_dns_ipv6, std::path::Path::new("/etc/resolv.conf")) {
+                warn!("resolv.conf contains non-VPN nameservers — potential DNS leak (check_and_reapply should fix on next cycle)");
             }
 
             std::thread::sleep(std::time::Duration::from_secs(1));
@@ -1151,7 +1170,7 @@ fn cmd_servers(
         stdin_password.as_deref().map(|s| s.as_str()),
     )?;
     let password = Zeroizing::new(password);
-    let xml = api::fetch_manifest(&username, &password)?;
+    let xml = Zeroizing::new(api::fetch_manifest(&username, &password)?);
 
     if debug {
         // Redact credentials from the raw XML before printing

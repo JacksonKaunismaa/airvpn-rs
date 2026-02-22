@@ -202,6 +202,7 @@ fn fetch_encrypted(
         .timeout(Duration::from_secs(10))
         .user_agent("Eddie/2.24.6")
         .https_only(true)
+        .min_tls_version(reqwest::tls::Version::TLS_1_2)
         .build()
         .context("failed to build HTTP client")?;
 

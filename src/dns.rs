@@ -572,6 +572,26 @@ pub fn check_and_reapply(dns_ipv4: &str, dns_ipv6: &str, vpn_iface: &str) -> Res
     Ok(reapplied)
 }
 
+/// Verify that /etc/resolv.conf contains only the expected VPN DNS servers.
+/// Returns true if all nameserver entries match the expected VPN DNS IPs.
+/// This catches DNS drift that the server-side check cannot detect
+/// (the server-side check passes even when DNS leaks to upstream, because
+/// the query still reaches AirVPN's authoritative nameserver).
+pub fn verify_resolv_conf(expected_ipv4: &str, expected_ipv6: &str, resolv_path: &Path) -> bool {
+    let content = match std::fs::read_to_string(resolv_path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let nameservers: Vec<&str> = content.lines()
+        .filter(|l| l.trim_start().starts_with("nameserver"))
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .collect();
+    if nameservers.is_empty() {
+        return false;
+    }
+    nameservers.iter().all(|ns| *ns == expected_ipv4 || *ns == expected_ipv6)
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -678,5 +698,43 @@ mod tests {
                 "/sys/class/net exists but no non-loopback interfaces found"
             );
         }
+    }
+
+    #[test]
+    fn test_verify_resolv_conf_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolv.conf");
+        std::fs::write(&path, "nameserver 10.128.0.1\nnameserver fd7d::1\n").unwrap();
+        assert!(verify_resolv_conf("10.128.0.1", "fd7d::1", &path));
+    }
+
+    #[test]
+    fn test_verify_resolv_conf_extra_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolv.conf");
+        std::fs::write(&path, "nameserver 10.128.0.1\nnameserver 8.8.8.8\n").unwrap();
+        assert!(!verify_resolv_conf("10.128.0.1", "fd7d::1", &path));
+    }
+
+    #[test]
+    fn test_verify_resolv_conf_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolv.conf");
+        std::fs::write(&path, "# empty\n").unwrap();
+        assert!(!verify_resolv_conf("10.128.0.1", "fd7d::1", &path));
+    }
+
+    #[test]
+    fn test_verify_resolv_conf_missing_file() {
+        let path = Path::new("/nonexistent/resolv.conf");
+        assert!(!verify_resolv_conf("10.128.0.1", "fd7d::1", path));
+    }
+
+    #[test]
+    fn test_verify_resolv_conf_with_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolv.conf");
+        std::fs::write(&path, "# Created by airvpn-rs\nnameserver 10.128.0.1\n").unwrap();
+        assert!(verify_resolv_conf("10.128.0.1", "fd7d::1", &path));
     }
 }
