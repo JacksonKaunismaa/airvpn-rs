@@ -109,7 +109,7 @@ if start_vpn; then
     fi
 
     # Check VPN interface allowed (look for the comment tag pattern)
-    WG_IFACE=$(ip link show type wireguard 2>/dev/null | head -1 | awk -F: '{print $2}' | tr -d ' ')
+    WG_IFACE=$(ip link show type wireguard 2>/dev/null | grep -o 'avpn-[^ :]*' | head -1)
     if [ -n "$WG_IFACE" ] && echo "$RULES" | grep -qE "iifname.*$WG_IFACE|airvpn_interface.*$WG_IFACE"; then
         pass "Test 1d: VPN interface ($WG_IFACE) allowed in rules"
     elif [ -n "$WG_IFACE" ]; then
