@@ -190,6 +190,81 @@ fn check_api_error(xml: &str) -> anyhow::Result<()> {
     }
 }
 
+/// Maximum length for a server name.
+const MAX_SERVER_NAME_LEN: usize = 64;
+
+/// Validate that a server name contains only safe characters.
+///
+/// Server names are used in hostname construction (e.g. `{name}_exit.{domain}`),
+/// so they must only contain [a-zA-Z0-9_-] to prevent hostname injection.
+fn validate_server_name(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() {
+        bail!("server name is empty");
+    }
+    if name.len() > MAX_SERVER_NAME_LEN {
+        bail!(
+            "server name '{}' exceeds maximum length ({} > {})",
+            name,
+            name.len(),
+            MAX_SERVER_NAME_LEN,
+        );
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        bail!(
+            "server name '{}' contains invalid characters (only [a-zA-Z0-9_-] allowed)",
+            name,
+        );
+    }
+    Ok(())
+}
+
+/// Validate that a bootstrap URL's hostname is in the allowed domain list or is an IP address.
+///
+/// SECURITY: A compromised API could inject "https://attacker.com/api/" into the
+/// manifest's <url> entries, which would be added to the netlock allowlist and used
+/// for API calls. Only accept URLs whose hostname is an IP address or matches the
+/// domain allowlist (ALLOWED_EXACT_DOMAINS / ALLOWED_DOMAIN_SUFFIXES).
+fn validate_bootstrap_url_domain(url: &str) -> anyhow::Result<()> {
+    // URL format: "https://host/path" or "https://[ipv6]/path" or "https://host:port/path"
+    let after_scheme = url.strip_prefix("https://")
+        .with_context(|| format!("bootstrap URL missing https:// scheme: {}", url))?;
+
+    let host = if after_scheme.starts_with('[') {
+        // IPv6 literal: https://[::1]:port/path or https://[::1]/path
+        let end = after_scheme.find(']')
+            .with_context(|| format!("malformed IPv6 URL: {}", url))?;
+        &after_scheme[1..end]
+    } else {
+        // hostname or IPv4: take everything before first '/' or ':'
+        let rest = after_scheme;
+        let end = rest.find('/').unwrap_or(rest.len());
+        let host_port = &rest[..end];
+        // Strip port if present
+        match host_port.rsplit_once(':') {
+            Some((h, port_str)) if port_str.chars().all(|c| c.is_ascii_digit()) => h,
+            _ => host_port,
+        }
+    };
+
+    // If host is a valid IP address, accept it (IPs don't need domain validation)
+    if host.parse::<IpAddr>().is_ok() {
+        return Ok(());
+    }
+
+    // Validate hostname against domain allowlist
+    let host_lower = host.to_lowercase();
+    let valid = ALLOWED_EXACT_DOMAINS.iter().any(|d| host_lower == *d)
+        || ALLOWED_DOMAIN_SUFFIXES.iter().any(|s| host_lower.ends_with(s));
+    if !valid {
+        bail!(
+            "bootstrap URL hostname '{}' not in allowed domain list (from URL: {})",
+            host,
+            url,
+        );
+    }
+    Ok(())
+}
+
 fn validate_check_domain(domain: &str) -> anyhow::Result<()> {
     if domain.is_empty() {
         return Ok(());
@@ -290,6 +365,7 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
                             bail!("manifest exceeds maximum server count ({})", MAX_SERVERS);
                         }
                         let name = attr_req(e, "name")?;
+                        validate_server_name(&name)?;
                         let group = attr_opt(e, b"group").unwrap_or_default();
                         raw_servers.push(RawServerAttrs {
                             name, group,
@@ -348,6 +424,8 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
                                 }
                                 if !addr.starts_with("https://") {
                                     warn!("Skipping non-HTTPS bootstrap URL: {}", sanitize_server_message(&addr));
+                                } else if let Err(e) = validate_bootstrap_url_domain(&addr) {
+                                    warn!("Skipping bootstrap URL with disallowed domain: {} ({})", sanitize_server_message(&addr), e);
                                 } else {
                                     bootstrap_urls.push(addr);
                                 }
@@ -415,15 +493,18 @@ pub fn parse_user(xml: &str) -> anyhow::Result<UserInfo> {
             Ok(Event::Eof) => break,
             Ok(Event::Empty(ref e)) => {
                 if e.name().as_ref() == b"key" && in_user {
+                    let wg_ipv4 = attr_opt(e, b"wg_ipv4").unwrap_or_default();
+                    let wg_ipv6 = attr_opt(e, b"wg_ipv6").unwrap_or_default();
                     let wg_dns_ipv4 = attr_opt(e, b"wg_dns_ipv4").unwrap_or_default();
                     let wg_dns_ipv6 = attr_opt(e, b"wg_dns_ipv6").unwrap_or_default();
+                    if !wg_ipv4.is_empty() { validate_ip(&wg_ipv4, "wg_ipv4")?; }
+                    if !wg_ipv6.is_empty() { validate_ip(&wg_ipv6, "wg_ipv6")?; }
                     if !wg_dns_ipv4.is_empty() { validate_ip(&wg_dns_ipv4, "wg_dns_ipv4")?; }
                     if !wg_dns_ipv6.is_empty() { validate_ip(&wg_dns_ipv6, "wg_dns_ipv6")?; }
                     keys.push(WireGuardKey {
                         name: attr_opt(e, b"name").unwrap_or_default(),
                         wg_private_key: Zeroizing::new(attr_opt(e, b"wg_private_key").unwrap_or_default()),
-                        wg_ipv4: attr_opt(e, b"wg_ipv4").unwrap_or_default(),
-                        wg_ipv6: attr_opt(e, b"wg_ipv6").unwrap_or_default(),
+                        wg_ipv4, wg_ipv6,
                         wg_dns_ipv4, wg_dns_ipv6,
                         wg_preshared: Zeroizing::new(attr_opt(e, b"wg_preshared").unwrap_or_default()),
                     });
@@ -443,15 +524,18 @@ pub fn parse_user(xml: &str) -> anyhow::Result<UserInfo> {
                         keys.clear();
                     }
                     b"key" if in_user => {
+                        let wg_ipv4 = attr_opt(e, b"wg_ipv4").unwrap_or_default();
+                        let wg_ipv6 = attr_opt(e, b"wg_ipv6").unwrap_or_default();
                         let wg_dns_ipv4 = attr_opt(e, b"wg_dns_ipv4").unwrap_or_default();
                         let wg_dns_ipv6 = attr_opt(e, b"wg_dns_ipv6").unwrap_or_default();
+                        if !wg_ipv4.is_empty() { validate_ip(&wg_ipv4, "wg_ipv4")?; }
+                        if !wg_ipv6.is_empty() { validate_ip(&wg_ipv6, "wg_ipv6")?; }
                         if !wg_dns_ipv4.is_empty() { validate_ip(&wg_dns_ipv4, "wg_dns_ipv4")?; }
                         if !wg_dns_ipv6.is_empty() { validate_ip(&wg_dns_ipv6, "wg_dns_ipv6")?; }
                         keys.push(WireGuardKey {
                             name: attr_opt(e, b"name").unwrap_or_default(),
                             wg_private_key: Zeroizing::new(attr_opt(e, b"wg_private_key").unwrap_or_default()),
-                            wg_ipv4: attr_opt(e, b"wg_ipv4").unwrap_or_default(),
-                            wg_ipv6: attr_opt(e, b"wg_ipv6").unwrap_or_default(),
+                            wg_ipv4, wg_ipv6,
                             wg_dns_ipv4, wg_dns_ipv6,
                             wg_preshared: Zeroizing::new(attr_opt(e, b"wg_preshared").unwrap_or_default()),
                         });
@@ -493,7 +577,7 @@ mod tests {
     <mode title="OpenVPN UDP 443" type="openvpn" protocol="UDP" port="443" entry_index="0" />
   </modes>
   <urls>
-    <url address="https://eddie.website/api/" />
+    <url address="https://api.airvpn.org/api/" />
   </urls>
 </manifest>"#;
 
@@ -604,12 +688,12 @@ mod tests {
 <manifest time="0" next_update="0" force_reauth_ts="0" check_domain="" check_dns_query="">
   <urls>
     <url address="http://evil.example.com/api/" />
-    <url address="https://good.example.com/api/" />
+    <url address="https://api.airvpn.org/api/" />
   </urls>
 </manifest>"#;
         let m = parse_manifest(xml).unwrap();
         assert_eq!(m.bootstrap_urls.len(), 1);
-        assert_eq!(m.bootstrap_urls[0], "https://good.example.com/api/");
+        assert_eq!(m.bootstrap_urls[0], "https://api.airvpn.org/api/");
     }
 
     #[test]
@@ -645,5 +729,106 @@ mod tests {
     fn test_check_api_error_empty() {
         assert!(check_api_error("").is_ok());
         assert!(check_api_error(r#"<manifest error="" />"#).is_ok());
+    }
+
+    // --- Fix 2: Bootstrap URL domain validation ---
+
+    #[test]
+    fn test_bootstrap_url_domain_allowed() {
+        assert!(validate_bootstrap_url_domain("https://airvpn.org/api/").is_ok());
+        assert!(validate_bootstrap_url_domain("https://api.airvpn.org/api/").is_ok());
+        assert!(validate_bootstrap_url_domain("https://airdns.org/api/").is_ok());
+        assert!(validate_bootstrap_url_domain("https://check.airdns.org/").is_ok());
+    }
+
+    #[test]
+    fn test_bootstrap_url_domain_ip_accepted() {
+        assert!(validate_bootstrap_url_domain("https://1.2.3.4/api/").is_ok());
+        assert!(validate_bootstrap_url_domain("https://1.2.3.4:443/api/").is_ok());
+        assert!(validate_bootstrap_url_domain("https://[2a03:b0c0::1]/api/").is_ok());
+    }
+
+    #[test]
+    fn test_bootstrap_url_domain_rejected() {
+        assert!(validate_bootstrap_url_domain("https://attacker.com/api/").is_err());
+        assert!(validate_bootstrap_url_domain("https://evilairvpn.org/api/").is_err());
+        assert!(validate_bootstrap_url_domain("https://evil.com:443/api/").is_err());
+    }
+
+    #[test]
+    fn test_bootstrap_url_domain_rejected_in_manifest() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<manifest time="0" next_update="0" force_reauth_ts="0" check_domain="" check_dns_query="">
+  <urls>
+    <url address="https://attacker.com/api/" />
+    <url address="https://1.2.3.4/api/" />
+    <url address="https://api.airvpn.org/api/" />
+  </urls>
+</manifest>"#;
+        let m = parse_manifest(xml).unwrap();
+        // attacker.com rejected, IP and airvpn.org accepted
+        assert_eq!(m.bootstrap_urls.len(), 2);
+        assert_eq!(m.bootstrap_urls[0], "https://1.2.3.4/api/");
+        assert_eq!(m.bootstrap_urls[1], "https://api.airvpn.org/api/");
+    }
+
+    // --- Fix 4: Server name validation ---
+
+    #[test]
+    fn test_validate_server_name_valid() {
+        assert!(validate_server_name("Alchiba").is_ok());
+        assert!(validate_server_name("server-1").is_ok());
+        assert!(validate_server_name("server_2").is_ok());
+        assert!(validate_server_name("A").is_ok());
+    }
+
+    #[test]
+    fn test_validate_server_name_invalid() {
+        assert!(validate_server_name("").is_err());
+        assert!(validate_server_name("server.evil.com").is_err());
+        assert!(validate_server_name("server name").is_err());
+        assert!(validate_server_name("server/path").is_err());
+        assert!(validate_server_name(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn test_manifest_rejects_bad_server_name() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<manifest time="0" next_update="0" force_reauth_ts="0" check_domain="" check_dns_query="">
+  <servers>
+    <server name="evil.server.com" group="eu" ips_entry="1.2.3.4" ips_exit="1.2.3.5" />
+  </servers>
+</manifest>"#;
+        assert!(parse_manifest(xml).is_err());
+    }
+
+    // --- Fix 5: wg_ipv4/wg_ipv6 validated at parse time ---
+
+    #[test]
+    fn test_parse_user_invalid_wg_ipv4() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<user login="t" wg_public_key="P">
+  <keys><key name="d" wg_private_key="P" wg_ipv4="not-an-ip" wg_ipv6="fd00::1" wg_dns_ipv4="10.0.0.1" wg_dns_ipv6="fd00::53" wg_preshared="" /></keys>
+</user>"#;
+        assert!(parse_user(xml).is_err());
+    }
+
+    #[test]
+    fn test_parse_user_invalid_wg_ipv6() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<user login="t" wg_public_key="P">
+  <keys><key name="d" wg_private_key="P" wg_ipv4="10.0.0.1" wg_ipv6="not-an-ip" wg_dns_ipv4="10.0.0.1" wg_dns_ipv6="fd00::53" wg_preshared="" /></keys>
+</user>"#;
+        assert!(parse_user(xml).is_err());
+    }
+
+    #[test]
+    fn test_parse_user_valid_wg_ips_with_cidr() {
+        // wg_ipv4 often has /32 CIDR suffix -- validate_ip handles this
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<user login="t" wg_public_key="P">
+  <keys><key name="d" wg_private_key="P" wg_ipv4="10.0.0.1/32" wg_ipv6="fd00::1/128" wg_dns_ipv4="10.0.0.1" wg_dns_ipv6="fd00::53" wg_preshared="" /></keys>
+</user>"#;
+        assert!(parse_user(xml).is_ok());
     }
 }

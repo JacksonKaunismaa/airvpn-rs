@@ -99,6 +99,7 @@ fn check_tunnel_inner(server_name: &str, expected_ipv4: &str, check_domain: &str
 
     let client = Client::builder()
         .timeout(HTTP_TIMEOUT)
+        .https_only(true)
         .resolve(&check_hostname, resolve_addr)
         .build()
         .context("failed to build HTTP client for tunnel check")?;
@@ -225,6 +226,7 @@ fn check_dns_inner(server_name: &str, check_domain: &str, exit_ip: &str, check_d
 
     let client = Client::builder()
         .timeout(HTTP_TIMEOUT)
+        .https_only(true)
         .resolve(&check_hostname, resolve_addr)
         .build()
         .context("failed to build HTTP client for DNS check")?;

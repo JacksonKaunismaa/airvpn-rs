@@ -24,6 +24,11 @@ use crate::manifest::{attr_opt, sanitize_server_message};
 
 /// Bootstrap IPs tried in order until one succeeds.
 ///
+/// SECURITY: All entries MUST be IP addresses (not hostnames). Hostname entries
+/// would require plaintext DNS resolution before netlock is active, allowing a
+/// router-level attacker to poison the DNS response and inject their IP into
+/// the netlock allowlist.
+///
 /// SECURITY: HTTPS is required for transport security. The application-layer
 /// RSA+AES envelope only protects against passive eavesdroppers -- an active
 /// MITM can tamper with the ciphertext or inject their own envelope if the
@@ -34,7 +39,6 @@ pub const BOOTSTRAP_IPS: &[&str] = &[
     "https://82.196.3.205",
     "https://63.33.116.50",
     "https://[2a03:b0c0:0:1010::9b:c001]",
-    "https://bootme.org",
 ];
 
 /// AirVPN's RSA-4096 public key modulus (base64).
@@ -197,6 +201,7 @@ fn fetch_encrypted(
     let client = Client::builder()
         .timeout(Duration::from_secs(10))
         .user_agent("Eddie/2.24.6")
+        .https_only(true)
         .build()
         .context("failed to build HTTP client")?;
 
