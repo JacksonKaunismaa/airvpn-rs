@@ -325,15 +325,9 @@ fn recover_from_state(state: &State) -> Result<()> {
             }
         }
     }
-    // Also clean up legacy /tmp location from older versions
-    if let Ok(entries) = std::fs::read_dir("/tmp") {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("avpn-") && name.ends_with(".conf") {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
+    // Legacy /tmp cleanup removed: configs have been in /run/airvpn-rs/ since
+    // the early releases. Scanning /tmp and deleting matching filenames is unsafe
+    // because symlinks in /tmp could cause deletion of arbitrary files.
 
     // 2. Restore IPv6 on previously blocked interfaces
     if !state.blocked_ipv6_ifaces.is_empty() {

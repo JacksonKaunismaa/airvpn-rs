@@ -14,7 +14,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
-use log::{debug, warn};
+use log::{info, warn};
 
 static RESOLV_WAS_IMMUTABLE: AtomicBool = AtomicBool::new(false);
 
@@ -216,7 +216,27 @@ fn configure_systemd_resolved_all(dns_ipv4: &str, dns_ipv6: &str, vpn_iface: &st
                     .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                     .unwrap_or_default();
                 let backup_content = format!("dns={}\ndefault_route={}", dns_state, dr_state);
-                let _ = fs::write(&backup_path, &backup_content);
+                // Write with restricted permissions (0o600) — these files contain
+                // DNS server IPs and live in /etc/, so avoid world-readable default.
+                #[cfg(unix)]
+                {
+                    use std::io::Write;
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let result = fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .mode(0o600)
+                        .open(&backup_path)
+                        .and_then(|mut f| f.write_all(backup_content.as_bytes()));
+                    if let Err(e) = result {
+                        warn!("failed to write systemd-resolved backup {}: {}", backup_path.display(), e);
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = fs::write(&backup_path, &backup_content);
+                }
             }
 
             // Non-VPN interface: set VPN DNS + default-route=false.
@@ -461,11 +481,16 @@ pub fn check_and_reapply(dns_ipv4: &str, dns_ipv6: &str, vpn_iface: &str) -> Res
 
     if resolv_path.exists() {
         let expected = build_resolv_conf(dns_ipv4, dns_ipv6);
-        let current =
-            fs::read_to_string(resolv_path).context("failed to read /etc/resolv.conf")?;
+        let current = match fs::read_to_string(resolv_path) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("DNS check_and_reapply: failed to read /etc/resolv.conf: {}", e);
+                return Err(e).context("failed to read /etc/resolv.conf");
+            }
+        };
 
         if current != expected {
-            debug!("DNS drift detected in /etc/resolv.conf, re-applying VPN DNS");
+            info!("DNS drift detected in /etc/resolv.conf, re-applying VPN DNS");
             // Clear immutable flag before modifying (Fedora/RHEL set this on resolv.conf)
             clear_immutable(resolv_path);
 
@@ -475,13 +500,18 @@ pub fn check_and_reapply(dns_ipv4: &str, dns_ipv6: &str, vpn_iface: &str) -> Res
                 let _ = fs::remove_file(resolv_path);
             }
 
-            fs::write(resolv_path, &expected).context("failed to re-apply /etc/resolv.conf")?;
+            if let Err(e) = fs::write(resolv_path, &expected) {
+                warn!("DNS check_and_reapply: failed to re-apply /etc/resolv.conf: {}", e);
+                return Err(e).context("failed to re-apply /etc/resolv.conf");
+            }
 
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(resolv_path, fs::Permissions::from_mode(0o644))
-                    .context("failed to set /etc/resolv.conf permissions")?;
+                if let Err(e) = fs::set_permissions(resolv_path, fs::Permissions::from_mode(0o644)) {
+                    warn!("DNS check_and_reapply: failed to set /etc/resolv.conf permissions: {}", e);
+                    return Err(e).context("failed to set /etc/resolv.conf permissions");
+                }
             }
 
             flush();

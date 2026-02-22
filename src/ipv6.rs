@@ -42,6 +42,17 @@ pub fn block_all() -> Vec<String> {
             continue;
         }
 
+        // Validate interface name: alphanumeric + dash + underscore, max 15 chars.
+        // Kernel-created names are safe, but defense-in-depth prevents path traversal
+        // if /proc is ever somehow compromised or a FUSE overlay is mounted.
+        if name.is_empty()
+            || name.len() > 15
+            || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            warn!("skipping invalid interface name in block_all: {:?}", name);
+            continue;
+        }
+
         let disable_path = conf_dir.join(&name).join("disable_ipv6");
 
         // Check current state — only block if currently enabled
