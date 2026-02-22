@@ -101,9 +101,11 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
     // 1. Loopback accept (Eddie: ip filter INPUT iifname "lo" + ip6 filter INPUT iifname "lo")
     r.push_str("    iifname \"lo\" counter accept\n");
 
-    // 2. IPv6 anti-spoof: reject ::1 not from lo
-    //    (Eddie: ip6 filter INPUT iifname != "lo" ip6 saddr ::1 counter reject)
-    r.push_str("    iifname != \"lo\" ip6 saddr ::1 counter reject\n");
+    // 2. IPv6 anti-spoof: drop ::1 not from lo
+    //    Eddie uses "reject" in a separate ip6 table. In our inet table,
+    //    bare "reject" fails on some nftables versions (needs icmpx type).
+    //    "drop" achieves the same anti-spoof protection.
+    r.push_str("    iifname != \"lo\" ip6 saddr ::1 counter drop\n");
 
     // 3. DHCP rules
     if config.allow_dhcp {
@@ -640,7 +642,7 @@ mod tests {
         assert!(ruleset.contains("oifname \"lo\" counter accept"));
 
         // IPv6 anti-spoof
-        assert!(ruleset.contains("iifname != \"lo\" ip6 saddr ::1 counter reject"));
+        assert!(ruleset.contains("iifname != \"lo\" ip6 saddr ::1 counter drop"));
 
         // Conntrack only in input (OUTPUT conntrack omitted when incoming_policy_accept=false)
         let ct_count = ruleset.matches("ct state related,established counter accept").count();
