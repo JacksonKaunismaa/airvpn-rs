@@ -96,7 +96,7 @@ fn ensure_cidr(ip: &str, default_suffix: &str) -> String {
 /// the other version.
 ///
 /// IPv6 endpoint IPs are wrapped in brackets per WireGuard convention.
-pub fn generate_config(key: &WireGuardKey, server: &Server, mode: &Mode, user: &UserInfo) -> Result<(String, String)> {
+pub fn generate_config(key: &WireGuardKey, server: &Server, mode: &Mode, user: &UserInfo) -> Result<(zeroize::Zeroizing<String>, String)> {
     if key.wg_private_key.is_empty() {
         anyhow::bail!("missing WireGuard private key from API response");
     }
@@ -161,7 +161,8 @@ PersistentKeepalive = 15
         endpoint,
     ));
 
-    let config = format!(
+    // Wrap config in Zeroizing — it contains the WireGuard private key
+    let config = zeroize::Zeroizing::new(format!(
         "\
 [Interface]
 PrivateKey = {}
@@ -174,7 +175,7 @@ Table = off
         ensure_cidr(&key.wg_ipv4, "/32"),
         ensure_cidr(&key.wg_ipv6, "/128"),
         peer_section,
-    );
+    ));
 
     Ok((config, endpoint_ip.to_string()))
 }
@@ -870,7 +871,7 @@ mod tests {
         assert!(
             config.contains("Endpoint = [fd00::1]:1637"),
             "IPv6 endpoint should be wrapped in brackets, got: {}",
-            config
+            &*config
         );
     }
 
@@ -950,7 +951,7 @@ mod tests {
         assert!(
             config.contains("Endpoint = 203.0.113.1:1637"),
             "should prefer IPv4 even when IPv6 is listed first, got: {}",
-            config
+            &*config
         );
     }
 
@@ -989,7 +990,7 @@ mod tests {
         assert!(
             config.contains("Endpoint = [2001:db8::1]:1637"),
             "should fall back to IPv6 when no IPv4 available, got: {}",
-            config
+            &*config
         );
     }
 
@@ -1030,7 +1031,7 @@ mod tests {
         assert!(
             config.contains("Endpoint = [2001:db8::2]:1637"),
             "should use IPv6 at entry_index=1 when no IPv4, got: {}",
-            config
+            &*config
         );
     }
 

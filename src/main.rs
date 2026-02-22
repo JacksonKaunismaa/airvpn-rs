@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 
 use clap::{Parser, Subcommand};
 use log::{debug, error, info, warn};
+use zeroize::Zeroizing;
 
 #[derive(Parser)]
 #[command(name = "airvpn", about = "AirVPN WireGuard client")]
@@ -302,22 +303,25 @@ fn cmd_connect(
     let nonce = recovery::generate_nonce();
 
     // 2. Resolve credentials (password via profile, interactive prompt, or --password-stdin)
-    let stdin_password = if password_stdin {
-        let mut line = String::new();
+    //    Wrapped in Zeroizing to clear from memory on drop.
+    let stdin_password: Option<Zeroizing<String>> = if password_stdin {
+        let mut line = Zeroizing::new(String::new());
         std::io::stdin().read_line(&mut line)
             .map_err(|e| anyhow::anyhow!("failed to read password from stdin: {}", e))?;
         let trimmed = line.trim_end_matches('\n').trim_end_matches('\r').to_string();
         if trimmed.is_empty() {
             anyhow::bail!("--password-stdin: received empty password");
         }
-        Some(trimmed)
+        Some(Zeroizing::new(trimmed))
     } else {
         None
     };
     let (username, password) = config::resolve_credentials(
         cli_username.as_deref(),
-        stdin_password.as_deref(),
+        stdin_password.as_deref().map(|s| s.as_str()),
     )?;
+    let username = Zeroizing::new(username);
+    let password = Zeroizing::new(password);
 
     // 3. Fetch manifest + user data (two separate API calls)
     info!("Fetching server list...");
@@ -506,16 +510,25 @@ fn cmd_connect(
             }
         };
 
-        // Handle auth-level reset before establishing infrastructure
+        // Handle auth-level reset before establishing infrastructure.
+        // On reconnection (2nd+ iteration), netlock and IPv6 blocking are still
+        // active from the previous iteration.  Any bail!() must clean up first
+        // to avoid locking the user out of network connectivity.
         if let Some(level) = reset_from_auth {
             match level {
                 ResetLevel::Fatal => {
+                    if !no_lock { let _ = netlock::deactivate(); }
+                    ipv6::restore(&blocked_ipv6_ifaces);
+                    let _ = recovery::remove();
                     anyhow::bail!("Fatal: server rejected connection");
                 }
                 ResetLevel::Error => {
                     penalties.penalize(&server_ref.name, 30);
                     forced_server = Option::None; // clear forced server for rotation
                     if no_reconnect {
+                        if !no_lock { let _ = netlock::deactivate(); }
+                        ipv6::restore(&blocked_ipv6_ifaces);
+                        let _ = recovery::remove();
                         anyhow::bail!("Server directed to try another (--no-reconnect)");
                     }
                     warn!("Penalized {}. Trying another server in 5s...", server_ref.name);
@@ -524,6 +537,9 @@ fn cmd_connect(
                 }
                 ResetLevel::Retry => {
                     if no_reconnect {
+                        if !no_lock { let _ = netlock::deactivate(); }
+                        ipv6::restore(&blocked_ipv6_ifaces);
+                        let _ = recovery::remove();
                         anyhow::bail!("Server asked to retry (--no-reconnect)");
                     }
                     warn!("Retrying in 10s...");
