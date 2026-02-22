@@ -91,11 +91,15 @@ fn init_logging() {
         // Validate AIRVPN_LOG: reject path traversal and symlinks to prevent
         // arbitrary file writes when running as root (e.g. sudo -E).
         let log_p = std::path::Path::new(&log_path);
+        let allowed_prefixes = ["/var/log/", "/run/airvpn-rs/"];
         if log_path.contains("..") {
             eprintln!("warning: AIRVPN_LOG contains '..', ignoring (path traversal rejected)");
             String::new()
         } else if log_p.is_symlink() {
             eprintln!("warning: AIRVPN_LOG points to a symlink, ignoring (symlink rejected)");
+            String::new()
+        } else if !allowed_prefixes.iter().any(|p| log_path.starts_with(p)) {
+            eprintln!("warning: AIRVPN_LOG must be under /var/log/ or /run/airvpn-rs/, ignoring");
             String::new()
         } else {
             log_path
@@ -296,19 +300,12 @@ fn cmd_connect(
         }
     }
 
-    // Unconditional cleanup: remove orphaned WireGuard config files (private key material)
-    if let Ok(entries) = std::fs::read_dir("/tmp") {
+    // Cleanup orphaned WireGuard config files (contain private key material).
+    // Only scan /run/airvpn-rs/ (our config directory) — never /tmp (symlink attack surface).
+    if let Ok(entries) = std::fs::read_dir("/run/airvpn-rs") {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             if name.starts_with("avpn-") && name.ends_with(".conf") {
-                // Skip symlinks — an attacker could create /tmp/avpn-x.conf -> /etc/shadow
-                if let Ok(meta) = std::fs::symlink_metadata(entry.path()) {
-                    if meta.file_type().is_symlink() {
-                        warn!("skipping symlink during /tmp cleanup: {}", entry.path().display());
-                        continue;
-                    }
-                }
-                // Only clean up if no airvpn process is running
                 if recovery::load().ok().flatten().map_or(true, |s| !recovery::is_pid_alive(s.pid)) {
                     let _ = std::fs::remove_file(entry.path());
                 }
