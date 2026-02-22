@@ -19,7 +19,17 @@ fn main() {
     println!();
 
     // Step 1: Start tcpdump in background
-    let pcap_path = "/tmp/airvpn-crypto-verify.pcap";
+    // Use /run/airvpn-rs/ instead of /tmp to avoid symlink attacks (this runs as root).
+    let pcap_dir = std::path::Path::new("/run/airvpn-rs");
+    if !pcap_dir.exists() {
+        std::fs::create_dir_all(pcap_dir).expect("failed to create /run/airvpn-rs/");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(pcap_dir, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let pcap_path = "/run/airvpn-rs/airvpn-crypto-verify.pcap";
     println!("[1/4] Starting packet capture...");
     let mut tcpdump = Command::new("tcpdump")
         .args([
