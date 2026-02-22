@@ -85,7 +85,7 @@ impl ServerPenalties {
 /// `bwCur = 2 * (Bandwidth * 8) / (1_000_000)` (bytes/s → Mbit/s, with 2x factor)
 /// `LoadPerc = (bwCur * 100) / BandwidthMax`
 /// Returns 100 if BandwidthMax == 0.
-fn load_perc(server: &Server) -> i64 {
+pub fn load_perc(server: &Server) -> i64 {
     if server.bandwidth_max == 0 {
         return 100;
     }

@@ -88,6 +88,22 @@ fn init_logging() {
     // Prefer /var/log (root-owned, standard location), fall back to /run/airvpn-rs/
     // (root-owned, restricted permissions). Never use /tmp — symlink attack vector.
     let log_path = if !log_path.is_empty() {
+        // Validate AIRVPN_LOG: reject path traversal and symlinks to prevent
+        // arbitrary file writes when running as root (e.g. sudo -E).
+        let log_p = std::path::Path::new(&log_path);
+        if log_path.contains("..") {
+            eprintln!("warning: AIRVPN_LOG contains '..', ignoring (path traversal rejected)");
+            String::new()
+        } else if log_p.is_symlink() {
+            eprintln!("warning: AIRVPN_LOG points to a symlink, ignoring (symlink rejected)");
+            String::new()
+        } else {
+            log_path
+        }
+    } else {
+        String::new()
+    };
+    let log_path = if !log_path.is_empty() {
         log_path
     } else {
         let preferred = "/var/log/airvpn-rs.log";
@@ -285,6 +301,13 @@ fn cmd_connect(
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             if name.starts_with("avpn-") && name.ends_with(".conf") {
+                // Skip symlinks — an attacker could create /tmp/avpn-x.conf -> /etc/shadow
+                if let Ok(meta) = std::fs::symlink_metadata(entry.path()) {
+                    if meta.file_type().is_symlink() {
+                        warn!("skipping symlink during /tmp cleanup: {}", entry.path().display());
+                        continue;
+                    }
+                }
                 // Only clean up if no airvpn process is running
                 if recovery::load().ok().flatten().map_or(true, |s| !recovery::is_pid_alive(s.pid)) {
                     let _ = std::fs::remove_file(entry.path());
@@ -535,7 +558,7 @@ fn cmd_connect(
                 dns_ipv4: String::new(),
                 dns_ipv6: String::new(),
                 pid: std::process::id(),
-                blocked_ipv6_ifaces: vec![],
+                blocked_ipv6_ifaces: blocked_ipv6_ifaces.clone(),
                 endpoint_ip: String::new(),
                 nonce,
             })?;
@@ -1009,29 +1032,30 @@ fn cmd_servers(
     password_stdin: bool,
     _skip_ping: bool,
 ) -> anyhow::Result<()> {
-    let stdin_password = if password_stdin {
-        let mut line = String::new();
+    let stdin_password: Option<Zeroizing<String>> = if password_stdin {
+        let mut line = Zeroizing::new(String::new());
         std::io::stdin().read_line(&mut line)
             .map_err(|e| anyhow::anyhow!("failed to read password from stdin: {}", e))?;
         let trimmed = line.trim_end_matches('\n').trim_end_matches('\r').to_string();
         if trimmed.is_empty() {
             anyhow::bail!("--password-stdin: received empty password");
         }
-        Some(trimmed)
+        Some(Zeroizing::new(trimmed))
     } else {
         None
     };
     let (username, password) = config::resolve_credentials(
         cli_username.as_deref(),
-        stdin_password.as_deref(),
+        stdin_password.as_deref().map(|s| s.as_str()),
     )?;
+    let password = Zeroizing::new(password);
     let xml = api::fetch_manifest(&username, &password)?;
 
     if debug {
         // Redact credentials from the raw XML before printing
         let redacted = xml
             .replace(&username, "[REDACTED_USER]")
-            .replace(&password, "[REDACTED_PASS]");
+            .replace(password.as_str(), "[REDACTED_PASS]");
         println!("{}", redacted);
         return Ok(());
     }
@@ -1042,19 +1066,7 @@ fn cmd_servers(
     match sort {
         "score" => servers.sort_by(|a, b| server::score(a).cmp(&server::score(b))),
         "load" => servers.sort_by(|a, b| {
-            let load_a = if a.bandwidth_max == 0 {
-                100
-            } else {
-                let bw_cur = 2 * (a.bandwidth * 8) / (1_000 * 1_000);
-                (bw_cur * 100) / a.bandwidth_max
-            };
-            let load_b = if b.bandwidth_max == 0 {
-                100
-            } else {
-                let bw_cur = 2 * (b.bandwidth * 8) / (1_000 * 1_000);
-                (bw_cur * 100) / b.bandwidth_max
-            };
-            load_a.cmp(&load_b)
+            server::load_perc(a).cmp(&server::load_perc(b))
         }),
         "users" => servers.sort_by(|a, b| a.users.cmp(&b.users)),
         "name" => servers.sort_by(|a, b| a.name.cmp(&b.name)),
@@ -1071,12 +1083,7 @@ fn cmd_servers(
     println!("{}", "-".repeat(64));
 
     for s in &servers {
-        let load = if s.bandwidth_max == 0 {
-            100
-        } else {
-            let bw_cur = 2 * (s.bandwidth * 8) / (1_000 * 1_000);
-            (bw_cur * 100) / s.bandwidth_max
-        };
+        let load = server::load_perc(s);
         println!(
             "{:<20} {:<6} {:<12} {:>6} {:>5}% {:>8}",
             s.name,
