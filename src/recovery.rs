@@ -197,6 +197,20 @@ fn recover_from_state(state: &State) -> Result<()> {
         cleanup_failed = true;
     }
 
+    // 3b. Clean up routing policy rules (table 51820) that setup_routing adds.
+    // wireguard::disconnect calls teardown_routing, but if disconnect failed
+    // (e.g., config_path was empty or interface already gone), rules may linger.
+    // These are idempotent deletes — they silently fail if rules don't exist.
+    let routing_cleanups: &[&[&str]] = &[
+        &["ip", "-4", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
+        &["ip", "-6", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
+        &["ip", "-4", "rule", "delete", "table", "main", "suppress_prefixlength", "0"],
+        &["ip", "-6", "rule", "delete", "table", "main", "suppress_prefixlength", "0"],
+    ];
+    for cmd in routing_cleanups {
+        let _ = std::process::Command::new(cmd[0]).args(&cmd[1..]).output();
+    }
+
     // 4. Deactivate network lock if it was active (last — prevents traffic leaks)
     if state.lock_active {
         if let Err(e) = netlock::deactivate() {
@@ -258,12 +272,19 @@ pub fn setup_signal_handler() -> Result<Arc<AtomicBool>> {
 
     // SAFETY: signal_hook_registry style — we only set an atomic bool.
     // Using nix::sys::signal for the handler setup.
+    //
+    // NOTE: We intentionally do NOT use SA_RESTART. With SA_RESTART, blocking
+    // syscalls (DNS resolution, HTTP requests via reqwest) auto-restart after
+    // the signal, making Ctrl+C unresponsive during verification and other
+    // blocking operations. Without SA_RESTART, these calls return EINTR,
+    // causing reqwest/DNS to fail fast and letting the main thread check the
+    // shutdown flag promptly.
     unsafe {
         nix::sys::signal::sigaction(
             nix::sys::signal::Signal::SIGINT,
             &nix::sys::signal::SigAction::new(
                 nix::sys::signal::SigHandler::Handler(signal_handler),
-                nix::sys::signal::SaFlags::SA_RESTART,
+                nix::sys::signal::SaFlags::empty(),
                 nix::sys::signal::SigSet::empty(),
             ),
         )
@@ -273,7 +294,7 @@ pub fn setup_signal_handler() -> Result<Arc<AtomicBool>> {
             nix::sys::signal::Signal::SIGTERM,
             &nix::sys::signal::SigAction::new(
                 nix::sys::signal::SigHandler::Handler(signal_handler),
-                nix::sys::signal::SaFlags::SA_RESTART,
+                nix::sys::signal::SaFlags::empty(),
                 nix::sys::signal::SigSet::empty(),
             ),
         )
@@ -283,7 +304,7 @@ pub fn setup_signal_handler() -> Result<Arc<AtomicBool>> {
             nix::sys::signal::Signal::SIGHUP,
             &nix::sys::signal::SigAction::new(
                 nix::sys::signal::SigHandler::Handler(signal_handler),
-                nix::sys::signal::SaFlags::SA_RESTART,
+                nix::sys::signal::SaFlags::empty(),
                 nix::sys::signal::SigSet::empty(),
             ),
         )

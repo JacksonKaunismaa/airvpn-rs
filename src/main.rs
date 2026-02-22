@@ -516,11 +516,18 @@ fn cmd_connect(
         println!("Handshake established.");
 
         // 9-12: Remaining setup — if any step fails, clean up and treat as fatal
-        // (DNS/netlock setup failures are not transient server issues)
+        // (DNS/netlock setup failures are not transient server issues).
+        // Verification steps (10b, 10c) are best-effort with timeouts and
+        // respect the shutdown flag so Ctrl+C remains responsive.
         if let Err(e) = (|| -> anyhow::Result<()> {
             // 9. Allow VPN interface in netlock
             if !no_lock {
                 netlock::allow_interface(&iface)?;
+            }
+
+            // Bail early if shutdown was requested during netlock setup
+            if shutdown.load(Ordering::Relaxed) {
+                anyhow::bail!("shutdown requested during setup");
             }
 
             // 10. Activate DNS
@@ -530,19 +537,27 @@ fn cmd_connect(
             // 10b. Verify tunnel is working (Eddie: Service.cs check/tun endpoint)
             // check_domain comes from the provider manifest; default to "airvpn.org"
             // until we parse it from the manifest/provider config.
+            //
+            // Verification is best-effort: time-bounded (10s) and non-fatal.
+            // If shutdown is requested, skip verification entirely.
             let check_domain = "airvpn.org";
             let exit_ip = server_ref.ips_exit.first().map(|s| s.as_str()).unwrap_or("");
-            println!("Verifying tunnel...");
-            match verify::check_tunnel(&server_ref.name, &wg_key.wg_ipv4, check_domain, exit_ip) {
-                Ok(()) => println!("Tunnel verified."),
-                Err(e) => eprintln!("warning: tunnel verification failed: {:#}", e),
+
+            if !shutdown.load(Ordering::Relaxed) {
+                println!("Verifying tunnel...");
+                match verify::check_tunnel(&server_ref.name, &wg_key.wg_ipv4, check_domain, exit_ip) {
+                    Ok(()) => println!("Tunnel verified."),
+                    Err(e) => eprintln!("warning: tunnel verification failed: {:#}", e),
+                }
             }
 
             // 10c. Verify DNS goes through VPN (Eddie: Service.cs check/dns endpoint)
-            println!("Verifying DNS...");
-            match verify::check_dns(&server_ref.name, check_domain, exit_ip) {
-                Ok(()) => println!("DNS verified."),
-                Err(e) => eprintln!("warning: DNS verification failed: {:#}", e),
+            if !shutdown.load(Ordering::Relaxed) {
+                println!("Verifying DNS...");
+                match verify::check_dns(&server_ref.name, check_domain, exit_ip) {
+                    Ok(()) => println!("DNS verified."),
+                    Err(e) => eprintln!("warning: DNS verification failed: {:#}", e),
+                }
             }
 
             // 11. Save credentials (non-fatal — don't kill connection over keyring issues)
@@ -563,6 +578,14 @@ fn cmd_connect(
 
             Ok(())
         })() {
+            // If the error was a shutdown request, don't treat it as a fatal
+            // setup failure — fall through to the monitor loop which will see
+            // the shutdown flag and disconnect cleanly.
+            if shutdown.load(Ordering::Relaxed) {
+                eprintln!("Setup interrupted by shutdown signal, disconnecting...");
+                let _ = cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces);
+                break;
+            }
             eprintln!("Setup failed after WireGuard connected: {:#}", e);
             eprintln!("Cleaning up...");
             let _ = cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces);
