@@ -12,6 +12,7 @@
 //! Reference: Eddie src/Lib.Platform.Linux/NetworkLockNftables.cs
 
 use anyhow::{Context, Result};
+use log::warn;
 use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::net::IpAddr;
@@ -354,7 +355,7 @@ pub fn activate(config: &NetlockConfig) -> Result<()> {
     // Clean up stale table from previous crash before creating fresh one
     if is_active() {
         if let Err(e) = deactivate() {
-            eprintln!("warning: failed to remove stale nftables table: {}", e);
+            warn!("failed to remove stale nftables table: {}", e);
         }
     }
 

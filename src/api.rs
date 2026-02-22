@@ -8,6 +8,7 @@
 //! Reference: Eddie src/Lib.Core/Providers/Service.cs
 
 use anyhow::{Context, Result};
+use log::debug;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use reqwest::blocking::Client;
@@ -215,6 +216,19 @@ fn fetch_encrypted(
     rsa_exponent: Option<&str>,
     extra_urls: &[String],
 ) -> Result<String> {
+    // Log API params with credentials redacted
+    let safe_params: Vec<(&str, &str)> = params.iter()
+        .map(|(k, v)| {
+            let v_safe: &str = match k.as_str() {
+                "login" | "password" => "[REDACTED]",
+                _ => v.as_str(),
+            };
+            (k.as_str(), v_safe)
+        })
+        .collect();
+    debug!("API request params: {:?}", safe_params);
+    debug!("Using {} bootstrap URLs + {} extra URLs", BOOTSTRAP_IPS.len(), extra_urls.len());
+
     let modulus = rsa_modulus.unwrap_or(RSA_MODULUS_B64);
     let exponent = rsa_exponent.unwrap_or(RSA_EXPONENT_B64);
     let public_key = crypto::build_rsa_public_key(modulus, exponent)
@@ -237,6 +251,8 @@ fn fetch_encrypted(
 
     for base_url in &all_urls {
         let url = format!("{}/", base_url);
+        debug!("Trying bootstrap URL: {}", base_url);
+        let req_start = std::time::Instant::now();
 
         match client
             .post(&url)
@@ -273,6 +289,13 @@ fn fetch_encrypted(
                     }
                 };
 
+                debug!(
+                    "API response from {}: {} bytes encrypted, {} bytes decrypted, {:.1}ms",
+                    base_url,
+                    body.len(),
+                    xml.len(),
+                    req_start.elapsed().as_secs_f64() * 1000.0,
+                );
                 return Ok(xml);
             }
             Err(e) => {

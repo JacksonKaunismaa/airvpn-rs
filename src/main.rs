@@ -3,6 +3,7 @@ use airvpn::{api, config, dns, ipv6, manifest, netlock, pinger, recovery, server
 use std::sync::atomic::Ordering;
 
 use clap::{Parser, Subcommand};
+use log::{debug, error, info, warn};
 
 #[derive(Parser)]
 #[command(name = "airvpn", about = "AirVPN WireGuard client")]
@@ -78,7 +79,54 @@ enum Commands {
     Recover,
 }
 
+fn init_logging() {
+    use simplelog::*;
+
+    let log_path = std::env::var("AIRVPN_LOG")
+        .unwrap_or_else(|_| "/tmp/airvpn-rs.log".to_string());
+
+    let mut loggers: Vec<Box<dyn SharedLogger>> = vec![
+        // stderr: INFO level, no timestamps (clean user-facing output)
+        TermLogger::new(
+            LevelFilter::Info,
+            ConfigBuilder::new()
+                .set_time_level(LevelFilter::Off)
+                .set_target_level(LevelFilter::Off)
+                .set_thread_level(LevelFilter::Off)
+                .build(),
+            TerminalMode::Stderr,
+            ColorChoice::Auto,
+        ),
+    ];
+
+    // File logger: DEBUG level with timestamps
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(file) => {
+            loggers.push(WriteLogger::new(
+                LevelFilter::Debug,
+                ConfigBuilder::new()
+                    .set_target_level(LevelFilter::Off)
+                    .set_thread_level(LevelFilter::Off)
+                    .build(),
+                file,
+            ));
+        }
+        Err(e) => {
+            eprintln!("warning: could not open log file {}: {}", log_path, e);
+        }
+    }
+
+    CombinedLogger::init(loggers).unwrap_or_else(|e| {
+        eprintln!("warning: failed to initialize logging: {}", e);
+    });
+}
+
 fn main() -> anyhow::Result<()> {
+    init_logging();
     let cli = Cli::parse();
     match cli.command {
         Commands::Connect {
@@ -184,7 +232,7 @@ fn cmd_connect(
     if dns_backup.exists() {
         // Only restore if no airvpn process is running
         if recovery::load().ok().flatten().map_or(true, |s| !recovery::is_pid_alive(s.pid)) {
-            eprintln!("Restoring orphaned DNS backup...");
+            warn!("Restoring orphaned DNS backup...");
             let _ = dns::deactivate();
         }
     }
@@ -192,7 +240,7 @@ fn cmd_connect(
     // Unconditional cleanup: remove orphaned nftables table (Eddie: OnRecoveryAlways)
     if netlock::is_active() {
         if recovery::load().ok().flatten().map_or(true, |s| !recovery::is_pid_alive(s.pid)) {
-            eprintln!("Removing orphaned nftables table...");
+            warn!("Removing orphaned nftables table...");
             let _ = netlock::deactivate();
         }
     }
@@ -225,21 +273,31 @@ fn cmd_connect(
     )?;
 
     // 3. Fetch manifest + user data (two separate API calls)
-    println!("Fetching server list...");
+    info!("Fetching server list...");
+    debug!("API request: act=manifest (credentials redacted)");
     let manifest_xml = api::fetch_manifest(&username, &password)?;
+    debug!("Manifest XML response: {} bytes", manifest_xml.len());
     let manifest = manifest::parse_manifest(&manifest_xml)?;
-    println!(
+    info!(
         "Found {} servers, {} WireGuard modes",
         manifest.servers.len(),
         manifest.modes.len()
+    );
+    debug!(
+        "Manifest parse results: {} servers, {} modes, {} bootstrap URLs, check_domain={:?}, rsa_key_rotated={}",
+        manifest.servers.len(),
+        manifest.modes.len(),
+        manifest.bootstrap_urls.len(),
+        manifest.check_domain,
+        manifest.rsa_modulus.is_some(),
     );
 
     // Display any service messages from AirVPN
     for msg in &manifest.messages {
         match msg.kind.as_str() {
-            "error" => eprintln!("[AirVPN Error] {}", msg.text),
-            "warning" => eprintln!("[AirVPN Warning] {}", msg.text),
-            _ => println!("[AirVPN] {}", msg.text),
+            "error" => error!("[AirVPN] {}", msg.text),
+            "warning" => warn!("[AirVPN] {}", msg.text),
+            _ => info!("[AirVPN] {}", msg.text),
         }
     }
 
@@ -247,9 +305,12 @@ fn cmd_connect(
     let rsa_mod = manifest.rsa_modulus.as_deref();
     let rsa_exp = manifest.rsa_exponent.as_deref();
 
-    println!("Fetching user data...");
+    info!("Fetching user data...");
+    debug!("API request: act=user (credentials redacted)");
     let user_xml = api::fetch_user_with_key(&username, &password, rsa_mod, rsa_exp, &manifest.bootstrap_urls)?;
+    debug!("User XML response: {} bytes", user_xml.len());
     let user_info = manifest::parse_user(&user_xml)?;
+    debug!("User info: login={}, {} WireGuard keys", user_info.login, user_info.keys.len());
 
     // 4. Select WireGuard mode (first available) — invariant across reconnections
     let mode = manifest
@@ -288,7 +349,7 @@ fn cmd_connect(
         || !allow_country.is_empty()
         || !deny_country.is_empty();
     if has_filters {
-        println!(
+        info!(
             "Filters applied: {} of {} servers eligible",
             filtered_servers.len(),
             manifest.servers.len()
@@ -303,12 +364,12 @@ fn cmd_connect(
     // -----------------------------------------------------------------------
 
     let ping_results = if skip_ping {
-        println!("Skipping latency measurement (--skip-ping).");
+        info!("Skipping latency measurement (--skip-ping).");
         pinger::PingResults::new()
     } else {
-        println!("Measuring server latencies...");
+        info!("Measuring server latencies...");
         let results = pinger::measure_all(&filtered_servers);
-        println!("Pinged {} servers.", results.latencies.len());
+        info!("Pinged {} servers.", results.latencies.len());
         results
     };
 
@@ -326,7 +387,7 @@ fn cmd_connect(
     loop {
         // Check for shutdown before attempting connection
         if shutdown.load(Ordering::Relaxed) {
-            println!("Shutdown requested before connection attempt.");
+            info!("Shutdown requested before connection attempt.");
             break;
         }
 
@@ -337,14 +398,28 @@ fn cmd_connect(
             &penalties,
             &ping_results,
         )?;
-        println!(
+        info!(
             "Selected server: {} ({}, {})",
             server_ref.name, server_ref.location, server_ref.country_code
+        );
+        debug!(
+            "Server details: name={}, group={}, entry_ips={:?}, exit_ips={:?}, score={}, bw={}/{}, users={}/{}, ipv4={}, ipv6={}",
+            server_ref.name,
+            server_ref.group,
+            server_ref.ips_entry,
+            server_ref.ips_exit,
+            server::score(server_ref),
+            server_ref.bandwidth,
+            server_ref.bandwidth_max,
+            server_ref.users,
+            server_ref.users_max,
+            server_ref.support_ipv4,
+            server_ref.support_ipv6,
         );
 
         // Validate server supports required protocols
         if !server_ref.support_ipv4 {
-            eprintln!("warning: server {} does not advertise IPv4 support", server_ref.name);
+            warn!("server {} does not advertise IPv4 support", server_ref.name);
         }
 
         // 6b. Pre-connection authorization (Eddie: Session.cs:173-218)
@@ -357,25 +432,25 @@ fn cmd_connect(
             &manifest.bootstrap_urls,
         ) {
             Ok(api::ConnectDirective::Ok) => {
-                println!("Authorizing connection... OK");
+                info!("Authorizing connection... OK");
                 Option::<ResetLevel>::None
             }
             Ok(api::ConnectDirective::Stop(msg)) => {
-                eprintln!("Server rejected connection: {}", msg);
+                error!("Server rejected connection: {}", msg);
                 Some(ResetLevel::Fatal)
             }
             Ok(api::ConnectDirective::Next(msg)) => {
                 // Eddie: Penality += penality_on_error, waitingSecs = 5
-                eprintln!("Server says try another: {}", msg);
+                warn!("Server says try another: {}", msg);
                 Some(ResetLevel::Error)
             }
             Ok(api::ConnectDirective::Retry(msg)) => {
-                eprintln!("Server message: {}", msg);
+                warn!("Server message: {}", msg);
                 Some(ResetLevel::Retry)
             }
             Err(e) => {
                 // Non-fatal — Eddie: "If failed, continue anyway"
-                eprintln!("warning: pre-connection authorization failed: {:#}", e);
+                warn!("pre-connection authorization failed: {:#}", e);
                 Option::<ResetLevel>::None
             }
         };
@@ -392,7 +467,7 @@ fn cmd_connect(
                     if no_reconnect {
                         anyhow::bail!("Server directed to try another (--no-reconnect)");
                     }
-                    eprintln!("Penalized {}. Trying another server in 5s...", server_ref.name);
+                    warn!("Penalized {}. Trying another server in 5s...", server_ref.name);
                     interruptible_sleep(&shutdown, 5);
                     continue;
                 }
@@ -400,7 +475,7 @@ fn cmd_connect(
                     if no_reconnect {
                         anyhow::bail!("Server asked to retry (--no-reconnect)");
                     }
-                    eprintln!("Retrying in 10s...");
+                    warn!("Retrying in 10s...");
                     interruptible_sleep(&shutdown, 10);
                     continue;
                 }
@@ -410,7 +485,7 @@ fn cmd_connect(
 
         // 7. Activate network lock (BEFORE connecting -- this is critical)
         if !no_lock {
-            println!("Activating network lock...");
+            info!("Activating network lock...");
             let mut allowed_ips: Vec<String> = server_ref.ips_entry.clone();
             // Also whitelist API bootstrap IPs (extract bare IP from URLs like "http://1.2.3.4")
             for url in api::BOOTSTRAP_IPS {
@@ -444,13 +519,18 @@ fn cmd_connect(
                 blocked_ipv6_ifaces: vec![],
                 endpoint_ip: String::new(),
             })?;
-            println!("Network lock active (dedicated nftables table)");
+            info!("Network lock active (dedicated nftables table)");
+            debug!(
+                "Network lock: {} outgoing IPs whitelisted, allow_lan={}",
+                lock_config.allowed_ips_outgoing.len(),
+                lock_config.allow_lan,
+            );
         }
 
         // 7b. Block IPv6 on all interfaces (Eddie default: network.ipv6.mode="in-block")
         let blocked_ipv6_ifaces = ipv6::block_all();
         if !blocked_ipv6_ifaces.is_empty() {
-            println!("IPv6 disabled on {} interfaces", blocked_ipv6_ifaces.len());
+            info!("IPv6 disabled on {} interfaces", blocked_ipv6_ifaces.len());
         }
         recovery::save(&recovery::State {
             lock_active: !no_lock,
@@ -465,15 +545,24 @@ fn cmd_connect(
 
         // 8. Generate WireGuard config and connect
         let (wg_config, endpoint_ip) = wireguard::generate_config(wg_key, server_ref, mode, &user_info)?;
-        println!("Connecting to {} via mode {}...", server_ref.name, mode.title);
+        debug!(
+            "WireGuard config: endpoint={}, ipv4={}, ipv6={}, dns={}/{}, mode={} (keys redacted)",
+            endpoint_ip,
+            wg_key.wg_ipv4,
+            wg_key.wg_ipv6,
+            wg_key.wg_dns_ipv4,
+            wg_key.wg_dns_ipv6,
+            mode.title,
+        );
+        info!("Connecting to {} via mode {}...", server_ref.name, mode.title);
         let (config_path, iface) = match wireguard::connect(&wg_config, &endpoint_ip) {
             Ok(result) => result,
             Err(e) => {
-                eprintln!("WireGuard connection failed: {:#}", e);
+                error!("WireGuard connection failed: {:#}", e);
                 // Deactivate netlock first, then restore IPv6 (avoid window where
                 // IPv6 is live but firewall rules have stale state)
                 if !no_lock {
-                    eprintln!("Removing network lock...");
+                    warn!("Removing network lock...");
                     let _ = netlock::deactivate();
                 }
                 ipv6::restore(&blocked_ipv6_ifaces);
@@ -484,7 +573,7 @@ fn cmd_connect(
                 if no_reconnect {
                     return Err(e.context("WireGuard connection failed"));
                 }
-                eprintln!("Reconnecting in 3s (penalized {})...", server_ref.name);
+                warn!("Reconnecting in 3s (penalized {})...", server_ref.name);
                 interruptible_sleep(&shutdown, 3);
                 continue;
             }
@@ -499,12 +588,12 @@ fn cmd_connect(
             blocked_ipv6_ifaces: blocked_ipv6_ifaces.clone(),
             endpoint_ip: endpoint_ip.clone(),
         })?;
-        println!("WireGuard interface: {}", iface);
+        info!("WireGuard interface: {}", iface);
 
         // Wait for first WireGuard handshake (Eddie: handshake_timeout_first=50s)
-        println!("Waiting for handshake...");
+        info!("Waiting for handshake...");
         if let Err(e) = wireguard::wait_for_handshake(&iface, 50) {
-            eprintln!("Handshake failed: {:#}", e);
+            error!("Handshake failed: {:#}", e);
             // Order: WG down -> netlock deactivate -> IPv6 restore
             let _ = wireguard::disconnect(&config_path, &endpoint_ip);
             if !no_lock {
@@ -518,11 +607,11 @@ fn cmd_connect(
             if no_reconnect {
                 return Err(e);
             }
-            eprintln!("Reconnecting in 3s (penalized {})...", server_ref.name);
+            warn!("Reconnecting in 3s (penalized {})...", server_ref.name);
             interruptible_sleep(&shutdown, 3);
             continue;
         }
-        println!("Handshake established.");
+        info!("Handshake established.");
 
         // 9-12: Remaining setup — if any step fails, clean up and treat as fatal
         // (DNS/netlock setup failures are not transient server issues).
@@ -538,12 +627,13 @@ fn cmd_connect(
             }
 
             // 10. Activate DNS
+            debug!("Activating DNS: ipv4={}, ipv6={}, iface={}", wg_key.wg_dns_ipv4, wg_key.wg_dns_ipv6, iface);
             dns::activate(&wg_key.wg_dns_ipv4, &wg_key.wg_dns_ipv6, &iface)?;
-            println!("DNS configured: {}, {}", wg_key.wg_dns_ipv4, wg_key.wg_dns_ipv6);
+            info!("DNS configured: {}, {}", wg_key.wg_dns_ipv4, wg_key.wg_dns_ipv6);
 
             // 11. Save credentials (non-fatal — don't kill connection over keyring issues)
             if let Err(e) = config::save_credentials(&username, &password) {
-                eprintln!("warning: failed to save credentials: {:#}", e);
+                warn!("failed to save credentials: {:#}", e);
             }
 
             // 12. Save recovery state
@@ -564,12 +654,12 @@ fn cmd_connect(
             // setup failure — fall through to the monitor loop which will see
             // the shutdown flag and disconnect cleanly.
             if shutdown.load(Ordering::Relaxed) {
-                eprintln!("Setup interrupted by shutdown signal, disconnecting...");
+                warn!("Setup interrupted by shutdown signal, disconnecting...");
                 let _ = cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces, &endpoint_ip);
                 break;
             }
-            eprintln!("Setup failed after WireGuard connected: {:#}", e);
-            eprintln!("Cleaning up...");
+            error!("Setup failed after WireGuard connected: {:#}", e);
+            warn!("Cleaning up...");
             let _ = cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces, &endpoint_ip);
             return Err(e);
         }
@@ -580,34 +670,35 @@ fn cmd_connect(
         // reconnection (matching Eddie's behavior). Use --no-verify to skip
         // during testing.
         if !no_verify && !shutdown.load(Ordering::Relaxed) {
-            let check_domain = "airvpn.org";
+            let check_domain = manifest.check_domain.as_str();
             let exit_ip = server_ref.ips_exit.first().map(|s| s.as_str()).unwrap_or("");
+            debug!("Verification: check_domain={:?}, exit_ip={:?}, server={}", check_domain, exit_ip, server_ref.name);
             let mut verify_failed = false;
 
             // 10b. Verify tunnel is working
-            println!("Verifying tunnel...");
+            info!("Verifying tunnel...");
             match verify::check_tunnel(&server_ref.name, &wg_key.wg_ipv4, check_domain, exit_ip) {
-                Ok(()) => println!("Tunnel verified."),
+                Ok(()) => info!("Tunnel verified."),
                 Err(e) => {
-                    eprintln!("Tunnel verification failed: {:#}", e);
+                    warn!("Tunnel verification failed: {:#}", e);
                     verify_failed = true;
                 }
             }
 
             // 10c. Verify DNS goes through VPN
             if !verify_failed && !shutdown.load(Ordering::Relaxed) {
-                println!("Verifying DNS...");
+                info!("Verifying DNS...");
                 match verify::check_dns(&server_ref.name, check_domain, exit_ip) {
-                    Ok(()) => println!("DNS verified."),
+                    Ok(()) => info!("DNS verified."),
                     Err(e) => {
-                        eprintln!("DNS verification failed: {:#}", e);
+                        warn!("DNS verification failed: {:#}", e);
                         verify_failed = true;
                     }
                 }
             }
 
             if verify_failed && !shutdown.load(Ordering::Relaxed) {
-                eprintln!("Verification failed — treating as connection failure, reconnecting...");
+                warn!("Verification failed, treating as connection failure, reconnecting...");
                 let _ = cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces, &endpoint_ip);
                 penalties.penalize(&server_ref.name, 30);
                 forced_server = Option::None;
@@ -619,8 +710,8 @@ fn cmd_connect(
             }
         }
 
-        println!(
-            "\nConnected to {} via {}.{}",
+        info!(
+            "Connected to {} via {}.{}",
             server_ref.name,
             iface,
             if no_reconnect {
@@ -633,19 +724,19 @@ fn cmd_connect(
         // 13. Monitor loop — determines ResetLevel when connection ends
         let reset_level = loop {
             if shutdown.load(Ordering::Relaxed) {
-                println!("\nDisconnecting...");
+                info!("Disconnecting...");
                 break ResetLevel::None;
             }
 
             // Check interface still exists
             if !wireguard::is_connected(&iface) {
-                eprintln!("WireGuard interface {} disappeared!", iface);
+                error!("WireGuard interface {} disappeared!", iface);
                 break ResetLevel::Error;
             }
 
             // Check handshake staleness (Eddie: handshake_timeout_connected=200s)
             if wireguard::is_handshake_stale(&iface, 200) {
-                eprintln!("WireGuard handshake stale (>200s) -- tunnel may be dead");
+                error!("WireGuard handshake stale (>200s) -- tunnel may be dead");
                 break ResetLevel::Error;
             }
 
@@ -663,12 +754,12 @@ fn cmd_connect(
             ResetLevel::None | ResetLevel::Fatal => break,
             ResetLevel::Error => {
                 if no_reconnect {
-                    eprintln!("Connection lost (--no-reconnect, exiting).");
+                    warn!("Connection lost (--no-reconnect, exiting).");
                     break;
                 }
                 penalties.penalize(&server_ref.name, 30);
                 forced_server = Option::None; // clear forced server for rotation
-                eprintln!(
+                warn!(
                     "Connection lost. Reconnecting in 3s (penalized {})...",
                     server_ref.name
                 );
@@ -676,19 +767,19 @@ fn cmd_connect(
             }
             ResetLevel::Retry => {
                 if no_reconnect {
-                    eprintln!("Connection lost (--no-reconnect, exiting).");
+                    warn!("Connection lost (--no-reconnect, exiting).");
                     break;
                 }
-                eprintln!("Retrying same server in 1s...");
+                warn!("Retrying same server in 1s...");
                 interruptible_sleep(&shutdown, 1);
             }
             ResetLevel::Switch => {
                 if no_reconnect {
-                    eprintln!("Server switch requested (--no-reconnect, exiting).");
+                    warn!("Server switch requested (--no-reconnect, exiting).");
                     break;
                 }
                 forced_server = Option::None;
-                eprintln!("Switching server...");
+                info!("Switching server...");
             }
         }
     }
@@ -706,7 +797,7 @@ fn cmd_disconnect() -> anyhow::Result<()> {
 
     // If the connect process is still running, signal it to shut down gracefully
     if recovery::is_pid_alive(state.pid) && state.pid != std::process::id() {
-        eprintln!("Signaling PID {} to disconnect...", state.pid);
+        info!("Signaling PID {} to disconnect...", state.pid);
         let _ = nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(state.pid as i32),
             nix::sys::signal::Signal::SIGTERM,
@@ -714,12 +805,12 @@ fn cmd_disconnect() -> anyhow::Result<()> {
         // Wait up to 5 seconds for graceful shutdown
         for _ in 0..50 {
             if !recovery::is_pid_alive(state.pid) {
-                println!("Disconnected.");
+                info!("Disconnected.");
                 return Ok(());
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        eprintln!("PID {} did not exit, forcing cleanup...", state.pid);
+        warn!("PID {} did not exit, forcing cleanup...", state.pid);
     }
 
     cmd_disconnect_internal(&state.wg_config_path, &state.wg_interface, state.lock_active, &state.blocked_ipv6_ifaces, &state.endpoint_ip)
@@ -746,7 +837,7 @@ fn cmd_disconnect_internal(config_path: &str, iface: &str, lock_active: bool, bl
     ipv6::restore(blocked_ipv6);
     // 6. Remove state
     let _ = recovery::remove();
-    println!("Disconnected.");
+    info!("Disconnected.");
     Ok(())
 }
 
@@ -821,7 +912,7 @@ fn cmd_servers(
         "users" => servers.sort_by(|a, b| a.users.cmp(&b.users)),
         "name" => servers.sort_by(|a, b| a.name.cmp(&b.name)),
         _ => {
-            eprintln!("Unknown sort key '{}', defaulting to score", sort);
+            warn!("Unknown sort key '{}', defaulting to score", sort);
             servers.sort_by(|a, b| server::score(a).cmp(&server::score(b)));
         }
     }

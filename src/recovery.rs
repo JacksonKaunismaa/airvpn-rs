@@ -21,6 +21,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use log::{debug, info, warn};
+
 use crate::{dns, ipv6, netlock, wireguard};
 
 const PRIMARY_STATE_DIR: &str = "/run/airvpn-rs";
@@ -68,6 +70,16 @@ fn find_state_file() -> Option<PathBuf> {
 
 /// Save current connection state.
 pub fn save(state: &State) -> Result<()> {
+    debug!(
+        "Saving recovery state: lock={}, iface={}, dns={}/{}, pid={}, ipv6_blocked={}, endpoint={}",
+        state.lock_active,
+        state.wg_interface,
+        state.dns_ipv4,
+        state.dns_ipv6,
+        state.pid,
+        state.blocked_ipv6_ifaces.len(),
+        state.endpoint_ip,
+    );
     let path = state_path();
     let json = serde_json::to_string_pretty(state).context("failed to serialize state")?;
 
@@ -112,7 +124,7 @@ pub fn load() -> Result<Option<State>> {
             match serde_json::from_str::<State>(&json) {
                 Ok(state) => Ok(Some(state)),
                 Err(e) => {
-                    eprintln!("warning: corrupt state file ({}), removing it", e);
+                    warn!("corrupt state file ({}), removing it", e);
                     let _ = fs::remove_file(&path);
                     Ok(None)
                 }
@@ -164,7 +176,7 @@ fn recover_from_state(state: &State) -> Result<()> {
         // endpoint host route removal is skipped (it'll be removed when the interface
         // goes down anyway since the route's nexthop becomes unreachable).
         if let Err(e) = wireguard::disconnect(&state.wg_config_path, &state.endpoint_ip) {
-            eprintln!("warning: failed to disconnect WireGuard: {}", e);
+            warn!("failed to disconnect WireGuard: {}", e);
             cleanup_failed = true;
         }
     } else if !state.wg_interface.is_empty() {
@@ -177,7 +189,7 @@ fn recover_from_state(state: &State) -> Result<()> {
                     String::from_utf8_lossy(&o.stderr).to_string()))
             })
         {
-            eprintln!("warning: failed to delete WireGuard interface {}: {}", state.wg_interface, e);
+            warn!("failed to delete WireGuard interface {}: {}", state.wg_interface, e);
             cleanup_failed = true;
         }
     }
@@ -195,12 +207,12 @@ fn recover_from_state(state: &State) -> Result<()> {
     // 2. Restore IPv6 on previously blocked interfaces
     if !state.blocked_ipv6_ifaces.is_empty() {
         ipv6::restore(&state.blocked_ipv6_ifaces);
-        eprintln!("restored IPv6 on {} interfaces", state.blocked_ipv6_ifaces.len());
+        info!("restored IPv6 on {} interfaces", state.blocked_ipv6_ifaces.len());
     }
 
     // 3. Restore DNS
     if let Err(e) = dns::deactivate() {
-        eprintln!("warning: failed to restore DNS: {}", e);
+        warn!("failed to restore DNS: {}", e);
         cleanup_failed = true;
     }
 
@@ -229,7 +241,7 @@ fn recover_from_state(state: &State) -> Result<()> {
     // 4. Deactivate network lock if it was active (last — prevents traffic leaks)
     if state.lock_active {
         if let Err(e) = netlock::deactivate() {
-            eprintln!("warning: failed to deactivate network lock: {}", e);
+            warn!("failed to deactivate network lock: {}", e);
             cleanup_failed = true;
         }
     }
@@ -237,7 +249,7 @@ fn recover_from_state(state: &State) -> Result<()> {
     // 5. Only remove state file if all cleanup steps succeeded.
     // If any failed, keep it so next startup can retry recovery.
     if cleanup_failed {
-        eprintln!("warning: some cleanup steps failed; keeping state file for next recovery attempt");
+        warn!("some cleanup steps failed; keeping state file for next recovery attempt");
     } else {
         remove()?;
     }
@@ -260,7 +272,7 @@ pub fn check_and_recover() -> Result<()> {
         );
     }
 
-    eprintln!("recovering from stale state (PID {} is dead)...", state.pid);
+    info!("recovering from stale state (PID {} is dead)...", state.pid);
     recover_from_state(&state)
 }
 
@@ -269,12 +281,12 @@ pub fn force_recover() -> Result<()> {
     let state = match load()? {
         Some(s) => s,
         None => {
-            eprintln!("no state file found, nothing to recover");
+            info!("no state file found, nothing to recover");
             return Ok(());
         }
     };
 
-    eprintln!("force recovering...");
+    info!("force recovering...");
     recover_from_state(&state)
 }
 
@@ -338,10 +350,13 @@ pub fn setup_signal_handler() -> Result<Arc<AtomicBool>> {
 static SHUTDOWN_FLAG: std::sync::OnceLock<Arc<AtomicBool>> = std::sync::OnceLock::new();
 
 /// C-compatible signal handler that sets the shutdown flag.
-extern "C" fn signal_handler(_sig: nix::libc::c_int) {
+extern "C" fn signal_handler(sig: nix::libc::c_int) {
     if let Some(flag) = SHUTDOWN_FLAG.get() {
         flag.store(true, Ordering::SeqCst);
     }
+    // Cannot use log macros in signal handlers (not async-signal-safe).
+    // Signal number is recorded; the main loop will log when it detects the flag.
+    let _ = sig;
 }
 
 // =============================================================================

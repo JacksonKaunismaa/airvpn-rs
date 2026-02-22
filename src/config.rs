@@ -6,6 +6,7 @@
 //! 3. Interactive stdin prompt (lowest priority)
 
 use anyhow::{bail, Context, Result};
+use log::warn;
 use std::path::PathBuf;
 
 use crate::profile::{default_format, generate_id, load_profile, save_profile, ProfileFormat};
@@ -72,7 +73,7 @@ pub fn resolve_credentials(
                 return Ok((login, password));
             }
             Err(e) => {
-                eprintln!("warning: failed to load profile: {:#}", e);
+                warn!("failed to load profile: {:#}", e);
                 // Fall through to stdin prompt
             }
         }

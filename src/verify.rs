@@ -10,6 +10,7 @@
 //! Reference: Eddie src/Lib.Core/Providers/Service.cs:296-556
 
 use anyhow::{Context, Result};
+use log::debug;
 use reqwest::blocking::Client;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -71,6 +72,7 @@ fn check_tunnel_inner(server_name: &str, expected_ipv4: &str, check_domain: &str
         .context("failed to build HTTP client for tunnel check")?;
 
     let url = format!("https://{}/check/tun/", check_host);
+    debug!("Tunnel check URL: {}, expected_ipv4={}", url, expected_ipv4);
 
     // Try up to 3 times (with the outer timeout as the real deadline).
     for attempt in 1..=3 {
@@ -158,6 +160,7 @@ fn check_dns_inner(server_name: &str, check_domain: &str, exit_ip: &str) -> Resu
         .context("failed to build HTTP client for DNS check")?;
 
     let check_url = format!("https://{}/check/dns/", check_host);
+    debug!("DNS check URL: {}", check_url);
 
     // Try up to 3 times (with the outer timeout as the real deadline).
     for attempt in 1..=3 {

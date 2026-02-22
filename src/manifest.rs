@@ -26,6 +26,10 @@ pub struct Manifest {
     pub rsa_exponent: Option<String>,
     pub force_reauth_ts: i64,
     pub messages: Vec<Message>,
+    /// Domain used for post-connection verification (tunnel + DNS checks).
+    /// Parsed from `check_domain` attribute on the `<manifest>` root element.
+    /// Eddie: Service.cs `_checkDomain` field.
+    pub check_domain: String,
 }
 
 // UserInfo and WireGuardKey are parsed separately via parse_user() from the act=user response.
@@ -248,6 +252,7 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
     let mut bootstrap_urls: Vec<String> = Vec::new();
     let mut messages: Vec<Message> = Vec::new();
     let mut force_reauth_ts: i64 = 0;
+    let mut check_domain = String::new();
 
     // RSA key rotation: parsed from <manifest> attributes or nested <rsa> element
     let mut rsa_modulus: Option<String> = None;
@@ -347,6 +352,13 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
                         force_reauth_ts = attr_opt(e, b"force_reauth_ts")
                             .and_then(|s| s.parse::<i64>().ok())
                             .unwrap_or(0);
+                        // Check domain for post-connection verification
+                        // Eddie: Service.cs `_checkDomain` parsed from manifest root
+                        if let Some(cd) = attr_opt(e, b"check_domain") {
+                            if !cd.is_empty() {
+                                check_domain = cd;
+                            }
+                        }
                         // RSA key rotation: attributes on the root <manifest> element
                         if let Some(m) = attr_opt(e, b"auth_rsa_modulus") {
                             if !m.is_empty() {
@@ -407,6 +419,7 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
         rsa_exponent,
         force_reauth_ts,
         messages,
+        check_domain,
     })
 }
 
@@ -506,7 +519,7 @@ mod tests {
     use super::*;
 
     const FULL_MANIFEST: &str = r#"<?xml version="1.0" encoding="utf-8"?>
-<manifest time="1708444800" next_update="3600" force_reauth_ts="0">
+<manifest time="1708444800" next_update="3600" force_reauth_ts="0" check_domain="airvpn.org">
   <rsa><RSAParameters><Modulus>base64modulus==</Modulus><Exponent>AQAB</Exponent></RSAParameters></rsa>
 
   <servers>
@@ -733,6 +746,25 @@ mod tests {
             "error message should contain 'Session expired', got: {}",
             err
         );
+    }
+
+    #[test]
+    fn test_parse_manifest_check_domain() {
+        let manifest = parse_manifest(FULL_MANIFEST).expect("failed to parse manifest");
+        assert_eq!(manifest.check_domain, "airvpn.org");
+    }
+
+    #[test]
+    fn test_parse_manifest_check_domain_absent() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<manifest time="1708444800">
+  <servers />
+  <servers_groups />
+  <modes />
+  <urls />
+</manifest>"#;
+        let manifest = parse_manifest(xml).expect("failed to parse manifest");
+        assert_eq!(manifest.check_domain, "", "absent check_domain should be empty string");
     }
 
     #[test]

@@ -14,6 +14,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
+use log::{debug, warn};
 
 static RESOLV_WAS_IMMUTABLE: AtomicBool = AtomicBool::new(false);
 
@@ -225,8 +226,8 @@ fn configure_systemd_resolved_all(dns_ipv4: &str, dns_ipv6: &str, vpn_iface: &st
             if let Ok(o) = &output {
                 if !o.status.success() {
                     let stderr = String::from_utf8_lossy(&o.stderr);
-                    eprintln!(
-                        "warning: resolvectl default-route false on {} failed (non-fatal): {}",
+                    warn!(
+                        "resolvectl default-route false on {} failed (non-fatal): {}",
                         iface, stderr
                     );
                 }
@@ -449,6 +450,7 @@ pub fn check_and_reapply(dns_ipv4: &str, dns_ipv6: &str) -> Result<bool> {
             fs::read_to_string(resolv_path).context("failed to read /etc/resolv.conf")?;
 
         if current != expected {
+            debug!("DNS drift detected in /etc/resolv.conf, re-applying VPN DNS");
             // Clear immutable flag before modifying (Fedora/RHEL set this on resolv.conf)
             clear_immutable(resolv_path);
 

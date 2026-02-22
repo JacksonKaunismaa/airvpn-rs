@@ -7,6 +7,7 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result};
+use log::{debug, warn};
 
 use crate::manifest::{Mode, Server, UserInfo, WireGuardKey};
 
@@ -118,6 +119,7 @@ Table = off
 /// so the encrypted WireGuard packets can reach the server without being
 /// caught by our policy routing rules.
 pub fn connect(config: &str, endpoint_ip: &str) -> Result<(String, String)> {
+    debug!("WireGuard connect: endpoint_ip={}, config_len={} bytes", endpoint_ip, config.len());
     // Write config to a temporary file with a recognizable prefix
     let tmpfile = tempfile::Builder::new()
         .prefix("avpn-")
@@ -157,7 +159,7 @@ pub fn connect(config: &str, endpoint_ip: &str) -> Result<(String, String)> {
 
     // Pre-cleanup: if interface already exists from a crash, remove it
     if is_connected(&iface) {
-        eprintln!("Cleaning up stale WireGuard interface {}...", iface);
+        warn!("Cleaning up stale WireGuard interface {}...", iface);
         let _ = Command::new("ip")
             .args(["link", "delete", &iface])
             .output();
@@ -226,6 +228,7 @@ fn get_default_gateway() -> Result<String> {
 /// 5. Add policy rule: unmarked traffic uses table 51820.
 /// 6. Suppress default route from main table to prevent leaks.
 fn setup_routing(iface: &str, endpoint_ip: &str) -> Result<()> {
+    debug!("Setting up routing: iface={}, endpoint_ip={}", iface, endpoint_ip);
     // 1. Set fwmark on WireGuard interface — MUST be first, before any policy
     //    routing rules. Without this, WireGuard's own encrypted packets (going
     //    to the real VPN server) would be routed through table 51820 (i.e.,
@@ -241,6 +244,7 @@ fn setup_routing(iface: &str, endpoint_ip: &str) -> Result<()> {
 
     // 2. Save original default gateway before any route changes
     let original_gw = get_default_gateway()?;
+    debug!("Original default gateway: {}", original_gw);
 
     // 3. Add host route for VPN endpoint through original gateway.
     //    This ensures encrypted WireGuard packets reach the server even after
@@ -278,6 +282,7 @@ fn setup_routing(iface: &str, endpoint_ip: &str) -> Result<()> {
     ];
 
     for cmd in &commands {
+        debug!("Routing command: {}", cmd.join(" "));
         let output = Command::new(cmd[0])
             .args(&cmd[1..])
             .output()
@@ -285,7 +290,7 @@ fn setup_routing(iface: &str, endpoint_ip: &str) -> Result<()> {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             // Non-fatal: some rules may already exist or IPv6 may be disabled
-            eprintln!("routing warning: {} — {}", cmd.join(" "), stderr.trim());
+            warn!("routing: {} -- {}", cmd.join(" "), stderr.trim());
         }
     }
 
@@ -323,6 +328,7 @@ fn teardown_routing(_iface: &str, endpoint_ip: &str) {
 /// route added during `setup_routing`. Pass an empty string if unknown
 /// (best-effort cleanup will skip the host route removal).
 pub fn disconnect(config_path: &str, endpoint_ip: &str) -> Result<()> {
+    debug!("WireGuard disconnect: config_path={}, endpoint_ip={}", config_path, endpoint_ip);
     // Tear down routing rules before wg-quick removes the interface
     // (derive interface name from config path)
     if let Some(iface) = Path::new(config_path).file_stem().map(|s| s.to_string_lossy().to_string()) {
