@@ -14,7 +14,7 @@
 //! Reference: Eddie src/Lib.Core/Providers/Service.cs:296-556
 
 use anyhow::{Context, Result};
-use log::{debug, warn};
+use log::{debug, info, warn};
 use reqwest::blocking::Client;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -98,18 +98,21 @@ fn check_tunnel_inner(server_name: &str, expected_ipv4: &str, check_domain: &str
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid exit IP '{}' or port {}: {}", exit_ip, port, e))?;
 
-    // Eddie uses check_protocol from the manifest (default "https").
-    // We use HTTPS when available but don't force it — the check server
-    // may only serve HTTP on its custom port.
+    // The check server is accessed via forced DNS resolution to the VPN exit IP.
+    // The exit IP typically serves a cert for a different hostname (or the shared
+    // *.airservers.org cert which doesn't cover the specific exit IP). Disabling
+    // cert verification here is correct — this check verifies the tunnel works,
+    // not the check server's TLS configuration. The original code had this, and
+    // removing it (H4 "fix") broke verification entirely.
     let client = Client::builder()
         .timeout(HTTP_TIMEOUT)
-        .min_tls_version(reqwest::tls::Version::TLS_1_2)
+        .danger_accept_invalid_certs(true)
         .resolve(&check_hostname, resolve_addr)
         .build()
         .context("failed to build HTTP client for tunnel check")?;
 
     let url = format!("{}://{}:{}/check/tun/", check_protocol, check_hostname, port);
-    debug!("Tunnel check URL: {}, expected_ip={} (raw={})", url, expected_ip, expected_ipv4);
+    info!("Tunnel check: url={}, resolve={}:{}, expected_ip={}", url, exit_ip, port, expected_ip);
 
     // Track last error for the final bail message.
     let mut last_error: Option<String> = None;
@@ -122,6 +125,7 @@ fn check_tunnel_inner(server_name: &str, expected_ipv4: &str, check_domain: &str
 
         match client.get(&url).send() {
             Ok(response) => {
+                debug!("Tunnel check attempt {}: got HTTP response", attempt);
                 let status = response.status();
                 let body = match response.text() {
                     Ok(b) => b,
@@ -158,8 +162,15 @@ fn check_tunnel_inner(server_name: &str, expected_ipv4: &str, check_domain: &str
                 warn!("{}", last_error.as_ref().unwrap());
             }
             Err(e) => {
-                last_error = Some(format!("attempt {}: request failed: {}", attempt, e));
-                warn!("{}", last_error.as_ref().unwrap());
+                // Log the full error source chain for debugging
+                let mut msg = format!("attempt {}: {}", attempt, e);
+                let mut source = std::error::Error::source(&e);
+                while let Some(cause) = source {
+                    msg.push_str(&format!(" → {}", cause));
+                    source = std::error::Error::source(cause);
+                }
+                last_error = Some(msg.clone());
+                warn!("{}", msg);
                 continue;
             }
         }
@@ -229,9 +240,10 @@ fn check_dns_inner(server_name: &str, check_domain: &str, exit_ip: &str, check_d
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid exit IP '{}' or port {}: {}", exit_ip, port, e))?;
 
+    // Same as tunnel check: exit IP cert doesn't match the check hostname.
     let client = Client::builder()
         .timeout(HTTP_TIMEOUT)
-        .min_tls_version(reqwest::tls::Version::TLS_1_2)
+        .danger_accept_invalid_certs(true)
         .resolve(&check_hostname, resolve_addr)
         .build()
         .context("failed to build HTTP client for DNS check")?;
@@ -303,7 +315,7 @@ fn check_dns_inner(server_name: &str, check_domain: &str, exit_ip: &str, check_d
                 }
             }
             Err(e) => {
-                last_error = Some(format!("attempt {}: request failed: {}", attempt, e));
+                last_error = Some(format!("attempt {}: request failed: {:#}", attempt, e));
                 warn!("{}", last_error.as_ref().unwrap());
                 continue;
             }

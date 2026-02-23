@@ -359,11 +359,13 @@ fn cmd_connect(
         manifest.modes.len()
     );
     debug!(
-        "Manifest parse results: {} servers, {} modes, {} bootstrap URLs, check_domain={:?}",
+        "Manifest: {} servers, {} modes, {} bootstrap URLs, check_domain={:?}, check_dns_query={:?}, check_protocol={:?}",
         manifest.servers.len(),
         manifest.modes.len(),
         manifest.bootstrap_urls.len(),
         manifest.check_domain,
+        manifest.check_dns_query,
+        manifest.check_protocol,
     );
 
     // Display any service messages from AirVPN
