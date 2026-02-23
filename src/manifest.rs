@@ -110,8 +110,6 @@ const MAX_SERVERS: usize = 10_000;
 const MAX_MODES: usize = 100;
 const MAX_BOOTSTRAP_URLS: usize = 50;
 
-const ALLOWED_EXACT_DOMAINS: &[&str] = &["airvpn.org", "airdns.org"];
-const ALLOWED_DOMAIN_SUFFIXES: &[&str] = &[".airvpn.org", ".airdns.org"];
 
 pub fn sanitize_server_message(msg: &str) -> String {
     let mut result = String::with_capacity(msg.len());
@@ -218,68 +216,13 @@ fn validate_server_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Validate that a bootstrap URL's hostname is in the allowed domain list or is an IP address.
-///
-/// SECURITY: A compromised API could inject "https://attacker.com/api/" into the
-/// manifest's <url> entries, which would be added to the netlock allowlist and used
-/// for API calls. Only accept URLs whose hostname is an IP address or matches the
-/// domain allowlist (ALLOWED_EXACT_DOMAINS / ALLOWED_DOMAIN_SUFFIXES).
-fn validate_bootstrap_url_domain(url: &str) -> anyhow::Result<()> {
-    // URL format: "https://host/path" or "https://[ipv6]/path" or "https://host:port/path"
-    let after_scheme = url.strip_prefix("https://")
-        .with_context(|| format!("bootstrap URL missing https:// scheme: {}", url))?;
-
-    let host = if after_scheme.starts_with('[') {
-        // IPv6 literal: https://[::1]:port/path or https://[::1]/path
-        let end = after_scheme.find(']')
-            .with_context(|| format!("malformed IPv6 URL: {}", url))?;
-        &after_scheme[1..end]
-    } else {
-        // hostname or IPv4: take everything before first '/' or ':'
-        let rest = after_scheme;
-        let end = rest.find('/').unwrap_or(rest.len());
-        let host_port = &rest[..end];
-        // Strip port if present
-        match host_port.rsplit_once(':') {
-            Some((h, port_str)) if port_str.chars().all(|c| c.is_ascii_digit()) => h,
-            _ => host_port,
-        }
-    };
-
-    // If host is a valid IP address, accept it (IPs don't need domain validation)
-    if host.parse::<IpAddr>().is_ok() {
-        return Ok(());
-    }
-
-    // Validate hostname against domain allowlist
-    let host_lower = host.to_lowercase();
-    let valid = ALLOWED_EXACT_DOMAINS.iter().any(|d| host_lower == *d)
-        || ALLOWED_DOMAIN_SUFFIXES.iter().any(|s| host_lower.ends_with(s));
-    if !valid {
-        bail!(
-            "bootstrap URL hostname '{}' not in allowed domain list (from URL: {})",
-            host,
-            url,
-        );
-    }
-    Ok(())
-}
-
-fn validate_check_domain(domain: &str) -> anyhow::Result<()> {
-    if domain.is_empty() {
-        return Ok(());
-    }
-    let host = domain.split(':').next().unwrap_or(domain).to_lowercase();
-    let valid = ALLOWED_EXACT_DOMAINS.iter().any(|d| host == *d)
-        || ALLOWED_DOMAIN_SUFFIXES.iter().any(|s| host.ends_with(s));
-    if !valid {
-        bail!(
-            "check_domain '{}' not in allowed domain list",
-            domain,
-        );
-    }
-    Ok(())
-}
+// NOTE: Eddie does NOT validate check_domain or bootstrap URL domains against
+// an allowlist. The manifest is received over an authenticated channel (RSA+AES
+// envelope with a hardcoded, integrity-verified RSA key). If an attacker can
+// compromise the API response, they already control everything. Domain allowlists
+// were previously added here but broke real functionality (airservers.org, HTTP
+// bootstrap IPs) because they couldn't anticipate every legitimate domain AirVPN
+// uses. Removed to match Eddie's approach.
 
 fn validate_ip(s: &str, context: &str) -> anyhow::Result<()> {
     let ip_str = s.split('/').next().unwrap_or(s);
@@ -439,8 +382,6 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
                                 }
                                 if !addr.starts_with("http://") && !addr.starts_with("https://") {
                                     warn!("Skipping bootstrap URL with unknown scheme: {}", sanitize_server_message(&addr));
-                                } else if let Err(e) = validate_bootstrap_url_domain(&addr) {
-                                    warn!("Skipping bootstrap URL with disallowed domain: {} ({})", sanitize_server_message(&addr), e);
                                 } else {
                                     bootstrap_urls.push(addr);
                                 }
@@ -483,11 +424,6 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
             }
             _ => {}
         }
-    }
-    validate_check_domain(&check_domain)?;
-    if !check_dns_query.is_empty() {
-        let domain_part = check_dns_query.replace("{hash}.", "").replace("{hash}", "");
-        validate_check_domain(&domain_part).context("check_dns_query domain validation failed")?;
     }
     let servers: Vec<Server> = raw_servers.into_iter().map(|raw| resolve_server(raw, &groups)).collect();
     Ok(Manifest { servers, modes, bootstrap_urls, force_reauth_ts, messages, check_domain, check_dns_query })
@@ -638,23 +574,6 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_check_domain_valid() {
-        assert!(validate_check_domain("airvpn.org").is_ok());
-        assert!(validate_check_domain("airdns.org").is_ok());
-        assert!(validate_check_domain("check.airvpn.org").is_ok());
-        assert!(validate_check_domain("").is_ok());
-    }
-
-    #[test]
-    fn test_validate_check_domain_rejected() {
-        assert!(validate_check_domain("evil.com").is_err());
-        // Must reject domains that share a suffix but aren't subdomains
-        assert!(validate_check_domain("evilairvpn.org").is_err());
-        assert!(validate_check_domain("evilairdns.org").is_err());
-        assert!(validate_check_domain("notairvpn.org").is_err());
-    }
-
-    #[test]
     fn test_validate_ip_valid() {
         assert!(validate_ip("10.128.0.1", "test").is_ok());
         assert!(validate_ip("fd7d:76ee:3c49:9950::1", "test").is_ok());
@@ -698,20 +617,6 @@ mod tests {
     }
 
     #[test]
-    fn test_bootstrap_url_requires_https() {
-        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
-<manifest time="0" next_update="0" force_reauth_ts="0" check_domain="" check_dns_query="">
-  <urls>
-    <url address="http://evil.example.com/api/" />
-    <url address="https://api.airvpn.org/api/" />
-  </urls>
-</manifest>"#;
-        let m = parse_manifest(xml).unwrap();
-        assert_eq!(m.bootstrap_urls.len(), 1);
-        assert_eq!(m.bootstrap_urls[0], "https://api.airvpn.org/api/");
-    }
-
-    #[test]
     fn test_message_text_sanitized() {
         let xml = r#"<?xml version="1.0" encoding="utf-8"?>
 <manifest time="0" next_update="0" force_reauth_ts="0" check_domain="" check_dns_query="">
@@ -746,48 +651,7 @@ mod tests {
         assert!(check_api_error(r#"<manifest error="" />"#).is_ok());
     }
 
-    // --- Fix 2: Bootstrap URL domain validation ---
-
-    #[test]
-    fn test_bootstrap_url_domain_allowed() {
-        assert!(validate_bootstrap_url_domain("https://airvpn.org/api/").is_ok());
-        assert!(validate_bootstrap_url_domain("https://api.airvpn.org/api/").is_ok());
-        assert!(validate_bootstrap_url_domain("https://airdns.org/api/").is_ok());
-        assert!(validate_bootstrap_url_domain("https://check.airdns.org/").is_ok());
-    }
-
-    #[test]
-    fn test_bootstrap_url_domain_ip_accepted() {
-        assert!(validate_bootstrap_url_domain("https://1.2.3.4/api/").is_ok());
-        assert!(validate_bootstrap_url_domain("https://1.2.3.4:443/api/").is_ok());
-        assert!(validate_bootstrap_url_domain("https://[2a03:b0c0::1]/api/").is_ok());
-    }
-
-    #[test]
-    fn test_bootstrap_url_domain_rejected() {
-        assert!(validate_bootstrap_url_domain("https://attacker.com/api/").is_err());
-        assert!(validate_bootstrap_url_domain("https://evilairvpn.org/api/").is_err());
-        assert!(validate_bootstrap_url_domain("https://evil.com:443/api/").is_err());
-    }
-
-    #[test]
-    fn test_bootstrap_url_domain_rejected_in_manifest() {
-        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
-<manifest time="0" next_update="0" force_reauth_ts="0" check_domain="" check_dns_query="">
-  <urls>
-    <url address="https://attacker.com/api/" />
-    <url address="https://1.2.3.4/api/" />
-    <url address="https://api.airvpn.org/api/" />
-  </urls>
-</manifest>"#;
-        let m = parse_manifest(xml).unwrap();
-        // attacker.com rejected, IP and airvpn.org accepted
-        assert_eq!(m.bootstrap_urls.len(), 2);
-        assert_eq!(m.bootstrap_urls[0], "https://1.2.3.4/api/");
-        assert_eq!(m.bootstrap_urls[1], "https://api.airvpn.org/api/");
-    }
-
-    // --- Fix 4: Server name validation ---
+    // --- Server name validation ---
 
     #[test]
     fn test_validate_server_name_valid() {
