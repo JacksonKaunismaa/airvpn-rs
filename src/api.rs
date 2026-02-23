@@ -11,8 +11,8 @@
 //!
 //! Reference: Eddie src/Lib.Core/Providers/Service.cs
 
-use anyhow::{Context, Result};
-use log::{debug, error, info};
+use anyhow::{bail, Context, Result};
+use log::{debug, error};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use reqwest::blocking::Client;
@@ -75,9 +75,6 @@ struct UrlEntry {
 /// Detects tampering of the provider JSON file or embedded fallback.
 const RSA_KEY_SHA256: &str = "d86e44a1b74da304ae9fc646b471a6ffa648ce1639304e44c5c67b6cc2440b56";
 
-/// Embedded fallback: the provider JSON is compiled into the binary so it
-/// works standalone without an external file on disk.
-const EMBEDDED_PROVIDER_JSON: &str = include_str!("../resources/provider.json");
 
 fn parse_provider_json(json_str: &str) -> Result<ProviderConfig> {
     let provider: ProviderJson = serde_json::from_str(json_str)
@@ -105,31 +102,31 @@ fn parse_provider_json(json_str: &str) -> Result<ProviderConfig> {
 /// Load the provider configuration from JSON.
 ///
 /// Search order:
-/// 1. `./resources/provider.json` (relative to binary, for development)
+/// 1. `./resources/provider.json` (relative to CWD, for development)
 /// 2. `/etc/airvpn-rs/provider.json` (system-wide install)
-/// 3. Embedded fallback via `include_str!` (standalone binary)
+///
+/// Fails hard if neither exists — no silent fallback.
 pub fn load_provider_config() -> Result<ProviderConfig> {
-    // 1. Development: relative to CWD
-    let dev_path = std::path::Path::new("./resources/provider.json");
-    if dev_path.is_file() {
-        debug!("Loading provider config from {}", dev_path.display());
-        let json_str = std::fs::read_to_string(dev_path)
-            .context("failed to read ./resources/provider.json")?;
-        return parse_provider_json(&json_str);
+    let paths = [
+        "./resources/provider.json",
+        "/etc/airvpn-rs/provider.json",
+    ];
+
+    for path_str in &paths {
+        let path = std::path::Path::new(path_str);
+        if path.is_file() {
+            debug!("Loading provider config from {}", path.display());
+            let json_str = std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read {}", path_str))?;
+            return parse_provider_json(&json_str);
+        }
     }
 
-    // 2. System-wide install
-    let system_path = std::path::Path::new("/etc/airvpn-rs/provider.json");
-    if system_path.is_file() {
-        debug!("Loading provider config from {}", system_path.display());
-        let json_str = std::fs::read_to_string(system_path)
-            .context("failed to read /etc/airvpn-rs/provider.json")?;
-        return parse_provider_json(&json_str);
-    }
-
-    // 3. Embedded fallback (compiled into binary)
-    info!("Using embedded provider config (no external file found)");
-    parse_provider_json(EMBEDDED_PROVIDER_JSON)
+    bail!(
+        "provider.json not found. Searched:\n  {}\n\
+         Copy resources/provider.json to one of these locations.",
+        paths.join("\n  ")
+    )
 }
 
 /// Verify the integrity of the loaded RSA public key.
