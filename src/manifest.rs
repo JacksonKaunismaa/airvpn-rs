@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 
 use anyhow::{bail, Context};
-use log::warn;
+use log::{debug, warn};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use zeroize::Zeroizing;
@@ -421,7 +421,7 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
                         // intentionally ignored. The hardcoded RSA public key in api.rs
                         // is the ONLY key used.
                         if attr_opt(e, b"auth_rsa_modulus").is_some() || attr_opt(e, b"auth_rsa_exponent").is_some() {
-                            warn!("Manifest contains RSA key rotation fields -- ignored for security (C2)");
+                            debug!("Manifest contains RSA key rotation fields -- ignored for security (C2)");
                         }
                     }
                     _ => {}

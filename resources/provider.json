@@ -13,8 +13,7 @@
       { "address": "http://54.93.175.114" },
       { "address": "http://82.196.3.205" },
       { "address": "http://63.33.116.50" },
-      { "address": "http://[2a03:b0c0:0:1010::9b:c001]" },
-      { "address": "http://bootme.org" }
+      { "address": "http://[2a03:b0c0:0:1010::9b:c001]" }
     ]
   }
 }
