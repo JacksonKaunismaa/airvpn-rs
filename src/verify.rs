@@ -55,16 +55,17 @@ fn split_domain_port(check_domain: &str) -> (&str, u16) {
 /// The caller should treat errors as non-fatal warnings.
 ///
 /// `check_domain` comes from the provider manifest (e.g. "airservers.org:89").
-pub fn check_tunnel(server_name: &str, expected_ipv4: &str, check_domain: &str, exit_ip: &str) -> Result<()> {
+pub fn check_tunnel(server_name: &str, expected_ipv4: &str, check_domain: &str, exit_ip: &str, check_protocol: &str) -> Result<()> {
     let server_name = server_name.to_string();
     let expected_ipv4 = expected_ipv4.to_string();
     let check_domain = check_domain.to_string();
     let exit_ip = exit_ip.to_string();
+    let check_protocol = check_protocol.to_string();
 
     let (tx, rx) = mpsc::channel();
 
     std::thread::spawn(move || {
-        let result = check_tunnel_inner(&server_name, &expected_ipv4, &check_domain, &exit_ip);
+        let result = check_tunnel_inner(&server_name, &expected_ipv4, &check_domain, &exit_ip, &check_protocol);
         let _ = tx.send(result);
     });
 
@@ -80,7 +81,7 @@ pub fn check_tunnel(server_name: &str, expected_ipv4: &str, check_domain: &str, 
 }
 
 /// Inner tunnel check logic, run inside a thread with a hard timeout.
-fn check_tunnel_inner(server_name: &str, expected_ipv4: &str, check_domain: &str, exit_ip: &str) -> Result<()> {
+fn check_tunnel_inner(server_name: &str, expected_ipv4: &str, check_domain: &str, exit_ip: &str, check_protocol: &str) -> Result<()> {
     // Strip CIDR suffix: "10.167.32.97/32" -> "10.167.32.97"
     let expected_ip = strip_cidr(expected_ipv4);
 
@@ -97,15 +98,17 @@ fn check_tunnel_inner(server_name: &str, expected_ipv4: &str, check_domain: &str
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid exit IP '{}' or port {}: {}", exit_ip, port, e))?;
 
+    // Eddie uses check_protocol from the manifest (default "https").
+    // We use HTTPS when available but don't force it — the check server
+    // may only serve HTTP on its custom port.
     let client = Client::builder()
         .timeout(HTTP_TIMEOUT)
-        .https_only(true)
         .min_tls_version(reqwest::tls::Version::TLS_1_2)
         .resolve(&check_hostname, resolve_addr)
         .build()
         .context("failed to build HTTP client for tunnel check")?;
 
-    let url = format!("https://{}:{}/check/tun/", check_hostname, port);
+    let url = format!("{}://{}:{}/check/tun/", check_protocol, check_hostname, port);
     debug!("Tunnel check URL: {}, expected_ip={} (raw={})", url, expected_ip, expected_ipv4);
 
     // Track last error for the final bail message.
@@ -182,7 +185,7 @@ fn check_tunnel_inner(server_name: &str, expected_ipv4: &str, check_domain: &str
 ///
 /// `check_domain` comes from the provider manifest (e.g. "airservers.org:89").
 /// `check_dns_query` is the DNS query template (e.g. "{hash}.airvpn.org").
-pub fn check_dns(server_name: &str, check_domain: &str, exit_ip: &str, check_dns_query: &str) -> Result<()> {
+pub fn check_dns(server_name: &str, check_domain: &str, exit_ip: &str, check_dns_query: &str, check_protocol: &str) -> Result<()> {
     if check_dns_query.is_empty() {
         anyhow::bail!("DNS check skipped: manifest has no check_dns_query template");
     }
@@ -191,11 +194,12 @@ pub fn check_dns(server_name: &str, check_domain: &str, exit_ip: &str, check_dns
     let check_domain = check_domain.to_string();
     let exit_ip = exit_ip.to_string();
     let check_dns_query = check_dns_query.to_string();
+    let check_protocol = check_protocol.to_string();
 
     let (tx, rx) = mpsc::channel();
 
     std::thread::spawn(move || {
-        let result = check_dns_inner(&server_name, &check_domain, &exit_ip, &check_dns_query);
+        let result = check_dns_inner(&server_name, &check_domain, &exit_ip, &check_dns_query, &check_protocol);
         let _ = tx.send(result);
     });
 
@@ -211,7 +215,7 @@ pub fn check_dns(server_name: &str, check_domain: &str, exit_ip: &str, check_dns
 }
 
 /// Inner DNS check logic, run inside a thread with a hard timeout.
-fn check_dns_inner(server_name: &str, check_domain: &str, exit_ip: &str, check_dns_query: &str) -> Result<()> {
+fn check_dns_inner(server_name: &str, check_domain: &str, exit_ip: &str, check_dns_query: &str, check_protocol: &str) -> Result<()> {
     // Split "airservers.org:89" into ("airservers.org", 89)
     let (domain, port) = split_domain_port(check_domain);
 
@@ -227,13 +231,12 @@ fn check_dns_inner(server_name: &str, check_domain: &str, exit_ip: &str, check_d
 
     let client = Client::builder()
         .timeout(HTTP_TIMEOUT)
-        .https_only(true)
         .min_tls_version(reqwest::tls::Version::TLS_1_2)
         .resolve(&check_hostname, resolve_addr)
         .build()
         .context("failed to build HTTP client for DNS check")?;
 
-    let check_url = format!("https://{}:{}/check/dns/", check_hostname, port);
+    let check_url = format!("{}://{}:{}/check/dns/", check_protocol, check_hostname, port);
     debug!("DNS check URL: {}, query_template={}", check_url, check_dns_query);
 
     // Track last error for the final bail message.

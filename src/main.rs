@@ -881,13 +881,14 @@ fn cmd_connect(
         if !no_verify && !shutdown.load(Ordering::Relaxed) {
             let check_domain = manifest.check_domain.as_str();
             let check_dns_query = manifest.check_dns_query.as_str();
+            let check_protocol = manifest.check_protocol.as_str();
             let exit_ip = server_ref.ips_exit.first().map(|s| s.as_str()).unwrap_or("");
             debug!("Verification: check_domain={:?}, check_dns_query={:?}, exit_ip={:?}, server={}", check_domain, check_dns_query, exit_ip, server_ref.name);
             let mut verify_failed = false;
 
             // 10b. Verify tunnel is working
             info!("Verifying tunnel...");
-            match verify::check_tunnel(&server_ref.name, &wg_key.wg_ipv4, check_domain, exit_ip) {
+            match verify::check_tunnel(&server_ref.name, &wg_key.wg_ipv4, check_domain, exit_ip, check_protocol) {
                 Ok(()) => info!("Tunnel verified."),
                 Err(e) => {
                     warn!("Tunnel verification failed: {:#}", e);
@@ -898,7 +899,7 @@ fn cmd_connect(
             // 10c. Verify DNS goes through VPN
             if !verify_failed && !shutdown.load(Ordering::Relaxed) {
                 info!("Verifying DNS...");
-                match verify::check_dns(&server_ref.name, check_domain, exit_ip, check_dns_query) {
+                match verify::check_dns(&server_ref.name, check_domain, exit_ip, check_dns_query, check_protocol) {
                     Ok(()) => info!("DNS verified."),
                     Err(e) => {
                         warn!("DNS verification failed: {:#}", e);

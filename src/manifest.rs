@@ -23,6 +23,7 @@ pub struct Manifest {
     pub messages: Vec<Message>,
     pub check_domain: String,
     pub check_dns_query: String,
+    pub check_protocol: String,  // "https" or "http" (Eddie default: "https")
 }
 
 #[derive(Debug, Clone)]
@@ -312,6 +313,7 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
     let mut force_reauth_ts: i64 = 0;
     let mut check_domain = String::new();
     let mut check_dns_query = String::new();
+    let mut check_protocol = String::from("https");
     loop {
         match reader.read_event() {
             Err(e) => bail!("XML parse error at position {}: {e}", reader.error_position()),
@@ -412,6 +414,9 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
                         if let Some(dq) = attr_opt(e, b"check_dns_query") {
                             if !dq.is_empty() { check_dns_query = dq; }
                         }
+                        if let Some(cp) = attr_opt(e, b"check_protocol") {
+                            if !cp.is_empty() { check_protocol = cp; }
+                        }
                         // SECURITY (C2): RSA key rotation from untrusted manifest is
                         // intentionally ignored. The hardcoded RSA public key in api.rs
                         // is the ONLY key used.
@@ -426,7 +431,7 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
         }
     }
     let servers: Vec<Server> = raw_servers.into_iter().map(|raw| resolve_server(raw, &groups)).collect();
-    Ok(Manifest { servers, modes, bootstrap_urls, force_reauth_ts, messages, check_domain, check_dns_query })
+    Ok(Manifest { servers, modes, bootstrap_urls, force_reauth_ts, messages, check_domain, check_dns_query, check_protocol })
 }
 
 pub fn parse_user(xml: &str) -> anyhow::Result<UserInfo> {
