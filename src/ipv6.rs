@@ -25,6 +25,13 @@ pub fn block_all() -> Vec<String> {
     let mut blocked = Vec::new();
     let conf_dir = Path::new("/proc/sys/net/ipv6/conf");
 
+    // Ensure "default" template is NOT set to disable_ipv6=1.
+    // Previous versions set this, which breaks wg-quick (new WG interface
+    // inherits disable_ipv6=1, then `ip -6 address add` fails). Clean it
+    // up on every run to handle upgrades from old versions.
+    let default_disable = conf_dir.join("default").join("disable_ipv6");
+    let _ = fs::write(&default_disable, "0");
+
     let entries = match fs::read_dir(conf_dir) {
         Ok(e) => e,
         Err(_) => return blocked,
