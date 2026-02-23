@@ -5,13 +5,18 @@
 //! 2. POST to bootstrap IPs with fallback
 //! 3. Decrypt AES-CBC response to get XML manifest
 //!
+//! Provider configuration (bootstrap URLs, RSA key) is loaded from
+//! `resources/provider.json` at runtime, matching Eddie's approach of loading
+//! from `resources/providers/AirVPN.json`.
+//!
 //! Reference: Eddie src/Lib.Core/Providers/Service.cs
 
 use anyhow::{Context, Result};
-use log::{debug, error};
+use log::{debug, error, info};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use reqwest::blocking::Client;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 
@@ -19,55 +24,133 @@ use crate::crypto;
 use crate::manifest::{attr_opt, sanitize_server_message};
 
 // ---------------------------------------------------------------------------
-// Constants
+// Provider configuration (loaded from JSON, matching Eddie's AirVPN.json)
 // ---------------------------------------------------------------------------
 
-/// Bootstrap IPs tried in order until one succeeds.
+/// Provider configuration loaded from `resources/provider.json`.
 ///
-/// SECURITY: All entries MUST be IP addresses (not hostnames). Hostname entries
-/// would require plaintext DNS resolution before netlock is active, allowing a
-/// router-level attacker to poison the DNS response and inject their IP into
-/// the netlock allowlist.
-///
-/// NOTE: These use HTTP (not HTTPS) because AirVPN's API servers serve TLS
-/// certificates for *.airvpn.org which don't include IP SANs. Connecting via
-/// HTTPS to a bare IP fails TLS certificate validation. This matches Eddie's
-/// design ("We don't use SSL. Useless layer in our case" — Service.cs:906).
-/// The RSA+AES application-layer envelope provides the actual security:
-/// credentials are encrypted with AirVPN's hardcoded RSA-4096 key before
-/// being sent, and responses are AES-encrypted with the session key.
-pub const BOOTSTRAP_IPS: &[&str] = &[
-    "http://63.33.78.166",
-    "http://54.93.175.114",
-    "http://82.196.3.205",
-    "http://63.33.116.50",
-    "http://[2a03:b0c0:0:1010::9b:c001]",
-];
+/// Matches the structure of Eddie's `resources/providers/AirVPN.json`:
+/// bootstrap URLs, RSA modulus, and RSA exponent are loaded from JSON
+/// rather than being hardcoded in source.
+#[derive(Debug, Clone)]
+pub struct ProviderConfig {
+    /// Bootstrap URLs tried in order until one succeeds.
+    ///
+    /// SECURITY: IP-address entries are preferred over hostnames. Hostname
+    /// entries require plaintext DNS resolution before netlock is active,
+    /// allowing a router-level attacker to poison the DNS response and inject
+    /// their IP into the netlock allowlist.
+    ///
+    /// NOTE: These use HTTP (not HTTPS) because AirVPN's API servers serve TLS
+    /// certificates for *.airvpn.org which don't include IP SANs. This matches
+    /// Eddie's design ("We don't use SSL. Useless layer in our case" —
+    /// Service.cs:906). The RSA+AES application-layer envelope provides the
+    /// actual security.
+    pub bootstrap_urls: Vec<String>,
+    /// AirVPN's RSA-4096 public key modulus (base64).
+    pub rsa_modulus: String,
+    /// AirVPN's RSA public key exponent (base64).
+    pub rsa_exponent: String,
+}
 
-/// AirVPN's RSA-4096 public key modulus (base64).
-pub const RSA_MODULUS_B64: &str = "wuQXz7eZeEBwaaRsVK8iEHpueXoKyQzW8sr8qMUkZIcKtKv5iseXMrTbcGYGpRXdiqXp7FqrSjPSMDuRGaHfjWgjbnW4PwecmgJSfhkWt4xY8OnIwKkuI2Eo0MAa9lduPOQRKSfa9I1PBogIyEUrf7kSjcoJQgeY66D429m1BDWY3f65c+8HrCQ8qPg1GY+pSxuwp6+2dV7fd1tiKLQEoJg9NeWGW0he/DDkNSe4c8gFfHj3ANYwDhTQijb+VaVZqPmxVJIzLoE1JOom0/P8fKsvpx3cFOtDS4apiI+N7MyVAMcx5Jjk2AQ/tyDiybwwZ32fOqYJVGxs13guOlgI6h77QxqNIq2bGEjzSRZ4tem1uN7F8AoVKPls6yAUQK1cWM5AVu4apoNIFG+svS/2kmn0Nx8DRVDvKD+nOByXgqg01Y6r0Se8Tz9EEBTiEopdlKjmO1wlrmW3iWKeFIwZnHt2PMceJMqziV8rRGh9gUMLLJC9qdXCAS4vf5VVnZ+Pq3SK9pP87hOislIu4/Kcn06cotQChpVnALA83hFW5LXJvc85iloWJkuLGAV3CcAwoSA5CG1Uo2S76MM+GLLkVIqUk1PiJMTTlSw1SlMEflU4bZiZP8di5e2OJI6vOHjdM2oonpPi/Ul5KKmfp+jci+kGMs9+zOyjKFLVIKDE+Vc=";
+/// Intermediate serde structs for deserializing the provider JSON.
+#[derive(Deserialize)]
+struct ProviderJson {
+    manifest: ManifestJson,
+}
 
-/// AirVPN's RSA public key exponent (base64).
-pub const RSA_EXPONENT_B64: &str = "AQAB";
+#[derive(Deserialize)]
+struct ManifestJson {
+    auth_rsa_exponent: String,
+    auth_rsa_modulus: String,
+    urls: Vec<UrlEntry>,
+}
 
-/// SHA-256 hash of "{RSA_MODULUS_B64}:{RSA_EXPONENT_B64}" for binary integrity verification.
+#[derive(Deserialize)]
+struct UrlEntry {
+    address: String,
+}
+
+/// SHA-256 hash of "{rsa_modulus}:{rsa_exponent}" for integrity verification.
+/// Detects tampering of the provider JSON file or embedded fallback.
 const RSA_KEY_SHA256: &str = "d86e44a1b74da304ae9fc646b471a6ffa648ce1639304e44c5c67b6cc2440b56";
 
-/// Verify the integrity of the embedded RSA public key at startup.
-/// Panics on mismatch (unrecoverable -- binary is compromised).
-pub fn verify_rsa_key_integrity() {
-    let material = format!("{}:{}", RSA_MODULUS_B64, RSA_EXPONENT_B64);
+/// Embedded fallback: the provider JSON is compiled into the binary so it
+/// works standalone without an external file on disk.
+const EMBEDDED_PROVIDER_JSON: &str = include_str!("../resources/provider.json");
+
+fn parse_provider_json(json_str: &str) -> Result<ProviderConfig> {
+    let provider: ProviderJson = serde_json::from_str(json_str)
+        .context("failed to parse provider JSON")?;
+    let bootstrap_urls: Vec<String> = provider.manifest.urls
+        .into_iter()
+        .map(|u| u.address)
+        .collect();
+    if bootstrap_urls.is_empty() {
+        anyhow::bail!("provider JSON contains no bootstrap URLs");
+    }
+    if provider.manifest.auth_rsa_modulus.is_empty() {
+        anyhow::bail!("provider JSON contains empty RSA modulus");
+    }
+    if provider.manifest.auth_rsa_exponent.is_empty() {
+        anyhow::bail!("provider JSON contains empty RSA exponent");
+    }
+    Ok(ProviderConfig {
+        bootstrap_urls,
+        rsa_modulus: provider.manifest.auth_rsa_modulus,
+        rsa_exponent: provider.manifest.auth_rsa_exponent,
+    })
+}
+
+/// Load the provider configuration from JSON.
+///
+/// Search order:
+/// 1. `./resources/provider.json` (relative to binary, for development)
+/// 2. `/etc/airvpn-rs/provider.json` (system-wide install)
+/// 3. Embedded fallback via `include_str!` (standalone binary)
+pub fn load_provider_config() -> Result<ProviderConfig> {
+    // 1. Development: relative to CWD
+    let dev_path = std::path::Path::new("./resources/provider.json");
+    if dev_path.is_file() {
+        debug!("Loading provider config from {}", dev_path.display());
+        let json_str = std::fs::read_to_string(dev_path)
+            .context("failed to read ./resources/provider.json")?;
+        return parse_provider_json(&json_str);
+    }
+
+    // 2. System-wide install
+    let system_path = std::path::Path::new("/etc/airvpn-rs/provider.json");
+    if system_path.is_file() {
+        debug!("Loading provider config from {}", system_path.display());
+        let json_str = std::fs::read_to_string(system_path)
+            .context("failed to read /etc/airvpn-rs/provider.json")?;
+        return parse_provider_json(&json_str);
+    }
+
+    // 3. Embedded fallback (compiled into binary)
+    info!("Using embedded provider config (no external file found)");
+    parse_provider_json(EMBEDDED_PROVIDER_JSON)
+}
+
+/// Verify the integrity of the loaded RSA public key.
+/// Panics on mismatch (unrecoverable -- config may have been tampered with).
+pub fn verify_rsa_key_integrity(config: &ProviderConfig) {
+    let material = format!("{}:{}", config.rsa_modulus, config.rsa_exponent);
     let hash = hex::encode(Sha256::digest(material.as_bytes()));
     if hash != RSA_KEY_SHA256 {
         error!(
             "CRITICAL: RSA key integrity check FAILED. Expected hash {}, got {}. \
-             The binary may have been tampered with. Aborting.",
+             The provider config may have been tampered with. Aborting.",
             RSA_KEY_SHA256, hash
         );
         panic!("RSA key integrity verification failed");
     }
     debug!("RSA key integrity check passed (SHA-256: {}...)", &hash[..16]);
 }
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
 
 const SOFTWARE_ID: &str = "EddieDesktop_2.24.6";
 
@@ -118,32 +201,39 @@ fn parse_connect_response(xml: &str) -> Result<ConnectDirective> {
 // API calls
 // ---------------------------------------------------------------------------
 
-pub fn fetch_manifest(username: &str, password: &str) -> Result<String> {
+pub fn fetch_manifest(config: &ProviderConfig, username: &str, password: &str) -> Result<String> {
     let mut params = base_params(username, password);
     params.insert(0, ("act".into(), "manifest".into()));
     params.insert(1, ("ts".into(), "0".into()));
-    fetch_encrypted(&params, &[])
+    fetch_encrypted(config, &params, &[])
 }
 
-pub fn fetch_user(username: &str, password: &str) -> Result<String> {
-    fetch_user_with_urls(username, password, &[])
+pub fn fetch_user(config: &ProviderConfig, username: &str, password: &str) -> Result<String> {
+    fetch_user_with_urls(config, username, password, &[])
 }
 
 pub fn fetch_user_with_urls(
+    config: &ProviderConfig,
     username: &str,
     password: &str,
     extra_urls: &[String],
 ) -> Result<String> {
     let mut params = base_params(username, password);
     params.insert(0, ("act".into(), "user".into()));
-    fetch_encrypted(&params, extra_urls)
+    fetch_encrypted(config, &params, extra_urls)
 }
 
-pub fn fetch_connect(username: &str, password: &str, server_name: &str) -> Result<ConnectDirective> {
-    fetch_connect_with_urls(username, password, server_name, &[])
+pub fn fetch_connect(
+    config: &ProviderConfig,
+    username: &str,
+    password: &str,
+    server_name: &str,
+) -> Result<ConnectDirective> {
+    fetch_connect_with_urls(config, username, password, server_name, &[])
 }
 
 pub fn fetch_connect_with_urls(
+    config: &ProviderConfig,
     username: &str,
     password: &str,
     server_name: &str,
@@ -152,7 +242,7 @@ pub fn fetch_connect_with_urls(
     let mut params = base_params(username, password);
     params.insert(0, ("act".into(), "connect".into()));
     params.insert(1, ("server".into(), server_name.into()));
-    let xml = fetch_encrypted(&params, extra_urls)?;
+    let xml = fetch_encrypted(config, &params, extra_urls)?;
     parse_connect_response(&xml)
 }
 
@@ -177,9 +267,10 @@ fn base_params(username: &str, password: &str) -> Vec<(String, String)> {
     ]
 }
 
-/// SECURITY: Always uses the hardcoded RSA key. RSA key rotation from
-/// untrusted manifest responses is intentionally rejected (C2).
+/// SECURITY: Always uses the loaded (and integrity-verified) RSA key. RSA key
+/// rotation from untrusted manifest responses is intentionally rejected (C2).
 fn fetch_encrypted(
+    config: &ProviderConfig,
     params: &[(String, String)],
     extra_urls: &[String],
 ) -> Result<String> {
@@ -193,9 +284,9 @@ fn fetch_encrypted(
         })
         .collect();
     debug!("API request params: {:?}", safe_params);
-    debug!("Using {} bootstrap URLs + {} extra URLs", BOOTSTRAP_IPS.len(), extra_urls.len());
+    debug!("Using {} bootstrap URLs + {} extra URLs", config.bootstrap_urls.len(), extra_urls.len());
 
-    let public_key = crypto::build_rsa_public_key(RSA_MODULUS_B64, RSA_EXPONENT_B64)
+    let public_key = crypto::build_rsa_public_key(&config.rsa_modulus, &config.rsa_exponent)
         .context("failed to build AirVPN RSA public key")?;
 
     let (s_b64, d_b64, session_key) = crypto::build_envelope(&public_key, params)
@@ -211,7 +302,7 @@ fn fetch_encrypted(
         .context("failed to build HTTP client")?;
 
     let mut last_error: Option<anyhow::Error> = None;
-    let all_urls: Vec<&str> = BOOTSTRAP_IPS.iter().copied()
+    let all_urls: Vec<&str> = config.bootstrap_urls.iter().map(|s| s.as_str())
         .chain(extra_urls.iter().map(|s| s.as_str()))
         .collect();
 
@@ -268,8 +359,29 @@ mod tests {
     }
 
     #[test]
+    fn test_load_provider_config() {
+        let config = load_provider_config().expect("failed to load provider config");
+        assert!(!config.bootstrap_urls.is_empty());
+        assert!(!config.rsa_modulus.is_empty());
+        assert!(!config.rsa_exponent.is_empty());
+    }
+
+    #[test]
     fn test_rsa_key_integrity_passes() {
-        verify_rsa_key_integrity();
+        let config = load_provider_config().expect("failed to load provider config");
+        verify_rsa_key_integrity(&config);
+    }
+
+    #[test]
+    fn test_parse_provider_json_rejects_empty_urls() {
+        let json = r#"{"manifest":{"auth_rsa_exponent":"AQAB","auth_rsa_modulus":"abc","urls":[]}}"#;
+        assert!(parse_provider_json(json).is_err());
+    }
+
+    #[test]
+    fn test_parse_provider_json_rejects_empty_modulus() {
+        let json = r#"{"manifest":{"auth_rsa_exponent":"AQAB","auth_rsa_modulus":"","urls":[{"address":"http://1.2.3.4"}]}}"#;
+        assert!(parse_provider_json(json).is_err());
     }
 
     #[test]

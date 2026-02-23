@@ -5,8 +5,9 @@ use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 
 fn main() -> anyhow::Result<()> {
+    let provider_config = airvpn::api::load_provider_config()?;
     let (username, password) = airvpn::config::resolve_credentials(None, None)?;
-    let xml = airvpn::api::fetch_manifest(&username, &password)?;
+    let xml = airvpn::api::fetch_manifest(&provider_config, &username, &password)?;
 
     println!("=== Manifest XML Structure (element names only) ===\n");
     println!("Total XML length: {} bytes\n", xml.len());

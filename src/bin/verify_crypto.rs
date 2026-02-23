@@ -50,7 +50,9 @@ fn main() {
 
     // Step 2: Make the API call with fake credentials
     println!("[2/4] Sending API request with fake credentials...");
-    let result = airvpn::api::fetch_manifest(canary_user, canary_pass);
+    let provider_config = airvpn::api::load_provider_config()
+        .expect("failed to load provider configuration");
+    let result = airvpn::api::fetch_manifest(&provider_config, canary_user, canary_pass);
 
     match &result {
         Ok(xml) => {

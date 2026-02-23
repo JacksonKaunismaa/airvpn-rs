@@ -181,7 +181,9 @@ fn init_logging() {
 
 fn main() -> anyhow::Result<()> {
     init_logging();
-    api::verify_rsa_key_integrity();
+    let provider_config = api::load_provider_config()
+        .expect("failed to load provider configuration");
+    api::verify_rsa_key_integrity(&provider_config);
     let cli = Cli::parse();
     match cli.command {
         Commands::Connect {
@@ -198,6 +200,7 @@ fn main() -> anyhow::Result<()> {
             skip_ping,
             no_verify,
         } => cmd_connect(
+            &provider_config,
             server,
             no_lock,
             allow_lan,
@@ -213,7 +216,7 @@ fn main() -> anyhow::Result<()> {
         ),
         Commands::Disconnect => cmd_disconnect(),
         Commands::Status => cmd_status(),
-        Commands::Servers { sort, debug, username, password_stdin, skip_ping } => cmd_servers(&sort, debug, username, password_stdin, skip_ping),
+        Commands::Servers { sort, debug, username, password_stdin, skip_ping } => cmd_servers(&provider_config, &sort, debug, username, password_stdin, skip_ping),
         Commands::Recover => cmd_recover(),
     }
 }
@@ -266,6 +269,7 @@ enum ResetLevel {
 // ---------------------------------------------------------------------------
 
 fn cmd_connect(
+    provider_config: &api::ProviderConfig,
     server_name: Option<String>,
     no_lock: bool,
     allow_lan: bool,
@@ -346,7 +350,7 @@ fn cmd_connect(
     // 3. Fetch manifest + user data (two separate API calls)
     info!("Fetching server list...");
     debug!("API request: act=manifest (credentials redacted)");
-    let manifest_xml = Zeroizing::new(api::fetch_manifest(&username, &password)?);
+    let manifest_xml = Zeroizing::new(api::fetch_manifest(provider_config, &username, &password)?);
     debug!("Manifest XML response: {} bytes", manifest_xml.len());
     let manifest = manifest::parse_manifest(&manifest_xml)?;
     info!(
@@ -373,7 +377,7 @@ fn cmd_connect(
 
     info!("Fetching user data...");
     debug!("API request: act=user (credentials redacted)");
-    let user_xml = Zeroizing::new(api::fetch_user_with_urls(&username, &password, &manifest.bootstrap_urls)?);
+    let user_xml = Zeroizing::new(api::fetch_user_with_urls(provider_config, &username, &password, &manifest.bootstrap_urls)?);
     debug!("User XML response: {} bytes", user_xml.len());
     let user_info = manifest::parse_user(&user_xml)?;
     debug!("User info: login={}, {} WireGuard keys", user_info.login, user_info.keys.len());
@@ -483,7 +487,7 @@ fn cmd_connect(
         // reconnection), we fall back to the existing manifest data.
         if !first_iteration {
             info!("Re-fetching manifest for updated server data...");
-            match api::fetch_manifest(&username, &password).map(Zeroizing::new) {
+            match api::fetch_manifest(provider_config, &username, &password).map(Zeroizing::new) {
                 Ok(new_xml) => match manifest::parse_manifest(&new_xml) {
                     Ok(new_manifest) => {
                         // Re-apply server filters to the fresh manifest
@@ -514,7 +518,7 @@ fn cmd_connect(
                 Err(e) => warn!("Failed to re-fetch manifest, using stale data: {:#}", e),
             }
             // Also refresh user data (WireGuard keys may have changed)
-            match api::fetch_user_with_urls(&username, &password, &manifest.bootstrap_urls).map(Zeroizing::new) {
+            match api::fetch_user_with_urls(provider_config, &username, &password, &manifest.bootstrap_urls).map(Zeroizing::new) {
                 Ok(new_user_xml) => match manifest::parse_user(&new_user_xml) {
                     Ok(new_user) => {
                         user_info = new_user;
@@ -583,7 +587,7 @@ fn cmd_connect(
             info!("Activating network lock...");
             let mut allowed_ips: Vec<String> = server_ref.ips_entry.clone();
             // Also whitelist API bootstrap IPs (extract bare IP from URLs like "http://1.2.3.4")
-            for url in api::BOOTSTRAP_IPS {
+            for url in &provider_config.bootstrap_urls {
                 if let Some(host) = extract_ip_from_url(url) {
                     allowed_ips.push(host);
                 }
@@ -648,6 +652,7 @@ fn cmd_connect(
         // Netlock is already active with bootstrap IPs allowlisted, so the
         // auth API call works through the lock.
         let reset_from_auth = match api::fetch_connect_with_urls(
+            provider_config,
             &username,
             &password,
             &server_ref.name,
@@ -1153,6 +1158,7 @@ fn cmd_status() -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 fn cmd_servers(
+    provider_config: &api::ProviderConfig,
     sort: &str,
     debug: bool,
     cli_username: Option<String>,
@@ -1176,7 +1182,7 @@ fn cmd_servers(
         stdin_password.as_deref().map(|s| s.as_str()),
     )?;
     let password = Zeroizing::new(password);
-    let xml = Zeroizing::new(api::fetch_manifest(&username, &password)?);
+    let xml = Zeroizing::new(api::fetch_manifest(provider_config, &username, &password)?);
 
     if debug {
         // Redact credentials from the raw XML before printing
@@ -1363,9 +1369,10 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_ip_from_bootstrap_ips() {
-        // Verify it works on every actual BOOTSTRAP_IPS entry
-        for url in api::BOOTSTRAP_IPS {
+    fn test_extract_ip_from_bootstrap_urls() {
+        // Verify it works on every actual provider config bootstrap URL
+        let config = api::load_provider_config().expect("failed to load provider config");
+        for url in &config.bootstrap_urls {
             let host = extract_ip_from_url(url);
             assert!(host.is_some(), "failed to extract host from {}", url);
             let host = host.unwrap();
