@@ -437,8 +437,8 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
                                 if bootstrap_urls.len() >= MAX_BOOTSTRAP_URLS {
                                     bail!("manifest exceeds maximum bootstrap URL count ({})", MAX_BOOTSTRAP_URLS);
                                 }
-                                if !addr.starts_with("https://") {
-                                    warn!("Skipping non-HTTPS bootstrap URL: {}", sanitize_server_message(&addr));
+                                if !addr.starts_with("http://") && !addr.starts_with("https://") {
+                                    warn!("Skipping bootstrap URL with unknown scheme: {}", sanitize_server_message(&addr));
                                 } else if let Err(e) = validate_bootstrap_url_domain(&addr) {
                                     warn!("Skipping bootstrap URL with disallowed domain: {} ({})", sanitize_server_message(&addr), e);
                                 } else {

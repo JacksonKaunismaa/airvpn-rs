@@ -29,16 +29,19 @@ use crate::manifest::{attr_opt, sanitize_server_message};
 /// router-level attacker to poison the DNS response and inject their IP into
 /// the netlock allowlist.
 ///
-/// SECURITY: HTTPS is required for transport security. The application-layer
-/// RSA+AES envelope only protects against passive eavesdroppers -- an active
-/// MITM can tamper with the ciphertext or inject their own envelope if the
-/// transport is plaintext HTTP.
+/// NOTE: These use HTTP (not HTTPS) because AirVPN's API servers serve TLS
+/// certificates for *.airvpn.org which don't include IP SANs. Connecting via
+/// HTTPS to a bare IP fails TLS certificate validation. This matches Eddie's
+/// design ("We don't use SSL. Useless layer in our case" — Service.cs:906).
+/// The RSA+AES application-layer envelope provides the actual security:
+/// credentials are encrypted with AirVPN's hardcoded RSA-4096 key before
+/// being sent, and responses are AES-encrypted with the session key.
 pub const BOOTSTRAP_IPS: &[&str] = &[
-    "https://63.33.78.166",
-    "https://54.93.175.114",
-    "https://82.196.3.205",
-    "https://63.33.116.50",
-    "https://[2a03:b0c0:0:1010::9b:c001]",
+    "http://63.33.78.166",
+    "http://54.93.175.114",
+    "http://82.196.3.205",
+    "http://63.33.116.50",
+    "http://[2a03:b0c0:0:1010::9b:c001]",
 ];
 
 /// AirVPN's RSA-4096 public key modulus (base64).
@@ -198,11 +201,12 @@ fn fetch_encrypted(
     let (s_b64, d_b64, session_key) = crypto::build_envelope(&public_key, params)
         .context("failed to build API envelope")?;
 
+    // NOTE: no https_only(true) here because bootstrap IPs use HTTP
+    // (AirVPN's servers don't have IP-matching TLS certificates).
+    // The RSA+AES application-layer envelope is the security layer.
     let client = Client::builder()
         .timeout(Duration::from_secs(10))
         .user_agent("Eddie/2.24.6")
-        .https_only(true)
-        .min_tls_version(reqwest::tls::Version::TLS_1_2)
         .build()
         .context("failed to build HTTP client")?;
 
