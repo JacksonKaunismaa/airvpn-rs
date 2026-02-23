@@ -15,19 +15,15 @@ use log::warn;
 ///
 /// Returns the list of interfaces that were blocked (for restore on disconnect).
 ///
-/// Also sets the "default" sysctl so that newly created interfaces (including
-/// the WireGuard interface) inherit `disable_ipv6=1`. This must happen BEFORE
-/// the WG interface is created. The caller is responsible for explicitly
-/// re-enabling IPv6 on the WG interface after creation if needed.
+/// NOTE: We do NOT set the "default" sysctl template. Eddie doesn't either
+/// (impl.cpp:483 only iterates existing interfaces). Setting "default" to 1
+/// causes wg-quick to fail because the newly created WireGuard interface
+/// inherits disable_ipv6=1 and `ip -6 address add` errors out. The nftables
+/// kill switch (policy drop on inet table) prevents IPv6 leaks on new
+/// interfaces regardless of the sysctl setting.
 pub fn block_all() -> Vec<String> {
     let mut blocked = Vec::new();
     let conf_dir = Path::new("/proc/sys/net/ipv6/conf");
-
-    // First, set "default" so any interface created after this point
-    // (including the WireGuard interface) inherits disable_ipv6=1.
-    // This closes the window where a new interface could leak IPv6 traffic.
-    let default_disable = conf_dir.join("default").join("disable_ipv6");
-    let _ = fs::write(&default_disable, "1");
 
     let entries = match fs::read_dir(conf_dir) {
         Ok(e) => e,
@@ -37,7 +33,7 @@ pub fn block_all() -> Vec<String> {
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
 
-        // Skip special interfaces (matching Eddie) and "default" (already handled above)
+        // Skip special pseudo-interfaces (matching Eddie impl.cpp:483)
         if matches!(name.as_str(), "all" | "default" | "lo" | "lo0") {
             continue;
         }
@@ -73,21 +69,12 @@ pub fn block_all() -> Vec<String> {
 
 /// Restore IPv6 on previously blocked interfaces.
 ///
-/// Also restores the "default" sysctl template so newly created interfaces
-/// get IPv6 enabled again.
-///
 /// Only restores interfaces that were explicitly tracked in `block_all()`.
 /// We do NOT scan for untracked interfaces — re-enabling IPv6 on interfaces
 /// we didn't disable (e.g., Docker, user-configured) could break their
 /// intended configuration.
 pub fn restore(interfaces: &[String]) {
     let conf_dir = Path::new("/proc/sys/net/ipv6/conf");
-
-    // Restore the "default" template first so new interfaces get IPv6 enabled
-    let default_disable = conf_dir.join("default").join("disable_ipv6");
-    let _ = fs::write(&default_disable, "0");
-
-    // Restore only tracked interfaces
     for name in interfaces {
         // Validate interface name to prevent path traversal
         if name.is_empty()
