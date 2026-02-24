@@ -129,7 +129,13 @@ pub fn load_provider_config() -> Result<ProviderConfig> {
     )
 }
 
-/// Verify the integrity of the loaded RSA public key.
+/// Verify the integrity of the provider.json RSA public key.
+///
+/// This detects tampering of the provider JSON file (binary integrity check).
+/// Only applies to the initial bootstrap key from provider.json. The manifest's
+/// RSA key (if provided) does not need this check because it was authenticated
+/// by the RSA+AES envelope of the manifest response.
+///
 /// Panics on mismatch (unrecoverable -- config may have been tampered with).
 pub fn verify_rsa_key_integrity(config: &ProviderConfig) {
     let material = format!("{}:{}", config.rsa_modulus, config.rsa_exponent);
@@ -264,8 +270,15 @@ fn base_params(username: &str, password: &str) -> Vec<(String, String)> {
     ]
 }
 
-/// SECURITY: Always uses the loaded (and integrity-verified) RSA key. RSA key
-/// rotation from untrusted manifest responses is intentionally rejected (C2).
+/// Performs an encrypted API call using the RSA+AES envelope protocol.
+///
+/// The RSA key comes from `config` which is either:
+/// - The provider.json key (for the initial manifest fetch, integrity-verified)
+/// - The manifest-provided key (for subsequent calls, authenticated by the
+///   RSA+AES envelope of the manifest response)
+///
+/// This matches Eddie (Service.cs:920-938) which reads the RSA key from the
+/// current Manifest node, updated after each manifest fetch.
 fn fetch_encrypted(
     config: &ProviderConfig,
     params: &[(String, String)],

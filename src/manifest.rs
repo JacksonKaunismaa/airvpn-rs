@@ -24,6 +24,15 @@ pub struct Manifest {
     pub check_domain: String,
     pub check_dns_query: String,
     pub check_protocol: String,  // "https" or "http" (Eddie default: "https")
+    /// RSA modulus from `auth_rsa_modulus` attribute on `<manifest>` element.
+    /// When present, subsequent API calls should use this key instead of the
+    /// provider.json key. This allows AirVPN to rotate their RSA key without
+    /// requiring a software update. The manifest is received encrypted with
+    /// the CURRENT key, so the new key is authenticated.
+    /// (Eddie: Service.cs:924-932)
+    pub rsa_modulus: Option<String>,
+    /// RSA exponent from `auth_rsa_exponent` attribute on `<manifest>` element.
+    pub rsa_exponent: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -219,11 +228,11 @@ fn validate_server_name(name: &str) -> anyhow::Result<()> {
 
 // NOTE: Eddie does NOT validate check_domain or bootstrap URL domains against
 // an allowlist. The manifest is received over an authenticated channel (RSA+AES
-// envelope with a hardcoded, integrity-verified RSA key). If an attacker can
-// compromise the API response, they already control everything. Domain allowlists
-// were previously added here but broke real functionality (airservers.org, HTTP
-// bootstrap IPs) because they couldn't anticipate every legitimate domain AirVPN
-// uses. Removed to match Eddie's approach.
+// envelope). If an attacker can compromise the API response, they already control
+// everything. Domain allowlists were previously added here but broke real
+// functionality (airservers.org, HTTP bootstrap IPs) because they couldn't
+// anticipate every legitimate domain AirVPN uses. Removed to match Eddie's
+// approach.
 
 fn validate_ip(s: &str, context: &str) -> anyhow::Result<()> {
     let ip_str = s.split('/').next().unwrap_or(s);
@@ -314,6 +323,8 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
     let mut check_domain = String::new();
     let mut check_dns_query = String::new();
     let mut check_protocol = String::from("https");
+    let mut rsa_modulus: Option<String> = None;
+    let mut rsa_exponent: Option<String> = None;
     loop {
         match reader.read_event() {
             Err(e) => bail!("XML parse error at position {}: {e}", reader.error_position()),
@@ -417,11 +428,22 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
                         if let Some(cp) = attr_opt(e, b"check_protocol") {
                             if !cp.is_empty() { check_protocol = cp; }
                         }
-                        // SECURITY (C2): RSA key rotation from untrusted manifest is
-                        // intentionally ignored. The hardcoded RSA public key in api.rs
-                        // is the ONLY key used.
-                        if attr_opt(e, b"auth_rsa_modulus").is_some() || attr_opt(e, b"auth_rsa_exponent").is_some() {
-                            debug!("Manifest contains RSA key rotation fields -- ignored for security (C2)");
+                        // Eddie (Service.cs:924-932): read RSA key from manifest
+                        // for use in subsequent API calls. This allows AirVPN to
+                        // rotate their RSA key without requiring a software update.
+                        // The manifest itself was received encrypted with the current
+                        // (provider.json) key, so the new key is authenticated.
+                        if let Some(modulus) = attr_opt(e, b"auth_rsa_modulus") {
+                            if !modulus.is_empty() {
+                                debug!("Manifest contains auth_rsa_modulus ({} chars)", modulus.len());
+                                rsa_modulus = Some(modulus);
+                            }
+                        }
+                        if let Some(exponent) = attr_opt(e, b"auth_rsa_exponent") {
+                            if !exponent.is_empty() {
+                                debug!("Manifest contains auth_rsa_exponent ({} chars)", exponent.len());
+                                rsa_exponent = Some(exponent);
+                            }
                         }
                     }
                     _ => {}
@@ -431,7 +453,7 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
         }
     }
     let servers: Vec<Server> = raw_servers.into_iter().map(|raw| resolve_server(raw, &groups)).collect();
-    Ok(Manifest { servers, modes, bootstrap_urls, force_reauth_ts, messages, check_domain, check_dns_query, check_protocol })
+    Ok(Manifest { servers, modes, bootstrap_urls, force_reauth_ts, messages, check_domain, check_dns_query, check_protocol, rsa_modulus, rsa_exponent })
 }
 
 pub fn parse_user(xml: &str) -> anyhow::Result<UserInfo> {

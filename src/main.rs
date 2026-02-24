@@ -181,8 +181,12 @@ fn init_logging() {
 
 fn main() -> anyhow::Result<()> {
     init_logging();
-    let provider_config = api::load_provider_config()
+    let mut provider_config = api::load_provider_config()
         .expect("failed to load provider configuration");
+    // Verify the provider.json RSA key hasn't been tampered with (binary integrity).
+    // This check only applies to the initial bootstrap key. Once the manifest
+    // provides a rotated RSA key (Fix 1), that key is authenticated by the
+    // RSA+AES envelope and doesn't need integrity checking.
     api::verify_rsa_key_integrity(&provider_config);
     let cli = Cli::parse();
     match cli.command {
@@ -200,7 +204,7 @@ fn main() -> anyhow::Result<()> {
             skip_ping,
             no_verify,
         } => cmd_connect(
-            &provider_config,
+            &mut provider_config,
             server,
             no_lock,
             allow_lan,
@@ -216,7 +220,7 @@ fn main() -> anyhow::Result<()> {
         ),
         Commands::Disconnect => cmd_disconnect(),
         Commands::Status => cmd_status(),
-        Commands::Servers { sort, debug, username, password_stdin, skip_ping } => cmd_servers(&provider_config, &sort, debug, username, password_stdin, skip_ping),
+        Commands::Servers { sort, debug, username, password_stdin, skip_ping } => cmd_servers(&mut provider_config, &sort, debug, username, password_stdin, skip_ping),
         Commands::Recover => cmd_recover(),
     }
 }
@@ -269,7 +273,7 @@ enum ResetLevel {
 // ---------------------------------------------------------------------------
 
 fn cmd_connect(
-    provider_config: &api::ProviderConfig,
+    provider_config: &mut api::ProviderConfig,
     server_name: Option<String>,
     no_lock: bool,
     allow_lan: bool,
@@ -367,6 +371,18 @@ fn cmd_connect(
         manifest.check_dns_query,
         manifest.check_protocol,
     );
+
+    // Eddie (Service.cs:924-932): if the manifest provides RSA key fields,
+    // use them for all subsequent API calls. This allows AirVPN to rotate
+    // their RSA key without requiring a software update. The manifest was
+    // received encrypted with the provider.json key, so the new key is
+    // authenticated by the RSA+AES envelope.
+    if let (Some(modulus), Some(exponent)) = (&manifest.rsa_modulus, &manifest.rsa_exponent) {
+        info!("Using RSA key from manifest for subsequent API calls");
+        debug!("Manifest RSA modulus: {} chars, exponent: {} chars", modulus.len(), exponent.len());
+        provider_config.rsa_modulus = modulus.clone();
+        provider_config.rsa_exponent = exponent.clone();
+    }
 
     // Display any service messages from AirVPN
     for msg in &manifest.messages {
@@ -511,6 +527,12 @@ fn cmd_connect(
                                 new_manifest.servers.len(),
                                 new_filtered.len(),
                             );
+                            // Update RSA key from re-fetched manifest (Eddie: Service.cs:924-932)
+                            if let (Some(modulus), Some(exponent)) = (&new_manifest.rsa_modulus, &new_manifest.rsa_exponent) {
+                                debug!("Updating RSA key from re-fetched manifest");
+                                provider_config.rsa_modulus = modulus.clone();
+                                provider_config.rsa_exponent = exponent.clone();
+                            }
                             filtered_servers = new_filtered;
                             manifest = new_manifest;
                         }
@@ -1161,7 +1183,7 @@ fn cmd_status() -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 fn cmd_servers(
-    provider_config: &api::ProviderConfig,
+    provider_config: &mut api::ProviderConfig,
     sort: &str,
     debug: bool,
     cli_username: Option<String>,

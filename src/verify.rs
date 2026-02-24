@@ -402,7 +402,7 @@ mod tests {
     fn test_check_tunnel_timeout_on_bad_ip() {
         // With a non-routable exit IP, the check should time out (not hang).
         let start = std::time::Instant::now();
-        let result = check_tunnel("TestServer", "10.0.0.1", "example.invalid", "192.0.2.1");
+        let result = check_tunnel("TestServer", "10.0.0.1", "example.invalid", "192.0.2.1", "https");
         let elapsed = start.elapsed();
         assert!(result.is_err());
         // Must complete within VERIFY_TIMEOUT + small margin (not hang forever)
@@ -414,7 +414,7 @@ mod tests {
     fn test_check_tunnel_timeout_on_bad_ip_with_port() {
         // Same as above but with a port in check_domain.
         let start = std::time::Instant::now();
-        let result = check_tunnel("TestServer", "10.0.0.1/32", "example.invalid:89", "192.0.2.1");
+        let result = check_tunnel("TestServer", "10.0.0.1/32", "example.invalid:89", "192.0.2.1", "https");
         let elapsed = start.elapsed();
         assert!(result.is_err());
         assert!(elapsed < VERIFY_TIMEOUT + Duration::from_secs(2),
@@ -425,7 +425,7 @@ mod tests {
     fn test_check_dns_timeout_on_bad_ip() {
         // With a non-routable exit IP, the check should time out (not hang).
         let start = std::time::Instant::now();
-        let result = check_dns("TestServer", "example.invalid", "192.0.2.1", "{hash}.example.invalid");
+        let result = check_dns("TestServer", "example.invalid", "192.0.2.1", "{hash}.example.invalid", "https");
         let elapsed = start.elapsed();
         assert!(result.is_err());
         // Must complete within VERIFY_TIMEOUT + small margin (not hang forever)
@@ -437,7 +437,7 @@ mod tests {
     fn test_check_dns_timeout_on_bad_ip_with_port() {
         // Same as above but with a port in check_domain.
         let start = std::time::Instant::now();
-        let result = check_dns("TestServer", "example.invalid:89", "192.0.2.1", "{hash}.example.invalid");
+        let result = check_dns("TestServer", "example.invalid:89", "192.0.2.1", "{hash}.example.invalid", "https");
         let elapsed = start.elapsed();
         assert!(result.is_err());
         assert!(elapsed < VERIFY_TIMEOUT + Duration::from_secs(2),
@@ -447,7 +447,7 @@ mod tests {
     #[test]
     fn test_check_dns_empty_query_template() {
         // Empty check_dns_query should bail immediately, not hang.
-        let result = check_dns("TestServer", "example.invalid", "192.0.2.1", "");
+        let result = check_dns("TestServer", "example.invalid", "192.0.2.1", "", "https");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("no check_dns_query"));
     }
