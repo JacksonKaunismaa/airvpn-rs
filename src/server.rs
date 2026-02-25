@@ -18,7 +18,8 @@ use crate::pinger::PingResults;
 // We use "Speed" scoreType (Eddie default: servers.scoretype="Speed"):
 //   All factors are 1.0 (ScoreBase *= 1, LoadPerc *= 1, UsersPerc *= 1)
 // Penalty tracking via ServerPenalties (Eddie: Penality field on ConnectionInfo).
-// Ping is always 0 (no ping data; we skip Eddie's Ping==-1 → 99995 path).
+// Unmeasured ping (Ping==-1) contributes 0 instead of Eddie's 99995 sentinel,
+// so that load/users/scorebase/penalties still differentiate servers.
 // Result is truncated to i64 to match Eddie's `(int)(sum)` cast.
 // ---------------------------------------------------------------------------
 
@@ -159,8 +160,14 @@ pub fn score(server: &Server) -> i64 {
 /// `ConnectionInfo.Score()` with the Ping field populated.
 ///
 /// Eddie behavior (ConnectionInfo.cs line 219-246):
-/// - `ping_ms == -1` (not measured) -> return 99995 (sentinel)
+/// - `ping_ms == -1` (not measured) -> fall back to base score (load + scorebase + users)
 /// - Otherwise: `PingB = ping_ms * ping_factor(1)` added to score sum
+///
+/// NOTE: Eddie returns 99995 sentinel for unmeasured ping, which makes all
+/// unmeasured servers score identically and breaks penalty-based rotation
+/// (score_with_penalty skips penalties for sentinels >= 99995). We diverge
+/// from Eddie here: unmeasured ping contributes 0 instead of a sentinel,
+/// so that load/users/scorebase/penalties still differentiate servers.
 pub fn score_with_ping(server: &Server, ping_ms: i64) -> i64 {
     // warning_closed -> Error in Eddie -> HasWarningsErrors() -> 99998
     if !server.warning_closed.is_empty() {
@@ -171,13 +178,13 @@ pub fn score_with_ping(server: &Server, ping_ms: i64) -> i64 {
         return 99997;
     }
 
-    // Eddie: Ping == -1 means not yet measured -> return 99995
-    if ping_ms == -1 {
-        return 99995;
-    }
+    // Unmeasured ping: fall back to base score (ping contributes 0).
+    // Eddie returns 99995 here, but that makes all unmeasured servers
+    // score identically, breaking penalty rotation and degenerating
+    // selection to manifest order (alphabetically first server always wins).
+    let ping_b = if ping_ms == -1 { 0 } else { ping_ms };
 
     let penality_b = 0; // Base score excludes penalty; use score_with_penalty() for penalty-aware scoring
-    let ping_b = ping_ms; // Eddie: Ping * ping_factor where ping_factor defaults to 1
 
     let load = load_perc(server);
     let users = users_perc(server);
@@ -545,11 +552,13 @@ mod tests {
 
     #[test]
     fn test_score_with_penalty_unmeasured_ping() {
-        // ping == -1 -> sentinel 99995; penalty should NOT inflate it
+        // ping == -1 falls back to base score; penalty should still apply.
+        // Base: LoadB=0 + ScoreB=10 + UsersB=20 = 30
+        // Penalty: 30 * 1000 = 30000
         let s = make_server("Alpha", 500_000, 1000, 50, 250, 10, "", "");
         let mut penalties = ServerPenalties::new();
         penalties.penalize("Alpha", 30);
-        assert_eq!(score_with_penalty(&s, &penalties, -1), 99995);
+        assert_eq!(score_with_penalty(&s, &penalties, -1), 30030);
     }
 
     #[test]
@@ -567,8 +576,10 @@ mod tests {
 
     #[test]
     fn test_score_with_ping_unmeasured() {
+        // Unmeasured ping (-1) falls back to base score (ping contributes 0).
+        // Base: LoadB=0 + ScoreB=10 + UsersB=20 = 30
         let s = make_server("Alpha", 500_000, 1000, 50, 250, 10, "", "");
-        assert_eq!(score_with_ping(&s, -1), 99995);
+        assert_eq!(score_with_ping(&s, -1), score(&s));
     }
 
     #[test]
@@ -648,18 +659,45 @@ mod tests {
     }
 
     #[test]
-    fn test_select_server_unmeasured_ping_sorted_last() {
+    fn test_select_server_unmeasured_ping_not_penalized() {
+        // Unmeasured ping falls back to base score (30), which is lower than
+        // a measured server with high ping (30 + 50 = 80). The unmeasured
+        // server should win since its base score is better.
         let servers = vec![
             make_server("Unmeasured", 500_000, 1000, 50, 250, 10, "", ""),
             make_server("Measured", 500_000, 1000, 50, 250, 10, "", ""),
         ];
         let penalties = ServerPenalties::new();
         let mut pings = PingResults::new();
-        // Only "Measured" has a ping result; "Unmeasured" defaults to -1
+        // Only "Measured" has a ping result; "Unmeasured" defaults to -1 (→ 0 contribution)
         pings.latencies.insert("Measured".to_string(), 50);
 
         let selected = select_server_with_penalties(&servers, None, &penalties, &pings).unwrap();
-        assert_eq!(selected.name, "Measured");
+        // Unmeasured: base 30 + ping 0 = 30
+        // Measured: base 30 + ping 50 = 80
+        assert_eq!(selected.name, "Unmeasured");
+    }
+
+    #[test]
+    fn test_select_server_penalty_works_without_ping() {
+        // Core regression test: penalties must differentiate servers even when
+        // all pings are unmeasured (--skip-ping). Previously all servers scored
+        // sentinel 99995 and penalties were skipped, degenerating to manifest order.
+        let servers = vec![
+            make_server("Achernar", 500_000, 1000, 50, 250, 10, "", ""),
+            make_server("Geminorum", 500_000, 1000, 50, 250, 10, "", ""),
+        ];
+        let mut penalties = ServerPenalties::new();
+        let pings = PingResults::new(); // No pings (--skip-ping)
+
+        // Without penalty, both score 30; min_by picks first (Achernar)
+        let selected = select_server_with_penalties(&servers, None, &penalties, &pings).unwrap();
+        assert_eq!(selected.name, "Achernar");
+
+        // Penalize Achernar — Geminorum should now win
+        penalties.penalize("Achernar", 30);
+        let selected = select_server_with_penalties(&servers, None, &penalties, &pings).unwrap();
+        assert_eq!(selected.name, "Geminorum");
     }
 
     // -------------------------------------------------------------------
