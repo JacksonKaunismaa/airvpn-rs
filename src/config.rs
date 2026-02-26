@@ -2,12 +2,14 @@
 //!
 //! Resolution chain:
 //! 1. CLI flags (highest priority)
-//! 2. Saved profile file (`~/.config/airvpn-rs/default.profile`)
-//! 3. Eddie profile (`~/.config/eddie/default.profile`) as fallback
+//! 2. Saved profile file (`/etc/airvpn-rs/default.profile`, root-owned)
+//! 3. Eddie profile (`~user/.config/eddie/default.profile`) as one-time import
 //! 4. Interactive stdin prompt (lowest priority)
 //!
 //! Profile format matches Eddie: encrypted XML with `<option name="..." value="..." />`
-//! elements. Profiles are interchangeable — copying an Eddie profile to our path works.
+//! elements. Our profile uses v2n (file permissions provide security since
+//! the file is root:root 0600 in /etc/). Eddie's profile is read via the
+//! appropriate format (v2n/v2s/v2p).
 //!
 //! Eddie reference: Storage.cs (Save/Load), ProfileOptions.cs (defaults)
 
@@ -15,20 +17,49 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
-use log::{debug, warn};
+use log::{debug, info, warn};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use sha2::{Digest, Sha256};
 
-use crate::profile::{default_format, generate_id, load_profile, save_profile, ProfileFormat};
+use crate::profile::{generate_id, load_profile, save_profile, ProfileFormat};
 
-const PROFILE_PATH: &str = "~/.config/airvpn-rs/default.profile";
-const EDDIE_PROFILE_PATH: &str = "~/.config/eddie/default.profile";
+const PROFILE_PATH: &str = "/etc/airvpn-rs/default.profile";
+
+/// Get the profile file path.
+fn profile_path() -> PathBuf {
+    PathBuf::from(PROFILE_PATH)
+}
+
+/// Get the Eddie profile path for the actual (non-root) user.
+///
+/// When running via sudo, we need the invoking user's home directory
+/// (where Eddie stores its profile), not /root. `$SUDO_USER` gives us
+/// the original username, and we look up their home via /etc/passwd.
+fn eddie_profile_path() -> Option<PathBuf> {
+    let home = if nix::unistd::getuid().is_root() {
+        // Running as root (probably via sudo) — find the real user's home
+        if let Some(sudo_user) = std::env::var_os("SUDO_USER") {
+            let username = sudo_user.to_string_lossy().to_string();
+            let user = nix::unistd::User::from_name(&username).ok()??;
+            PathBuf::from(user.dir)
+        } else {
+            // Running as root without sudo — no user Eddie profile to find
+            return None;
+        }
+    } else {
+        // Running as regular user
+        std::env::var_os("HOME").map(PathBuf::from)?
+    };
+
+    let path = home.join(".config/eddie/default.profile");
+    if path.exists() { Some(path) } else { None }
+}
 
 /// Expand `~` to the user's home directory.
 ///
-/// When running as root (uid 0), uses /root instead of trusting `$HOME`,
-/// which can be spoofed by a non-root user via `sudo -E` or `env HOME=...`.
+/// When running as root (uid 0), uses /root instead of trusting `$HOME`.
+#[cfg(test)]
 fn expand_tilde(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
         let home = if nix::unistd::getuid().is_root() {
@@ -41,16 +72,6 @@ fn expand_tilde(path: &str) -> PathBuf {
         return home.join(rest);
     }
     PathBuf::from(path)
-}
-
-/// Get the expanded profile file path.
-fn profile_path() -> PathBuf {
-    expand_tilde(PROFILE_PATH)
-}
-
-/// Get the expanded Eddie profile file path.
-fn eddie_profile_path() -> PathBuf {
-    expand_tilde(EDDIE_PROFILE_PATH)
 }
 
 /// SHA256 hex digest of a string (Eddie: Crypto.Manager.HashSHA256).
@@ -187,7 +208,7 @@ fn xml_escape(s: &str) -> String {
 ///
 /// Returns an empty HashMap if no profile exists (caller uses defaults).
 pub fn load_profile_options() -> HashMap<String, String> {
-    // Try our profile first
+    // Try our profile first (/etc/airvpn-rs/default.profile)
     let path = profile_path();
     if path.exists() {
         match load_options_from_path(&path) {
@@ -196,20 +217,65 @@ pub fn load_profile_options() -> HashMap<String, String> {
         }
     }
 
-    // Fall back to Eddie's profile
-    let eddie_path = eddie_profile_path();
-    if eddie_path.exists() {
-        debug!("Our profile not found, trying Eddie profile at {}", eddie_path.display());
-        match load_options_from_path(&eddie_path) {
+    // Fall back to Eddie's profile (~user/.config/eddie/default.profile)
+    if let Some(eddie_path) = eddie_profile_path() {
+        info!(
+            "Eddie profile detected at {}. Importing settings...",
+            eddie_path.display()
+        );
+        match load_eddie_profile(&eddie_path) {
             Ok(opts) => {
-                debug!("Loaded {} options from Eddie profile", opts.len());
+                info!("Imported {} settings from Eddie profile.", opts.len());
                 return opts;
             }
-            Err(e) => debug!("Could not load Eddie profile: {:#}", e),
+            Err(e) => warn!("Could not import Eddie profile: {:#}", e),
         }
     }
 
     HashMap::new()
+}
+
+/// Load options from Eddie's profile, handling Eddie's v2s keyring format.
+///
+/// Eddie stores keyring passwords under attribute `"Eddie Profile" = "<profile_id>"`
+/// instead of our `application=airvpn-rs, profile-id=<id>`.
+fn load_eddie_profile(path: &PathBuf) -> Result<HashMap<String, String>> {
+    let password_provider = || {
+        rpassword::prompt_password("Eddie profile password: ")
+            .context("failed to read profile password from stdin")
+    };
+
+    let (format, _id, data) = crate::profile::load_profile_with_keyring(
+        path,
+        password_provider,
+        crate::profile::eddie_keyring_read,
+    )?;
+
+    // Warn if Eddie's profile uses v2n (fake encryption) on a user-owned file
+    if format == ProfileFormat::V2N {
+        // Check file ownership — v2n is only a concern if the file isn't root-owned
+        if let Ok(metadata) = std::fs::metadata(path) {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.uid() != 0 {
+                warn!(
+                    "Eddie profile at {} uses v2n format (no real encryption) and is owned by uid {}. \
+                     Your credentials are readable by any process running as that user. \
+                     Consider switching Eddie to 'Linux secret-tool' in Settings > General > Profile data protection.",
+                    path.display(),
+                    metadata.uid()
+                );
+            }
+        }
+    }
+
+    let trimmed = data.iter().position(|&b| !b.is_ascii_whitespace());
+    let is_xml = trimmed.map_or(false, |i| data[i] == b'<');
+
+    if is_xml {
+        parse_xml_options(&data)
+    } else {
+        parse_json_options(&data)
+    }
 }
 
 /// Load options from a specific profile path.
@@ -277,11 +343,14 @@ pub fn save_credentials(username: &str, password: &str) -> Result<()> {
 }
 
 /// Write options to profile as Eddie XML.
+///
+/// Always uses V2N format — the profile lives at /etc/airvpn-rs/ (root:root 0600),
+/// so file permissions provide security. The user's keyring is not accessible
+/// when running as root via sudo.
 fn save_options(path: &PathBuf, options: &HashMap<String, String>) -> Result<()> {
     let data = serialize_xml_options(options);
-    let format = default_format();
 
-    // Reuse existing profile ID to avoid orphaning keyring entries
+    // Reuse existing profile ID
     let id = if path.exists() {
         match load_profile(path, || Ok(String::new())) {
             Ok((_fmt, existing_id, _data)) => existing_id,
@@ -291,19 +360,7 @@ fn save_options(path: &PathBuf, options: &HashMap<String, String>) -> Result<()>
         generate_id()
     };
 
-    let profile_password = match format {
-        ProfileFormat::V2S => {
-            let mut bytes = [0u8; 32];
-            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
-            hex::encode(bytes)
-        }
-        ProfileFormat::V2N => String::new(),
-        ProfileFormat::V2P => {
-            bail!("V2P format requires explicit password — use save_profile directly");
-        }
-    };
-
-    save_profile(path, format, &id, &data, &profile_password)?;
+    save_profile(path, ProfileFormat::V2N, &id, &data, "")?;
     Ok(())
 }
 

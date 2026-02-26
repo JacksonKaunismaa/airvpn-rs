@@ -394,6 +394,44 @@ pub fn load_profile(
     Ok((format, id, decrypted))
 }
 
+/// Load profile using a custom keyring reader (for Eddie profile import).
+///
+/// Same as `load_profile` but uses `keyring_reader` instead of our
+/// `keyring_read` for V2S format. Eddie stores keyring entries with
+/// different attributes than we do.
+pub fn load_profile_with_keyring(
+    path: &Path,
+    password_provider: impl Fn() -> Result<String>,
+    keyring_reader: impl Fn(&str) -> Result<Option<String>>,
+) -> Result<(ProfileFormat, String, Vec<u8>)> {
+    let file_data = std::fs::read(path)
+        .with_context(|| format!("failed to read profile: {}", path.display()))?;
+
+    if file_data.len() < HEADER_LEN + ID_LEN {
+        bail!("profile file too small: {} bytes", file_data.len());
+    }
+
+    let format = ProfileFormat::from_header(&file_data[..HEADER_LEN])?;
+    let id = std::str::from_utf8(&file_data[HEADER_LEN..HEADER_LEN + ID_LEN])
+        .context("profile ID is not valid ASCII")?
+        .to_string();
+    let encrypted = &file_data[HEADER_LEN + ID_LEN..];
+
+    let password = match format {
+        ProfileFormat::V2N => PASSWORD_IF_EMPTY.to_string(),
+        ProfileFormat::V2S => {
+            keyring_reader(&id)?
+                .context("keyring entry not found for this profile; cannot decrypt V2S profile")?
+        }
+        ProfileFormat::V2P => password_provider()?,
+    };
+
+    let decrypted = profile_decrypt(encrypted, &password)
+        .context("profile decryption failed — wrong password or corrupt data")?;
+
+    Ok((format, id, decrypted))
+}
+
 /// Default format: V2S if keyring is available, else V2N.
 pub fn default_format() -> ProfileFormat {
     if keyring_available() {
@@ -462,6 +500,34 @@ pub fn keyring_read(id: &str) -> Result<Option<String>> {
         }
     } else {
         // secret-tool returns non-zero if key not found (or timeout kills it)
+        Ok(None)
+    }
+}
+
+/// Read a password from Eddie's keyring entry for the given profile ID.
+///
+/// Eddie uses attribute `"Eddie Profile" = "<profile_id>"` instead of
+/// our `application=airvpn-rs, profile-id=<id>`.
+pub fn eddie_keyring_read(id: &str) -> Result<Option<String>> {
+    let output = std::process::Command::new("timeout")
+        .args([
+            "10", "secret-tool", "lookup",
+            "Eddie Profile", id,
+        ])
+        .output()
+        .context("failed to run secret-tool for Eddie keyring lookup")?;
+
+    if output.status.success() {
+        let password = String::from_utf8(output.stdout)
+            .context("keyring value is not valid UTF-8")?
+            .trim_end_matches('\n')
+            .to_string();
+        if password.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(password))
+        }
+    } else {
         Ok(None)
     }
 }
