@@ -300,6 +300,16 @@ pub fn connect(config: &str, endpoint_ip: &str) -> Result<(String, String)> {
     Ok((config_path, iface))
 }
 
+/// Check if any IPv4 default gateway exists (i.e., is the network up?).
+///
+/// Used to distinguish "server failed" from "network is down" during
+/// reconnection. After partial_disconnect removes the WireGuard interface,
+/// a missing default gateway means the underlying network (WiFi/ethernet)
+/// is down — not a server-specific failure.
+pub fn has_default_gateway() -> bool {
+    get_default_gateway().is_ok()
+}
+
 /// Get the current IPv4 default gateway from the main routing table.
 ///
 /// Parses `ip -4 route show default` output which looks like:

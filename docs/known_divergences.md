@@ -5,7 +5,7 @@
 > code comments (search for "Eddie" or "diverge") and compare against
 > [Eddie's source](https://github.com/AirVPN/Eddie).
 >
-> Last reviewed: 2026-02-25
+> Last reviewed: 2026-02-26
 
 This codebase is a faithful Rust reimplementation of Eddie (AirVPN's official
 C# client). The vast majority of behavior — scoring formulas, penalty system,
@@ -87,3 +87,4 @@ tools to accidentally remove than a flushed-and-replaced ruleset.
 **Files:** `src/netlock.rs` — `is_active()`, `src/main.rs` — monitor loop
 
 **Eddie ref:** No equivalent in Eddie
+

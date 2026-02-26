@@ -781,8 +781,16 @@ fn cmd_connect(
                 // Keep netlock and IPv6 blocking active across reconnection
                 // attempts (Eddie pattern: lock persists until explicit disconnect).
                 // Only deactivate on --no-reconnect exit.
-                penalties.penalize(&server_ref.name, 30);
-                forced_server = Option::None;
+                let network_down = !wireguard::has_default_gateway();
+                if network_down {
+                    // Network is down (e.g. WiFi off, moved laptop). Don't penalize
+                    // the server — it's not at fault. Keep forced_server so we retry
+                    // the same server once network returns.
+                    warn!("Network appears down (no default gateway). Will retry same server.");
+                } else {
+                    penalties.penalize(&server_ref.name, 30);
+                    forced_server = Option::None;
+                }
                 if no_reconnect {
                     // Tearing down — full cleanup
                     if !no_lock {
@@ -794,7 +802,11 @@ fn cmd_connect(
                 }
                 consecutive_failures += 1;
                 let backoff_secs = std::cmp::min(3u64.saturating_mul(2u64.saturating_pow(consecutive_failures.saturating_sub(1).min(6))), 300);
-                warn!("Reconnecting in {}s (penalized {})...", backoff_secs, server_ref.name);
+                if network_down {
+                    warn!("Reconnecting in {}s (network down, not penalizing {})...", backoff_secs, server_ref.name);
+                } else {
+                    warn!("Reconnecting in {}s (penalized {})...", backoff_secs, server_ref.name);
+                }
                 interruptible_sleep(&shutdown, backoff_secs);
                 continue;
             }
@@ -1041,14 +1053,29 @@ fn cmd_connect(
                 }
                 // Reconnecting — partial disconnect only (keep netlock + IPv6 blocking)
                 let _ = partial_disconnect(&config_path, &iface, !no_lock, &endpoint_ip);
-                penalties.penalize(&server_ref.name, 30);
-                forced_server = Option::None; // clear forced server for rotation
+                // After removing WG interface, check if the underlying network is
+                // still up. If no default gateway exists, the network itself is down
+                // (WiFi dropped, laptop moved, etc.) — don't blame the server.
+                let network_down = !wireguard::has_default_gateway();
+                if network_down {
+                    warn!("Network appears down (no default gateway). Will retry same server.");
+                } else {
+                    penalties.penalize(&server_ref.name, 30);
+                    forced_server = Option::None; // clear forced server for rotation
+                }
                 consecutive_failures += 1;
                 let backoff_secs = std::cmp::min(3u64.saturating_mul(2u64.saturating_pow(consecutive_failures.saturating_sub(1).min(6))), 300);
-                warn!(
-                    "Connection lost. Reconnecting in {}s (penalized {})...",
-                    backoff_secs, server_ref.name
-                );
+                if network_down {
+                    warn!(
+                        "Connection lost. Reconnecting in {}s (network down, not penalizing {})...",
+                        backoff_secs, server_ref.name
+                    );
+                } else {
+                    warn!(
+                        "Connection lost. Reconnecting in {}s (penalized {})...",
+                        backoff_secs, server_ref.name
+                    );
+                }
                 interruptible_sleep(&shutdown, backoff_secs);
             }
             ResetLevel::Retry => {
