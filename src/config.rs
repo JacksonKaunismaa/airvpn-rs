@@ -1,17 +1,29 @@
-//! Config and credential resolution.
+//! Config and credential resolution using Eddie-compatible XML profile format.
 //!
 //! Resolution chain:
 //! 1. CLI flags (highest priority)
-//! 2. Saved profile file
-//! 3. Interactive stdin prompt (lowest priority)
+//! 2. Saved profile file (`~/.config/airvpn-rs/default.profile`)
+//! 3. Eddie profile (`~/.config/eddie/default.profile`) as fallback
+//! 4. Interactive stdin prompt (lowest priority)
+//!
+//! Profile format matches Eddie: encrypted XML with `<option name="..." value="..." />`
+//! elements. Profiles are interchangeable — copying an Eddie profile to our path works.
+//!
+//! Eddie reference: Storage.cs (Save/Load), ProfileOptions.cs (defaults)
+
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
-use log::warn;
-use std::path::PathBuf;
+use log::{debug, warn};
+use quick_xml::events::Event;
+use quick_xml::reader::Reader;
+use sha2::{Digest, Sha256};
 
 use crate::profile::{default_format, generate_id, load_profile, save_profile, ProfileFormat};
 
 const PROFILE_PATH: &str = "~/.config/airvpn-rs/default.profile";
+const EDDIE_PROFILE_PATH: &str = "~/.config/eddie/default.profile";
 
 /// Expand `~` to the user's home directory.
 ///
@@ -36,7 +48,258 @@ fn profile_path() -> PathBuf {
     expand_tilde(PROFILE_PATH)
 }
 
-/// Resolve credentials from: CLI flags -> saved profile -> stdin prompt.
+/// Get the expanded Eddie profile file path.
+fn eddie_profile_path() -> PathBuf {
+    expand_tilde(EDDIE_PROFILE_PATH)
+}
+
+/// SHA256 hex digest of a string (Eddie: Crypto.Manager.HashSHA256).
+/// Used for `servers.last` which stores SHA256(server_name).
+pub fn sha256_hex(input: &str) -> String {
+    hex::encode(Sha256::digest(input.as_bytes()))
+}
+
+/// Reverse-lookup a servers.last SHA256 hash against server names.
+/// Returns the matching server name, or None if no match.
+pub fn reverse_server_hash(hash: &str, server_names: &[&str]) -> Option<String> {
+    server_names
+        .iter()
+        .find(|name| sha256_hex(name) == hash)
+        .map(|s| s.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Profile XML parsing (Eddie: Storage.cs Save/Load)
+// ---------------------------------------------------------------------------
+
+/// Extract an XML attribute value with entity unescaping (e.g., `&amp;` → `&`).
+///
+/// Unlike `manifest::attr_opt` (which returns raw bytes), this properly
+/// unescapes XML entities for profile values that may contain special characters.
+fn attr_unescaped(e: &quick_xml::events::BytesStart<'_>, name: &[u8]) -> Option<String> {
+    for attr in e.attributes().flatten() {
+        if attr.key.as_ref() == name {
+            return attr.unescape_value().ok().map(|s| s.into_owned());
+        }
+    }
+    None
+}
+
+/// Parse Eddie-format XML profile data into a HashMap of option name→value.
+///
+/// Expected format:
+/// ```xml
+/// <eddie>
+///   <options>
+///     <option name="login" value="..." />
+///     <option name="servers.locklast" value="True" />
+///   </options>
+///   <providers>...</providers>  <!-- ignored -->
+/// </eddie>
+/// ```
+fn parse_xml_options(data: &[u8]) -> Result<HashMap<String, String>> {
+    let mut options = HashMap::new();
+    let mut reader = Reader::from_reader(data);
+    reader.config_mut().trim_text(true);
+
+    let mut in_options = false;
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                let tag = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                if tag == "options" {
+                    in_options = true;
+                } else if tag == "option" && in_options {
+                    let name = attr_unescaped(e, b"name");
+                    let value = attr_unescaped(e, b"value");
+                    if let (Some(n), Some(v)) = (name, value) {
+                        options.insert(n, v);
+                    }
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                let tag = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                if tag == "options" {
+                    in_options = false;
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(anyhow::anyhow!("XML parse error: {}", e)),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(options)
+}
+
+/// Parse legacy JSON profile data (pre-XML migration) into options HashMap.
+fn parse_json_options(data: &[u8]) -> Result<HashMap<String, String>> {
+    let json: serde_json::Value =
+        serde_json::from_slice(data).context("failed to parse profile JSON")?;
+    let mut options = HashMap::new();
+
+    if let Some(login) = json.get("login").and_then(|v| v.as_str()) {
+        options.insert("login".to_string(), login.to_string());
+    }
+    if let Some(password) = json.get("password").and_then(|v| v.as_str()) {
+        options.insert("password".to_string(), password.to_string());
+    }
+
+    Ok(options)
+}
+
+/// Serialize options HashMap to Eddie-format XML.
+fn serialize_xml_options(options: &HashMap<String, String>) -> Vec<u8> {
+    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<eddie>\n  <options>\n");
+    // Sort keys for deterministic output
+    let mut keys: Vec<&String> = options.keys().collect();
+    keys.sort();
+    for key in keys {
+        let value = &options[key];
+        // XML-escape name and value (minimal: & < > ")
+        let name_esc = xml_escape(key);
+        let value_esc = xml_escape(value);
+        xml.push_str(&format!(
+            "    <option name=\"{}\" value=\"{}\" />\n",
+            name_esc, value_esc
+        ));
+    }
+    xml.push_str("  </options>\n</eddie>\n");
+    xml.into_bytes()
+}
+
+/// Minimal XML attribute value escaping.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Load all profile options from our profile, falling back to Eddie's profile.
+///
+/// Returns an empty HashMap if no profile exists (caller uses defaults).
+pub fn load_profile_options() -> HashMap<String, String> {
+    // Try our profile first
+    let path = profile_path();
+    if path.exists() {
+        match load_options_from_path(&path) {
+            Ok(opts) => return opts,
+            Err(e) => warn!("failed to load profile: {:#}", e),
+        }
+    }
+
+    // Fall back to Eddie's profile
+    let eddie_path = eddie_profile_path();
+    if eddie_path.exists() {
+        debug!("Our profile not found, trying Eddie profile at {}", eddie_path.display());
+        match load_options_from_path(&eddie_path) {
+            Ok(opts) => {
+                debug!("Loaded {} options from Eddie profile", opts.len());
+                return opts;
+            }
+            Err(e) => debug!("Could not load Eddie profile: {:#}", e),
+        }
+    }
+
+    HashMap::new()
+}
+
+/// Load options from a specific profile path.
+fn load_options_from_path(path: &PathBuf) -> Result<HashMap<String, String>> {
+    let password_provider = || {
+        rpassword::prompt_password("Profile password: ")
+            .context("failed to read profile password from stdin")
+    };
+
+    let (_format, _id, data) = load_profile(path, password_provider)?;
+
+    // Detect format: XML starts with '<' (possibly after BOM/whitespace)
+    let trimmed = data.iter().position(|&b| !b.is_ascii_whitespace());
+    let is_xml = trimmed.map_or(false, |i| data[i] == b'<');
+
+    if is_xml {
+        parse_xml_options(&data)
+    } else {
+        parse_json_options(&data)
+    }
+}
+
+/// Save a single option to the profile (read-modify-write).
+///
+/// Loads existing options, patches the key, writes back as Eddie XML.
+pub fn save_profile_option(key: &str, value: &str) -> Result<()> {
+    let path = profile_path();
+
+    // Load existing options (or start fresh)
+    let mut options = if path.exists() {
+        load_options_from_path(&path).unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+
+    options.insert(key.to_string(), value.to_string());
+    save_options(&path, &options)
+}
+
+/// Save credentials and optionally other options to the profile.
+///
+/// Preserves existing options (e.g., servers.last) while updating credentials.
+pub fn save_credentials(username: &str, password: &str) -> Result<()> {
+    let path = profile_path();
+
+    // Load existing options to preserve non-credential fields
+    let mut options = if path.exists() {
+        load_options_from_path(&path).unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+
+    options.insert("login".to_string(), username.to_string());
+    options.insert("password".to_string(), password.to_string());
+
+    save_options(&path, &options)
+}
+
+/// Write options to profile as Eddie XML.
+fn save_options(path: &PathBuf, options: &HashMap<String, String>) -> Result<()> {
+    let data = serialize_xml_options(options);
+    let format = default_format();
+
+    // Reuse existing profile ID to avoid orphaning keyring entries
+    let id = if path.exists() {
+        match load_profile(path, || Ok(String::new())) {
+            Ok((_fmt, existing_id, _data)) => existing_id,
+            Err(_) => generate_id(),
+        }
+    } else {
+        generate_id()
+    };
+
+    let profile_password = match format {
+        ProfileFormat::V2S => {
+            let mut bytes = [0u8; 32];
+            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
+            hex::encode(bytes)
+        }
+        ProfileFormat::V2N => String::new(),
+        ProfileFormat::V2P => {
+            bail!("V2P format requires explicit password — use save_profile directly");
+        }
+    };
+
+    save_profile(path, format, &id, &data, &profile_password)?;
+    Ok(())
+}
+
+/// Resolve credentials from: CLI flags -> saved profile -> Eddie profile -> stdin prompt.
 ///
 /// Returns `(username, password)`.
 pub fn resolve_credentials(
@@ -53,37 +316,11 @@ pub fn resolve_credentials(
         return Ok((user.to_string(), pass.to_string()));
     }
 
-    // 2. Try loading from saved profile
-    let path = profile_path();
-    if path.exists() {
-        let password_provider = || {
-            rpassword::prompt_password("Profile password: ")
-                .context("failed to read profile password from stdin")
-        };
-
-        match load_profile(&path, password_provider) {
-            Ok((_format, _id, data)) => {
-                let profile: serde_json::Value = serde_json::from_slice(&data)
-                    .context("failed to parse profile JSON")?;
-
-                let login = profile
-                    .get("login")
-                    .and_then(|v| v.as_str())
-                    .context("profile missing 'login' field")?
-                    .to_string();
-
-                let password = profile
-                    .get("password")
-                    .and_then(|v| v.as_str())
-                    .context("profile missing 'password' field")?
-                    .to_string();
-
-                return Ok((login, password));
-            }
-            Err(e) => {
-                warn!("failed to load profile: {:#}", e);
-                // Fall through to stdin prompt
-            }
+    // 2. Try loading from profile (our profile first, then Eddie's)
+    let options = load_profile_options();
+    if let (Some(login), Some(password)) = (options.get("login"), options.get("password")) {
+        if !login.is_empty() && !password.is_empty() {
+            return Ok((login.clone(), password.clone()));
         }
     }
 
@@ -92,63 +329,21 @@ pub fn resolve_credentials(
     print!("AirVPN username: ");
     std::io::stdout().flush().context("failed to flush stdout")?;
     let mut username = String::new();
-    std::io::stdin().read_line(&mut username).context("failed to read username from stdin")?;
+    std::io::stdin()
+        .read_line(&mut username)
+        .context("failed to read username from stdin")?;
     let username = username.trim().to_string();
     if username.is_empty() {
         bail!("username cannot be empty");
     }
 
-    let password = rpassword::prompt_password("AirVPN password: ")
-        .context("failed to read password from stdin")?;
+    let password =
+        rpassword::prompt_password("AirVPN password: ").context("failed to read password from stdin")?;
     if password.is_empty() {
         bail!("password cannot be empty");
     }
 
     Ok((username, password))
-}
-
-/// Save credentials to profile (respecting the default format).
-pub fn save_credentials(username: &str, password: &str) -> Result<()> {
-    let profile_data = serde_json::json!({
-        "login": username,
-        "password": password,
-        "remember": true,
-    });
-    let data = serde_json::to_vec(&profile_data).context("failed to serialize profile data")?;
-
-    let path = profile_path();
-    let format = default_format();
-
-    // Reuse existing profile ID to avoid orphaning keyring entries
-    let id = if path.exists() {
-        match crate::profile::load_profile(&path, || Ok(String::new())) {
-            Ok((_fmt, existing_id, _data)) => existing_id,
-            Err(_) => generate_id(),
-        }
-    } else {
-        generate_id()
-    };
-
-    // For V2S, generate a random password for the keyring
-    // For V2N, password is ignored (uses constant)
-    // For V2P, we'd need a user-provided password — but save_credentials uses default format
-    let profile_password = match format {
-        ProfileFormat::V2S => {
-            // Generate a random password to store in keyring
-            let mut bytes = [0u8; 32];
-            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
-            hex::encode(bytes)
-        }
-        ProfileFormat::V2N => String::new(), // Will be replaced by constant
-        ProfileFormat::V2P => {
-            // Shouldn't happen via save_credentials (default_format returns V2S or V2N)
-            bail!("V2P format requires explicit password — use save_profile directly");
-        }
-    };
-
-    save_profile(&path, format, &id, &data, &profile_password)?;
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -169,9 +364,11 @@ mod tests {
     #[test]
     fn test_expand_tilde() {
         let expanded = expand_tilde("~/.config/airvpn-rs/default.profile");
-        // Should not start with ~ anymore
         assert!(!expanded.to_str().unwrap().starts_with('~'));
-        assert!(expanded.to_str().unwrap().ends_with(".config/airvpn-rs/default.profile"));
+        assert!(expanded
+            .to_str()
+            .unwrap()
+            .ends_with(".config/airvpn-rs/default.profile"));
     }
 
     #[test]
@@ -194,22 +391,18 @@ mod tests {
 
     #[test]
     fn test_expand_tilde_just_tilde_slash() {
-        // "~/" should expand to home dir
         let expanded = expand_tilde("~/");
         assert!(!expanded.to_str().unwrap().starts_with('~'));
     }
 
     #[test]
     fn test_expand_tilde_bare_tilde() {
-        // Just "~" without "/" does NOT match the strip_prefix("~/") pattern
-        // so it should be returned as-is
         let expanded = expand_tilde("~");
         assert_eq!(expanded, PathBuf::from("~"));
     }
 
     #[test]
     fn test_expand_tilde_nested_tilde() {
-        // Tilde not at start should be left alone
         let expanded = expand_tilde("/foo/~/bar");
         assert_eq!(expanded, PathBuf::from("/foo/~/bar"));
     }
@@ -221,16 +414,15 @@ mod tests {
         assert!(!expanded.to_str().unwrap().starts_with('~'));
     }
 
-    // -------------------------------------------------------------------
-    // resolve_credentials with partial flags should error
-    // -------------------------------------------------------------------
-
     #[test]
     fn test_resolve_credentials_only_username_errors() {
         let result = resolve_credentials(Some("alice"), None);
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().to_string().contains("--username and password"),
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("--username and password"),
             "should mention both flags are required"
         );
     }
@@ -240,7 +432,10 @@ mod tests {
         let result = resolve_credentials(None, Some("s3cret"));
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().to_string().contains("--username and password"),
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("--username and password"),
             "should mention both flags are required"
         );
     }
@@ -254,7 +449,6 @@ mod tests {
 
     #[test]
     fn test_expand_tilde_home_set() {
-        // Ensure expand_tilde produces a path that contains the HOME dir
         let home = std::env::var("HOME").unwrap_or_default();
         if !home.is_empty() {
             let expanded = expand_tilde("~/.config/test");
@@ -264,5 +458,126 @@ mod tests {
                 expanded.display()
             );
         }
+    }
+
+    // -------------------------------------------------------------------
+    // XML parsing tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_xml_options_basic() {
+        let xml = br#"<?xml version="1.0" encoding="utf-8"?>
+<eddie>
+  <options>
+    <option name="login" value="alice" />
+    <option name="password" value="s3cret" />
+    <option name="servers.locklast" value="True" />
+  </options>
+</eddie>"#;
+        let opts = parse_xml_options(xml).unwrap();
+        assert_eq!(opts.get("login").unwrap(), "alice");
+        assert_eq!(opts.get("password").unwrap(), "s3cret");
+        assert_eq!(opts.get("servers.locklast").unwrap(), "True");
+    }
+
+    #[test]
+    fn test_parse_xml_options_ignores_providers() {
+        let xml = br#"<eddie>
+  <options>
+    <option name="login" value="bob" />
+  </options>
+  <providers>
+    <option name="should_be_ignored" value="yes" />
+  </providers>
+</eddie>"#;
+        let opts = parse_xml_options(xml).unwrap();
+        assert_eq!(opts.len(), 1);
+        assert_eq!(opts.get("login").unwrap(), "bob");
+    }
+
+    #[test]
+    fn test_parse_xml_options_empty() {
+        let xml = b"<eddie><options></options></eddie>";
+        let opts = parse_xml_options(xml).unwrap();
+        assert!(opts.is_empty());
+    }
+
+    #[test]
+    fn test_parse_json_options_legacy() {
+        let json = br#"{"login":"alice","password":"pass123","remember":true}"#;
+        let opts = parse_json_options(json).unwrap();
+        assert_eq!(opts.get("login").unwrap(), "alice");
+        assert_eq!(opts.get("password").unwrap(), "pass123");
+        // "remember" is not mapped (not an Eddie option name)
+        assert!(!opts.contains_key("remember"));
+    }
+
+    #[test]
+    fn test_serialize_xml_options_roundtrip() {
+        let mut options = HashMap::new();
+        options.insert("login".to_string(), "alice".to_string());
+        options.insert("password".to_string(), "s3cret".to_string());
+        options.insert("servers.locklast".to_string(), "True".to_string());
+
+        let xml = serialize_xml_options(&options);
+        let parsed = parse_xml_options(&xml).unwrap();
+
+        assert_eq!(parsed.get("login").unwrap(), "alice");
+        assert_eq!(parsed.get("password").unwrap(), "s3cret");
+        assert_eq!(parsed.get("servers.locklast").unwrap(), "True");
+    }
+
+    #[test]
+    fn test_serialize_xml_options_escaping() {
+        let mut options = HashMap::new();
+        options.insert("key".to_string(), "value with \"quotes\" & <brackets>".to_string());
+
+        let xml = serialize_xml_options(&options);
+        let xml_str = String::from_utf8(xml.clone()).unwrap();
+        assert!(xml_str.contains("&quot;"));
+        assert!(xml_str.contains("&amp;"));
+        assert!(xml_str.contains("&lt;"));
+        assert!(xml_str.contains("&gt;"));
+
+        // Roundtrip: quick-xml should unescape back
+        let parsed = parse_xml_options(&xml).unwrap();
+        assert_eq!(
+            parsed.get("key").unwrap(),
+            "value with \"quotes\" & <brackets>"
+        );
+    }
+
+    #[test]
+    fn test_sha256_hex_matches_eddie() {
+        // Eddie: Crypto.Manager.HashSHA256("Carinae")
+        // Verified from user's actual Eddie profile
+        assert_eq!(
+            sha256_hex("Carinae"),
+            "600bb65180381071c7d4e7e6f472233b6d0caeaabddf5ca2690a978fb59111dc"
+        );
+    }
+
+    #[test]
+    fn test_reverse_server_hash() {
+        let names = vec!["Achernar", "Carinae", "Geminorum"];
+        let hash = sha256_hex("Carinae");
+        assert_eq!(
+            reverse_server_hash(&hash, &names),
+            Some("Carinae".to_string())
+        );
+    }
+
+    #[test]
+    fn test_reverse_server_hash_not_found() {
+        let names = vec!["Achernar", "Geminorum"];
+        assert_eq!(reverse_server_hash("deadbeef", &names), None);
+    }
+
+    #[test]
+    fn test_xml_escape() {
+        assert_eq!(xml_escape("hello"), "hello");
+        assert_eq!(xml_escape("a&b"), "a&amp;b");
+        assert_eq!(xml_escape("a\"b"), "a&quot;b");
+        assert_eq!(xml_escape("<b>"), "&lt;b&gt;");
     }
 }

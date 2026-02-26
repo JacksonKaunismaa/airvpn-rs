@@ -53,6 +53,12 @@ enum Commands {
         /// Skip post-connection tunnel and DNS verification
         #[arg(long)]
         no_verify: bool,
+        /// Don't lock to the same server within this session (Eddie: servers.locklast)
+        #[arg(long)]
+        no_lock_last: bool,
+        /// Don't prefer the last-used server on startup (Eddie: servers.startlast)
+        #[arg(long)]
+        no_start_last: bool,
     },
     /// Disconnect from AirVPN
     Disconnect,
@@ -203,6 +209,8 @@ fn main() -> anyhow::Result<()> {
             deny_country,
             skip_ping,
             no_verify,
+            no_lock_last,
+            no_start_last,
         } => cmd_connect(
             &mut provider_config,
             server,
@@ -217,6 +225,8 @@ fn main() -> anyhow::Result<()> {
             deny_country,
             skip_ping,
             no_verify,
+            no_lock_last,
+            no_start_last,
         ),
         Commands::Disconnect => cmd_disconnect(),
         Commands::Status => cmd_status(),
@@ -286,6 +296,8 @@ fn cmd_connect(
     deny_country: Vec<String>,
     skip_ping: bool,
     no_verify: bool,
+    no_lock_last: bool,
+    no_start_last: bool,
 ) -> anyhow::Result<()> {
     // 0. Pre-flight checks (root, wg-quick, nft)
     preflight_checks()?;
@@ -463,13 +475,44 @@ fn cmd_connect(
     // -----------------------------------------------------------------------
     // Reconnection loop (Eddie: Session.cs outer `for (; CancelRequested == false;)`)
     //
-    // The --server flag forces a specific server only on the FIRST attempt.
-    // On ResetLevel::Error, we clear it so select_server_with_penalties can
-    // pick a different (non-penalized) server.
+    // servers.locklast: lock to same server within this session (never rotate)
+    // servers.startlast: prefer last-used server on startup
+    // --server: explicit server name overrides both
     // -----------------------------------------------------------------------
 
+    // Load profile settings for locklast/startlast (Eddie: ProfileOptions)
+    let profile_options = config::load_profile_options();
+    let lock_last = !no_lock_last
+        && profile_options
+            .get("servers.locklast")
+            .map_or(true, |v| v != "False"); // default true (Eddie defaults false)
+    let start_last = !no_start_last
+        && profile_options
+            .get("servers.startlast")
+            .map_or(true, |v| v != "False"); // default true (Eddie defaults false)
+
+    // Determine initial forced_server: CLI --server > startlast > auto-select
+    // Eddie: Session.cs lines 102-149 priority chain
+    let start_last_name: Option<String> = if server_name.is_some() {
+        None // CLI --server takes priority
+    } else if start_last {
+        // Reverse-lookup servers.last SHA256 hash against manifest server names
+        profile_options.get("servers.last").and_then(|hash| {
+            let names: Vec<&str> = filtered_servers.iter().map(|s| s.name.as_str()).collect();
+            let resolved = config::reverse_server_hash(hash, &names);
+            if let Some(ref name) = resolved {
+                info!("Resuming last server: {} (servers.startlast)", name);
+            }
+            resolved
+        })
+    } else {
+        None
+    };
+
     let mut penalties = server::ServerPenalties::new();
-    let mut forced_server: Option<&str> = server_name.as_deref();
+    let mut forced_server: Option<&str> = server_name
+        .as_deref()
+        .or(start_last_name.as_deref());
     let mut first_iteration = true;
     let mut consecutive_failures: u32 = 0;
 
@@ -718,8 +761,10 @@ fn cmd_connect(
                     anyhow::bail!("Fatal: server rejected connection");
                 }
                 ResetLevel::Error => {
+                    // Server explicitly directed us to try another — always rotate,
+                    // even with lock_last (server is actively rejecting us).
                     penalties.penalize(&server_ref.name, 30);
-                    forced_server = Option::None; // clear forced server for rotation
+                    forced_server = Option::None;
                     if no_reconnect {
                         if !no_lock { let _ = netlock::deactivate(); }
                         ipv6::restore(&blocked_ipv6_ifaces);
@@ -782,17 +827,16 @@ fn cmd_connect(
                 // attempts (Eddie pattern: lock persists until explicit disconnect).
                 // Only deactivate on --no-reconnect exit.
                 let network_down = !wireguard::has_default_gateway();
-                if network_down {
-                    // Network is down (e.g. WiFi off, moved laptop). Don't penalize
-                    // the server — it's not at fault. Keep forced_server so we retry
-                    // the same server once network returns.
-                    warn!("Network appears down (no default gateway). Will retry same server.");
+                if network_down || lock_last {
+                    if network_down {
+                        warn!("Network appears down (no default gateway). Will retry same server.");
+                    }
+                    // Don't penalize, don't clear forced_server (retry same server)
                 } else {
                     penalties.penalize(&server_ref.name, 30);
                     forced_server = Option::None;
                 }
                 if no_reconnect {
-                    // Tearing down — full cleanup
                     if !no_lock {
                         let _ = netlock::deactivate();
                     }
@@ -802,8 +846,8 @@ fn cmd_connect(
                 }
                 consecutive_failures += 1;
                 let backoff_secs = std::cmp::min(3u64.saturating_mul(2u64.saturating_pow(consecutive_failures.saturating_sub(1).min(6))), 300);
-                if network_down {
-                    warn!("Reconnecting in {}s (network down, not penalizing {})...", backoff_secs, server_ref.name);
+                if network_down || lock_last {
+                    warn!("Reconnecting in {}s (retrying {})...", backoff_secs, server_ref.name);
                 } else {
                     warn!("Reconnecting in {}s (penalized {})...", backoff_secs, server_ref.name);
                 }
@@ -832,10 +876,13 @@ fn cmd_connect(
             // Tear down WireGuard interface but keep netlock and IPv6 blocking
             // active across reconnection (Eddie pattern).
             let _ = wireguard::disconnect(&config_path, &endpoint_ip);
-            penalties.penalize(&server_ref.name, 30);
-            forced_server = Option::None;
+            if lock_last {
+                // Don't penalize, don't clear forced_server (retry same server)
+            } else {
+                penalties.penalize(&server_ref.name, 30);
+                forced_server = Option::None;
+            }
             if no_reconnect {
-                // Tearing down — full cleanup
                 if !no_lock {
                     let _ = netlock::deactivate();
                 }
@@ -845,7 +892,11 @@ fn cmd_connect(
             }
             consecutive_failures += 1;
             let backoff_secs = std::cmp::min(3u64.saturating_mul(2u64.saturating_pow(consecutive_failures.saturating_sub(1).min(6))), 300);
-            warn!("Reconnecting in {}s (penalized {})...", backoff_secs, server_ref.name);
+            if lock_last {
+                warn!("Reconnecting in {}s (retrying {})...", backoff_secs, server_ref.name);
+            } else {
+                warn!("Reconnecting in {}s (penalized {})...", backoff_secs, server_ref.name);
+            }
             interruptible_sleep(&shutdown, backoff_secs);
             continue;
         }
@@ -874,9 +925,16 @@ fn cmd_connect(
                 warn!("resolv.conf contains non-VPN nameservers after DNS activation — potential DNS leak");
             }
 
-            // 11. Save credentials (non-fatal — don't kill connection over keyring issues)
+            // 11. Save credentials + last server (non-fatal — don't kill connection over keyring issues)
             if let Err(e) = config::save_credentials(&username, &password) {
                 warn!("failed to save credentials: {:#}", e);
+            }
+            // Eddie: servers.last = SHA256(server_name), saved to profile for startlast
+            if let Err(e) = config::save_profile_option(
+                "servers.last",
+                &config::sha256_hex(&server_ref.name),
+            ) {
+                warn!("failed to save servers.last: {:#}", e);
             }
 
             // 12. Save recovery state
@@ -954,11 +1012,13 @@ fn cmd_connect(
 
             if verify_failed && !shutdown.load(Ordering::Relaxed) {
                 warn!("Verification failed, treating as connection failure, reconnecting...");
-                // Use partial_disconnect: tear down WG + DNS only, keep netlock
-                // and IPv6 blocking active to prevent leak window during reconnection.
                 let _ = partial_disconnect(&config_path, &iface, !no_lock, &endpoint_ip);
-                penalties.penalize(&server_ref.name, 30);
-                forced_server = Option::None;
+                if lock_last {
+                    // Don't penalize, don't clear forced_server
+                } else {
+                    penalties.penalize(&server_ref.name, 30);
+                    forced_server = Option::None;
+                }
                 if no_reconnect {
                     // Full cleanup on exit — tear down netlock and IPv6 too
                     if !no_lock {
@@ -1057,17 +1117,20 @@ fn cmd_connect(
                 // still up. If no default gateway exists, the network itself is down
                 // (WiFi dropped, laptop moved, etc.) — don't blame the server.
                 let network_down = !wireguard::has_default_gateway();
-                if network_down {
-                    warn!("Network appears down (no default gateway). Will retry same server.");
+                if network_down || lock_last {
+                    if network_down {
+                        warn!("Network appears down (no default gateway). Will retry same server.");
+                    }
+                    // Don't penalize, don't clear forced_server
                 } else {
                     penalties.penalize(&server_ref.name, 30);
-                    forced_server = Option::None; // clear forced server for rotation
+                    forced_server = Option::None;
                 }
                 consecutive_failures += 1;
                 let backoff_secs = std::cmp::min(3u64.saturating_mul(2u64.saturating_pow(consecutive_failures.saturating_sub(1).min(6))), 300);
-                if network_down {
+                if network_down || lock_last {
                     warn!(
-                        "Connection lost. Reconnecting in {}s (network down, not penalizing {})...",
+                        "Connection lost. Reconnecting in {}s (retrying {})...",
                         backoff_secs, server_ref.name
                     );
                 } else {
