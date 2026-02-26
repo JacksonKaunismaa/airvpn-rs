@@ -356,9 +356,13 @@ fn cmd_connect(
     } else {
         None
     };
+    // 2b. Load profile options once (used for credentials + locklast/startlast)
+    let profile_options = config::load_profile_options();
+
     let (username, password) = config::resolve_credentials(
         cli_username.as_deref(),
         stdin_password.as_deref().map(|s| s.as_str()),
+        &profile_options,
     )?;
     let username = Zeroizing::new(username);
     let password = Zeroizing::new(password);
@@ -480,8 +484,7 @@ fn cmd_connect(
     // --server: explicit server name overrides both
     // -----------------------------------------------------------------------
 
-    // Load profile settings for locklast/startlast (Eddie: ProfileOptions)
-    let profile_options = config::load_profile_options();
+    // Use profile_options loaded earlier (same data, no re-prompt)
     let lock_last = !no_lock_last
         && profile_options
             .get("servers.locklast")
@@ -1292,9 +1295,11 @@ fn cmd_servers(
     } else {
         None
     };
+    let profile_options = config::load_profile_options();
     let (username, password) = config::resolve_credentials(
         cli_username.as_deref(),
         stdin_password.as_deref().map(|s| s.as_str()),
+        &profile_options,
     )?;
     let password = Zeroizing::new(password);
     let xml = Zeroizing::new(api::fetch_manifest(provider_config, &username, &password)?);

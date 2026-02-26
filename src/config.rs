@@ -386,12 +386,14 @@ fn save_options(path: &PathBuf, options: &HashMap<String, String>) -> Result<()>
     Ok(())
 }
 
-/// Resolve credentials from: CLI flags -> saved profile -> Eddie profile -> stdin prompt.
+/// Resolve credentials from: CLI flags -> profile options -> stdin prompt.
 ///
+/// Takes pre-loaded profile options to avoid redundant loading/prompting.
 /// Returns `(username, password)`.
 pub fn resolve_credentials(
     cli_username: Option<&str>,
     cli_password: Option<&str>,
+    profile_options: &HashMap<String, String>,
 ) -> Result<(String, String)> {
     // Error if only one of username/password provided via CLI/stdin
     if cli_username.is_some() != cli_password.is_some() {
@@ -403,9 +405,8 @@ pub fn resolve_credentials(
         return Ok((user.to_string(), pass.to_string()));
     }
 
-    // 2. Try loading from profile (our profile first, then Eddie's)
-    let options = load_profile_options();
-    if let (Some(login), Some(password)) = (options.get("login"), options.get("password")) {
+    // 2. Try credentials from profile options
+    if let (Some(login), Some(password)) = (profile_options.get("login"), profile_options.get("password")) {
         if !login.is_empty() && !password.is_empty() {
             return Ok((login.clone(), password.clone()));
         }
@@ -443,7 +444,7 @@ mod tests {
 
     #[test]
     fn test_resolve_from_cli_flags() {
-        let (user, pass) = resolve_credentials(Some("alice"), Some("s3cret")).unwrap();
+        let (user, pass) = resolve_credentials(Some("alice"), Some("s3cret"), &HashMap::new()).unwrap();
         assert_eq!(user, "alice");
         assert_eq!(pass, "s3cret");
     }
@@ -503,7 +504,7 @@ mod tests {
 
     #[test]
     fn test_resolve_credentials_only_username_errors() {
-        let result = resolve_credentials(Some("alice"), None);
+        let result = resolve_credentials(Some("alice"), None, &HashMap::new());
         assert!(result.is_err());
         assert!(
             result
@@ -516,7 +517,7 @@ mod tests {
 
     #[test]
     fn test_resolve_credentials_only_password_errors() {
-        let result = resolve_credentials(None, Some("s3cret"));
+        let result = resolve_credentials(None, Some("s3cret"), &HashMap::new());
         assert!(result.is_err());
         assert!(
             result
@@ -529,7 +530,7 @@ mod tests {
 
     #[test]
     fn test_resolve_credentials_both_cli_flags() {
-        let (user, pass) = resolve_credentials(Some("bob"), Some("pass123")).unwrap();
+        let (user, pass) = resolve_credentials(Some("bob"), Some("pass123"), &HashMap::new()).unwrap();
         assert_eq!(user, "bob");
         assert_eq!(pass, "pass123");
     }
