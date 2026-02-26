@@ -219,7 +219,15 @@ fn load_options_from_path(path: &PathBuf) -> Result<HashMap<String, String>> {
             .context("failed to read profile password from stdin")
     };
 
-    let (_format, _id, data) = load_profile(path, password_provider)?;
+    let (format, _id, data) = load_profile(path, password_provider)?;
+
+    if format == ProfileFormat::V2N {
+        debug!(
+            "Profile {} uses v2n format (obfuscated, not encrypted). \
+             This is normal when running as root — the user keyring is not accessible via sudo.",
+            path.display()
+        );
+    }
 
     // Detect format: XML starts with '<' (possibly after BOM/whitespace)
     let trimmed = data.iter().position(|&b| !b.is_ascii_whitespace());
