@@ -86,15 +86,6 @@ fn warn_if_insecure_v2n(path: &Path, format: ProfileFormat) {
     }
 }
 
-/// Expand `~` to root's home directory (/root).
-/// Used to check for old pre-migration profile at /root/.config/airvpn-rs/.
-fn expand_tilde_root(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        return PathBuf::from("/root").join(rest);
-    }
-    PathBuf::from(path)
-}
-
 /// Expand `~` to the user's home directory.
 ///
 /// When running as root (uid 0), uses /root instead of trusting `$HOME`.
@@ -256,21 +247,10 @@ pub fn load_profile_options() -> HashMap<String, String> {
         }
     }
 
-    // Check for old profile at ~/.config/airvpn-rs/ (pre-migration location)
-    let old_path = expand_tilde_root("~/.config/airvpn-rs/default.profile");
-    if old_path.exists() {
-        warn!(
-            "Found old profile at {} (pre-migration location). \
-             It will be ignored — please delete it. \
-             The new profile location is {}.",
-            old_path.display(),
-            PROFILE_PATH,
-        );
-    }
-
-    // Offer to import Eddie's profile (~user/.config/eddie/default.profile)
+    // Offer to import Eddie's profile (~user/.config/eddie/default.profile).
+    // Only prompt if we don't have our own profile yet (i.e., first run).
     if let Some(eddie_path) = eddie_profile_path() {
-        eprintln!(
+        eprint!(
             "Eddie profile detected at {}. Import settings? [Y/n] ",
             eddie_path.display()
         );
