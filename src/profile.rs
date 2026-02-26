@@ -508,14 +508,39 @@ pub fn keyring_read(id: &str) -> Result<Option<String>> {
 ///
 /// Eddie uses attribute `"Eddie Profile" = "<profile_id>"` instead of
 /// our `application=airvpn-rs, profile-id=<id>`.
+///
+/// When running as root (via sudo), we need to run secret-tool as the
+/// original user with their D-Bus session, since the keyring is only
+/// accessible from the user's session — not from root.
 pub fn eddie_keyring_read(id: &str) -> Result<Option<String>> {
-    let output = std::process::Command::new("timeout")
-        .args([
-            "10", "secret-tool", "lookup",
-            "Eddie Profile", id,
-        ])
-        .output()
-        .context("failed to run secret-tool for Eddie keyring lookup")?;
+    let output = if nix::unistd::getuid().is_root() {
+        // Running as root — use sudo -u to drop back to the original user,
+        // and pass their DBUS_SESSION_BUS_ADDRESS so secret-tool can reach the keyring.
+        let sudo_user = std::env::var("SUDO_USER")
+            .context("SUDO_USER not set — cannot access user keyring from root")?;
+        // The D-Bus address is in /run/user/<uid>/bus for systemd sessions
+        let uid_str = nix::unistd::User::from_name(&sudo_user)
+            .context("failed to look up SUDO_USER")?
+            .context("SUDO_USER not found in /etc/passwd")?
+            .uid
+            .to_string();
+        let dbus_addr = format!("unix:path=/run/user/{}/bus", uid_str);
+
+        std::process::Command::new("timeout")
+            .args(["10", "sudo", "-u", &sudo_user])
+            .arg(format!("DBUS_SESSION_BUS_ADDRESS={}", dbus_addr))
+            .args(["secret-tool", "lookup", "Eddie Profile", id])
+            .output()
+            .context("failed to run secret-tool as user for Eddie keyring lookup")?
+    } else {
+        std::process::Command::new("timeout")
+            .args([
+                "10", "secret-tool", "lookup",
+                "Eddie Profile", id,
+            ])
+            .output()
+            .context("failed to run secret-tool for Eddie keyring lookup")?
+    };
 
     if output.status.success() {
         let password = String::from_utf8(output.stdout)
