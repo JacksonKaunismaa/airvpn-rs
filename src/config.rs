@@ -14,7 +14,7 @@
 //! Eddie reference: Storage.cs (Save/Load), ProfileOptions.cs (defaults)
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use log::{debug, info, warn};
@@ -54,6 +54,45 @@ fn eddie_profile_path() -> Option<PathBuf> {
 
     let path = home.join(".config/eddie/default.profile");
     if path.exists() { Some(path) } else { None }
+}
+
+/// Warn if a profile uses v2n format on a non-root-owned file.
+///
+/// v2n uses a hardcoded password (no real encryption). This is fine for
+/// root-owned files in /etc/ (file permissions are the security), but
+/// insecure for user-owned files where any process running as that user
+/// can decrypt the profile.
+fn warn_if_insecure_v2n(path: &Path, format: ProfileFormat) {
+    if format != ProfileFormat::V2N {
+        return;
+    }
+    if let Ok(metadata) = std::fs::metadata(path) {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() == 0 {
+            // Root-owned v2n is fine — file perms are the security
+            debug!(
+                "Profile {} uses v2n format (root-owned, secured by file permissions).",
+                path.display()
+            );
+        } else {
+            warn!(
+                "Profile {} uses v2n format (no real encryption) and is owned by uid {}. \
+                 Your credentials are readable by any process running as that user. \
+                 Consider switching to 'Linux secret-tool' or 'Password' protection.",
+                path.display(),
+                metadata.uid()
+            );
+        }
+    }
+}
+
+/// Expand `~` to root's home directory (/root).
+/// Used to check for old pre-migration profile at /root/.config/airvpn-rs/.
+fn expand_tilde_root(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        return PathBuf::from("/root").join(rest);
+    }
+    PathBuf::from(path)
 }
 
 /// Expand `~` to the user's home directory.
@@ -217,18 +256,42 @@ pub fn load_profile_options() -> HashMap<String, String> {
         }
     }
 
-    // Fall back to Eddie's profile (~user/.config/eddie/default.profile)
+    // Check for old profile at ~/.config/airvpn-rs/ (pre-migration location)
+    let old_path = expand_tilde_root("~/.config/airvpn-rs/default.profile");
+    if old_path.exists() {
+        warn!(
+            "Found old profile at {} (pre-migration location). \
+             It will be ignored — please delete it. \
+             The new profile location is {}.",
+            old_path.display(),
+            PROFILE_PATH,
+        );
+    }
+
+    // Offer to import Eddie's profile (~user/.config/eddie/default.profile)
     if let Some(eddie_path) = eddie_profile_path() {
-        info!(
-            "Eddie profile detected at {}. Importing settings...",
+        eprintln!(
+            "Eddie profile detected at {}. Import settings? [Y/n] ",
             eddie_path.display()
         );
-        match load_eddie_profile(&eddie_path) {
-            Ok(opts) => {
-                info!("Imported {} settings from Eddie profile.", opts.len());
-                return opts;
+        let mut answer = String::new();
+        let import = match std::io::stdin().read_line(&mut answer) {
+            Ok(_) => {
+                let trimmed = answer.trim().to_lowercase();
+                trimmed.is_empty() || trimmed == "y" || trimmed == "yes"
             }
-            Err(e) => warn!("Could not import Eddie profile: {:#}", e),
+            Err(_) => false,
+        };
+        if import {
+            match load_eddie_profile(&eddie_path) {
+                Ok(opts) => {
+                    info!("Imported {} settings from Eddie profile.", opts.len());
+                    return opts;
+                }
+                Err(e) => warn!("Could not import Eddie profile: {:#}", e),
+            }
+        } else {
+            info!("Skipping Eddie profile import.");
         }
     }
 
@@ -251,22 +314,7 @@ fn load_eddie_profile(path: &PathBuf) -> Result<HashMap<String, String>> {
         crate::profile::eddie_keyring_read,
     )?;
 
-    // Warn if Eddie's profile uses v2n (fake encryption) on a user-owned file
-    if format == ProfileFormat::V2N {
-        // Check file ownership — v2n is only a concern if the file isn't root-owned
-        if let Ok(metadata) = std::fs::metadata(path) {
-            use std::os::unix::fs::MetadataExt;
-            if metadata.uid() != 0 {
-                warn!(
-                    "Eddie profile at {} uses v2n format (no real encryption) and is owned by uid {}. \
-                     Your credentials are readable by any process running as that user. \
-                     Consider switching Eddie to 'Linux secret-tool' in Settings > General > Profile data protection.",
-                    path.display(),
-                    metadata.uid()
-                );
-            }
-        }
-    }
+    warn_if_insecure_v2n(path, format);
 
     let trimmed = data.iter().position(|&b| !b.is_ascii_whitespace());
     let is_xml = trimmed.map_or(false, |i| data[i] == b'<');
@@ -287,13 +335,7 @@ fn load_options_from_path(path: &PathBuf) -> Result<HashMap<String, String>> {
 
     let (format, _id, data) = load_profile(path, password_provider)?;
 
-    if format == ProfileFormat::V2N {
-        debug!(
-            "Profile {} uses v2n format (obfuscated, not encrypted). \
-             This is normal when running as root — the user keyring is not accessible via sudo.",
-            path.display()
-        );
-    }
+    warn_if_insecure_v2n(path, format);
 
     // Detect format: XML starts with '<' (possibly after BOM/whitespace)
     let trimmed = data.iter().position(|&b| !b.is_ascii_whitespace());
