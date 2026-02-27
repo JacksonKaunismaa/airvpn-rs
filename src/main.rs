@@ -2,6 +2,7 @@ use airvpn::{api, config, dns, ipv6, manifest, netlock, pinger, recovery, server
 
 use std::sync::atomic::Ordering;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use log::{debug, error, info, warn};
 use zeroize::Zeroizing;
@@ -144,6 +145,25 @@ enum Commands {
     },
     /// Clean up stale state after crash
     Recover,
+    /// Manage persistent network lock (kill switch)
+    Lock {
+        #[command(subcommand)]
+        action: LockAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum LockAction {
+    /// Install persistent lock (generate rules, enable systemd service)
+    Install,
+    /// Uninstall persistent lock (remove rules, disable service, delete table)
+    Uninstall,
+    /// Reload persistent lock table now
+    Enable,
+    /// Temporarily disable persistent lock (returns on reboot)
+    Disable,
+    /// Show persistent lock status
+    Status,
 }
 
 /// Rotate log file if it exceeds 5MB. Keeps at most 3 files:
@@ -331,6 +351,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Status => cmd_status(),
         Commands::Servers { sort, debug, username, password_stdin, skip_ping } => cmd_servers(&mut provider_config, &sort, debug, username, password_stdin, skip_ping),
         Commands::Recover => cmd_recover(),
+        Commands::Lock { action } => cmd_lock(action),
     }
 }
 
@@ -1621,6 +1642,185 @@ fn cmd_servers(
 fn cmd_recover() -> anyhow::Result<()> {
     preflight_checks()?;
     recovery::force_recover()
+}
+
+// ---------------------------------------------------------------------------
+// Lock — persistent kill switch management
+// ---------------------------------------------------------------------------
+
+fn cmd_lock(action: LockAction) -> anyhow::Result<()> {
+    // lock commands need root (nft access)
+    if !nix::unistd::geteuid().is_root() {
+        anyhow::bail!("must run as root");
+    }
+    match action {
+        LockAction::Install => cmd_lock_install(),
+        LockAction::Uninstall => cmd_lock_uninstall(),
+        LockAction::Enable => cmd_lock_enable(),
+        LockAction::Disable => cmd_lock_disable(),
+        LockAction::Status => cmd_lock_status(),
+    }
+}
+
+fn cmd_lock_install() -> anyhow::Result<()> {
+    let provider_config = api::load_provider_config()?;
+
+    // Extract bootstrap IPs from provider.json (skip hostnames — can't resolve
+    // without DNS, and that's the whole point of the persistent lock)
+    let bootstrap_ips: Vec<String> = provider_config
+        .bootstrap_urls
+        .iter()
+        .filter_map(|url| extract_ip_from_url(url))
+        .filter(|host| host.parse::<std::net::IpAddr>().is_ok())
+        .collect();
+
+    if bootstrap_ips.is_empty() {
+        anyhow::bail!("no bootstrap IPs found in provider config");
+    }
+
+    let ruleset = netlock::generate_persistent_ruleset(&bootstrap_ips);
+
+    // Write rules file
+    std::fs::create_dir_all("/etc/airvpn-rs")
+        .context("failed to create /etc/airvpn-rs")?;
+    std::fs::write(netlock::PERSISTENT_RULES_PATH, &ruleset)
+        .context("failed to write lock.nft")?;
+    info!("Wrote {}", netlock::PERSISTENT_RULES_PATH);
+
+    // Write systemd service
+    let service = "\
+[Unit]
+Description=AirVPN persistent kill switch
+DefaultDependencies=no
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/nft -f /etc/airvpn-rs/lock.nft
+ExecStop=/usr/bin/nft delete table inet airvpn_lock
+
+[Install]
+WantedBy=sysinit.target
+";
+    std::fs::write(netlock::PERSISTENT_SERVICE_PATH, service)
+        .context("failed to write systemd service")?;
+    info!("Wrote {}", netlock::PERSISTENT_SERVICE_PATH);
+
+    // Enable service
+    let output = std::process::Command::new("systemctl")
+        .args(["daemon-reload"])
+        .output()
+        .context("failed to run systemctl daemon-reload")?;
+    if !output.status.success() {
+        warn!("systemctl daemon-reload failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    let output = std::process::Command::new("systemctl")
+        .args(["enable", "airvpn-lock.service"])
+        .output()
+        .context("failed to enable service")?;
+    if !output.status.success() {
+        anyhow::bail!("systemctl enable failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    info!("Enabled airvpn-lock.service");
+
+    // Load the table now (if not already active)
+    if !netlock::is_active() {
+        let output = std::process::Command::new("nft")
+            .args(["-f", netlock::PERSISTENT_RULES_PATH])
+            .output()
+            .context("failed to load lock.nft")?;
+        if !output.status.success() {
+            anyhow::bail!("nft -f failed: {}", String::from_utf8_lossy(&output.stderr));
+        }
+    }
+
+    info!("Persistent lock installed and active.");
+    info!("{} bootstrap IPs allowlisted.", bootstrap_ips.len());
+    info!("To temporarily disable: airvpn-rs lock disable");
+    Ok(())
+}
+
+fn cmd_lock_uninstall() -> anyhow::Result<()> {
+    // Stop and disable service
+    let _ = std::process::Command::new("systemctl")
+        .args(["stop", "airvpn-lock.service"])
+        .output();
+    let _ = std::process::Command::new("systemctl")
+        .args(["disable", "airvpn-lock.service"])
+        .output();
+    let _ = std::process::Command::new("systemctl")
+        .args(["daemon-reload"])
+        .output();
+
+    // Remove files
+    let _ = std::fs::remove_file(netlock::PERSISTENT_SERVICE_PATH);
+    let _ = std::fs::remove_file(netlock::PERSISTENT_RULES_PATH);
+
+    // Delete table if active
+    if netlock::is_active() {
+        // Try to reclaim first (in case it's orphaned+owned, need to be owner to delete)
+        let _ = netlock::reclaim_ownership();
+        let _ = netlock::deactivate();
+    }
+
+    info!("Persistent lock uninstalled.");
+    Ok(())
+}
+
+fn cmd_lock_enable() -> anyhow::Result<()> {
+    if !std::path::Path::new(netlock::PERSISTENT_RULES_PATH).exists() {
+        anyhow::bail!("persistent lock not installed — run `airvpn-rs lock install` first");
+    }
+    if netlock::is_active() {
+        info!("Lock table already active.");
+        return Ok(());
+    }
+    let output = std::process::Command::new("nft")
+        .args(["-f", netlock::PERSISTENT_RULES_PATH])
+        .output()
+        .context("failed to load lock.nft")?;
+    if !output.status.success() {
+        anyhow::bail!("nft -f failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    info!("Persistent lock re-enabled.");
+    Ok(())
+}
+
+fn cmd_lock_disable() -> anyhow::Result<()> {
+    if !netlock::is_active() {
+        info!("Lock table not active.");
+        return Ok(());
+    }
+    // Reclaim if needed (orphaned table can't be deleted by non-owner)
+    let _ = netlock::reclaim_ownership();
+    netlock::deactivate()?;
+    info!("Persistent lock disabled (will return on next reboot if service enabled).");
+    Ok(())
+}
+
+fn cmd_lock_status() -> anyhow::Result<()> {
+    let table_active = netlock::is_active();
+    let rules_exist = std::path::Path::new(netlock::PERSISTENT_RULES_PATH).exists();
+    let service_exists = std::path::Path::new(netlock::PERSISTENT_SERVICE_PATH).exists();
+
+    // Check if service is enabled
+    let service_enabled = std::process::Command::new("systemctl")
+        .args(["is-enabled", "airvpn-lock.service"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    println!("Persistent lock:");
+    println!("  Table active:     {}", if table_active { "yes" } else { "no" });
+    println!("  Rules file:       {}", if rules_exist { netlock::PERSISTENT_RULES_PATH } else { "not installed" });
+    println!("  Service enabled:  {}", if service_enabled { "yes" } else { "no" });
+
+    if !rules_exist && !service_exists {
+        println!("\nNot installed. Run `airvpn-rs lock install` to set up.");
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
