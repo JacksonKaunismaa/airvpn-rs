@@ -5,7 +5,7 @@
 //! restore DNS, remove nftables rules).
 //!
 //! Recovery sequence matches normal disconnect order (WireGuard → IPv6 → DNS → netlock):
-//! 1. wireguard::disconnect(config_path) (wg-quick down)
+//! 1. wireguard::disconnect(config_path) (ip link delete)
 //! 2. ipv6::restore() (re-enable IPv6 on blocked interfaces)
 //! 3. dns::deactivate() (restore resolv.conf)
 //! 4. netlock::deactivate() (delete nft table — removed last to prevent leaks)
@@ -289,7 +289,7 @@ pub fn is_pid_alive_with_nonce(pid: u32, expected_nonce: u64) -> bool {
 }
 
 /// Run the recovery cleanup sequence (matches normal disconnect order):
-/// 1. wireguard::disconnect(config_path) (wg-quick down)
+/// 1. wireguard::disconnect(config_path) (ip link delete)
 /// 2. ipv6::restore() (re-enable IPv6 on blocked interfaces)
 /// 3. dns::deactivate() (restore resolv.conf)
 /// 4. netlock::deactivate() (delete nft table — removed last to prevent leaks)

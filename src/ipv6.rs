@@ -11,26 +11,22 @@ use std::path::Path;
 
 use log::warn;
 
-/// Disable IPv6 on all non-loopback interfaces.
+/// Disable IPv6 on all non-loopback interfaces, including `default`.
 ///
 /// Returns the list of interfaces that were blocked (for restore on disconnect).
 ///
-/// NOTE: We do NOT set the "default" sysctl template. Eddie doesn't either
-/// (impl.cpp:483 only iterates existing interfaces). Setting "default" to 1
-/// causes wg-quick to fail because the newly created WireGuard interface
-/// inherits disable_ipv6=1 and `ip -6 address add` errors out. The nftables
-/// kill switch (policy drop on inet table) prevents IPv6 leaks on new
-/// interfaces regardless of the sysctl setting.
+/// Setting `default` to `disable_ipv6=1` means newly created interfaces
+/// (including the WireGuard tunnel) inherit disabled IPv6 automatically.
+/// This matches Eddie's behavior (impl.cpp iterates all entries in
+/// `/proc/sys/net/ipv6/conf/`, skipping only `all`, `lo`, `lo0`).
+///
+/// We no longer use wg-quick (which breaks with `default=1`), so this is safe.
+/// The WireGuard interface is set up via direct `ip`/`wg` commands with IPv4 only.
+///
+/// Reference: Eddie src/App.CLI.Linux.Elevated/src/impl.cpp lines 478-510
 pub fn block_all() -> Vec<String> {
     let mut blocked = Vec::new();
     let conf_dir = Path::new("/proc/sys/net/ipv6/conf");
-
-    // Ensure "default" template is NOT set to disable_ipv6=1.
-    // Previous versions set this, which breaks wg-quick (new WG interface
-    // inherits disable_ipv6=1, then `ip -6 address add` fails). Clean it
-    // up on every run to handle upgrades from old versions.
-    let default_disable = conf_dir.join("default").join("disable_ipv6");
-    let _ = fs::write(&default_disable, "0");
 
     let entries = match fs::read_dir(conf_dir) {
         Ok(e) => e,
@@ -40,8 +36,11 @@ pub fn block_all() -> Vec<String> {
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
 
-        // Skip special pseudo-interfaces (matching Eddie impl.cpp:483)
-        if matches!(name.as_str(), "all" | "default" | "lo" | "lo0") {
+        // Skip special pseudo-interfaces (matching Eddie impl.cpp:483-490).
+        // "all" is skipped because setting it auto-cascades to all interfaces
+        // (Eddie prefers per-interface control). "default" is NOT skipped —
+        // it acts as a template for newly created interfaces.
+        if matches!(name.as_str(), "all" | "lo" | "lo0") {
             continue;
         }
 

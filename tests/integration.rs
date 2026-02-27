@@ -16,6 +16,7 @@ use std::path::Path;
 use std::process::Command;
 
 use airvpn::{dns, ipv6, netlock, recovery, wireguard};
+use zeroize::Zeroizing;
 use airvpn::netlock::NetlockConfig;
 use airvpn::recovery::State;
 
@@ -601,24 +602,28 @@ fn test_wireguard_config_file_permissions() {
         return;
     }
 
-    // Generate a config string — we use a fake config that wg-quick will
-    // reject, but the file should still be created with correct permissions
-    // before wg-quick runs.
-    let config = "\
+    // Generate a WgConnectParams with fake keys — connect() will fail because
+    // the endpoint is unreachable, but the file should still be created with
+    // correct permissions before the failure.
+    let params = wireguard::WgConnectParams {
+        wg_config: Zeroizing::new("\
 [Interface]
 PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
-Address = 10.99.99.99/32
 
 [Peer]
 PublicKey = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=
 Endpoint = 192.0.2.1:51820
 AllowedIPs = 0.0.0.0/0
-";
+".to_string()),
+        ipv4_address: "10.99.99.99/32".to_string(),
+        ipv6_address: String::new(),
+        endpoint_ip: "192.0.2.1".to_string(),
+    };
 
     // connect() will fail because the endpoint is unreachable / keys are fake,
     // but we can check the file was created with correct permissions.
     // The function cleans up the config file on failure.
-    let result = wireguard::connect(config, "192.0.2.1");
+    let result = wireguard::connect(&params, false);
 
     // connect() should fail (no real server), but we need to verify the file
     // handling behavior. The config file should be cleaned up after failure.

@@ -5,7 +5,7 @@
 > code comments (search for "Eddie" or "diverge") and compare against
 > [Eddie's source](https://github.com/AirVPN/Eddie).
 >
-> Last reviewed: 2026-02-26
+> Last reviewed: 2026-02-27
 
 This codebase is a faithful Rust reimplementation of Eddie (AirVPN's official
 C# client). The vast majority of behavior — scoring formulas, penalty system,
@@ -108,4 +108,25 @@ worse servers after transient network drops. Users can disable with
 **Files:** `src/main.rs` — connection loop setup, `src/config.rs` — profile options
 
 **Eddie ref:** `ProfileOptions.cs` lines 435-436
+
+---
+
+## 5. Direct ip/wg commands instead of wg-quick
+
+**Eddie:** Uses OpenVPN with its own tun device management.
+
+**airvpn-rs:** Uses WireGuard via direct `ip link add` / `wg setconf` / `ip address add`
+commands. No dependency on `wg-quick`.
+
+**Why:** wg-quick is a convenience wrapper that adds routing, DNS, and firewall rules
+we don't need (we manage those ourselves via `netlock.rs`, `dns.rs`, and
+`setup_routing()`). Removing wg-quick also enables matching Eddie's IPv6
+blocking behavior: `block_all()` sets `net.ipv6.conf.default.disable_ipv6=1`
+before the WireGuard interface is created, so it inherits disabled IPv6
+with no race condition. With wg-quick, this was impossible because wg-quick's
+`ip -6 address add` would fail on an interface with IPv6 disabled.
+
+**Files:** `src/wireguard.rs` — `connect()`, `disconnect()`
+
+**Eddie ref:** `src/Lib.Platform.Linux/Platform.cs`, `src/App.CLI.Linux.Elevated/src/impl.cpp`
 

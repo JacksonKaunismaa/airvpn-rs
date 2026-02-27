@@ -1,7 +1,7 @@
-//! WireGuard config generation and wg-quick management.
+//! WireGuard config generation and tunnel lifecycle management.
 //!
-//! Generates WireGuard config from manifest data and manages the tunnel
-//! lifecycle via wg-quick up/down.
+//! Generates wg-native config from manifest data and manages the tunnel
+//! via direct `ip`/`wg` commands (no wg-quick dependency).
 
 use std::path::Path;
 use std::process::Command;
@@ -14,6 +14,27 @@ use crate::manifest::{Mode, Server, UserInfo, WireGuardKey};
 /// Secure directory for WireGuard config files (mode 0o700).
 /// Avoids /tmp which is world-readable and vulnerable to symlink attacks.
 const WG_CONFIG_DIR: &str = "/run/airvpn-rs";
+
+/// MTU for the WireGuard interface. Matches Eddie's WireGuard MTU.
+const WG_MTU: u16 = 1320;
+
+/// Parameters for establishing a WireGuard connection.
+///
+/// Returned by `generate_config()` with the wg-native config and the
+/// address/MTU info that `connect()` needs to set up the interface.
+#[derive(Debug)]
+pub struct WgConnectParams {
+    /// wg-native config (PrivateKey + Peer section only, for `wg setconf`).
+    /// Wrapped in Zeroizing because it contains the private key.
+    pub wg_config: zeroize::Zeroizing<String>,
+    /// IPv4 address with CIDR (e.g., "10.167.32.97/32")
+    pub ipv4_address: String,
+    /// IPv6 address with CIDR (e.g., "fd7d:76ee:.../128").
+    /// Kept for future IPv6-through-tunnel support but NOT assigned in block mode.
+    pub ipv6_address: String,
+    /// VPN server endpoint IP (without port)
+    pub endpoint_ip: String,
+}
 
 /// Validate an interface name: alphanumeric + dash + underscore, max 15 chars.
 /// Matches the validation in netlock.rs to prevent path traversal and command injection.
@@ -88,15 +109,19 @@ fn ensure_cidr(ip: &str, default_suffix: &str) -> String {
 /// preventing a routing loop when policy routing sends all traffic through
 /// the VPN.
 ///
-/// The config format matches what wg-quick expects. IPv4 entry IPs are
-/// preferred over IPv6 (matching Eddie's default `network.entry.iplayer =
-/// "ipv4-ipv6"`), since we block IPv6 on all interfaces during connection.
-/// The endpoint IP is selected at `mode.entry_index` within the preferred
-/// IP version, falling back to the first IP of that version, then trying
-/// the other version.
+/// The config format is wg-native (suitable for `wg setconf`), NOT wg-quick.
+/// It contains only fields the WireGuard kernel module understands:
+/// `[Interface]` with `PrivateKey`, and `[Peer]` with keys/endpoint/AllowedIPs.
 ///
-/// IPv6 endpoint IPs are wrapped in brackets per WireGuard convention.
-pub fn generate_config(key: &WireGuardKey, server: &Server, mode: &Mode, user: &UserInfo) -> Result<(zeroize::Zeroizing<String>, String)> {
+/// wg-quick-only directives (Address, MTU, Table, DNS, PostUp/PostDown) are
+/// NOT included — we handle those via direct `ip` commands in `connect()`.
+///
+/// IPv4 entry IPs are preferred over IPv6 (matching Eddie's default
+/// `network.entry.iplayer = "ipv4-ipv6"`), since we block IPv6 on all
+/// interfaces during connection.
+///
+/// Returns `WgConnectParams` containing the config and separated address/MTU info.
+pub fn generate_config(key: &WireGuardKey, server: &Server, mode: &Mode, user: &UserInfo) -> Result<WgConnectParams> {
     if key.wg_private_key.is_empty() {
         anyhow::bail!("missing WireGuard private key from API response");
     }
@@ -161,36 +186,41 @@ PersistentKeepalive = 15
         endpoint,
     ));
 
-    // Wrap config in Zeroizing — it contains the WireGuard private key
+    // wg-native config: only fields `wg setconf` understands.
+    // No Address, MTU, Table, DNS, PostUp/PostDown (those are wg-quick extensions).
     let config = zeroize::Zeroizing::new(format!(
         "\
 [Interface]
 PrivateKey = {}
-Address = {}, {}
-MTU = 1320
-Table = off
 
 {}",
         &*key.wg_private_key,
-        ensure_cidr(&key.wg_ipv4, "/32"),
-        ensure_cidr(&key.wg_ipv6, "/128"),
         peer_section,
     ));
 
-    Ok((config, endpoint_ip.to_string()))
+    Ok(WgConnectParams {
+        wg_config: config,
+        ipv4_address: ensure_cidr(&key.wg_ipv4, "/32").to_string(),
+        ipv6_address: ensure_cidr(&key.wg_ipv6, "/128").to_string(),
+        endpoint_ip: endpoint_ip.to_string(),
+    })
 }
 
-/// Write config to a tmpfile, run `wg-quick up`, return (config_path, interface_name).
+/// Set up a WireGuard tunnel using direct `ip`/`wg` commands (no wg-quick).
 ///
-/// The interface name is derived by wg-quick from the config filename
-/// (basename without .conf extension).
+/// Steps:
+/// 1. Write wg-native config to a temp file (private key stays in file, not cmdline)
+/// 2. `ip link add dev <iface> type wireguard`
+/// 3. `wg setconf <iface> <config_path>`
+/// 4. `ip -4 address add <ipv4> dev <iface>` (IPv4 only — no IPv6 in block mode)
+/// 5. `ip link set mtu <mtu> dev <iface>`
+/// 6. `ip link set up dev <iface>`
+/// 7. `setup_routing()` — policy routing through the tunnel
 ///
-/// `endpoint_ip` is the VPN server's entry IP (from `generate_config`).
-/// It's needed to create a host route through the original default gateway
-/// so the encrypted WireGuard packets can reach the server without being
-/// caught by our policy routing rules.
-pub fn connect(config: &str, endpoint_ip: &str) -> Result<(String, String)> {
-    debug!("WireGuard connect: endpoint_ip={}, config_len={} bytes", endpoint_ip, config.len());
+/// Returns (config_path, interface_name) on success.
+pub fn connect(params: &WgConnectParams, ipv6_enabled: bool) -> Result<(String, String)> {
+    debug!("WireGuard connect: endpoint_ip={}, config_len={} bytes",
+           params.endpoint_ip, params.wg_config.len());
 
     // Ensure secure config directory exists with mode 0o700
     let config_dir = Path::new(WG_CONFIG_DIR);
@@ -212,13 +242,11 @@ pub fn connect(config: &str, endpoint_ip: &str) -> Result<(String, String)> {
         .tempfile_in(config_dir)
         .context("failed to create WireGuard config file in /run/airvpn-rs/")?;
 
-    // Persist the file so wg-quick can read it (NamedTempFile deletes on drop)
+    // Persist the file (NamedTempFile deletes on drop)
     let (_, path) = tmpfile.keep().context("failed to persist config file")?;
     let config_path = path.to_string_lossy().to_string();
 
     // Helper to clean up the persisted config file (contains private key) on error.
-    // After tmpfile.keep() the file is no longer auto-deleted, so we must remove it
-    // explicitly if any subsequent operation fails.
     let cleanup_config = |path: &str| {
         let _ = std::fs::remove_file(path);
     };
@@ -241,7 +269,7 @@ pub fn connect(config: &str, endpoint_ip: &str) -> Result<(String, String)> {
                     .context(format!("failed to create WireGuard config: {}", config_path)));
             }
         };
-        if let Err(e) = f.write_all(config.as_bytes()) {
+        if let Err(e) = f.write_all(params.wg_config.as_bytes()) {
             cleanup_config(&config_path);
             return Err(anyhow::Error::new(e)
                 .context(format!("failed to write WireGuard config: {}", config_path)));
@@ -249,7 +277,7 @@ pub fn connect(config: &str, endpoint_ip: &str) -> Result<(String, String)> {
     }
     #[cfg(not(unix))]
     {
-        if let Err(e) = std::fs::write(&config_path, config) {
+        if let Err(e) = std::fs::write(&config_path, &*params.wg_config) {
             cleanup_config(&config_path);
             return Err(anyhow::Error::new(e)
                 .context(format!("failed to write WireGuard config to {}", config_path)));
@@ -276,24 +304,94 @@ pub fn connect(config: &str, endpoint_ip: &str) -> Result<(String, String)> {
             .output();
     }
 
-    let output = Command::new("timeout")
-        .args(["30", "wg-quick", "up", &config_path])
-        .output()
-        .context("failed to execute wg-quick up (with 30s timeout)")?;
+    // Helper to clean up interface + config on failure
+    let cleanup_all = |iface: &str, config_path: &str| {
+        let _ = Command::new("ip").args(["link", "delete", iface]).output();
+        let _ = std::fs::remove_file(config_path);
+    };
 
+    // 1. Create WireGuard interface
+    let output = Command::new("ip")
+        .args(["link", "add", "dev", &iface, "type", "wireguard"])
+        .output()
+        .context("failed to execute: ip link add type wireguard")?;
     if !output.status.success() {
-        // Clean up config file containing private keys
-        let _ = std::fs::remove_file(&config_path);
+        cleanup_config(&config_path);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("wg-quick up failed: {}", stderr);
+        anyhow::bail!("ip link add dev {} type wireguard failed: {}", iface, stderr.trim());
     }
 
-    // With Table = off, wg-quick skips routing. We add our own default route
-    // through the WireGuard interface, similar to how Eddie manages routing directly.
-    if let Err(e) = setup_routing(&iface, endpoint_ip) {
-        // Clean up WireGuard interface if routing setup fails
-        let _ = Command::new("timeout").args(["30", "wg-quick", "down", &config_path]).output();
-        let _ = std::fs::remove_file(&config_path);
+    // 2. Load config (keys + peer) — private key stays in file, not on cmdline
+    let output = Command::new("wg")
+        .args(["setconf", &iface, &config_path])
+        .output()
+        .context("failed to execute: wg setconf")?;
+    if !output.status.success() {
+        cleanup_all(&iface, &config_path);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("wg setconf {} {} failed: {}", iface, config_path, stderr.trim());
+    }
+
+    // 3. Add IPv4 address only (no IPv6 — matches Eddie's in-block mode)
+    let output = Command::new("ip")
+        .args(["-4", "address", "add", &params.ipv4_address, "dev", &iface])
+        .output()
+        .context("failed to execute: ip address add")?;
+    if !output.status.success() {
+        cleanup_all(&iface, &config_path);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("ip -4 address add {} dev {} failed: {}", params.ipv4_address, iface, stderr.trim());
+    }
+
+    // 4. Set MTU
+    let mtu_str = WG_MTU.to_string();
+    let output = Command::new("ip")
+        .args(["link", "set", "mtu", &mtu_str, "dev", &iface])
+        .output()
+        .context("failed to execute: ip link set mtu")?;
+    if !output.status.success() {
+        cleanup_all(&iface, &config_path);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("ip link set mtu {} dev {} failed: {}", WG_MTU, iface, stderr.trim());
+    }
+
+    // 5. Bring interface up
+    let output = Command::new("ip")
+        .args(["link", "set", "up", "dev", &iface])
+        .output()
+        .context("failed to execute: ip link set up")?;
+    if !output.status.success() {
+        cleanup_all(&iface, &config_path);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("ip link set up dev {} failed: {}", iface, stderr.trim());
+    }
+
+    // 6. Optionally enable IPv6 on the WG interface (for "in" / "in-block" mode)
+    //    The interface inherits disable_ipv6=1 from the default sysctl template.
+    //    We explicitly re-enable IPv6 on just this interface, then add the address.
+    //    This is race-free: all other interfaces stay blocked.
+    if ipv6_enabled && !params.ipv6_address.is_empty() {
+        let disable_path = format!("/proc/sys/net/ipv6/conf/{}/disable_ipv6", iface);
+        if let Err(e) = std::fs::write(&disable_path, "0") {
+            warn!("failed to re-enable IPv6 on {}: {} (continuing without IPv6)", iface, e);
+        } else {
+            let output = Command::new("ip")
+                .args(["-6", "address", "add", &params.ipv6_address, "dev", &iface])
+                .output()
+                .context("failed to execute: ip -6 address add")?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                warn!("ip -6 address add {} dev {} failed: {} (continuing without IPv6)",
+                      params.ipv6_address, iface, stderr.trim());
+            } else {
+                debug!("IPv6 address {} added to {}", params.ipv6_address, iface);
+            }
+        }
+    }
+
+    // 7. Set up policy routing through the tunnel
+    if let Err(e) = setup_routing(&iface, &params.endpoint_ip) {
+        cleanup_all(&iface, &config_path);
         return Err(e);
     }
 
@@ -356,14 +454,12 @@ fn get_default_gateway_v6() -> Result<String> {
 
 /// Set up routing for the VPN tunnel.
 ///
-/// Since we use `Table = off` (to avoid wg-quick's nft rules conflicting with
-/// our netlock), we need to add routes ourselves. This is closer to what Eddie
-/// does (Eddie manages routing via ip commands, not wg-quick).
+/// We manage routing directly via `ip` commands (no wg-quick). This matches
+/// what Eddie does (Eddie manages routing via ip commands).
 ///
 /// The sequence is critical to avoid a routing loop:
 /// 1. Set fwmark on WireGuard interface so its encrypted packets use the main
-///    routing table (not table 51820). This matches what wg-quick does when
-///    `Table` is not `off`.
+///    routing table (not table 51820).
 /// 2. Save the original default gateway before any route changes.
 /// 3. Add a host route for the VPN endpoint through the original gateway so
 ///    encrypted packets can reach the server.
@@ -545,7 +641,12 @@ fn teardown_routing(_iface: &str, endpoint_ip: &str) {
     }
 }
 
-/// Run `wg-quick down` to disconnect the WireGuard tunnel.
+/// Disconnect the WireGuard tunnel using direct `ip` commands (no wg-quick).
+///
+/// Steps:
+/// 1. Tear down routing rules (policy routes, endpoint host route)
+/// 2. Delete the WireGuard interface (`ip link delete`)
+/// 3. Clean up the config file (contains private key)
 ///
 /// `endpoint_ip` is the VPN server's entry IP, needed to clean up the host
 /// route added during `setup_routing`. Pass an empty string if unknown
@@ -564,23 +665,32 @@ pub fn disconnect(config_path: &str, endpoint_ip: &str) -> Result<()> {
         }
     }
 
-    // Tear down routing rules before wg-quick removes the interface
-    // (derive interface name from config path)
-    if let Some(iface) = Path::new(config_path).file_stem().map(|s| s.to_string_lossy().to_string()) {
-        teardown_routing(&iface, endpoint_ip);
+    // Derive interface name from config path (basename without .conf)
+    let iface = Path::new(config_path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string());
+
+    // 1. Tear down routing rules before removing the interface
+    if let Some(ref iface) = iface {
+        teardown_routing(iface, endpoint_ip);
     }
 
-    let output = Command::new("timeout")
-        .args(["30", "wg-quick", "down", config_path])
-        .output()
-        .context("failed to execute wg-quick down (with 30s timeout)")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("wg-quick down failed: {}", stderr);
+    // 2. Delete the WireGuard interface
+    if let Some(ref iface) = iface {
+        let output = Command::new("ip")
+            .args(["link", "delete", "dev", iface])
+            .output()
+            .context("failed to execute: ip link delete")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Non-fatal if interface already gone (e.g., crashed, removed externally)
+            if !stderr.contains("Cannot find device") {
+                anyhow::bail!("ip link delete dev {} failed: {}", iface, stderr.trim());
+            }
+        }
     }
 
-    // Clean up the config file
+    // 3. Clean up the config file (contains private key)
     let _ = std::fs::remove_file(config_path);
 
     Ok(())
@@ -744,19 +854,22 @@ mod tests {
         let mode = test_mode();
         let user = test_user();
 
-        let (config, endpoint_ip) = generate_config(&key, &server, &mode, &user).unwrap();
+        let params = generate_config(&key, &server, &mode, &user).unwrap();
+        let config = &*params.wg_config;
 
-        // Verify returned endpoint IP matches what's in the config
-        assert_eq!(endpoint_ip, "185.32.12.1", "returned endpoint IP should match config");
+        // Verify returned fields
+        assert_eq!(params.endpoint_ip, "185.32.12.1");
+        assert_eq!(params.ipv4_address, "10.128.0.42/32");
+        assert_eq!(params.ipv6_address, "fd7d:76ee:3c49:9950::42/128");
 
-        // Check [Interface] section
+        // Check [Interface] section — wg-native format (no Address/MTU/Table)
         assert!(config.contains("[Interface]"));
         assert!(config.contains(&format!("PrivateKey = {}", TEST_PRIVATE_KEY)));
-        assert!(config.contains("Address = 10.128.0.42/32, fd7d:76ee:3c49:9950::42/128"));
-        assert!(config.contains("MTU = 1320"));
-        assert!(config.contains("Table = off"), "Table = off must be present to prevent wg-quick nft conflicts");
-        // DNS is NOT in config — managed by dns.rs to avoid double-configuration
-        assert!(!config.contains("DNS ="), "DNS line should not be in WireGuard config (managed by dns.rs)");
+        // These wg-quick extensions must NOT be present
+        assert!(!config.contains("Address ="), "Address is a wg-quick extension, not wg-native");
+        assert!(!config.contains("MTU ="), "MTU is a wg-quick extension, not wg-native");
+        assert!(!config.contains("Table ="), "Table is a wg-quick extension, not wg-native");
+        assert!(!config.contains("DNS ="), "DNS is a wg-quick extension, not wg-native");
 
         // Check [Peer] section
         assert!(config.contains("[Peer]"));
@@ -775,7 +888,8 @@ mod tests {
         let mode = test_mode();
         let user = test_user();
 
-        let (config, _endpoint_ip) = generate_config(&key, &server, &mode, &user).unwrap();
+        let params = generate_config(&key, &server, &mode, &user).unwrap();
+        let config = &*params.wg_config;
         assert!(
             !config.contains("PresharedKey"),
             "empty preshared key should not produce PresharedKey line"
@@ -796,7 +910,8 @@ mod tests {
             entry_index: 1,
         };
 
-        let (config, _endpoint_ip) = generate_config(&key, &server, &mode, &user).unwrap();
+        let params = generate_config(&key, &server, &mode, &user).unwrap();
+        let config = &*params.wg_config;
         assert!(
             config.contains("Endpoint = 185.32.12.2:1637"),
             "should use second entry IP when entry_index=1"
@@ -817,7 +932,8 @@ mod tests {
             entry_index: 99,
         };
 
-        let (config, _endpoint_ip) = generate_config(&key, &server, &mode, &user).unwrap();
+        let params = generate_config(&key, &server, &mode, &user).unwrap();
+        let config = &*params.wg_config;
         assert!(
             config.contains("Endpoint = 185.32.12.1:1637"),
             "should fall back to first entry IP when entry_index is out of bounds"
@@ -877,7 +993,8 @@ mod tests {
             warning_closed: String::new(),
         };
 
-        let (config, _endpoint_ip) = generate_config(&key, &server, &mode, &user).unwrap();
+        let params = generate_config(&key, &server, &mode, &user).unwrap();
+        let config = &*params.wg_config;
         assert!(
             config.contains("Endpoint = [fd00::1]:1637"),
             "IPv6 endpoint should be wrapped in brackets, got: {}",
@@ -898,7 +1015,8 @@ mod tests {
             entry_index: 0,
         };
 
-        let (config, _endpoint_ip) = generate_config(&key, &server, &mode, &user).unwrap();
+        let params = generate_config(&key, &server, &mode, &user).unwrap();
+        let config = &*params.wg_config;
         assert!(config.contains("Endpoint = 185.32.12.1:443"));
     }
 
@@ -909,7 +1027,8 @@ mod tests {
         let mode = test_mode();
         let user = test_user();
 
-        let (config, _endpoint_ip) = generate_config(&key, &server, &mode, &user).unwrap();
+        let params = generate_config(&key, &server, &mode, &user).unwrap();
+        let config = &*params.wg_config;
 
         let interface_pos = config.find("[Interface]").expect("[Interface]");
         let peer_pos = config.find("[Peer]").expect("[Peer]");
@@ -957,7 +1076,8 @@ mod tests {
             warning_closed: String::new(),
         };
 
-        let (config, _endpoint_ip) = generate_config(&key, &server, &mode, &user).unwrap();
+        let params = generate_config(&key, &server, &mode, &user).unwrap();
+        let config = &*params.wg_config;
         assert!(
             config.contains("Endpoint = 203.0.113.1:1637"),
             "should prefer IPv4 even when IPv6 is listed first, got: {}",
@@ -996,7 +1116,8 @@ mod tests {
             warning_closed: String::new(),
         };
 
-        let (config, _endpoint_ip) = generate_config(&key, &server, &mode, &user).unwrap();
+        let params = generate_config(&key, &server, &mode, &user).unwrap();
+        let config = &*params.wg_config;
         assert!(
             config.contains("Endpoint = [2001:db8::1]:1637"),
             "should fall back to IPv6 when no IPv4 available, got: {}",
@@ -1037,7 +1158,8 @@ mod tests {
             warning_closed: String::new(),
         };
 
-        let (config, _endpoint_ip) = generate_config(&key, &server, &mode, &user).unwrap();
+        let params = generate_config(&key, &server, &mode, &user).unwrap();
+        let config = &*params.wg_config;
         assert!(
             config.contains("Endpoint = [2001:db8::2]:1637"),
             "should use IPv6 at entry_index=1 when no IPv4, got: {}",

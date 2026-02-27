@@ -6,6 +6,28 @@ use clap::{Parser, Subcommand};
 use log::{debug, error, info, warn};
 use zeroize::Zeroizing;
 
+/// IPv6 mode matching Eddie's `network.ipv6.mode` setting.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Ipv6Mode {
+    /// Always route IPv6 through the VPN tunnel.
+    In,
+    /// Route IPv6 through tunnel if server supports it, block otherwise (Eddie default).
+    InBlock,
+    /// Always block IPv6.
+    Block,
+}
+
+impl Ipv6Mode {
+    fn parse(s: &str) -> anyhow::Result<Self> {
+        match s.to_lowercase().as_str() {
+            "in" => Ok(Ipv6Mode::In),
+            "in-block" => Ok(Ipv6Mode::InBlock),
+            "block" => Ok(Ipv6Mode::Block),
+            _ => anyhow::bail!("invalid --ipv6-mode '{}': expected 'in', 'in-block', or 'block'", s),
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "airvpn", about = "AirVPN WireGuard client")]
 struct Cli {
@@ -241,14 +263,14 @@ fn main() -> anyhow::Result<()> {
 
 /// Verify system prerequisites before connecting.
 ///
-/// Checks that we're running as root (needed for nft and wg-quick) and that
+/// Checks that we're running as root (needed for nft and wg/ip) and that
 /// required binaries are in PATH.
 fn preflight_checks() -> anyhow::Result<()> {
     if !nix::unistd::geteuid().is_root() {
-        anyhow::bail!("must run as root (need nft + wg-quick access)");
+        anyhow::bail!("must run as root (need nft + wg + ip access)");
     }
-    if std::process::Command::new("wg-quick").arg("--help").output().is_err() {
-        anyhow::bail!("wg-quick not found in PATH");
+    if std::process::Command::new("wg").arg("--version").output().is_err() {
+        anyhow::bail!("wg (wireguard-tools) not found in PATH");
     }
     if std::process::Command::new("nft").arg("--version").output().is_err() {
         anyhow::bail!("nft not found in PATH");
@@ -299,7 +321,7 @@ fn cmd_connect(
     no_lock_last: bool,
     no_start_last: bool,
 ) -> anyhow::Result<()> {
-    // 0. Pre-flight checks (root, wg-quick, nft)
+    // 0. Pre-flight checks (root, wg, nft)
     preflight_checks()?;
 
     // Unconditional cleanup: restore orphaned DNS backup from SIGKILL (Eddie: OnRecoveryAlways)
@@ -526,8 +548,19 @@ fn cmd_connect(
     let mut manifest = manifest;
     let mut user_info = user_info;
 
-    // 7b. Block IPv6 on all interfaces ONCE before the main loop
-    // (Eddie default: network.ipv6.mode="in-block").
+    // 7b. Resolve IPv6 mode from profile (Eddie: network.ipv6.mode, default: in-block)
+    let ipv6_mode = {
+        let mode_str = profile_options.get("network.ipv6.mode")
+            .cloned()
+            .unwrap_or_else(|| "in-block".to_string());
+        Ipv6Mode::parse(&mode_str)?
+    };
+    info!("IPv6 mode: {:?}", ipv6_mode);
+
+    // 7c. Block IPv6 on all interfaces ONCE before the main loop.
+    // Always blocks everything (including default) regardless of ipv6_mode.
+    // In "in" mode, IPv6 is selectively re-enabled on just the WG interface
+    // after creation — this prevents any race where a non-VPN interface gets IPv6.
     // Done here rather than inside the loop because ipv6::block_all() returns
     // an empty list when interfaces are already blocked. Calling it again on
     // reconnection would overwrite the recovery state with an empty list,
@@ -648,6 +681,20 @@ fn cmd_connect(
         if !server_ref.support_ipv4 {
             warn!("server {} does not advertise IPv4 support", server_ref.name);
         }
+
+        // Compute effective IPv6 for this connection (depends on server + mode)
+        let ipv6_enabled = match ipv6_mode {
+            Ipv6Mode::In => true,
+            Ipv6Mode::InBlock => server_ref.support_ipv6,
+            Ipv6Mode::Block => false,
+        };
+        if ipv6_enabled {
+            info!("IPv6 enabled for {} (mode={:?}, server.support_ipv6={})",
+                  server_ref.name, ipv6_mode, server_ref.support_ipv6);
+        }
+        // dns_ipv6 is used by activate, check_and_reapply, and verify_resolv_conf
+        // throughout the loop body (including the monitor loop after the setup closure).
+        let dns_ipv6: &str = if ipv6_enabled { &wg_key.wg_dns_ipv6 } else { "" };
 
         // 7. Activate network lock BEFORE auth (Eddie: Session.cs:57-64 —
         // netlock activates at session start, before server selection or auth.
@@ -808,7 +855,8 @@ fn cmd_connect(
         })?;
 
         // 8. Generate WireGuard config and connect
-        let (wg_config, endpoint_ip) = wireguard::generate_config(wg_key, server_ref, mode, &user_info)?;
+        let wg_params = wireguard::generate_config(wg_key, server_ref, mode, &user_info)?;
+        let endpoint_ip = wg_params.endpoint_ip.clone();
         debug!(
             "WireGuard config: endpoint={}, ipv4={}, ipv6={}, dns={}/{}, mode={} (keys redacted)",
             endpoint_ip,
@@ -819,7 +867,7 @@ fn cmd_connect(
             mode.title,
         );
         info!("Connecting to {} via mode {}...", server_ref.name, mode.title);
-        let (config_path, iface) = match wireguard::connect(&wg_config, &endpoint_ip) {
+        let (config_path, iface) = match wireguard::connect(&wg_params, ipv6_enabled) {
             Ok(result) => {
                 consecutive_failures = 0;
                 result
@@ -919,12 +967,14 @@ fn cmd_connect(
             }
 
             // 10. Activate DNS
-            debug!("Activating DNS: ipv4={}, ipv6={}, iface={}", wg_key.wg_dns_ipv4, wg_key.wg_dns_ipv6, iface);
-            dns::activate(&wg_key.wg_dns_ipv4, &wg_key.wg_dns_ipv6, &iface)?;
-            info!("DNS configured: {}, {}", wg_key.wg_dns_ipv4, wg_key.wg_dns_ipv6);
+            //     IPv6 DNS is included only when ipv6_enabled (matches Eddie's mode logic).
+            debug!("Activating DNS: ipv4={}, ipv6={}, iface={}", wg_key.wg_dns_ipv4, dns_ipv6, iface);
+            dns::activate(&wg_key.wg_dns_ipv4, dns_ipv6, &iface)?;
+            info!("DNS configured: {}{}", wg_key.wg_dns_ipv4,
+                  if dns_ipv6.is_empty() { String::new() } else { format!(", {}", dns_ipv6) });
 
             // Client-side DNS verification: ensure resolv.conf contains only VPN DNS
-            if !dns::verify_resolv_conf(&wg_key.wg_dns_ipv4, &wg_key.wg_dns_ipv6, std::path::Path::new("/etc/resolv.conf")) {
+            if !dns::verify_resolv_conf(&wg_key.wg_dns_ipv4, dns_ipv6, std::path::Path::new("/etc/resolv.conf")) {
                 warn!("resolv.conf contains non-VPN nameservers after DNS activation — potential DNS leak");
             }
 
@@ -1007,7 +1057,7 @@ fn cmd_connect(
 
             // 10d. Client-side DNS verification: resolv.conf should only contain VPN DNS
             if !verify_failed && !shutdown.load(Ordering::Relaxed) {
-                if !dns::verify_resolv_conf(&wg_key.wg_dns_ipv4, &wg_key.wg_dns_ipv6, std::path::Path::new("/etc/resolv.conf")) {
+                if !dns::verify_resolv_conf(&wg_key.wg_dns_ipv4, dns_ipv6, std::path::Path::new("/etc/resolv.conf")) {
                     warn!("resolv.conf contains non-VPN nameservers — potential DNS leak");
                     verify_failed = true;
                 }
@@ -1076,7 +1126,7 @@ fn cmd_connect(
             }
 
             // Periodic DNS re-check (matching Eddie's DnsSwitchCheck)
-            match dns::check_and_reapply(&wg_key.wg_dns_ipv4, &wg_key.wg_dns_ipv6, &iface) {
+            match dns::check_and_reapply(&wg_key.wg_dns_ipv4, dns_ipv6, &iface) {
                 Ok(_) => { dns_fail_count = 0; }
                 Err(e) => {
                     dns_fail_count += 1;
@@ -1093,7 +1143,7 @@ fn cmd_connect(
 
             // Client-side resolv.conf verification: catch DNS leaks that the
             // server-side check cannot detect (non-VPN nameservers in resolv.conf).
-            if !dns::verify_resolv_conf(&wg_key.wg_dns_ipv4, &wg_key.wg_dns_ipv6, std::path::Path::new("/etc/resolv.conf")) {
+            if !dns::verify_resolv_conf(&wg_key.wg_dns_ipv4, dns_ipv6, std::path::Path::new("/etc/resolv.conf")) {
                 warn!("resolv.conf contains non-VPN nameservers — potential DNS leak (check_and_reapply should fix on next cycle)");
             }
 
@@ -1216,7 +1266,7 @@ fn partial_disconnect(config_path: &str, iface: &str, lock_active: bool, endpoin
     if lock_active && !iface.is_empty() {
         let _ = netlock::deallow_interface(iface);
     }
-    // 2. wg-quick down
+    // 2. Tear down WireGuard
     let _ = wireguard::disconnect(config_path, endpoint_ip);
     // NOTE: DNS is intentionally kept active — deactivating would restore the
     // original resolv.conf, leaking queries through --allow-lan LAN rules.
@@ -1231,7 +1281,7 @@ fn cmd_disconnect_internal(config_path: &str, iface: &str, lock_active: bool, bl
             let _ = netlock::deallow_interface(iface);
         }
     }
-    // 2. wg-quick down (also tears down routing + endpoint host route)
+    // 2. Tear down WireGuard (also tears down routing + endpoint host route)
     let _ = wireguard::disconnect(config_path, endpoint_ip);
     // 3. Restore DNS
     let _ = dns::deactivate();
