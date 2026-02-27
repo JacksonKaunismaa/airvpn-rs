@@ -20,6 +20,12 @@ use std::process::Command;
 const TABLE_NAME: &str = "airvpn_lock";
 const PRIORITY: i32 = -300;
 
+/// Path to the persistent lock rules file.
+pub const PERSISTENT_RULES_PATH: &str = "/etc/airvpn-rs/lock.nft";
+
+/// Path to the persistent lock systemd service.
+pub const PERSISTENT_SERVICE_PATH: &str = "/etc/systemd/system/airvpn-lock.service";
+
 /// Configuration for the network lock.
 ///
 /// Eddie splits allowlisted IPs into two categories:
@@ -441,6 +447,77 @@ pub fn is_active() -> bool {
         Ok(o) => o.status.success(),
         Err(_) => false,
     }
+}
+
+/// Check if the persistent lock is installed (rules file exists on disk).
+///
+/// This is the decision point at disconnect/recovery time: if the file exists,
+/// we keep the base table alive; if not, we delete the whole table.
+pub fn is_persistent() -> bool {
+    std::path::Path::new(PERSISTENT_RULES_PATH).exists()
+}
+
+/// Reclaim ownership of an existing table (persistent lock loaded at boot).
+///
+/// Sends `add table inet airvpn_lock { flags owner, persist; }` which:
+/// - If table is orphaned: assigns us as owner
+/// - If table is owned by us already: no-op
+/// - If table is owned by another process: fails with EOPNOTSUPP
+pub fn reclaim_ownership() -> Result<()> {
+    let cmd = format!(
+        "add table inet {} {{ flags owner, persist; }}\n",
+        TABLE_NAME
+    );
+    let mut tmpfile =
+        tempfile::NamedTempFile::new().context("failed to create temp nft file")?;
+    tmpfile
+        .write_all(cmd.as_bytes())
+        .context("failed to write nft command")?;
+    tmpfile.flush().context("failed to flush nft command")?;
+
+    let output = Command::new("nft")
+        .arg("-f")
+        .arg(tmpfile.path())
+        .output()
+        .context("failed to execute nft")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("failed to reclaim table ownership: {}", stderr);
+    }
+    Ok(())
+}
+
+/// Release ownership of the table (no-op — ownership releases when process exits).
+///
+/// The table stays active because of the `persist` flag. On next connect,
+/// `reclaim_ownership()` re-asserts ownership.
+pub fn release_ownership() {
+    // No-op: ownership releases automatically when process exits.
+    // The table stays because of the persist flag.
+}
+
+/// Add a single server IP to the output chain allowlist.
+///
+/// Used in persistent lock mode to dynamically allow the VPN server endpoint.
+pub fn allow_server_ip(ip: &str) -> Result<()> {
+    let cidr = ensure_cidr(ip);
+    let (prefix, addr) = match classify_ip(&cidr) {
+        Some(IpVersion::V4) => ("ip daddr", cidr.as_str()),
+        Some(IpVersion::V6) => ("ip6 daddr", cidr.as_str()),
+        None => anyhow::bail!("invalid server IP: {}", ip),
+    };
+    let comment = format!("airvpn_server_endpoint_{}", ip.replace(':', "_"));
+    nft_insert_before_latest(
+        "output",
+        &format!("{} {} counter accept comment \"{}\"", prefix, addr, comment),
+    )
+}
+
+/// Remove a server IP from the output chain allowlist.
+pub fn deallow_server_ip(ip: &str) -> Result<()> {
+    let comment = format!("airvpn_server_endpoint_{}", ip.replace(':', "_"));
+    nft_delete_by_comment("output", &comment)
 }
 
 /// Allow VPN interface traffic (called when tunnel comes up).
