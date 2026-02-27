@@ -86,6 +86,39 @@ enum Commands {
         /// supports it, "block" = always block. Default: read from profile.
         #[arg(long)]
         ipv6_mode: Option<String>,
+        /// Custom DNS server (repeatable). Overrides AirVPN DNS.
+        /// (Eddie: dns.servers — comma-separated in profile)
+        #[arg(long = "dns")]
+        dns_servers: Vec<String>,
+        // Event hooks (Eddie: ProfileOptions.EnsureDefaultsEvent, Engine.RunEventCommand).
+        // CLI overrides profile, not saved.
+        /// Script to run before VPN connection (Eddie: event.vpn.pre.filename)
+        #[arg(long = "event.vpn.pre.filename")]
+        event_vpn_pre_filename: Option<String>,
+        /// Arguments for vpn.pre script (Eddie: event.vpn.pre.arguments)
+        #[arg(long = "event.vpn.pre.arguments")]
+        event_vpn_pre_arguments: Option<String>,
+        /// Wait for vpn.pre script to finish (Eddie: event.vpn.pre.waitend, default: true)
+        #[arg(long = "event.vpn.pre.waitend")]
+        event_vpn_pre_waitend: Option<String>,
+        /// Script to run after VPN connects (Eddie: event.vpn.up.filename)
+        #[arg(long = "event.vpn.up.filename")]
+        event_vpn_up_filename: Option<String>,
+        /// Arguments for vpn.up script (Eddie: event.vpn.up.arguments)
+        #[arg(long = "event.vpn.up.arguments")]
+        event_vpn_up_arguments: Option<String>,
+        /// Wait for vpn.up script to finish (Eddie: event.vpn.up.waitend, default: true)
+        #[arg(long = "event.vpn.up.waitend")]
+        event_vpn_up_waitend: Option<String>,
+        /// Script to run after VPN disconnects (Eddie: event.vpn.down.filename)
+        #[arg(long = "event.vpn.down.filename")]
+        event_vpn_down_filename: Option<String>,
+        /// Arguments for vpn.down script (Eddie: event.vpn.down.arguments)
+        #[arg(long = "event.vpn.down.arguments")]
+        event_vpn_down_arguments: Option<String>,
+        /// Wait for vpn.down script to finish (Eddie: event.vpn.down.waitend, default: true)
+        #[arg(long = "event.vpn.down.waitend")]
+        event_vpn_down_waitend: Option<String>,
     },
     /// Disconnect from AirVPN
     Disconnect,
@@ -111,6 +144,26 @@ enum Commands {
     },
     /// Clean up stale state after crash
     Recover,
+}
+
+/// Rotate log file if it exceeds 5MB. Keeps at most 3 files:
+/// {path}, {path}.1, {path}.2. Called before opening the log file.
+fn rotate_log(path: &str) {
+    const MAX_SIZE: u64 = 5 * 1024 * 1024; // 5 MB
+    let p = std::path::Path::new(path);
+    let size = match std::fs::metadata(p) {
+        Ok(m) => m.len(),
+        Err(_) => return, // file doesn't exist yet, nothing to rotate
+    };
+    if size < MAX_SIZE {
+        return;
+    }
+    // Rotate: .2 is deleted, .1 → .2, current → .1
+    let p2 = format!("{}.2", path);
+    let p1 = format!("{}.1", path);
+    let _ = std::fs::remove_file(&p2);
+    let _ = std::fs::rename(&p1, &p2);
+    let _ = std::fs::rename(path, &p1);
 }
 
 fn init_logging() {
@@ -185,6 +238,9 @@ fn init_logging() {
         ),
     ];
 
+    // Rotate log file if it's grown too large (>5MB → keep 3 files max).
+    rotate_log(&log_path);
+
     // File logger: DEBUG level with timestamps — mode 0o600 (owner-only read/write)
     match std::fs::OpenOptions::new()
         .create(true)
@@ -239,6 +295,16 @@ fn main() -> anyhow::Result<()> {
             no_lock_last,
             no_start_last,
             ipv6_mode,
+            dns_servers,
+            event_vpn_pre_filename,
+            event_vpn_pre_arguments,
+            event_vpn_pre_waitend,
+            event_vpn_up_filename,
+            event_vpn_up_arguments,
+            event_vpn_up_waitend,
+            event_vpn_down_filename,
+            event_vpn_down_arguments,
+            event_vpn_down_waitend,
         } => cmd_connect(
             &mut provider_config,
             server,
@@ -256,6 +322,10 @@ fn main() -> anyhow::Result<()> {
             no_lock_last,
             no_start_last,
             ipv6_mode,
+            dns_servers,
+            [event_vpn_pre_filename, event_vpn_pre_arguments, event_vpn_pre_waitend],
+            [event_vpn_up_filename, event_vpn_up_arguments, event_vpn_up_waitend],
+            [event_vpn_down_filename, event_vpn_down_arguments, event_vpn_down_waitend],
         ),
         Commands::Disconnect => cmd_disconnect(),
         Commands::Status => cmd_status(),
@@ -308,6 +378,80 @@ enum ResetLevel {
 }
 
 // ---------------------------------------------------------------------------
+// Event hooks (Eddie: ProfileOptions.EnsureDefaultsEvent, Engine.RunEventCommand)
+// ---------------------------------------------------------------------------
+
+/// VPN lifecycle event hook (Eddie: event.vpn.{pre,up,down}).
+///
+/// Each event has filename, arguments, and waitend (synchronous vs async).
+/// Eddie ref: Engine.cs RunEventCommand() lines 1546-1563.
+struct EventHook {
+    filename: String,
+    arguments: String,
+    wait_end: bool,
+}
+
+impl EventHook {
+    fn is_empty(&self) -> bool {
+        self.filename.trim().is_empty()
+    }
+
+    /// Resolve hook from CLI flags (highest priority) then profile options.
+    /// Matches Eddie: CLI overrides profile, not saved.
+    fn resolve(
+        event: &str,
+        cli_filename: &Option<String>,
+        cli_arguments: &Option<String>,
+        cli_waitend: &Option<String>,
+        profile: &std::collections::HashMap<String, String>,
+    ) -> Self {
+        let key_fn = format!("event.{}.filename", event);
+        let key_args = format!("event.{}.arguments", event);
+        let key_wait = format!("event.{}.waitend", event);
+        EventHook {
+            filename: cli_filename.clone()
+                .or_else(|| profile.get(&key_fn).cloned())
+                .unwrap_or_default(),
+            arguments: cli_arguments.clone()
+                .or_else(|| profile.get(&key_args).cloned())
+                .unwrap_or_default(),
+            wait_end: cli_waitend.as_deref()
+                .or_else(|| profile.get(&key_wait).map(|s| s.as_str()))
+                .map(|v| !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true), // Eddie default: true
+        }
+    }
+}
+
+/// Run a VPN lifecycle event hook (fire-and-forget, matching Eddie).
+///
+/// Eddie: SystemExec.ExecForUserEvent ignores return values. We log
+/// exit codes and failures but never abort the connection.
+fn run_hook(hook: &EventHook, event: &str) {
+    if hook.is_empty() {
+        return;
+    }
+    info!("Running {} hook: {} {}", event, hook.filename, hook.arguments);
+    let mut cmd = std::process::Command::new(&hook.filename);
+    if !hook.arguments.is_empty() {
+        // Eddie: Process.Start(filename, arguments) — OS splits the argument string
+        cmd.args(hook.arguments.split_whitespace());
+    }
+    if hook.wait_end {
+        match cmd.status() {
+            Ok(s) if s.success() => debug!("{} hook completed", event),
+            Ok(s) => warn!("{} hook exited with {}", event, s),
+            Err(e) => warn!("{} hook failed: {}", event, e),
+        }
+    } else {
+        match cmd.spawn() {
+            Ok(_) => debug!("{} hook spawned (async)", event),
+            Err(e) => warn!("{} hook failed to spawn: {}", event, e),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Connect
 // ---------------------------------------------------------------------------
 
@@ -328,6 +472,10 @@ fn cmd_connect(
     no_lock_last: bool,
     no_start_last: bool,
     cli_ipv6_mode: Option<String>,
+    cli_dns_servers: Vec<String>,
+    cli_event_pre: [Option<String>; 3],   // [filename, arguments, waitend]
+    cli_event_up: [Option<String>; 3],
+    cli_event_down: [Option<String>; 3],
 ) -> anyhow::Result<()> {
     // 0. Pre-flight checks (root, wg, nft)
     preflight_checks()?;
@@ -388,6 +536,14 @@ fn cmd_connect(
     };
     // 2b. Load profile options once (used for credentials + locklast/startlast)
     let profile_options = config::load_profile_options();
+
+    // Resolve event hooks (Eddie: Engine.RunEventCommand, CLI overrides profile).
+    let hook_pre = EventHook::resolve(
+        "vpn.pre", &cli_event_pre[0], &cli_event_pre[1], &cli_event_pre[2], &profile_options);
+    let hook_up = EventHook::resolve(
+        "vpn.up", &cli_event_up[0], &cli_event_up[1], &cli_event_up[2], &profile_options);
+    let hook_down = EventHook::resolve(
+        "vpn.down", &cli_event_down[0], &cli_event_down[1], &cli_event_down[2], &profile_options);
 
     let (username, password) = config::resolve_credentials(
         cli_username.as_deref(),
@@ -565,6 +721,24 @@ fn cmd_connect(
     };
     info!("IPv6 mode: {:?}", ipv6_mode);
 
+    // 7b2. Resolve custom DNS (Eddie: dns.servers — comma-separated IPs).
+    // CLI --dns overrides profile dns.servers. If neither set, use AirVPN's DNS.
+    let custom_dns_ips: Vec<String> = if !cli_dns_servers.is_empty() {
+        cli_dns_servers
+    } else if let Some(profile_dns) = profile_options.get("dns.servers") {
+        profile_dns.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+    } else {
+        vec![]
+    };
+    if !custom_dns_ips.is_empty() {
+        // Validate all custom DNS IPs upfront
+        for ip in &custom_dns_ips {
+            ip.parse::<std::net::IpAddr>()
+                .map_err(|_| anyhow::anyhow!("invalid DNS server IP: {}", ip))?;
+        }
+        info!("Custom DNS servers: {}", custom_dns_ips.join(", "));
+    }
+
     // 7c. Block IPv6 on all interfaces ONCE before the main loop.
     // Always blocks everything (including default) regardless of ipv6_mode.
     // In "in" mode, IPv6 is selectively re-enabled on just the WG interface
@@ -700,9 +874,29 @@ fn cmd_connect(
             info!("IPv6 enabled for {} (mode={:?}, server.support_ipv6={})",
                   server_ref.name, ipv6_mode, server_ref.support_ipv6);
         }
+        // Effective DNS: custom dns.servers override AirVPN's DNS (Eddie: WireGuard.cs line 69).
         // dns_ipv6 is used by activate, check_and_reapply, and verify_resolv_conf
         // throughout the loop body (including the monitor loop after the setup closure).
-        let dns_ipv6: &str = if ipv6_enabled { &wg_key.wg_dns_ipv6 } else { "" };
+        let (effective_dns_ipv4, effective_dns_ipv6_owned): (String, String) = if !custom_dns_ips.is_empty() {
+            let ipv4 = custom_dns_ips.iter()
+                .find(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())
+                .cloned().unwrap_or_default();
+            let ipv6 = if ipv6_enabled {
+                custom_dns_ips.iter()
+                    .find(|ip| ip.parse::<std::net::Ipv6Addr>().is_ok())
+                    .cloned().unwrap_or_default()
+            } else {
+                String::new()
+            };
+            (ipv4, ipv6)
+        } else {
+            let ipv6 = if ipv6_enabled { wg_key.wg_dns_ipv6.clone() } else { String::new() };
+            (wg_key.wg_dns_ipv4.clone(), ipv6)
+        };
+        let dns_ipv6: &str = &effective_dns_ipv6_owned;
+
+        // 6b. Run vpn.pre hook (Eddie: Session.cs line 301, before connection starts)
+        run_hook(&hook_pre, "vpn.pre");
 
         // 7. Activate network lock BEFORE auth (Eddie: Session.cs:57-64 —
         // netlock activates at session start, before server selection or auth.
@@ -870,8 +1064,8 @@ fn cmd_connect(
             endpoint_ip,
             wg_key.wg_ipv4,
             wg_key.wg_ipv6,
-            wg_key.wg_dns_ipv4,
-            wg_key.wg_dns_ipv6,
+            effective_dns_ipv4,
+            effective_dns_ipv6_owned,
             mode.title,
         );
         info!("Connecting to {} via mode {}...", server_ref.name, mode.title);
@@ -976,13 +1170,13 @@ fn cmd_connect(
 
             // 10. Activate DNS
             //     IPv6 DNS is included only when ipv6_enabled (matches Eddie's mode logic).
-            debug!("Activating DNS: ipv4={}, ipv6={}, iface={}", wg_key.wg_dns_ipv4, dns_ipv6, iface);
-            dns::activate(&wg_key.wg_dns_ipv4, dns_ipv6, &iface)?;
-            info!("DNS configured: {}{}", wg_key.wg_dns_ipv4,
+            debug!("Activating DNS: ipv4={}, ipv6={}, iface={}", effective_dns_ipv4, dns_ipv6, iface);
+            dns::activate(&effective_dns_ipv4, dns_ipv6, &iface)?;
+            info!("DNS configured: {}{}", effective_dns_ipv4,
                   if dns_ipv6.is_empty() { String::new() } else { format!(", {}", dns_ipv6) });
 
             // Client-side DNS verification: ensure resolv.conf contains only VPN DNS
-            if !dns::verify_resolv_conf(&wg_key.wg_dns_ipv4, dns_ipv6, std::path::Path::new("/etc/resolv.conf")) {
+            if !dns::verify_resolv_conf(&effective_dns_ipv4, dns_ipv6, std::path::Path::new("/etc/resolv.conf")) {
                 warn!("resolv.conf contains non-VPN nameservers after DNS activation — potential DNS leak");
             }
 
@@ -1003,8 +1197,8 @@ fn cmd_connect(
                 lock_active: !no_lock,
                 wg_interface: iface.clone(),
                 wg_config_path: config_path.clone(),
-                dns_ipv4: wg_key.wg_dns_ipv4.clone(),
-                dns_ipv6: wg_key.wg_dns_ipv6.clone(),
+                dns_ipv4: effective_dns_ipv4.clone(),
+                dns_ipv6: effective_dns_ipv6_owned.clone(),
                 pid: std::process::id(),
                 blocked_ipv6_ifaces: blocked_ipv6_ifaces.clone(),
                 endpoint_ip: endpoint_ip.clone(),
@@ -1019,12 +1213,12 @@ fn cmd_connect(
             // the shutdown flag and disconnect cleanly.
             if shutdown.load(Ordering::Relaxed) {
                 warn!("Setup interrupted by shutdown signal, disconnecting...");
-                let _ = cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces, &endpoint_ip);
+                let _ = cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces, &endpoint_ip, &hook_down);
                 break;
             }
             error!("Setup failed after WireGuard connected: {:#}", e);
             warn!("Cleaning up...");
-            let _ = cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces, &endpoint_ip);
+            let _ = cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces, &endpoint_ip, &hook_down);
             return Err(e);
         }
 
@@ -1065,7 +1259,7 @@ fn cmd_connect(
 
             // 10d. Client-side DNS verification: resolv.conf should only contain VPN DNS
             if !verify_failed && !shutdown.load(Ordering::Relaxed) {
-                if !dns::verify_resolv_conf(&wg_key.wg_dns_ipv4, dns_ipv6, std::path::Path::new("/etc/resolv.conf")) {
+                if !dns::verify_resolv_conf(&effective_dns_ipv4, dns_ipv6, std::path::Path::new("/etc/resolv.conf")) {
                     warn!("resolv.conf contains non-VPN nameservers — potential DNS leak");
                     verify_failed = true;
                 }
@@ -1107,6 +1301,9 @@ fn cmd_connect(
             }
         );
 
+        // 12b. Run vpn.up hook (Eddie: Session.cs line 799, after VPN established)
+        run_hook(&hook_up, "vpn.up");
+
         // 13. Monitor loop — determines ResetLevel when connection ends
         let mut dns_fail_count: u32 = 0;
         let reset_level = loop {
@@ -1134,7 +1331,7 @@ fn cmd_connect(
             }
 
             // Periodic DNS re-check (matching Eddie's DnsSwitchCheck)
-            match dns::check_and_reapply(&wg_key.wg_dns_ipv4, dns_ipv6, &iface) {
+            match dns::check_and_reapply(&effective_dns_ipv4, dns_ipv6, &iface) {
                 Ok(_) => { dns_fail_count = 0; }
                 Err(e) => {
                     dns_fail_count += 1;
@@ -1151,7 +1348,7 @@ fn cmd_connect(
 
             // Client-side resolv.conf verification: catch DNS leaks that the
             // server-side check cannot detect (non-VPN nameservers in resolv.conf).
-            if !dns::verify_resolv_conf(&wg_key.wg_dns_ipv4, dns_ipv6, std::path::Path::new("/etc/resolv.conf")) {
+            if !dns::verify_resolv_conf(&effective_dns_ipv4, dns_ipv6, std::path::Path::new("/etc/resolv.conf")) {
                 warn!("resolv.conf contains non-VPN nameservers — potential DNS leak (check_and_reapply should fix on next cycle)");
             }
 
@@ -1162,13 +1359,13 @@ fn cmd_connect(
         match reset_level {
             ResetLevel::None | ResetLevel::Fatal => {
                 // User-requested disconnect or fatal error — full cleanup
-                cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces, &endpoint_ip)?;
+                cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces, &endpoint_ip, &hook_down)?;
                 break;
             }
             ResetLevel::Error => {
                 if no_reconnect {
                     // Exiting — full cleanup
-                    cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces, &endpoint_ip)?;
+                    cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces, &endpoint_ip, &hook_down)?;
                     warn!("Connection lost (--no-reconnect, exiting).");
                     break;
                 }
@@ -1205,7 +1402,7 @@ fn cmd_connect(
             ResetLevel::Retry => {
                 if no_reconnect {
                     // Exiting — full cleanup
-                    cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces, &endpoint_ip)?;
+                    cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces, &endpoint_ip, &hook_down)?;
                     warn!("Connection lost (--no-reconnect, exiting).");
                     break;
                 }
@@ -1217,7 +1414,7 @@ fn cmd_connect(
             ResetLevel::Switch => {
                 if no_reconnect {
                     // Exiting — full cleanup
-                    cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces, &endpoint_ip)?;
+                    cmd_disconnect_internal(&config_path, &iface, !no_lock, &blocked_ipv6_ifaces, &endpoint_ip, &hook_down)?;
                     warn!("Server switch requested (--no-reconnect, exiting).");
                     break;
                 }
@@ -1240,6 +1437,10 @@ fn cmd_disconnect() -> anyhow::Result<()> {
     preflight_checks()?;
     let state = recovery::load()?.ok_or_else(|| anyhow::anyhow!("No active connection found"))?;
 
+    // Resolve vpn.down hook from profile (no CLI flags in disconnect path)
+    let profile_options = config::load_profile_options();
+    let hook_down = EventHook::resolve("vpn.down", &None, &None, &None, &profile_options);
+
     // If the connect process is still running, signal it to shut down gracefully
     if recovery::is_pid_alive(state.pid) && state.pid != std::process::id() {
         info!("Signaling PID {} to disconnect...", state.pid);
@@ -1258,7 +1459,7 @@ fn cmd_disconnect() -> anyhow::Result<()> {
         warn!("PID {} did not exit, forcing cleanup...", state.pid);
     }
 
-    cmd_disconnect_internal(&state.wg_config_path, &state.wg_interface, state.lock_active, &state.blocked_ipv6_ifaces, &state.endpoint_ip)
+    cmd_disconnect_internal(&state.wg_config_path, &state.wg_interface, state.lock_active, &state.blocked_ipv6_ifaces, &state.endpoint_ip, &hook_down)
 }
 
 /// Partial disconnect: tear down WireGuard only, keeping netlock, DNS, and IPv6
@@ -1282,7 +1483,7 @@ fn partial_disconnect(config_path: &str, iface: &str, lock_active: bool, endpoin
     Ok(())
 }
 
-fn cmd_disconnect_internal(config_path: &str, iface: &str, lock_active: bool, blocked_ipv6: &[String], endpoint_ip: &str) -> anyhow::Result<()> {
+fn cmd_disconnect_internal(config_path: &str, iface: &str, lock_active: bool, blocked_ipv6: &[String], endpoint_ip: &str, hook_down: &EventHook) -> anyhow::Result<()> {
     // 1. Remove interface-specific nft rules before deactivating table
     if lock_active {
         if !iface.is_empty() {
@@ -1291,6 +1492,9 @@ fn cmd_disconnect_internal(config_path: &str, iface: &str, lock_active: bool, bl
     }
     // 2. Tear down WireGuard (also tears down routing + endpoint host route)
     let _ = wireguard::disconnect(config_path, endpoint_ip);
+    // 2b. Run vpn.down hook (Eddie: Session.cs line 441, after disconnect/cleanup
+    // but BEFORE DNS restore and IPv6 restore)
+    run_hook(hook_down, "vpn.down");
     // 3. Restore DNS
     let _ = dns::deactivate();
     dns::flush();
