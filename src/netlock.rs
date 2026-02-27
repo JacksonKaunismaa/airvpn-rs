@@ -349,6 +349,26 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
     r
 }
 
+/// Generate the persistent lock ruleset for `/etc/airvpn-rs/lock.nft`.
+///
+/// This is a base ruleset with LAN, DHCP, ICMP, NDP, conntrack, and bootstrap
+/// API IPs. No server IPs, no tunnel interface, no `flags owner, persist`
+/// (those are set at runtime when airvpn-rs reclaims the table).
+///
+/// The systemd service loads this at boot with `nft -f`.
+pub fn generate_persistent_ruleset(bootstrap_ips: &[String]) -> String {
+    let config = NetlockConfig {
+        allow_lan: true,
+        allow_dhcp: true,
+        allow_ping: true,
+        allow_ipv4ipv6translation: true,
+        allowed_ips_incoming: vec![],
+        allowed_ips_outgoing: bootstrap_ips.to_vec(),
+        incoming_policy_accept: false,
+    };
+    generate_ruleset(&config)
+}
+
 /// Activate the network lock: write ruleset to tmpfile and load via `nft -f`.
 ///
 /// If the table already exists (e.g., reconnection), performs an atomic
@@ -1228,5 +1248,54 @@ mod tests {
         assert_ne!(hash_a, hash_b, "different inputs should produce different hashes");
         assert_eq!(hash_a.len(), 64);
         assert_eq!(hash_b.len(), 64);
+    }
+
+    // -------------------------------------------------------------------
+    // generate_persistent_ruleset tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_persistent_ruleset_has_bootstrap_ips() {
+        let bootstrap_ips = vec![
+            "63.33.78.166".to_string(),
+            "54.93.175.114".to_string(),
+            "82.196.3.205".to_string(),
+        ];
+        let ruleset = generate_persistent_ruleset(&bootstrap_ips);
+        assert!(ruleset.contains("table inet airvpn_lock"));
+        assert!(ruleset.contains("ip daddr 63.33.78.166/32"));
+        assert!(ruleset.contains("ip daddr 54.93.175.114/32"));
+        assert!(ruleset.contains("ip daddr 82.196.3.205/32"));
+        assert!(!ruleset.contains("flags"));
+        assert!(ruleset.contains("airvpn_filter_input_latest_rule"));
+        assert!(ruleset.contains("airvpn_filter_output_latest_rule"));
+        assert!(ruleset.contains("airvpn_filter_forward_latest_rule"));
+    }
+
+    #[test]
+    fn test_persistent_ruleset_no_server_ips_beyond_bootstrap() {
+        let bootstrap_ips = vec!["1.2.3.4".to_string()];
+        let ruleset = generate_persistent_ruleset(&bootstrap_ips);
+        // Only the bootstrap IP should be in output allowlist
+        assert!(ruleset.contains("ip daddr 1.2.3.4/32"));
+    }
+
+    #[test]
+    fn test_persistent_ruleset_ipv6_bootstrap() {
+        let bootstrap_ips = vec![
+            "1.2.3.4".to_string(),
+            "2a03:b0c0:0:1010::9b:c001".to_string(),
+        ];
+        let ruleset = generate_persistent_ruleset(&bootstrap_ips);
+        assert!(ruleset.contains("ip6 daddr 2a03:b0c0:0:1010::9b:c001/128"));
+    }
+
+    #[test]
+    fn test_persistent_ruleset_always_allows_lan() {
+        let ruleset = generate_persistent_ruleset(&vec![]);
+        assert!(ruleset.contains("192.168.0.0/16"));
+        assert!(ruleset.contains("10.0.0.0/8"));
+        assert!(ruleset.contains("172.16.0.0/12"));
+        assert!(ruleset.contains("fe80::/10"));
     }
 }
