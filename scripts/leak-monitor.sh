@@ -105,6 +105,31 @@ fi
 echo -e "${GREEN}VPN endpoint: ${ENDPOINT}${NC}"
 
 # -----------------------------------------------------------------------------
+# Auto-detect allowlisted IPs from nftables (bootstrap/API IPs)
+# These are deliberately permitted through the kill switch for VPN API calls
+# -----------------------------------------------------------------------------
+ALLOWED_IPS=()
+if command -v nft &>/dev/null; then
+    # Extract IPv4 IPs from nftables OUTPUT chain allowlist (daddr ... accept)
+    mapfile -t NFT_IPS < <(
+        nft list table inet airvpn_lock 2>/dev/null | \
+        grep -oP 'ip daddr \K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(?=\s.*accept.*comment.*eddie_ip)' | \
+        sort -u || true
+    )
+    # Extract IPv6 IPs
+    mapfile -t NFT_IPS6 < <(
+        nft list table inet airvpn_lock 2>/dev/null | \
+        grep -oP 'ip6 daddr \K[0-9a-f:]+(?=\s.*accept.*comment.*eddie_ip)' | \
+        sort -u || true
+    )
+    ALLOWED_IPS=("${NFT_IPS[@]}" "${NFT_IPS6[@]}")
+fi
+
+if [[ ${#ALLOWED_IPS[@]} -gt 0 ]]; then
+    echo -e "${GREEN}Allowlisted IPs (from nftables): ${#ALLOWED_IPS[@]} IPs${NC}"
+fi
+
+# -----------------------------------------------------------------------------
 # Auto-detect physical interfaces if not provided
 # -----------------------------------------------------------------------------
 if [[ ${#IFACES[@]} -eq 0 ]]; then
@@ -131,14 +156,24 @@ echo -e "${GREEN}Monitoring interfaces: ${IFACES[*]}${NC}"
 # -----------------------------------------------------------------------------
 build_filter() {
     local endpoint="$1"
+    shift
+    local -a allowed_ips=("$@")
 
-    # Everything NOT going to the endpoint and NOT local
+    # Everything NOT going to the endpoint/allowlisted IPs and NOT local
     # Exclude Layer 2 protocols (ARP, LLC/SNAP, STP, LLDP) — can't be tunneled, not IP leaks
     # This catches any potential leak
+
+    # Build the allowlist clause
+    local allowlist_clause=""
+    for ip in "${allowed_ips[@]}"; do
+        [[ -n "$ip" ]] && allowlist_clause="${allowlist_clause}    host $ip or
+"
+    done
+
     cat <<EOF
 not arp and not llc and not stp and not (
     host $endpoint or
-    host 127.0.0.1 or
+${allowlist_clause}    host 127.0.0.1 or
     net 224.0.0.0/4 or
     net 255.255.255.255/32 or
     (net 192.168.0.0/16 and dst net 192.168.0.0/16) or
@@ -156,7 +191,7 @@ and not (
 EOF
 }
 
-FILTER=$(build_filter "$ENDPOINT" | tr '\n' ' ')
+FILTER=$(build_filter "$ENDPOINT" "${ALLOWED_IPS[@]}" | tr '\n' ' ')
 
 # -----------------------------------------------------------------------------
 # Setup log directory

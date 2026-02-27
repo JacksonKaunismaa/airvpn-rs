@@ -81,6 +81,11 @@ enum Commands {
         /// Don't prefer the last-used server on startup (Eddie: servers.startlast)
         #[arg(long)]
         no_start_last: bool,
+        /// IPv6 mode (Eddie: network.ipv6.mode). Overrides profile setting.
+        /// "in" = always through tunnel, "in-block" = through tunnel if server
+        /// supports it, "block" = always block. Default: read from profile.
+        #[arg(long)]
+        ipv6_mode: Option<String>,
     },
     /// Disconnect from AirVPN
     Disconnect,
@@ -233,6 +238,7 @@ fn main() -> anyhow::Result<()> {
             no_verify,
             no_lock_last,
             no_start_last,
+            ipv6_mode,
         } => cmd_connect(
             &mut provider_config,
             server,
@@ -249,6 +255,7 @@ fn main() -> anyhow::Result<()> {
             no_verify,
             no_lock_last,
             no_start_last,
+            ipv6_mode,
         ),
         Commands::Disconnect => cmd_disconnect(),
         Commands::Status => cmd_status(),
@@ -320,6 +327,7 @@ fn cmd_connect(
     no_verify: bool,
     no_lock_last: bool,
     no_start_last: bool,
+    cli_ipv6_mode: Option<String>,
 ) -> anyhow::Result<()> {
     // 0. Pre-flight checks (root, wg, nft)
     preflight_checks()?;
@@ -548,10 +556,10 @@ fn cmd_connect(
     let mut manifest = manifest;
     let mut user_info = user_info;
 
-    // 7b. Resolve IPv6 mode from profile (Eddie: network.ipv6.mode, default: in-block)
+    // 7b. Resolve IPv6 mode: CLI --ipv6-mode overrides profile (Eddie: network.ipv6.mode)
     let ipv6_mode = {
-        let mode_str = profile_options.get("network.ipv6.mode")
-            .cloned()
+        let mode_str = cli_ipv6_mode
+            .or_else(|| profile_options.get("network.ipv6.mode").cloned())
             .unwrap_or_else(|| "in-block".to_string());
         Ipv6Mode::parse(&mode_str)?
     };
