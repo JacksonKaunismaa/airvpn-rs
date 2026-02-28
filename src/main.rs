@@ -578,15 +578,19 @@ WantedBy=sysinit.target
     }
     info!("Enabled airvpn-lock.service");
 
-    // Load the table now (if not already active)
-    if !netlock::is_active() {
-        let output = std::process::Command::new("nft")
-            .args(["-f", netlock::PERSISTENT_RULES_PATH])
-            .output()
-            .context("failed to load lock.nft")?;
-        if !output.status.success() {
-            anyhow::bail!("nft -f failed: {}", String::from_utf8_lossy(&output.stderr));
-        }
+    // Load the table now — always replace any existing table so the persistent
+    // version (with flags owner, persist) supersedes any old session lock.
+    if netlock::is_active() {
+        // Delete existing table first — owner+persist flags can only be set at creation.
+        // If owned by a running connect process, this fails silently (they'll reclaim later).
+        let _ = netlock::deactivate();
+    }
+    let output = std::process::Command::new("nft")
+        .args(["-f", netlock::PERSISTENT_RULES_PATH])
+        .output()
+        .context("failed to load lock.nft")?;
+    if !output.status.success() {
+        anyhow::bail!("nft -f failed: {}", String::from_utf8_lossy(&output.stderr));
     }
 
     info!("Persistent lock installed and active.");

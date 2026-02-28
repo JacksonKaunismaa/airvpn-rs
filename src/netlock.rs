@@ -358,10 +358,12 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
 /// Generate the persistent lock ruleset for `/etc/airvpn-rs/lock.nft`.
 ///
 /// This is a base ruleset with LAN, DHCP, ICMP, NDP, conntrack, and bootstrap
-/// API IPs. No server IPs, no tunnel interface, no `flags owner, persist`
-/// (those are set at runtime when airvpn-rs reclaims the table).
+/// API IPs. No server IPs, no tunnel interface rules.
 ///
-/// The systemd service loads this at boot with `nft -f`.
+/// The table is created with `flags owner, persist`. When the systemd oneshot
+/// loads this at boot and exits, `persist` keeps the table alive in an orphaned
+/// state (owner process exited). When airvpn-rs connects, `reclaim_ownership()`
+/// succeeds because the table is orphaned.
 pub fn generate_persistent_ruleset(bootstrap_ips: &[String]) -> String {
     let config = NetlockConfig {
         allow_lan: true,
@@ -372,7 +374,15 @@ pub fn generate_persistent_ruleset(bootstrap_ips: &[String]) -> String {
         allowed_ips_outgoing: bootstrap_ips.to_vec(),
         incoming_policy_accept: false,
     };
-    generate_ruleset(&config)
+    let base = generate_ruleset(&config);
+    // Insert flags after the table definition line.
+    // generate_ruleset produces: "table inet airvpn_lock {\n  chain ..."
+    // We need:                   "table inet airvpn_lock {\n  flags owner, persist;\n  chain ..."
+    base.replacen(
+        &format!("table inet {} {{\n", TABLE_NAME),
+        &format!("table inet {} {{\n  flags owner, persist;\n", TABLE_NAME),
+        1,
+    )
 }
 
 /// Activate the network lock: write ruleset to tmpfile and load via `nft -f`.
@@ -1374,7 +1384,7 @@ mod tests {
         assert!(ruleset.contains("ip daddr 63.33.78.166/32"));
         assert!(ruleset.contains("ip daddr 54.93.175.114/32"));
         assert!(ruleset.contains("ip daddr 82.196.3.205/32"));
-        assert!(!ruleset.contains("flags"));
+        assert!(ruleset.contains("flags owner, persist;"));
         assert!(ruleset.contains("airvpn_filter_input_latest_rule"));
         assert!(ruleset.contains("airvpn_filter_output_latest_rule"));
         assert!(ruleset.contains("airvpn_filter_forward_latest_rule"));
