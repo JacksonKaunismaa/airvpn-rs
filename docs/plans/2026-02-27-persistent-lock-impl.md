@@ -1,10 +1,12 @@
-# Persistent Network Lock — Implementation Plan
+# Persistent Network Lock — Implementation Plan (SUPERSEDED)
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **This plan describes the initial single-table approach, which was replaced by a
+> two-table architecture.** See `2026-02-27-persistent-lock-design.md` for the
+> current design. Kept for historical reference.
 
 **Goal:** Add an Android-style persistent kill switch that blocks all non-VPN traffic, surviving crashes, `nft flush ruleset`, and reboots.
 
-**Architecture:** A persistent nftables table (`airvpn_lock`) with `flags owner, persist` loaded at boot by a systemd oneshot service. When airvpn-rs connects, it detects the existing table, reclaims ownership, and adds server IP + tunnel interface rules dynamically. When no persistent lock exists, current transient session lock behavior is preserved unchanged.
+**Architecture (SUPERSEDED):** A persistent nftables table (`airvpn_lock`) with `flags owner, persist` loaded at boot by a systemd oneshot service. When airvpn-rs connects, it detects the existing table, reclaims ownership, and adds server IP + tunnel interface rules dynamically. When no persistent lock exists, current transient session lock behavior is preserved unchanged.
 
 **Tech Stack:** Rust, nftables (`nft` CLI), systemd
 
