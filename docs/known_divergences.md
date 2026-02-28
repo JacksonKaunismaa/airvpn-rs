@@ -135,31 +135,36 @@ with no race condition. With wg-quick, this was impossible because wg-quick's
 ## 6. Persistent network lock (kill switch)
 
 **Eddie:** Network lock activates at session start and deactivates at session end.
-Between sessions, traffic is unrestricted. Eddie resolves hostnames before activating
-the lock (NetworkLockManager.cs:127 — "resolve hostnames before a possible lock of
-DNS server"), creating a leak window during DNS resolution.
+Between sessions, traffic is unrestricted. Eddie uses a single nftables table and
+resolves hostnames before activating the lock (NetworkLockManager.cs:127), creating
+a leak window during DNS resolution.
 
-**airvpn-rs:** Adds `airvpn-rs lock install` which creates a persistent nftables
-table loaded at boot by a systemd service (`Before=network-pre.target`). This
-provides Android-style "always-on VPN" protection: all non-VPN traffic is blocked
-even when airvpn-rs is not running.
+**airvpn-rs:** Uses two fully independent nftables tables:
+- `airvpn_persist` (priority -400): persistent always-on lock, loaded at boot by a
+  systemd service (`Before=network-pre.target`). Allows LAN, DHCP, ICMP, bootstrap
+  IPs, and VPN tunnel traffic (`oifname "avpn-*"` for inner packets, `meta mark 51820`
+  for WireGuard outer packets). Uses `flags owner, persist` (kernel 5.12+/6.9+).
+- `airvpn_lock` (priority -300): session lock, identical to Eddie's. Created at
+  connect, deleted at disconnect. Completely unaware of the persistent table.
 
-The persistent table uses nftables `flags owner, persist` (kernel 5.12+/6.9+):
-`owner` makes the table immune to `nft flush ruleset` from other processes;
-`persist` keeps the table alive after the owning process exits. When airvpn-rs
-connects, it reclaims ownership and adds server IPs dynamically. When disconnected,
-only VPN-specific rules are removed — the base lock stays active.
+Both have `policy drop` — a packet must pass both to get through. When VPN is
+connected, both allow VPN traffic. When VPN disconnects, `airvpn_lock` is deleted
+and `airvpn_persist` blocks everything. The two tables don't interact: `lock
+disable/uninstall` can run while VPN is connected without conflict.
 
 Users who don't install the persistent lock get the same transient session lock
-behavior as Eddie (table created at connect, deleted at disconnect).
+behavior as Eddie.
 
-**Why:** Eliminates the startup leak window entirely. The persistent lock is loaded
-before networking comes up, so there's never a moment when traffic can flow
-unprotected. Eddie's resolve-then-lock design is an inherent limitation — you must
-resolve DNS before blocking DNS — but with a persistent lock, no DNS resolution is
-needed at lock activation time (bootstrap IPs are hardcoded from provider.json).
+**Why:** Eliminates the startup leak window entirely — the persistent lock loads
+before networking, so traffic is never unprotected. The two-table design avoids
+operational conflicts (disabling the persistent lock while VPN runs, uninstalling
+while connected). Similar to Android's always-on VPN, which uses routing-layer
+enforcement independently of the VPN tunnel itself. Android uses `ip rule` with
+UID ranges + fwmark; we use nftables with interface wildcard + fwmark (desktop Linux
+doesn't have per-app UIDs, so the nftables approach is more appropriate).
 
-**Files:** `src/netlock.rs`, `src/main.rs` (Lock subcommand + connect/disconnect flow)
+**Files:** `src/netlock.rs` (persistent + session ruleset generation), `src/main.rs`
+(Lock subcommand)
 
 **Eddie ref:** `src/Lib.Core/NetworkLockManager.cs`, `src/Lib.Platform.Linux/NetworkLockNftables.cs`
 
