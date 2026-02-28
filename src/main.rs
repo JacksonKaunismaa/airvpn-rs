@@ -1512,6 +1512,11 @@ fn partial_disconnect(config_path: &str, iface: &str, lock_active: bool, endpoin
     if lock_active && !iface.is_empty() {
         let _ = netlock::deallow_interface(iface);
     }
+    // In persistent mode, also remove server IP rules to prevent accumulation
+    // across reconnection attempts.
+    if lock_active && netlock::is_persistent() {
+        let _ = netlock::deallow_all_server_ips();
+    }
     // 2. Tear down WireGuard
     let _ = wireguard::disconnect(config_path, endpoint_ip);
     // NOTE: DNS is intentionally kept active — deactivating would restore the
@@ -1523,11 +1528,11 @@ fn partial_disconnect(config_path: &str, iface: &str, lock_active: bool, endpoin
 /// Clean up netlock state on error/disconnect within the connection loop.
 /// For persistent locks, only removes dynamic server IP rules and releases ownership
 /// (keeping the base table). For session locks, fully deactivates the table.
-fn teardown_lock_state(persistent_lock: bool, server_ips: &[String]) {
-    if persistent_lock {
-        for ip in server_ips {
-            let _ = netlock::deallow_server_ip(ip);
-        }
+fn teardown_lock_state(_persistent_lock: bool, _server_ips: &[String]) {
+    // Check is_persistent() dynamically — the cached persistent_lock flag may be stale
+    // if `lock install` was run while connected.
+    if netlock::is_persistent() && netlock::is_active() {
+        let _ = netlock::deallow_all_server_ips();
         netlock::release_ownership();
     } else {
         let _ = netlock::deactivate();
@@ -1553,6 +1558,7 @@ fn cmd_disconnect_internal(config_path: &str, iface: &str, lock_active: bool, bl
     if lock_active {
         if netlock::is_persistent() {
             info!("Persistent lock: keeping base table, removing dynamic rules");
+            let _ = netlock::deallow_all_server_ips();
             netlock::release_ownership();
         } else {
             let _ = netlock::deactivate();
@@ -1718,8 +1724,18 @@ fn cmd_lock_install() -> anyhow::Result<()> {
     // Write rules file
     std::fs::create_dir_all("/etc/airvpn-rs")
         .context("failed to create /etc/airvpn-rs")?;
-    std::fs::write(netlock::PERSISTENT_RULES_PATH, &ruleset)
-        .context("failed to write lock.nft")?;
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o644)
+            .open(netlock::PERSISTENT_RULES_PATH)
+            .context("failed to write lock.nft")?;
+        std::io::Write::write_all(&mut f, ruleset.as_bytes())
+            .context("failed to write lock.nft")?;
+    }
     info!("Wrote {}", netlock::PERSISTENT_RULES_PATH);
 
     // Write systemd service
@@ -1739,8 +1755,18 @@ ExecStop=/usr/bin/nft delete table inet airvpn_lock
 [Install]
 WantedBy=sysinit.target
 ";
-    std::fs::write(netlock::PERSISTENT_SERVICE_PATH, service)
-        .context("failed to write systemd service")?;
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o644)
+            .open(netlock::PERSISTENT_SERVICE_PATH)
+            .context("failed to write systemd service")?;
+        std::io::Write::write_all(&mut f, service.as_bytes())
+            .context("failed to write systemd service")?;
+    }
     info!("Wrote {}", netlock::PERSISTENT_SERVICE_PATH);
 
     // Enable service
@@ -1798,6 +1824,10 @@ fn cmd_lock_uninstall() -> anyhow::Result<()> {
         // Try to reclaim first (in case it's orphaned+owned, need to be owner to delete)
         let _ = netlock::reclaim_ownership();
         let _ = netlock::deactivate();
+    }
+
+    if netlock::is_active() {
+        warn!("Table still active in kernel (owned by running VPN process). It will be removed on next disconnect.");
     }
 
     info!("Persistent lock uninstalled.");

@@ -514,6 +514,43 @@ pub fn allow_server_ip(ip: &str) -> Result<()> {
     )
 }
 
+/// Remove ALL dynamically-added server IP rules from the output chain.
+///
+/// Finds rules by comment prefix `airvpn_server_endpoint_` and deletes them.
+/// Used during disconnect and reconnection to clean up stale server IPs.
+pub fn deallow_all_server_ips() -> Result<()> {
+    let output = Command::new("nft")
+        .args(["-n", "-a", "list", "chain", "inet", TABLE_NAME, "output"])
+        .output()
+        .context("failed to list output chain")?;
+
+    if !output.status.success() {
+        // Chain doesn't exist or table not active — nothing to clean up
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut handles: Vec<String> = Vec::new();
+    for line in stdout.lines() {
+        if line.contains("airvpn_server_endpoint_") {
+            if let Some(handle_pos) = line.rfind("# handle ") {
+                let handle = line[handle_pos + 9..].trim();
+                if !handle.is_empty() {
+                    handles.push(handle.to_string());
+                }
+            }
+        }
+    }
+
+    for handle in handles {
+        let _ = Command::new("nft")
+            .args(["delete", "rule", "inet", TABLE_NAME, "output", "handle", &handle])
+            .output();
+    }
+
+    Ok(())
+}
+
 /// Remove a server IP from the output chain allowlist.
 pub fn deallow_server_ip(ip: &str) -> Result<()> {
     let comment = format!("airvpn_server_endpoint_{}", ip.replace(':', "_"));
