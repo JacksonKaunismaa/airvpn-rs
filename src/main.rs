@@ -552,7 +552,7 @@ Wants=network-pre.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/bin/nft -f /etc/airvpn-rs/lock.nft
-ExecStop=/usr/bin/nft delete table inet airvpn_persist
+ExecStop=/bin/sh -c 'printf \"add table inet airvpn_persist { flags owner, persist; }\\ndelete table inet airvpn_persist\\n\" | /usr/bin/nft -f -'
 
 [Install]
 WantedBy=sysinit.target
