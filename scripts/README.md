@@ -21,12 +21,21 @@ sudo ./chaos-test.sh all         # Run all non-destructive chaos tests
 Watches physical interfaces for any traffic not going to the VPN endpoint. **Run this in a separate terminal during all testing.**
 
 ```bash
-sudo ./leak-monitor.sh                           # Auto-detect endpoint
-sudo ./leak-monitor.sh --endpoint 1.2.3.4        # Manual endpoint
+sudo ./leak-monitor.sh                           # Default mode (broad allowlist)
+sudo ./leak-monitor.sh --strict --iface eth0     # Strict mode (recommended)
+sudo ./leak-monitor.sh --strict --iface eth0 --endpoint 1.2.3.4
+sudo ./leak-monitor.sh --strict                  # Strict + active probes (auto)
 sudo ./leak-monitor.sh --duration 60             # Run for 60 seconds
 ```
 
 Any traffic that appears is a **potential leak**. Captured to `/tmp/leak-monitor/` for analysis.
+
+Strict mode behavior:
+- Auto-discovers all non-loopback/non-VPN interfaces (or use `--iface` to override)
+- Uses minimal allowlist: endpoint(s) + bootstrap IPs (+ any `--allow` extras)
+- If `--endpoint` is omitted, attempts to read endpoint from `/run/airvpn-rs/state.json`
+- Flags traffic to common public DNS resolvers even on non-DNS ports (DoH/DoQ bypass attempts)
+- Runs active leak-attempt probes by default (DNS/TCP/UDP/HTTP); disable with `--no-active-probe`
 
 ### `rule-diff.sh` — Eddie Compliance Check
 

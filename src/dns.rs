@@ -358,10 +358,20 @@ pub fn deactivate() -> Result<()> {
         // Atomic rename replaces dest on Linux — no gap where resolv.conf is missing
         fs::rename(backup_path, resolv_path).context("failed to restore resolv.conf from backup")?;
     } else {
-        // No backup means resolv.conf didn't exist before — remove our VPN version
+        // No backup file. Only delete resolv.conf if it's actually ours (contains
+        // our header marker). This prevents data loss when deactivate() is called
+        // twice: the first call consumes the backup, and a second call would
+        // otherwise delete the correctly-restored original resolv.conf.
         if resolv_path.exists() {
-            clear_immutable(resolv_path);
-            let _ = fs::remove_file(resolv_path);
+            let is_ours = fs::read_to_string(resolv_path)
+                .map(|c| c.contains("Created by airvpn-rs"))
+                .unwrap_or(false);
+            if is_ours {
+                clear_immutable(resolv_path);
+                let _ = fs::remove_file(resolv_path);
+            } else {
+                info!("resolv.conf exists but is not ours — leaving it intact");
+            }
         }
     }
 
