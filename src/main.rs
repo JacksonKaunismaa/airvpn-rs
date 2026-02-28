@@ -625,13 +625,24 @@ fn cmd_lock_uninstall() -> anyhow::Result<()> {
     let _ = std::fs::remove_file(netlock::PERSISTENT_SERVICE_PATH);
     let _ = std::fs::remove_file(netlock::PERSISTENT_RULES_PATH);
 
-    // Delete table if active — must reclaim+delete atomically (single nft -f)
+    // Delete table if active — but NOT if VPN is running (the monitor loop
+    // would detect the deletion and fight us by reconnecting to restore it).
+    // Instead, let the VPN process clean up on disconnect: it checks
+    // is_persistent() which will return false since we just deleted lock.nft.
     if netlock::is_active() {
-        match netlock::reclaim_and_delete() {
-            Ok(()) => {}
-            Err(e) => {
-                warn!("Could not delete table: {}", e);
-                warn!("A VPN process may own it. It will be removed on next disconnect.");
+        let vpn_running = recovery::load()
+            .ok()
+            .flatten()
+            .map_or(false, |s| recovery::is_pid_alive(s.pid));
+
+        if vpn_running {
+            info!("VPN is running — table will be removed on next disconnect.");
+        } else {
+            match netlock::reclaim_and_delete() {
+                Ok(()) => {}
+                Err(e) => {
+                    warn!("Could not delete table: {}", e);
+                }
             }
         }
     }
