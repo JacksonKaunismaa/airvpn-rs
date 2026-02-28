@@ -5,112 +5,128 @@ traffic, surviving crashes, `flush ruleset`, and reboots.
 
 ## Problem
 
-The current session netlock has a leak window during startup: DNS resolution for
-bootstrap hostnames (e.g. `bootme.org`) blocks for 10-30 seconds before the
-nftables rules are installed. Eddie has the same design (resolve-then-lock) and
-the same leak window.
+The session netlock has a leak window during startup: DNS resolution for bootstrap
+hostnames (e.g. `bootme.org`) blocks for 10-30 seconds before the nftables rules
+are installed. Eddie has the same design (resolve-then-lock) and the same leak
+window (NetworkLockManager.cs:127).
 
 ## Solution
 
-A persistent nftables table (`airvpn_lock`) loaded at boot by a systemd service,
-before networking comes up. The table blocks all outgoing traffic except:
-bootstrap API IPs, LAN, DHCP, loopback, ICMP, and the VPN tunnel interface.
+Two fully independent nftables tables:
+
+- **`airvpn_persist`** (priority -400): persistent always-on lock, loaded at boot
+- **`airvpn_lock`** (priority -300): session lock (unchanged — created at connect,
+  deleted at disconnect)
+
+Both have `policy drop`. A packet must pass both chains to get through. The two
+tables don't know about each other — no interaction, no coordination, no conflicts.
+
+### How the persistent table allows VPN traffic without knowing the server IP
+
+- Inner packets (app → internet via tunnel): `oifname "avpn-*" accept`
+- Outer packets (WireGuard → server): `meta mark 51820 accept` (WireGuard stamps
+  fwmark 51820 on encapsulated packets)
+- Responses: `ct state related,established accept`
+- Bootstrap API calls: explicit IP allowlist from provider.json
+
+Security model: forging fwmark requires `CAP_NET_ADMIN` (root-equivalent), same
+boundary as Android's always-on VPN.
 
 ### Key properties
 
 - **Crash-proof**: `persist` flag — table survives process exit
-- **Reboot-proof**: systemd oneshot service loads rules at boot (`Before=network-pre.target`)
+- **Reboot-proof**: systemd oneshot service loads rules before networking
+- **Operationally independent**: `lock disable/uninstall` while VPN runs — no conflict
 
-Note on `owner` flag: owner protection only lasts while the owning netlink socket is
-open. Since we use `nft -f` (which opens and closes a socket per invocation), the
-table is only owner-protected for the milliseconds while nft runs. Between nft
-invocations, the table is effectively unowned and can be modified by any root process.
-The real protection comes from the table's existence blocking traffic — not from the
-owner flag. The `persist` flag (table survives socket close) is the important one.
+Note on `owner` flag: owner protection only lasts while the owning netlink socket
+is open. Since we use `nft -f` (opens/closes socket per invocation), the table is
+effectively unowned between invocations. The `persist` flag (table survives socket
+close) is the important one. `reclaim_and_delete()` must do both in a single
+`nft -f` transaction.
 
-Kernel requirements: `owner` flag (kernel 5.12+), `persist` flag (kernel 6.9+).
+Kernel requirements: `owner` (5.12+), `persist` (6.9+).
 
-## Architecture
+## Flows
 
-No explicit "modes." The table's existence determines behavior:
-
-### Connect flow
+### Boot (no VPN)
 
 ```
-table inet airvpn_lock exists?
-├─ YES (persistent lock installed)
-│   → reclaim ownership: nft add table inet airvpn_lock { flags owner, persist; }
-│   → add server entry IP to output chain
-│   → (after tunnel up) add interface rules
-│   → skip session netlock activation
-│
-└─ NO (no persistent lock)
-    → create table from scratch (current session netlock behavior)
-    → full ruleset with server IPs baked in
+systemd loads airvpn_persist → blocks everything except LAN/DHCP/bootstrap
+no airvpn_lock exists → only one table, everything blocked
 ```
 
-### Disconnect flow
+### Connect
 
 ```
-/etc/airvpn-rs/lock.nft exists?
-├─ YES (persistent lock installed)
-│   → remove server IP rule
-│   → remove interface rules
-│   → release ownership (table stays, becomes orphaned)
-│   → base rules remain active — all non-VPN traffic still blocked
-│
-└─ NO (transient session lock)
-    → delete entire table (current behavior)
+airvpn connect → auth via bootstrap IPs (allowed by airvpn_persist)
+              → creates airvpn_lock (session lock, same as before)
+              → starts WireGuard
+              → outer packets (fwmark 51820) pass airvpn_persist
+              → inner packets (oifname avpn-*) pass airvpn_persist
+              → server IP + interface pass airvpn_lock
+              → connected
 ```
 
-### Recovery
+### Disconnect
 
-`airvpn-rs recover` checks for `/etc/airvpn-rs/lock.nft`:
-- If present: remove only dynamic rules (server IP, interface), keep base table
-- If absent: delete entire table (current behavior)
+```
+airvpn disconnect → deletes airvpn_lock (session lock gone)
+                  → airvpn_persist stays → everything blocked again
+```
+
+### lock disable while VPN running
+
+```
+lock disable → deletes airvpn_persist only
+             → airvpn_lock still running → VPN works, session lock protects
+             → no conflict, no crash
+```
+
+### lock uninstall while VPN running
+
+```
+lock uninstall → removes files + service, deletes airvpn_persist
+               → airvpn_lock still running → VPN works
+               → on disconnect → airvpn_lock deleted → internet open
+```
 
 ## Persistent ruleset (`/etc/airvpn-rs/lock.nft`)
 
-Base rules only — no server IPs, no tunnel interface, no `flags owner, persist`
-(the file is loaded by a systemd oneshot that exits immediately).
-
 ```
-table inet airvpn_lock {
+table inet airvpn_persist {
+  flags owner, persist;
+
   chain input {
-    type filter hook input priority -300; policy drop;
+    type filter hook input priority -400; policy drop;
     iifname "lo" counter accept
     iifname != "lo" ip6 saddr ::1 counter drop
-    ip saddr 255.255.255.255 counter accept          # DHCP
-    ip6 saddr ff02::1:2 counter accept                # DHCPv6
-    ip6 saddr ff05::1:3 counter accept                # DHCPv6
-    ip saddr 192.168.0.0/16 ip daddr 192.168.0.0/16 counter accept  # LAN
-    ip saddr 10.0.0.0/8 ip daddr 10.0.0.0/8 counter accept
-    ip saddr 172.16.0.0/12 ip daddr 172.16.0.0/12 counter accept
-    ip6 saddr fe80::/10 ip6 daddr fe80::/10 counter accept
-    ip6 saddr ff00::/8 ip6 daddr ff00::/8 counter accept
-    ip6 saddr fc00::/7 ip6 daddr fc00::/7 counter accept
-    icmp type echo-request counter accept
-    icmpv6 type { echo-request, echo-reply, ... } counter accept
-    rt type 0 counter drop
-    meta l4proto ipv6-icmp icmpv6 type nd-router-advert ip6 hoplimit 255 counter accept
-    meta l4proto ipv6-icmp icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 counter accept
-    meta l4proto ipv6-icmp icmpv6 type nd-neighbor-advert ip6 hoplimit 255 counter accept
-    meta l4proto ipv6-icmp icmpv6 type nd-redirect ip6 hoplimit 255 counter accept
+    iifname "avpn-*" counter accept                    # VPN tunnel
+    # DHCP, LAN, ICMP, NDP, NAT64, conntrack...
     ct state related,established counter accept
-    counter drop comment "airvpn_filter_input_latest_rule"
+    counter drop
   }
-  chain forward { ... }  # same structure
+
+  chain forward {
+    type filter hook forward priority -400; policy drop;
+    rt type 0 counter drop
+    iifname "avpn-*" counter accept                    # tunnel → local
+    oifname "avpn-*" counter accept                    # local → tunnel
+    counter drop
+  }
+
   chain output {
-    type filter hook output priority -300; policy drop;
+    type filter hook output priority -400; policy drop;
     oifname "lo" counter accept
-    # DHCP, LAN, ICMP, NDP, conntrack (same as input, mirrored)
-    # Bootstrap API IPs:
+    oifname "avpn-*" counter accept                    # inner VPN packets
+    meta mark 51820 counter accept                     # outer WireGuard packets
+    # DHCP, LAN, ICMP, NDP, NAT64...
+    # Bootstrap IPs:
     ip daddr 63.33.78.166 counter accept
     ip daddr 54.93.175.114 counter accept
     ip daddr 82.196.3.205 counter accept
     ip daddr 63.33.116.50 counter accept
     ip6 daddr 2a03:b0c0:0:1010::9b:c001 counter accept
-    counter drop comment "airvpn_filter_output_latest_rule"
+    counter drop
   }
 }
 ```
@@ -128,7 +144,7 @@ Wants=network-pre.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/bin/nft -f /etc/airvpn-rs/lock.nft
-ExecStop=/usr/bin/nft delete table inet airvpn_lock
+ExecStop=/usr/bin/nft delete table inet airvpn_persist
 
 [Install]
 WantedBy=sysinit.target
@@ -141,29 +157,30 @@ airvpn-rs lock install      # generate lock.nft + service, enable, load now
 airvpn-rs lock uninstall    # stop + disable service, remove files, delete table
 airvpn-rs lock enable       # reload table now (nft -f)
 airvpn-rs lock disable      # delete table temporarily (returns on reboot)
-airvpn-rs lock status       # table active? service enabled? owned/orphaned?
+airvpn-rs lock status       # table active? service enabled?
 ```
 
 ## Edge cases
 
-**`lock install` while connected**: Writes files, enables service. Table already
-exists with dynamic rules — that's fine. Next disconnect sees `lock.nft` on disk,
-keeps the base table.
-
-**`lock uninstall` while connected**: Removes files. Table stays (in-kernel, owned
-by running process). Next disconnect sees no `lock.nft`, deletes the whole table.
-
 **Stale bootstrap IPs**: Provider.json IPs are infrastructure — rarely change.
 If they do, user updates airvpn-rs and re-runs `lock install`.
 
-**Reboot**: Systemd service loads table (unowned). airvpn-rs connect reclaims
-ownership. Between boot and connect, table is unowned but active and blocking.
-Nothing else touches nftables during early boot (`Before=network-pre.target`).
+**Reboot**: Systemd service loads table (orphaned after nft exits). Active and
+blocking before networking comes up.
 
-## Files touched
+## Files
 
-- New: `/etc/airvpn-rs/lock.nft`
-- New: `/etc/systemd/system/airvpn-lock.service`
-- Modified: `src/netlock.rs` — persistent ruleset generation, ownership reclaim/release
-- Modified: `src/main.rs` — `Lock` subcommand, connect/disconnect flow changes
-- Modified: `src/recovery.rs` — persistent-aware cleanup
+- `/etc/airvpn-rs/lock.nft` — persistent ruleset
+- `/etc/systemd/system/airvpn-lock.service` — boot-time loader
+- `src/netlock.rs` — persistent + session ruleset generation
+- `src/main.rs` — Lock subcommand (session lock code untouched)
+
+## Design history
+
+Initial implementation used a single shared table (`airvpn_lock`) for both
+persistent and session lock. This caused operational conflicts: couldn't
+disable/uninstall persistent lock while VPN was running, monitor loop fought
+with lock management commands, reclaim_ownership semantics were broken by
+nft -f's ephemeral netlink sockets. Reworked to two independent tables based
+on Android's approach (separate enforcement layers). See git history for the
+single-table iteration.
