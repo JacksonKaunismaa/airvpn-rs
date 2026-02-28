@@ -2000,4 +2000,23 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_lock_subcommand_parse() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["airvpn", "lock", "status"]);
+        assert!(cli.is_ok(), "lock status should parse: {:?}", cli.err());
+
+        let cli = Cli::try_parse_from(["airvpn", "lock", "install"]);
+        assert!(cli.is_ok(), "lock install should parse: {:?}", cli.err());
+
+        let cli = Cli::try_parse_from(["airvpn", "lock", "uninstall"]);
+        assert!(cli.is_ok(), "lock uninstall should parse: {:?}", cli.err());
+
+        let cli = Cli::try_parse_from(["airvpn", "lock", "enable"]);
+        assert!(cli.is_ok(), "lock enable should parse: {:?}", cli.err());
+
+        let cli = Cli::try_parse_from(["airvpn", "lock", "disable"]);
+        assert!(cli.is_ok(), "lock disable should parse: {:?}", cli.err());
+    }
 }
