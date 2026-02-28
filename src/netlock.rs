@@ -20,6 +20,9 @@ use std::process::Command;
 const TABLE_NAME: &str = "airvpn_lock";
 const PRIORITY: i32 = -300;
 
+const PERSIST_TABLE_NAME: &str = "airvpn_persist";
+const PERSIST_PRIORITY: i32 = -400;
+
 /// Path to the persistent lock rules file.
 pub const PERSISTENT_RULES_PATH: &str = "/etc/airvpn-rs/lock.nft";
 
@@ -364,25 +367,197 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
 /// loads this at boot and exits, `persist` keeps the table alive in an orphaned
 /// state (owner process exited). When airvpn-rs connects, `reclaim_ownership()`
 /// succeeds because the table is orphaned.
+/// Generate the persistent lock ruleset as a standalone `airvpn_persist` table.
+///
+/// This table is independent of the session lock (`airvpn_lock`). It runs at
+/// priority -400 (before the session lock at -300). A packet must pass BOTH
+/// tables to get through.
+///
+/// The persistent table allows VPN traffic generically:
+/// - `oifname "avpn-*"` / `iifname "avpn-*"`: inner tunnel packets
+/// - `meta mark 51820`: outer WireGuard packets (marked by routing policy)
+///
+/// This means the persistent lock doesn't need to know the specific server IP
+/// or interface name — it just allows any AirVPN tunnel traffic.
 pub fn generate_persistent_ruleset(bootstrap_ips: &[String]) -> String {
-    let config = NetlockConfig {
-        allow_lan: true,
-        allow_dhcp: true,
-        allow_ping: true,
-        allow_ipv4ipv6translation: true,
-        allowed_ips_incoming: vec![],
-        allowed_ips_outgoing: bootstrap_ips.to_vec(),
-        incoming_policy_accept: false,
-    };
-    let base = generate_ruleset(&config);
-    // Insert flags after the table definition line.
-    // generate_ruleset produces: "table inet airvpn_lock {\n  chain ..."
-    // We need:                   "table inet airvpn_lock {\n  flags owner, persist;\n  chain ..."
-    base.replacen(
-        &format!("table inet {} {{\n", TABLE_NAME),
-        &format!("table inet {} {{\n  flags owner, persist;\n", TABLE_NAME),
-        1,
-    )
+    let mut r = String::new();
+
+    // Table definition with owner+persist flags
+    r.push_str(&format!("table inet {} {{\n", PERSIST_TABLE_NAME));
+    r.push_str("  flags owner, persist;\n");
+
+    // =========================================================================
+    // INPUT chain
+    // =========================================================================
+    r.push_str(&format!(
+        "  chain input {{\n    type filter hook input priority {}; policy drop;\n",
+        PERSIST_PRIORITY
+    ));
+
+    // 1. Loopback
+    r.push_str("    iifname \"lo\" counter accept\n");
+
+    // 2. IPv6 anti-spoof: drop ::1 not from lo
+    r.push_str("    iifname != \"lo\" ip6 saddr ::1 counter drop\n");
+
+    // 3. DHCP
+    r.push_str("    ip saddr 255.255.255.255 counter accept\n");
+    r.push_str("    ip6 saddr ff02::1:2 counter accept\n");
+    r.push_str("    ip6 saddr ff05::1:3 counter accept\n");
+
+    // 4. NAT64 (IPv4/IPv6 translation — RFC 6052/8215)
+    r.push_str("    ip6 saddr 64:ff9b::/96 ip6 daddr 64:ff9b::/96 counter accept\n");
+    r.push_str("    ip6 saddr 64:ff9b:1::/48 ip6 daddr 64:ff9b:1::/48 counter accept\n");
+
+    // 5. LAN (always enabled for persistent lock)
+    // IPv4 RFC1918 bidirectional
+    r.push_str("    ip saddr 192.168.0.0/16 ip daddr 192.168.0.0/16 counter accept\n");
+    r.push_str("    ip saddr 10.0.0.0/8 ip daddr 10.0.0.0/8 counter accept\n");
+    r.push_str("    ip saddr 172.16.0.0/12 ip daddr 172.16.0.0/12 counter accept\n");
+    // IPv6 link-local, multicast, ULA
+    r.push_str("    ip6 saddr fe80::/10 ip6 daddr fe80::/10 counter accept\n");
+    r.push_str("    ip6 saddr ff00::/8 ip6 daddr ff00::/8 counter accept\n");
+    r.push_str("    ip6 saddr fc00::/7 ip6 daddr fc00::/7 counter accept\n");
+
+    // 6. ICMP/ICMPv6
+    r.push_str("    icmp type echo-request counter accept\n");
+    r.push_str("    icmpv6 type { echo-request, echo-reply, destination-unreachable, packet-too-big, time-exceeded, parameter-problem } counter accept\n");
+
+    // 7. IPv6 RH0 drop
+    r.push_str("    rt type 0 counter drop\n");
+
+    // 8. IPv6 NDP (hoplimit 255)
+    r.push_str(
+        "    meta l4proto ipv6-icmp icmpv6 type nd-router-advert ip6 hoplimit 255 counter accept\n",
+    );
+    r.push_str(
+        "    meta l4proto ipv6-icmp icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 counter accept\n",
+    );
+    r.push_str(
+        "    meta l4proto ipv6-icmp icmpv6 type nd-neighbor-advert ip6 hoplimit 255 counter accept\n",
+    );
+    r.push_str(
+        "    meta l4proto ipv6-icmp icmpv6 type nd-redirect ip6 hoplimit 255 counter accept\n",
+    );
+
+    // 9. Conntrack
+    r.push_str("    ct state related,established counter accept\n");
+
+    // 10. VPN tunnel interface (inner packets arriving from tunnel)
+    r.push_str("    iifname \"avpn-*\" counter accept\n");
+
+    // Final drop sentinel
+    r.push_str("    counter drop comment \"airvpn_persist_input_latest_rule\"\n");
+
+    r.push_str("  }\n\n");
+
+    // =========================================================================
+    // FORWARD chain
+    // =========================================================================
+    r.push_str(&format!(
+        "  chain forward {{\n    type filter hook forward priority {}; policy drop;\n",
+        PERSIST_PRIORITY
+    ));
+
+    // IPv6 RH0 drop
+    r.push_str("    rt type 0 counter drop\n");
+
+    // VPN tunnel interface (forwarded traffic through tunnel)
+    r.push_str("    iifname \"avpn-*\" counter accept\n");
+    r.push_str("    oifname \"avpn-*\" counter accept\n");
+
+    // Final drop sentinel
+    r.push_str("    counter drop comment \"airvpn_persist_forward_latest_rule\"\n");
+
+    r.push_str("  }\n\n");
+
+    // =========================================================================
+    // OUTPUT chain
+    // =========================================================================
+    r.push_str(&format!(
+        "  chain output {{\n    type filter hook output priority {}; policy drop;\n",
+        PERSIST_PRIORITY
+    ));
+
+    // 1. Loopback
+    r.push_str("    oifname \"lo\" counter accept\n");
+
+    // 2. IPv6 RH0 drop
+    r.push_str("    rt type 0 counter drop\n");
+
+    // 3. DHCP
+    r.push_str("    ip daddr 255.255.255.255 counter accept\n");
+    r.push_str("    ip6 daddr ff02::1:2 counter accept\n");
+    r.push_str("    ip6 daddr ff05::1:3 counter accept\n");
+
+    // 4. NAT64
+    r.push_str("    ip6 saddr 64:ff9b::/96 ip6 daddr 64:ff9b::/96 counter accept\n");
+    r.push_str("    ip6 saddr 64:ff9b:1::/48 ip6 daddr 64:ff9b:1::/48 counter accept\n");
+
+    // 5. LAN (always enabled)
+    // RFC1918 bidirectional
+    r.push_str("    ip saddr 192.168.0.0/16 ip daddr 192.168.0.0/16 counter accept\n");
+    r.push_str("    ip saddr 10.0.0.0/8 ip daddr 10.0.0.0/8 counter accept\n");
+    r.push_str("    ip saddr 172.16.0.0/12 ip daddr 172.16.0.0/12 counter accept\n");
+    // IPv6
+    r.push_str("    ip6 saddr fe80::/10 ip6 daddr fe80::/10 counter accept\n");
+    r.push_str("    ip6 saddr ff00::/8 ip6 daddr ff00::/8 counter accept\n");
+    r.push_str("    ip6 saddr fc00::/7 ip6 daddr fc00::/7 counter accept\n");
+    // LAN multicast (mDNS, SSDP, SLPv2)
+    for subnet in &["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"] {
+        r.push_str(&format!(
+            "    ip saddr {} ip daddr 224.0.0.0/24 counter accept\n",
+            subnet
+        ));
+        r.push_str(&format!(
+            "    ip saddr {} ip daddr 239.255.255.250 counter accept\n",
+            subnet
+        ));
+        r.push_str(&format!(
+            "    ip saddr {} ip daddr 239.255.255.253 counter accept\n",
+            subnet
+        ));
+    }
+
+    // 6. ICMP/ICMPv6
+    r.push_str("    icmp type echo-reply counter accept\n");
+    r.push_str("    icmpv6 type { echo-request, echo-reply, destination-unreachable, packet-too-big, time-exceeded, parameter-problem } counter accept\n");
+
+    // 7. Bootstrap IPs (allow API access without VPN)
+    for ip_str in bootstrap_ips {
+        let cidr = ensure_cidr(ip_str);
+        match classify_ip(&cidr) {
+            Some(IpVersion::V4) => {
+                r.push_str(&format!(
+                    "    ip daddr {} counter accept comment \"airvpn_persist_bootstrap\"\n",
+                    cidr
+                ));
+            }
+            Some(IpVersion::V6) => {
+                r.push_str(&format!(
+                    "    ip6 daddr {} counter accept comment \"airvpn_persist_bootstrap\"\n",
+                    cidr
+                ));
+            }
+            None => {}
+        }
+    }
+
+    // 8. VPN tunnel interface (inner packets going into tunnel)
+    r.push_str("    oifname \"avpn-*\" counter accept\n");
+
+    // 9. WireGuard outer packets (marked by routing policy table 51820)
+    r.push_str("    meta mark 51820 counter accept\n");
+
+    // Final drop sentinel
+    r.push_str("    counter drop comment \"airvpn_persist_output_latest_rule\"\n");
+
+    r.push_str("  }\n\n");
+
+    // Close table
+    r.push_str("}\n");
+
+    r
 }
 
 /// Activate the network lock: write ruleset to tmpfile and load via `nft -f`.
@@ -447,22 +622,23 @@ pub fn deactivate() -> Result<()> {
     Ok(())
 }
 
-/// Reclaim ownership and delete the table in a single nft -f transaction.
+/// Reclaim ownership and delete the persistent table in a single nft -f transaction.
 ///
 /// Because each `nft` invocation opens a new netlink socket (new portid),
 /// reclaim and delete must happen in the SAME invocation. Otherwise:
-/// 1. reclaim_ownership() — nft opens socket, reclaims, exits → table orphaned
-/// 2. deactivate() — new nft, new portid, can't delete orphaned owner table → EPERM
+/// 1. reclaim — nft opens socket, reclaims, exits → table orphaned
+/// 2. delete — new nft, new portid, can't delete orphaned owner table → EPERM
 ///
 /// This function writes both commands to a single tmpfile and loads atomically.
+/// Operates on `airvpn_persist`, NOT `airvpn_lock`.
 pub fn reclaim_and_delete() -> Result<()> {
-    if !is_active() {
+    if !is_persist_active() {
         return Ok(());
     }
 
     let cmd = format!(
         "add table inet {} {{ flags owner, persist; }}\ndelete table inet {}\n",
-        TABLE_NAME, TABLE_NAME
+        PERSIST_TABLE_NAME, PERSIST_TABLE_NAME
     );
     let mut tmpfile =
         tempfile::NamedTempFile::new().context("failed to create temp nft file")?;
@@ -484,7 +660,7 @@ pub fn reclaim_and_delete() -> Result<()> {
     Ok(())
 }
 
-/// Check if our nftables table exists.
+/// Check if our session nftables table (`airvpn_lock`) exists.
 pub fn is_active() -> bool {
     let output = Command::new("nft")
         .args(["list", "table", "inet", TABLE_NAME])
@@ -496,112 +672,16 @@ pub fn is_active() -> bool {
     }
 }
 
-/// Check if the persistent lock is installed (rules file exists on disk).
-///
-/// This is the decision point at disconnect/recovery time: if the file exists,
-/// we keep the base table alive; if not, we delete the whole table.
-pub fn is_persistent() -> bool {
-    std::path::Path::new(PERSISTENT_RULES_PATH).exists()
-}
-
-/// Reclaim ownership of an existing table (persistent lock loaded at boot).
-///
-/// Sends `add table inet airvpn_lock { flags owner, persist; }` which:
-/// - If table is orphaned: assigns us as owner
-/// - If table is owned by us already: no-op
-/// - If table is owned by another process: fails with EOPNOTSUPP
-pub fn reclaim_ownership() -> Result<()> {
-    let cmd = format!(
-        "add table inet {} {{ flags owner, persist; }}\n",
-        TABLE_NAME
-    );
-    let mut tmpfile =
-        tempfile::NamedTempFile::new().context("failed to create temp nft file")?;
-    tmpfile
-        .write_all(cmd.as_bytes())
-        .context("failed to write nft command")?;
-    tmpfile.flush().context("failed to flush nft command")?;
-
+/// Check if the persistent nftables table (`airvpn_persist`) exists.
+pub fn is_persist_active() -> bool {
     let output = Command::new("nft")
-        .arg("-f")
-        .arg(tmpfile.path())
-        .output()
-        .context("failed to execute nft")?;
+        .args(["list", "table", "inet", PERSIST_TABLE_NAME])
+        .output();
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("failed to reclaim table ownership: {}", stderr);
+    match output {
+        Ok(o) => o.status.success(),
+        Err(_) => false,
     }
-    Ok(())
-}
-
-/// Release ownership of the table (no-op — ownership releases when process exits).
-///
-/// The table stays active because of the `persist` flag. On next connect,
-/// `reclaim_ownership()` re-asserts ownership.
-pub fn release_ownership() {
-    // No-op: ownership releases automatically when process exits.
-    // The table stays because of the persist flag.
-}
-
-/// Add a single server IP to the output chain allowlist.
-///
-/// Used in persistent lock mode to dynamically allow the VPN server endpoint.
-pub fn allow_server_ip(ip: &str) -> Result<()> {
-    let cidr = ensure_cidr(ip);
-    let (prefix, addr) = match classify_ip(&cidr) {
-        Some(IpVersion::V4) => ("ip daddr", cidr.as_str()),
-        Some(IpVersion::V6) => ("ip6 daddr", cidr.as_str()),
-        None => anyhow::bail!("invalid server IP: {}", ip),
-    };
-    let comment = format!("airvpn_server_endpoint_{}", ip.replace(':', "_"));
-    nft_insert_before_latest(
-        "output",
-        &format!("{} {} counter accept comment \"{}\"", prefix, addr, comment),
-    )
-}
-
-/// Remove ALL dynamically-added server IP rules from the output chain.
-///
-/// Finds rules by comment prefix `airvpn_server_endpoint_` and deletes them.
-/// Used during disconnect and reconnection to clean up stale server IPs.
-pub fn deallow_all_server_ips() -> Result<()> {
-    let output = Command::new("nft")
-        .args(["-n", "-a", "list", "chain", "inet", TABLE_NAME, "output"])
-        .output()
-        .context("failed to list output chain")?;
-
-    if !output.status.success() {
-        // Chain doesn't exist or table not active — nothing to clean up
-        return Ok(());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut handles: Vec<String> = Vec::new();
-    for line in stdout.lines() {
-        if line.contains("airvpn_server_endpoint_") {
-            if let Some(handle_pos) = line.rfind("# handle ") {
-                let handle = line[handle_pos + 9..].trim();
-                if !handle.is_empty() {
-                    handles.push(handle.to_string());
-                }
-            }
-        }
-    }
-
-    for handle in handles {
-        let _ = Command::new("nft")
-            .args(["delete", "rule", "inet", TABLE_NAME, "output", "handle", &handle])
-            .output();
-    }
-
-    Ok(())
-}
-
-/// Remove a server IP from the output chain allowlist.
-pub fn deallow_server_ip(ip: &str) -> Result<()> {
-    let comment = format!("airvpn_server_endpoint_{}", ip.replace(':', "_"));
-    nft_delete_by_comment("output", &comment)
 }
 
 /// Allow VPN interface traffic (called when tunnel comes up).
@@ -1406,8 +1486,61 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // generate_persistent_ruleset tests
+    // generate_persistent_ruleset tests (airvpn_persist table)
     // -------------------------------------------------------------------
+
+    #[test]
+    fn test_persistent_ruleset_uses_persist_table_name() {
+        let ruleset = generate_persistent_ruleset(&vec![]);
+        assert!(ruleset.contains("table inet airvpn_persist"),
+            "persistent ruleset should use airvpn_persist table name");
+        assert!(!ruleset.contains("table inet airvpn_lock"),
+            "persistent ruleset should NOT use airvpn_lock table name");
+    }
+
+    #[test]
+    fn test_persistent_ruleset_has_owner_persist_flags() {
+        let ruleset = generate_persistent_ruleset(&vec![]);
+        assert!(ruleset.contains("flags owner, persist;"),
+            "persistent ruleset should have owner+persist flags");
+    }
+
+    #[test]
+    fn test_persistent_ruleset_has_meta_mark_in_output() {
+        let ruleset = generate_persistent_ruleset(&vec![]);
+        assert!(ruleset.contains("meta mark 51820 counter accept"),
+            "persistent ruleset should allow WireGuard outer packets via meta mark");
+    }
+
+    #[test]
+    fn test_persistent_ruleset_has_avpn_oifname_in_output() {
+        let ruleset = generate_persistent_ruleset(&vec![]);
+        assert!(ruleset.contains("oifname \"avpn-*\" counter accept"),
+            "persistent ruleset should allow VPN tunnel output via oifname");
+    }
+
+    #[test]
+    fn test_persistent_ruleset_has_avpn_iifname_in_input() {
+        let ruleset = generate_persistent_ruleset(&vec![]);
+        assert!(ruleset.contains("iifname \"avpn-*\" counter accept"),
+            "persistent ruleset should allow VPN tunnel input via iifname");
+    }
+
+    #[test]
+    fn test_persistent_ruleset_has_avpn_in_forward() {
+        let ruleset = generate_persistent_ruleset(&vec![]);
+        // Forward chain should have both iifname and oifname for avpn-*
+        let forward_start = ruleset.find("chain forward").expect("forward chain");
+        let forward_end = ruleset[forward_start..]
+            .find("\n  }\n")
+            .map(|p| forward_start + p)
+            .expect("forward chain end");
+        let forward_section = &ruleset[forward_start..forward_end];
+        assert!(forward_section.contains("iifname \"avpn-*\" counter accept"),
+            "forward chain should allow incoming VPN tunnel traffic");
+        assert!(forward_section.contains("oifname \"avpn-*\" counter accept"),
+            "forward chain should allow outgoing VPN tunnel traffic");
+    }
 
     #[test]
     fn test_persistent_ruleset_has_bootstrap_ips() {
@@ -1417,22 +1550,9 @@ mod tests {
             "82.196.3.205".to_string(),
         ];
         let ruleset = generate_persistent_ruleset(&bootstrap_ips);
-        assert!(ruleset.contains("table inet airvpn_lock"));
         assert!(ruleset.contains("ip daddr 63.33.78.166/32"));
         assert!(ruleset.contains("ip daddr 54.93.175.114/32"));
         assert!(ruleset.contains("ip daddr 82.196.3.205/32"));
-        assert!(ruleset.contains("flags owner, persist;"));
-        assert!(ruleset.contains("airvpn_filter_input_latest_rule"));
-        assert!(ruleset.contains("airvpn_filter_output_latest_rule"));
-        assert!(ruleset.contains("airvpn_filter_forward_latest_rule"));
-    }
-
-    #[test]
-    fn test_persistent_ruleset_no_server_ips_beyond_bootstrap() {
-        let bootstrap_ips = vec!["1.2.3.4".to_string()];
-        let ruleset = generate_persistent_ruleset(&bootstrap_ips);
-        // Only the bootstrap IP should be in output allowlist
-        assert!(ruleset.contains("ip daddr 1.2.3.4/32"));
     }
 
     #[test]
@@ -1452,5 +1572,14 @@ mod tests {
         assert!(ruleset.contains("10.0.0.0/8"));
         assert!(ruleset.contains("172.16.0.0/12"));
         assert!(ruleset.contains("fe80::/10"));
+    }
+
+    #[test]
+    fn test_persistent_ruleset_priority_minus_400() {
+        let ruleset = generate_persistent_ruleset(&vec![]);
+        assert!(ruleset.contains("priority -400;"),
+            "persistent ruleset should use priority -400");
+        assert!(!ruleset.contains("priority -300;"),
+            "persistent ruleset should NOT use priority -300");
     }
 }

@@ -552,7 +552,7 @@ Wants=network-pre.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/bin/nft -f /etc/airvpn-rs/lock.nft
-ExecStop=/usr/bin/nft delete table inet airvpn_lock
+ExecStop=/usr/bin/nft delete table inet airvpn_persist
 
 [Install]
 WantedBy=sysinit.target
@@ -588,12 +588,10 @@ WantedBy=sysinit.target
     }
     info!("Enabled airvpn-lock.service");
 
-    // Load the table now — always replace any existing table so the persistent
-    // version (with flags owner, persist) supersedes any old session lock.
-    if netlock::is_active() {
-        // Delete existing table first — owner+persist flags can only be set at creation.
-        // If owned by a running connect process, this fails silently (they'll reclaim later).
-        let _ = netlock::deactivate();
+    // Load the table now. If airvpn_persist already active, delete it first
+    // (owner+persist flags can only be set at table creation time).
+    if netlock::is_persist_active() {
+        let _ = netlock::reclaim_and_delete();
     }
     let output = std::process::Command::new("nft")
         .args(["-f", netlock::PERSISTENT_RULES_PATH])
@@ -625,24 +623,13 @@ fn cmd_lock_uninstall() -> anyhow::Result<()> {
     let _ = std::fs::remove_file(netlock::PERSISTENT_SERVICE_PATH);
     let _ = std::fs::remove_file(netlock::PERSISTENT_RULES_PATH);
 
-    // Delete table if active — but NOT if VPN is running (the monitor loop
-    // would detect the deletion and fight us by reconnecting to restore it).
-    // Instead, let the VPN process clean up on disconnect: it checks
-    // is_persistent() which will return false since we just deleted lock.nft.
-    if netlock::is_active() {
-        let vpn_running = recovery::load()
-            .ok()
-            .flatten()
-            .map_or(false, |s| recovery::is_pid_alive(s.pid));
-
-        if vpn_running {
-            info!("VPN is running — table will be removed on next disconnect.");
-        } else {
-            match netlock::reclaim_and_delete() {
-                Ok(()) => {}
-                Err(e) => {
-                    warn!("Could not delete table: {}", e);
-                }
+    // Delete persistent table if active. Safe even while VPN is running —
+    // airvpn_persist and airvpn_lock are independent tables.
+    if netlock::is_persist_active() {
+        match netlock::reclaim_and_delete() {
+            Ok(()) => {}
+            Err(e) => {
+                warn!("Could not delete table: {}", e);
             }
         }
     }
@@ -655,8 +642,8 @@ fn cmd_lock_enable() -> anyhow::Result<()> {
     if !std::path::Path::new(netlock::PERSISTENT_RULES_PATH).exists() {
         anyhow::bail!("persistent lock not installed — run `airvpn-rs lock install` first");
     }
-    if netlock::is_active() {
-        info!("Lock table already active.");
+    if netlock::is_persist_active() {
+        info!("Persistent lock table already active.");
         return Ok(());
     }
     let output = std::process::Command::new("nft")
@@ -671,28 +658,19 @@ fn cmd_lock_enable() -> anyhow::Result<()> {
 }
 
 fn cmd_lock_disable() -> anyhow::Result<()> {
-    if !netlock::is_active() {
-        info!("Lock table not active.");
+    if !netlock::is_persist_active() {
+        info!("Persistent lock table not active.");
         return Ok(());
     }
-    // Check if VPN is running — warn before deleting the table under it
-    if let Ok(Some(state)) = recovery::load() {
-        if recovery::is_pid_alive(state.pid) {
-            anyhow::bail!(
-                "VPN process (PID {}) is running. Disconnect first, or use `lock uninstall` to force.",
-                state.pid
-            );
-        }
-    }
-    // Reclaim + delete atomically in one nft -f call (separate calls fail
-    // because each nft invocation gets a new netlink portid)
+    // Safe even while VPN is running — airvpn_persist and airvpn_lock are
+    // independent tables. Deleting airvpn_persist doesn't affect the session lock.
     netlock::reclaim_and_delete()?;
     info!("Persistent lock disabled (will return on next reboot if service enabled).");
     Ok(())
 }
 
 fn cmd_lock_status() -> anyhow::Result<()> {
-    let table_active = netlock::is_active();
+    let table_active = netlock::is_persist_active();
     let rules_exist = std::path::Path::new(netlock::PERSISTENT_RULES_PATH).exists();
     let service_exists = std::path::Path::new(netlock::PERSISTENT_SERVICE_PATH).exists();
 
