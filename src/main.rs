@@ -265,15 +265,21 @@ fn init_logging() {
     });
 }
 
-fn main() -> anyhow::Result<()> {
-    init_logging();
-    let mut provider_config = api::load_provider_config()
-        .expect("failed to load provider configuration");
+/// Load provider.json and verify RSA key integrity.
+/// Only needed for commands that talk to the AirVPN API (connect, servers).
+fn load_provider() -> anyhow::Result<api::ProviderConfig> {
+    let config = api::load_provider_config()
+        .context("failed to load provider configuration")?;
     // Verify the provider.json RSA key hasn't been tampered with (binary integrity).
     // This check only applies to the initial bootstrap key. Once the manifest
     // provides a rotated RSA key (Fix 1), that key is authenticated by the
     // RSA+AES envelope and doesn't need integrity checking.
-    api::verify_rsa_key_integrity(&provider_config);
+    api::verify_rsa_key_integrity(&config);
+    Ok(config)
+}
+
+fn main() -> anyhow::Result<()> {
+    init_logging();
     let cli = Cli::parse();
     match cli.command {
         Commands::Connect {
@@ -303,6 +309,7 @@ fn main() -> anyhow::Result<()> {
             event_vpn_down_arguments,
             event_vpn_down_waitend,
         } => {
+            let mut provider_config = load_provider()?;
             let connect_config = connect::ConnectConfig {
                 server_name: server,
                 no_lock,
@@ -328,7 +335,10 @@ fn main() -> anyhow::Result<()> {
         }
         Commands::Disconnect => cmd_disconnect(),
         Commands::Status => cmd_status(),
-        Commands::Servers { sort, debug, username, password_stdin, skip_ping } => cmd_servers(&mut provider_config, &sort, debug, username, password_stdin, skip_ping),
+        Commands::Servers { sort, debug, username, password_stdin, skip_ping } => {
+            let mut provider_config = load_provider()?;
+            cmd_servers(&mut provider_config, &sort, debug, username, password_stdin, skip_ping)
+        }
         Commands::Recover => cmd_recover(),
         Commands::Lock { action } => cmd_lock(action),
     }
