@@ -392,9 +392,19 @@ fn recover_from_state(state: &State) -> Result<()> {
 
     // 4. Deactivate network lock if it was active (last — prevents traffic leaks)
     if state.lock_active {
-        if let Err(e) = netlock::deactivate() {
-            warn!("failed to deactivate network lock: {}", e);
-            cleanup_failed = true;
+        if netlock::is_persistent() {
+            // Persistent lock installed — only clean up dynamic rules.
+            // Stale server IP rules from the crashed session are harmless
+            // (they just allow traffic to an old server we won't connect to).
+            // On next connect, new server IPs will be added fresh.
+            info!("Persistent lock: preserving base table during recovery");
+            let _ = netlock::reclaim_ownership();
+            netlock::release_ownership();
+        } else {
+            if let Err(e) = netlock::deactivate() {
+                warn!("failed to deactivate network lock: {}", e);
+                cleanup_failed = true;
+            }
         }
     }
 
