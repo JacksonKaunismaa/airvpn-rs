@@ -130,3 +130,36 @@ with no race condition. With wg-quick, this was impossible because wg-quick's
 
 **Eddie ref:** `src/Lib.Platform.Linux/Platform.cs`, `src/App.CLI.Linux.Elevated/src/impl.cpp`
 
+---
+
+## 5. Persistent network lock (kill switch)
+
+**Eddie:** Network lock activates at session start and deactivates at session end.
+Between sessions, traffic is unrestricted. Eddie resolves hostnames before activating
+the lock (NetworkLockManager.cs:127 — "resolve hostnames before a possible lock of
+DNS server"), creating a leak window during DNS resolution.
+
+**airvpn-rs:** Adds `airvpn-rs lock install` which creates a persistent nftables
+table loaded at boot by a systemd service (`Before=network-pre.target`). This
+provides Android-style "always-on VPN" protection: all non-VPN traffic is blocked
+even when airvpn-rs is not running.
+
+The persistent table uses nftables `flags owner, persist` (kernel 5.12+/6.9+):
+`owner` makes the table immune to `nft flush ruleset` from other processes;
+`persist` keeps the table alive after the owning process exits. When airvpn-rs
+connects, it reclaims ownership and adds server IPs dynamically. When disconnected,
+only VPN-specific rules are removed — the base lock stays active.
+
+Users who don't install the persistent lock get the same transient session lock
+behavior as Eddie (table created at connect, deleted at disconnect).
+
+**Why:** Eliminates the startup leak window entirely. The persistent lock is loaded
+before networking comes up, so there's never a moment when traffic can flow
+unprotected. Eddie's resolve-then-lock design is an inherent limitation — you must
+resolve DNS before blocking DNS — but with a persistent lock, no DNS resolution is
+needed at lock activation time (bootstrap IPs are hardcoded from provider.json).
+
+**Files:** `src/netlock.rs`, `src/main.rs` (Lock subcommand + connect/disconnect flow)
+
+**Eddie ref:** `src/Lib.Core/NetworkLockManager.cs`, `src/Lib.Platform.Linux/NetworkLockNftables.cs`
+
