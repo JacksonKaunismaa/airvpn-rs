@@ -18,10 +18,15 @@ bootstrap API IPs, LAN, DHCP, loopback, ICMP, and the VPN tunnel interface.
 
 ### Key properties
 
-- **Crash-proof**: `flags owner, persist` — table survives process exit
-- **Flush-proof**: `owner` flag makes the table immune to `nft flush ruleset`
+- **Crash-proof**: `persist` flag — table survives process exit
 - **Reboot-proof**: systemd oneshot service loads rules at boot (`Before=network-pre.target`)
-- **Tamper-proof**: only the owning process can modify the table (others get EPERM)
+
+Note on `owner` flag: owner protection only lasts while the owning netlink socket is
+open. Since we use `nft -f` (which opens and closes a socket per invocation), the
+table is only owner-protected for the milliseconds while nft runs. Between nft
+invocations, the table is effectively unowned and can be modified by any root process.
+The real protection comes from the table's existence blocking traffic — not from the
+owner flag. The `persist` flag (table survives socket close) is the important one.
 
 Kernel requirements: `owner` flag (kernel 5.12+), `persist` flag (kernel 6.9+).
 

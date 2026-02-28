@@ -132,7 +132,7 @@ with no race condition. With wg-quick, this was impossible because wg-quick's
 
 ---
 
-## 5. Persistent network lock (kill switch)
+## 6. Persistent network lock (kill switch)
 
 **Eddie:** Network lock activates at session start and deactivates at session end.
 Between sessions, traffic is unrestricted. Eddie resolves hostnames before activating
