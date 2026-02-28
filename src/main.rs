@@ -514,8 +514,12 @@ fn cmd_connect(
     // Unconditional cleanup: remove orphaned nftables table (Eddie: OnRecoveryAlways)
     if netlock::is_active() {
         if recovery::load().ok().flatten().map_or(true, |s| !recovery::is_pid_alive(s.pid)) {
-            warn!("Removing orphaned nftables table...");
-            let _ = netlock::deactivate();
+            if netlock::is_persistent() {
+                info!("Persistent lock table found (orphaned) — will reclaim on connect");
+            } else {
+                warn!("Removing orphaned nftables table...");
+                let _ = netlock::deactivate();
+            }
         }
     }
 
@@ -773,6 +777,15 @@ fn cmd_connect(
         info!("IPv6 disabled on {} interfaces", blocked_ipv6_ifaces.len());
     }
 
+    // Detect persistent lock: if we're not --no-lock, and a persistent lock table
+    // already exists on disk + in nftables, we'll reclaim it instead of creating
+    // a new session lock. Detected once before the loop — the table state at
+    // startup is what matters.
+    let persistent_lock = !no_lock && netlock::is_active() && netlock::is_persistent();
+    if persistent_lock {
+        info!("Persistent lock detected — will reclaim instead of creating session lock");
+    }
+
     loop {
         // Check for shutdown before attempting connection
         if shutdown.load(Ordering::Relaxed) {
@@ -924,50 +937,65 @@ fn cmd_connect(
         // NetworkLockManager.cs:132-135 resolves hostnames before lock).
         // Bootstrap IPs are allowlisted so the auth API call works through the lock.
         if !no_lock {
-            info!("Activating network lock...");
-            let mut allowed_ips: Vec<String> = server_ref.ips_entry.clone();
-            // Also whitelist API bootstrap IPs (extract bare IP from URLs like "http://1.2.3.4")
-            for url in &provider_config.bootstrap_urls {
-                if let Some(host) = extract_ip_from_url(url) {
-                    allowed_ips.push(host);
+            if persistent_lock {
+                info!("Persistent lock detected — reclaiming ownership...");
+                netlock::reclaim_ownership()?;
+                for ip in &server_ref.ips_entry {
+                    netlock::allow_server_ip(ip)?;
                 }
-            }
-            // Also whitelist manifest bootstrap URLs (Eddie merges these into the URL list)
-            for url in &manifest.bootstrap_urls {
-                if let Some(host) = extract_ip_from_url(url) {
-                    allowed_ips.push(host);
-                }
-            }
-            // Resolve hostnames to IPs before netlock activation (Eddie:
-            // NetworkLockManager.cs:132-135 "resolve hostnames before a possible
-            // lock of DNS server"). Entries that parse as IPs are kept as-is;
-            // hostnames are resolved via DNS and replaced with the resolved IPs.
-            let mut resolved_ips: Vec<String> = Vec::new();
-            for entry in &allowed_ips {
-                if entry.parse::<std::net::IpAddr>().is_ok() {
-                    resolved_ips.push(entry.clone());
-                } else {
-                    // Not a valid IP — try resolving as hostname
-                    let addrs = resolve_bootstrap_host(entry);
-                    if addrs.is_empty() {
-                        warn!("dropping unresolvable bootstrap host from allowlist: {}", entry);
-                    } else {
-                        debug!("resolved bootstrap host {} -> {:?}", entry, addrs);
-                        resolved_ips.extend(addrs);
+                info!("Persistent lock: added {} server IPs", server_ref.ips_entry.len());
+            } else {
+                info!("Activating network lock...");
+                let mut allowed_ips: Vec<String> = server_ref.ips_entry.clone();
+                // Also whitelist API bootstrap IPs (extract bare IP from URLs like "http://1.2.3.4")
+                for url in &provider_config.bootstrap_urls {
+                    if let Some(host) = extract_ip_from_url(url) {
+                        allowed_ips.push(host);
                     }
                 }
+                // Also whitelist manifest bootstrap URLs (Eddie merges these into the URL list)
+                for url in &manifest.bootstrap_urls {
+                    if let Some(host) = extract_ip_from_url(url) {
+                        allowed_ips.push(host);
+                    }
+                }
+                // Resolve hostnames to IPs before netlock activation (Eddie:
+                // NetworkLockManager.cs:132-135 "resolve hostnames before a possible
+                // lock of DNS server"). Entries that parse as IPs are kept as-is;
+                // hostnames are resolved via DNS and replaced with the resolved IPs.
+                let mut resolved_ips: Vec<String> = Vec::new();
+                for entry in &allowed_ips {
+                    if entry.parse::<std::net::IpAddr>().is_ok() {
+                        resolved_ips.push(entry.clone());
+                    } else {
+                        // Not a valid IP — try resolving as hostname
+                        let addrs = resolve_bootstrap_host(entry);
+                        if addrs.is_empty() {
+                            warn!("dropping unresolvable bootstrap host from allowlist: {}", entry);
+                        } else {
+                            debug!("resolved bootstrap host {} -> {:?}", entry, addrs);
+                            resolved_ips.extend(addrs);
+                        }
+                    }
+                }
+                let allowed_ips = resolved_ips;
+                let lock_config = netlock::NetlockConfig {
+                    allow_lan,
+                    allow_dhcp: true,
+                    allow_ping: true,
+                    allow_ipv4ipv6translation: true,
+                    allowed_ips_incoming: vec![],
+                    allowed_ips_outgoing: allowed_ips,
+                    incoming_policy_accept: false,
+                };
+                netlock::activate(&lock_config)?;
+                info!("Network lock active (dedicated nftables table)");
+                debug!(
+                    "Network lock: {} outgoing IPs whitelisted, allow_lan={}",
+                    lock_config.allowed_ips_outgoing.len(),
+                    lock_config.allow_lan,
+                );
             }
-            let allowed_ips = resolved_ips;
-            let lock_config = netlock::NetlockConfig {
-                allow_lan,
-                allow_dhcp: true,
-                allow_ping: true,
-                allow_ipv4ipv6translation: true,
-                allowed_ips_incoming: vec![],
-                allowed_ips_outgoing: allowed_ips,
-                incoming_policy_accept: false,
-            };
-            netlock::activate(&lock_config)?;
             recovery::save(&recovery::State {
                 lock_active: true,
                 wg_interface: String::new(),
@@ -980,12 +1008,6 @@ fn cmd_connect(
                 nonce,
                 resolv_was_immutable: dns::was_immutable(),
             })?;
-            info!("Network lock active (dedicated nftables table)");
-            debug!(
-                "Network lock: {} outgoing IPs whitelisted, allow_lan={}",
-                lock_config.allowed_ips_outgoing.len(),
-                lock_config.allow_lan,
-            );
         }
 
         // 7b. Pre-connection authorization (Eddie: Session.cs:173-218)
@@ -1028,7 +1050,7 @@ fn cmd_connect(
         if let Some(level) = reset_from_auth {
             match level {
                 ResetLevel::Fatal => {
-                    if !no_lock { let _ = netlock::deactivate(); }
+                    if !no_lock { teardown_lock_state(persistent_lock, &server_ref.ips_entry); }
                     ipv6::restore(&blocked_ipv6_ifaces);
                     let _ = recovery::remove();
                     anyhow::bail!("Fatal: server rejected connection");
@@ -1039,7 +1061,7 @@ fn cmd_connect(
                     penalties.penalize(&server_ref.name, 30);
                     forced_server = Option::None;
                     if no_reconnect {
-                        if !no_lock { let _ = netlock::deactivate(); }
+                        if !no_lock { teardown_lock_state(persistent_lock, &server_ref.ips_entry); }
                         ipv6::restore(&blocked_ipv6_ifaces);
                         let _ = recovery::remove();
                         anyhow::bail!("Server directed to try another (--no-reconnect)");
@@ -1050,7 +1072,7 @@ fn cmd_connect(
                 }
                 ResetLevel::Retry => {
                     if no_reconnect {
-                        if !no_lock { let _ = netlock::deactivate(); }
+                        if !no_lock { teardown_lock_state(persistent_lock, &server_ref.ips_entry); }
                         ipv6::restore(&blocked_ipv6_ifaces);
                         let _ = recovery::remove();
                         anyhow::bail!("Server asked to retry (--no-reconnect)");
@@ -1111,9 +1133,7 @@ fn cmd_connect(
                     forced_server = Option::None;
                 }
                 if no_reconnect {
-                    if !no_lock {
-                        let _ = netlock::deactivate();
-                    }
+                    if !no_lock { teardown_lock_state(persistent_lock, &server_ref.ips_entry); }
                     ipv6::restore(&blocked_ipv6_ifaces);
                     let _ = recovery::remove();
                     return Err(e.context("WireGuard connection failed"));
@@ -1157,9 +1177,7 @@ fn cmd_connect(
                 forced_server = Option::None;
             }
             if no_reconnect {
-                if !no_lock {
-                    let _ = netlock::deactivate();
-                }
+                if !no_lock { teardown_lock_state(persistent_lock, &server_ref.ips_entry); }
                 ipv6::restore(&blocked_ipv6_ifaces);
                 let _ = recovery::remove();
                 return Err(e);
@@ -1297,9 +1315,7 @@ fn cmd_connect(
                 }
                 if no_reconnect {
                     // Full cleanup on exit — tear down netlock and IPv6 too
-                    if !no_lock {
-                        let _ = netlock::deactivate();
-                    }
+                    if !no_lock { teardown_lock_state(persistent_lock, &server_ref.ips_entry); }
                     ipv6::restore(&blocked_ipv6_ifaces);
                     let _ = recovery::remove();
                     anyhow::bail!("Verification failed (--no-reconnect)");
@@ -1504,6 +1520,20 @@ fn partial_disconnect(config_path: &str, iface: &str, lock_active: bool, endpoin
     Ok(())
 }
 
+/// Clean up netlock state on error/disconnect within the connection loop.
+/// For persistent locks, only removes dynamic server IP rules and releases ownership
+/// (keeping the base table). For session locks, fully deactivates the table.
+fn teardown_lock_state(persistent_lock: bool, server_ips: &[String]) {
+    if persistent_lock {
+        for ip in server_ips {
+            let _ = netlock::deallow_server_ip(ip);
+        }
+        netlock::release_ownership();
+    } else {
+        let _ = netlock::deactivate();
+    }
+}
+
 fn cmd_disconnect_internal(config_path: &str, iface: &str, lock_active: bool, blocked_ipv6: &[String], endpoint_ip: &str, hook_down: &EventHook) -> anyhow::Result<()> {
     // 1. Remove interface-specific nft rules before deactivating table
     if lock_active {
@@ -1521,7 +1551,12 @@ fn cmd_disconnect_internal(config_path: &str, iface: &str, lock_active: bool, bl
     dns::flush();
     // 4. Remove netlock
     if lock_active {
-        let _ = netlock::deactivate();
+        if netlock::is_persistent() {
+            info!("Persistent lock: keeping base table, removing dynamic rules");
+            netlock::release_ownership();
+        } else {
+            let _ = netlock::deactivate();
+        }
     }
     // 5. Restore IPv6 (AFTER netlock is gone — avoids window where IPv6 is live
     //    but firewall rules have stale state)
