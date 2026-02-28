@@ -43,7 +43,7 @@ fn clear_immutable(path: &Path) {
 /// Check if a file has the immutable flag set.
 fn is_immutable(path: &Path) -> bool {
     Command::new("lsattr")
-        .arg(&path.to_string_lossy().to_string())
+        .arg(path.to_string_lossy().to_string())
         .output()
         .map(|o| {
             if !o.status.success() {

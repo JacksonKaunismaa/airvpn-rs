@@ -273,7 +273,7 @@ fn check_dns_inner(server_name: &str, check_domain: &str, exit_ip: &str, check_d
         // server, which logs the hash from the query it receives.
         let dns_host = check_dns_query.replace("{hash}", &hash);
         debug!("DNS check attempt {}: resolving {} (hash={})", attempt, dns_host, hash);
-        let _ = std::net::ToSocketAddrs::to_socket_addrs(&mut (dns_host.as_str(), 80));
+        let _ = std::net::ToSocketAddrs::to_socket_addrs(&(dns_host.as_str(), 80));
 
         // Small delay to let the server process the DNS query
         std::thread::sleep(Duration::from_millis(500));

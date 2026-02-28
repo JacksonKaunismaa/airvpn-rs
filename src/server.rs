@@ -41,15 +41,14 @@ use crate::pinger::PingResults;
 /// `penality_factor` (default 1000) in `Score()`. Penalties accumulate
 /// additively (`Penality += amount`) and decay by 1 every 60 seconds
 /// (Eddie: `Jobs/Penalities.cs` runs every 60s, decrements by 1).
+#[derive(Default)]
 pub struct ServerPenalties {
     penalties: HashMap<String, (i64, Instant)>,
 }
 
 impl ServerPenalties {
     pub fn new() -> Self {
-        Self {
-            penalties: HashMap::new(),
-        }
+        Self::default()
     }
 
     /// Maximum penalty value (2 hours of decay at 1/minute).
@@ -153,7 +152,7 @@ pub fn score(server: &Server) -> i64 {
     let score_b = score_base;
     let users_b = users;
 
-    (penality_b + ping_b + load_b + score_b + users_b) as i64
+    penality_b + ping_b + load_b + score_b + users_b
 }
 
 /// Calculate server score with ICMP ping latency, matching Eddie's
@@ -196,7 +195,7 @@ pub fn score_with_ping(server: &Server, ping_ms: i64) -> i64 {
     let score_b = score_base;
     let users_b = users;
 
-    (penality_b + ping_b + load_b + score_b + users_b) as i64
+    penality_b + ping_b + load_b + score_b + users_b
 }
 
 /// Compute server score including penalty, matching Eddie's `Score()` with

@@ -42,7 +42,7 @@ fn eddie_profile_path() -> Option<PathBuf> {
         if let Some(sudo_user) = std::env::var_os("SUDO_USER") {
             let username = sudo_user.to_string_lossy().to_string();
             let user = nix::unistd::User::from_name(&username).ok()??;
-            PathBuf::from(user.dir)
+            user.dir
         } else {
             // Running as root without sudo — no user Eddie profile to find
             return None;
@@ -282,7 +282,7 @@ pub fn load_profile_options() -> HashMap<String, String> {
 ///
 /// Eddie stores keyring passwords under attribute `"Eddie Profile" = "<profile_id>"`
 /// instead of our `application=airvpn-rs, profile-id=<id>`.
-fn load_eddie_profile(path: &PathBuf) -> Result<HashMap<String, String>> {
+fn load_eddie_profile(path: &Path) -> Result<HashMap<String, String>> {
     let password_provider = || {
         rpassword::prompt_password("Eddie profile password: ")
             .context("failed to read profile password from stdin")
@@ -297,7 +297,7 @@ fn load_eddie_profile(path: &PathBuf) -> Result<HashMap<String, String>> {
     warn_if_insecure_v2n(path, format);
 
     let trimmed = data.iter().position(|&b| !b.is_ascii_whitespace());
-    let is_xml = trimmed.map_or(false, |i| data[i] == b'<');
+    let is_xml = trimmed.is_some_and(|i| data[i] == b'<');
 
     if is_xml {
         parse_xml_options(&data)
@@ -307,7 +307,7 @@ fn load_eddie_profile(path: &PathBuf) -> Result<HashMap<String, String>> {
 }
 
 /// Load options from a specific profile path.
-fn load_options_from_path(path: &PathBuf) -> Result<HashMap<String, String>> {
+fn load_options_from_path(path: &Path) -> Result<HashMap<String, String>> {
     let password_provider = || {
         rpassword::prompt_password("Profile password: ")
             .context("failed to read profile password from stdin")
@@ -319,7 +319,7 @@ fn load_options_from_path(path: &PathBuf) -> Result<HashMap<String, String>> {
 
     // Detect format: XML starts with '<' (possibly after BOM/whitespace)
     let trimmed = data.iter().position(|&b| !b.is_ascii_whitespace());
-    let is_xml = trimmed.map_or(false, |i| data[i] == b'<');
+    let is_xml = trimmed.is_some_and(|i| data[i] == b'<');
 
     if is_xml {
         parse_xml_options(&data)
@@ -369,7 +369,7 @@ pub fn save_credentials(username: &str, password: &str) -> Result<()> {
 /// Always uses V2N format — the profile lives at /etc/airvpn-rs/ (root:root 0600),
 /// so file permissions provide security. The user's keyring is not accessible
 /// when running as root via sudo.
-fn save_options(path: &PathBuf, options: &HashMap<String, String>) -> Result<()> {
+fn save_options(path: &Path, options: &HashMap<String, String>) -> Result<()> {
     let data = serialize_xml_options(options);
 
     // Reuse existing profile ID

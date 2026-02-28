@@ -39,10 +39,7 @@ pub struct WgConnectParams {
 /// Validate an interface name: alphanumeric + dash + underscore, max 15 chars.
 /// Matches the validation in netlock.rs to prevent path traversal and command injection.
 fn validate_interface_name(iface: &str) -> Result<()> {
-    if iface.is_empty()
-        || iface.len() > 15
-        || !iface.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
+    if !crate::common::validate_interface_name(iface) {
         anyhow::bail!("invalid interface name: {:?}", iface);
     }
     Ok(())
@@ -605,13 +602,12 @@ fn teardown_routing(_iface: &str, endpoint_ip: &str) {
         &["ip", "-4", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
         &["ip", "-6", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
     ];
-    const MAX_RULE_DELETIONS: usize = 100;
     for cmd in commands {
         // Loop until the rule no longer exists (command fails).
         // Bound to MAX_RULE_DELETIONS to prevent infinite loops if deletion
         // keeps "succeeding" without actually removing the rule.
         let mut deleted = 0;
-        for _ in 0..MAX_RULE_DELETIONS {
+        for _ in 0..crate::common::MAX_RULE_DELETIONS {
             match Command::new(cmd[0]).args(&cmd[1..]).output() {
                 Ok(output) if output.status.success() => {
                     deleted += 1;
@@ -620,10 +616,10 @@ fn teardown_routing(_iface: &str, endpoint_ip: &str) {
                 _ => break,
             }
         }
-        if deleted >= MAX_RULE_DELETIONS {
+        if deleted >= crate::common::MAX_RULE_DELETIONS {
             warn!(
                 "hit {} rule deletions for {:?} — possible infinite loop",
-                MAX_RULE_DELETIONS,
+                crate::common::MAX_RULE_DELETIONS,
                 cmd.join(" ")
             );
         }

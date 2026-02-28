@@ -414,39 +414,36 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
                 }
             }
             Ok(Event::Start(ref e)) => {
-                match e.name().as_ref() {
-                    b"manifest" => {
-                        force_reauth_ts = attr_opt(e, b"force_reauth_ts")
-                            .and_then(|s| s.parse::<i64>().ok())
-                            .unwrap_or(0);
-                        if let Some(cd) = attr_opt(e, b"check_domain") {
-                            if !cd.is_empty() { check_domain = cd; }
-                        }
-                        if let Some(dq) = attr_opt(e, b"check_dns_query") {
-                            if !dq.is_empty() { check_dns_query = dq; }
-                        }
-                        if let Some(cp) = attr_opt(e, b"check_protocol") {
-                            if !cp.is_empty() { check_protocol = cp; }
-                        }
-                        // Eddie (Service.cs:924-932): read RSA key from manifest
-                        // for use in subsequent API calls. This allows AirVPN to
-                        // rotate their RSA key without requiring a software update.
-                        // The manifest itself was received encrypted with the current
-                        // (provider.json) key, so the new key is authenticated.
-                        if let Some(modulus) = attr_opt(e, b"auth_rsa_modulus") {
-                            if !modulus.is_empty() {
-                                debug!("Manifest contains auth_rsa_modulus ({} chars)", modulus.len());
-                                rsa_modulus = Some(modulus);
-                            }
-                        }
-                        if let Some(exponent) = attr_opt(e, b"auth_rsa_exponent") {
-                            if !exponent.is_empty() {
-                                debug!("Manifest contains auth_rsa_exponent ({} chars)", exponent.len());
-                                rsa_exponent = Some(exponent);
-                            }
+                if e.name().as_ref() == b"manifest" {
+                    force_reauth_ts = attr_opt(e, b"force_reauth_ts")
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .unwrap_or(0);
+                    if let Some(cd) = attr_opt(e, b"check_domain") {
+                        if !cd.is_empty() { check_domain = cd; }
+                    }
+                    if let Some(dq) = attr_opt(e, b"check_dns_query") {
+                        if !dq.is_empty() { check_dns_query = dq; }
+                    }
+                    if let Some(cp) = attr_opt(e, b"check_protocol") {
+                        if !cp.is_empty() { check_protocol = cp; }
+                    }
+                    // Eddie (Service.cs:924-932): read RSA key from manifest
+                    // for use in subsequent API calls. This allows AirVPN to
+                    // rotate their RSA key without requiring a software update.
+                    // The manifest itself was received encrypted with the current
+                    // (provider.json) key, so the new key is authenticated.
+                    if let Some(modulus) = attr_opt(e, b"auth_rsa_modulus") {
+                        if !modulus.is_empty() {
+                            debug!("Manifest contains auth_rsa_modulus ({} chars)", modulus.len());
+                            rsa_modulus = Some(modulus);
                         }
                     }
-                    _ => {}
+                    if let Some(exponent) = attr_opt(e, b"auth_rsa_exponent") {
+                        if !exponent.is_empty() {
+                            debug!("Manifest contains auth_rsa_exponent ({} chars)", exponent.len());
+                            rsa_exponent = Some(exponent);
+                        }
+                    }
                 }
             }
             _ => {}

@@ -47,10 +47,7 @@ pub fn block_all() -> Vec<String> {
         // Validate interface name: alphanumeric + dash + underscore, max 15 chars.
         // Kernel-created names are safe, but defense-in-depth prevents path traversal
         // if /proc is ever somehow compromised or a FUSE overlay is mounted.
-        if name.is_empty()
-            || name.len() > 15
-            || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
+        if !crate::common::validate_interface_name(&name) {
             warn!("skipping invalid interface name in block_all: {:?}", name);
             continue;
         }
@@ -63,10 +60,10 @@ pub fn block_all() -> Vec<String> {
             .trim()
             .to_string();
 
-        if current == "0" {
-            if fs::write(&disable_path, "1").is_ok() {
-                blocked.push(name);
-            }
+        if current == "0"
+            && fs::write(&disable_path, "1").is_ok()
+        {
+            blocked.push(name);
         }
     }
 
@@ -83,10 +80,7 @@ pub fn restore(interfaces: &[String]) {
     let conf_dir = Path::new("/proc/sys/net/ipv6/conf");
     for name in interfaces {
         // Validate interface name to prevent path traversal
-        if name.is_empty()
-            || name.len() > 15
-            || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
+        if !crate::common::validate_interface_name(name) {
             warn!("skipping invalid interface name in restore: {:?}", name);
             continue;
         }

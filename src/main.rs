@@ -37,6 +37,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Connect to AirVPN
     Connect {
@@ -476,6 +477,7 @@ fn run_hook(hook: &EventHook, event: &str) {
 // Connect
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)] // Will be decomposed in Phase 2
 fn cmd_connect(
     provider_config: &mut api::ProviderConfig,
     server_name: Option<String>,
@@ -505,21 +507,21 @@ fn cmd_connect(
     let dns_backup = std::path::Path::new("/etc/resolv.conf.airvpn-rs");
     if dns_backup.exists() {
         // Only restore if no airvpn process is running
-        if recovery::load().ok().flatten().map_or(true, |s| !recovery::is_pid_alive(s.pid)) {
+        if recovery::load().ok().flatten().is_none_or(|s| !recovery::is_pid_alive(s.pid)) {
             warn!("Restoring orphaned DNS backup...");
             let _ = dns::deactivate();
         }
     }
 
     // Unconditional cleanup: remove orphaned nftables table (Eddie: OnRecoveryAlways)
-    if netlock::is_active() {
-        if recovery::load().ok().flatten().map_or(true, |s| !recovery::is_pid_alive(s.pid)) {
-            if netlock::is_persistent() {
-                info!("Persistent lock table found (orphaned) — will reclaim on connect");
-            } else {
-                warn!("Removing orphaned nftables table...");
-                let _ = netlock::deactivate();
-            }
+    if netlock::is_active()
+        && recovery::load().ok().flatten().is_none_or(|s| !recovery::is_pid_alive(s.pid))
+    {
+        if netlock::is_persistent() {
+            info!("Persistent lock table found (orphaned) — will reclaim on connect");
+        } else {
+            warn!("Removing orphaned nftables table...");
+            let _ = netlock::deactivate();
         }
     }
 
@@ -528,10 +530,10 @@ fn cmd_connect(
     if let Ok(entries) = std::fs::read_dir("/run/airvpn-rs") {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("avpn-") && name.ends_with(".conf") {
-                if recovery::load().ok().flatten().map_or(true, |s| !recovery::is_pid_alive(s.pid)) {
-                    let _ = std::fs::remove_file(entry.path());
-                }
+            if name.starts_with("avpn-") && name.ends_with(".conf")
+                && recovery::load().ok().flatten().is_none_or(|s| !recovery::is_pid_alive(s.pid))
+            {
+                let _ = std::fs::remove_file(entry.path());
             }
         }
     }
@@ -547,18 +549,7 @@ fn cmd_connect(
 
     // 2. Resolve credentials (password via profile, interactive prompt, or --password-stdin)
     //    Wrapped in Zeroizing to clear from memory on drop.
-    let stdin_password: Option<Zeroizing<String>> = if password_stdin {
-        let mut line = Zeroizing::new(String::new());
-        std::io::stdin().read_line(&mut line)
-            .map_err(|e| anyhow::anyhow!("failed to read password from stdin: {}", e))?;
-        let trimmed = line.trim_end_matches('\n').trim_end_matches('\r').to_string();
-        if trimmed.is_empty() {
-            anyhow::bail!("--password-stdin: received empty password");
-        }
-        Some(Zeroizing::new(trimmed))
-    } else {
-        None
-    };
+    let stdin_password = airvpn::common::read_stdin_password(password_stdin)?;
     // 2b. Load profile options once (used for credentials + locklast/startlast)
     let profile_options = config::load_profile_options();
 
@@ -699,11 +690,11 @@ fn cmd_connect(
     let lock_last = !no_lock_last
         && profile_options
             .get("servers.locklast")
-            .map_or(true, |v| v != "False"); // default true (Eddie defaults false)
+            .is_none_or(|v| v != "False"); // default true (Eddie defaults false)
     let start_last = !no_start_last
         && profile_options
             .get("servers.startlast")
-            .map_or(true, |v| v != "False"); // default true (Eddie defaults false)
+            .is_none_or(|v| v != "False"); // default true (Eddie defaults false)
 
     // Determine initial forced_server: CLI --server > startlast > auto-select
     // Eddie: Session.cs lines 102-149 priority chain
@@ -1050,7 +1041,7 @@ fn cmd_connect(
         if let Some(level) = reset_from_auth {
             match level {
                 ResetLevel::Fatal => {
-                    if !no_lock { teardown_lock_state(persistent_lock, &server_ref.ips_entry); }
+                    if !no_lock { teardown_lock_state(); }
                     ipv6::restore(&blocked_ipv6_ifaces);
                     let _ = recovery::remove();
                     anyhow::bail!("Fatal: server rejected connection");
@@ -1061,7 +1052,7 @@ fn cmd_connect(
                     penalties.penalize(&server_ref.name, 30);
                     forced_server = Option::None;
                     if no_reconnect {
-                        if !no_lock { teardown_lock_state(persistent_lock, &server_ref.ips_entry); }
+                        if !no_lock { teardown_lock_state(); }
                         ipv6::restore(&blocked_ipv6_ifaces);
                         let _ = recovery::remove();
                         anyhow::bail!("Server directed to try another (--no-reconnect)");
@@ -1072,7 +1063,7 @@ fn cmd_connect(
                 }
                 ResetLevel::Retry => {
                     if no_reconnect {
-                        if !no_lock { teardown_lock_state(persistent_lock, &server_ref.ips_entry); }
+                        if !no_lock { teardown_lock_state(); }
                         ipv6::restore(&blocked_ipv6_ifaces);
                         let _ = recovery::remove();
                         anyhow::bail!("Server asked to retry (--no-reconnect)");
@@ -1133,13 +1124,13 @@ fn cmd_connect(
                     forced_server = Option::None;
                 }
                 if no_reconnect {
-                    if !no_lock { teardown_lock_state(persistent_lock, &server_ref.ips_entry); }
+                    if !no_lock { teardown_lock_state(); }
                     ipv6::restore(&blocked_ipv6_ifaces);
                     let _ = recovery::remove();
                     return Err(e.context("WireGuard connection failed"));
                 }
                 consecutive_failures += 1;
-                let backoff_secs = std::cmp::min(3u64.saturating_mul(2u64.saturating_pow(consecutive_failures.saturating_sub(1).min(6))), 300);
+                let backoff_secs = airvpn::common::backoff_secs(consecutive_failures);
                 if network_down || lock_last {
                     warn!("Reconnecting in {}s (retrying {})...", backoff_secs, server_ref.name);
                 } else {
@@ -1177,13 +1168,13 @@ fn cmd_connect(
                 forced_server = Option::None;
             }
             if no_reconnect {
-                if !no_lock { teardown_lock_state(persistent_lock, &server_ref.ips_entry); }
+                if !no_lock { teardown_lock_state(); }
                 ipv6::restore(&blocked_ipv6_ifaces);
                 let _ = recovery::remove();
                 return Err(e);
             }
             consecutive_failures += 1;
-            let backoff_secs = std::cmp::min(3u64.saturating_mul(2u64.saturating_pow(consecutive_failures.saturating_sub(1).min(6))), 300);
+            let backoff_secs = airvpn::common::backoff_secs(consecutive_failures);
             if lock_last {
                 warn!("Reconnecting in {}s (retrying {})...", backoff_secs, server_ref.name);
             } else {
@@ -1297,11 +1288,11 @@ fn cmd_connect(
             }
 
             // 10d. Client-side DNS verification: resolv.conf should only contain VPN DNS
-            if !verify_failed && !shutdown.load(Ordering::Relaxed) {
-                if !dns::verify_resolv_conf(&effective_dns_ipv4, dns_ipv6, std::path::Path::new("/etc/resolv.conf")) {
-                    warn!("resolv.conf contains non-VPN nameservers — potential DNS leak");
-                    verify_failed = true;
-                }
+            if !verify_failed && !shutdown.load(Ordering::Relaxed)
+                && !dns::verify_resolv_conf(&effective_dns_ipv4, dns_ipv6, std::path::Path::new("/etc/resolv.conf"))
+            {
+                warn!("resolv.conf contains non-VPN nameservers — potential DNS leak");
+                verify_failed = true;
             }
 
             if verify_failed && !shutdown.load(Ordering::Relaxed) {
@@ -1315,13 +1306,13 @@ fn cmd_connect(
                 }
                 if no_reconnect {
                     // Full cleanup on exit — tear down netlock and IPv6 too
-                    if !no_lock { teardown_lock_state(persistent_lock, &server_ref.ips_entry); }
+                    if !no_lock { teardown_lock_state(); }
                     ipv6::restore(&blocked_ipv6_ifaces);
                     let _ = recovery::remove();
                     anyhow::bail!("Verification failed (--no-reconnect)");
                 }
                 consecutive_failures += 1;
-                let backoff_secs = std::cmp::min(3u64.saturating_mul(2u64.saturating_pow(consecutive_failures.saturating_sub(1).min(6))), 300);
+                let backoff_secs = airvpn::common::backoff_secs(consecutive_failures);
                 interruptible_sleep(&shutdown, backoff_secs);
                 continue;
             }
@@ -1422,7 +1413,7 @@ fn cmd_connect(
                     forced_server = Option::None;
                 }
                 consecutive_failures += 1;
-                let backoff_secs = std::cmp::min(3u64.saturating_mul(2u64.saturating_pow(consecutive_failures.saturating_sub(1).min(6))), 300);
+                let backoff_secs = airvpn::common::backoff_secs(consecutive_failures);
                 if network_down || lock_last {
                     warn!(
                         "Connection lost. Reconnecting in {}s (retrying {})...",
@@ -1528,7 +1519,7 @@ fn partial_disconnect(config_path: &str, iface: &str, lock_active: bool, endpoin
 /// Clean up netlock state on error/disconnect within the connection loop.
 /// For persistent locks, only removes dynamic server IP rules and releases ownership
 /// (keeping the base table). For session locks, fully deactivates the table.
-fn teardown_lock_state(_persistent_lock: bool, _server_ips: &[String]) {
+fn teardown_lock_state() {
     // Check is_persistent() dynamically — the cached persistent_lock flag may be stale
     // if `lock install` was run while connected.
     if netlock::is_persistent() && netlock::is_active() {
@@ -1541,10 +1532,8 @@ fn teardown_lock_state(_persistent_lock: bool, _server_ips: &[String]) {
 
 fn cmd_disconnect_internal(config_path: &str, iface: &str, lock_active: bool, blocked_ipv6: &[String], endpoint_ip: &str, hook_down: &EventHook) -> anyhow::Result<()> {
     // 1. Remove interface-specific nft rules before deactivating table
-    if lock_active {
-        if !iface.is_empty() {
-            let _ = netlock::deallow_interface(iface);
-        }
+    if lock_active && !iface.is_empty() {
+        let _ = netlock::deallow_interface(iface);
     }
     // 2. Tear down WireGuard (also tears down routing + endpoint host route)
     let _ = wireguard::disconnect(config_path, endpoint_ip);
@@ -1607,18 +1596,7 @@ fn cmd_servers(
     password_stdin: bool,
     _skip_ping: bool,
 ) -> anyhow::Result<()> {
-    let stdin_password: Option<Zeroizing<String>> = if password_stdin {
-        let mut line = Zeroizing::new(String::new());
-        std::io::stdin().read_line(&mut line)
-            .map_err(|e| anyhow::anyhow!("failed to read password from stdin: {}", e))?;
-        let trimmed = line.trim_end_matches('\n').trim_end_matches('\r').to_string();
-        if trimmed.is_empty() {
-            anyhow::bail!("--password-stdin: received empty password");
-        }
-        Some(Zeroizing::new(trimmed))
-    } else {
-        None
-    };
+    let stdin_password = airvpn::common::read_stdin_password(password_stdin)?;
     let profile_options = config::load_profile_options();
     let (username, password) = config::resolve_credentials(
         cli_username.as_deref(),
@@ -1641,7 +1619,7 @@ fn cmd_servers(
 
     let mut servers: Vec<&manifest::Server> = manifest.servers.iter().collect();
     match sort {
-        "score" => servers.sort_by(|a, b| server::score(a).cmp(&server::score(b))),
+        "score" => servers.sort_by_key(|s| server::score(s)),
         "load" => servers.sort_by(|a, b| {
             server::load_perc(a).cmp(&server::load_perc(b))
         }),
@@ -1649,7 +1627,7 @@ fn cmd_servers(
         "name" => servers.sort_by(|a, b| a.name.cmp(&b.name)),
         _ => {
             warn!("Unknown sort key '{}', defaulting to score", sort);
-            servers.sort_by(|a, b| server::score(a).cmp(&server::score(b)));
+            servers.sort_by_key(|s| server::score(s));
         }
     }
 

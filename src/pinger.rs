@@ -12,6 +12,7 @@ use std::process::Command;
 use log::warn;
 
 /// Ping results for all servers.
+#[derive(Default)]
 pub struct PingResults {
     /// Server name -> latency in ms (-1 = not measured/failed)
     pub latencies: HashMap<String, i64>,
@@ -19,9 +20,7 @@ pub struct PingResults {
 
 impl PingResults {
     pub fn new() -> Self {
-        Self {
-            latencies: HashMap::new(),
-        }
+        Self::default()
     }
 
     /// Get latency for a server (-1 if not measured).

@@ -162,7 +162,7 @@ pub fn build_envelope(
     let d_plaintext = assoc_encode_strings(params);
 
     // 5. AES-CBC encrypt the request data
-    let d_encrypted = aes_cbc_encrypt(&d_plaintext, &*key, &*iv);
+    let d_encrypted = aes_cbc_encrypt(&d_plaintext, &key, &iv);
     let d_b64 = B64.encode(&d_encrypted);
 
     Ok((s_b64, d_b64, SessionKey { key, iv }))

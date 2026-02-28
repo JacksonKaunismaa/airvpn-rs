@@ -565,7 +565,7 @@ pub fn deallow_server_ip(ip: &str) -> Result<()> {
 /// Eddie equivalent: netlock-nftables-interface action=add
 pub fn allow_interface(iface: &str) -> Result<()> {
     // Validate interface name to prevent nft command injection
-    if iface.len() > 15 || !iface.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if !crate::common::validate_interface_name(iface) {
         anyhow::bail!("invalid interface name: {:?}", iface);
     }
 
@@ -613,18 +613,12 @@ pub fn allow_interface(iface: &str) -> Result<()> {
 /// Eddie equivalent: netlock-nftables-interface action=del
 pub fn deallow_interface(iface: &str) -> Result<()> {
     // Validate interface name to prevent nft command injection
-    if iface.len() > 15 || !iface.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if !crate::common::validate_interface_name(iface) {
         anyhow::bail!("invalid interface name: {:?}", iface);
     }
 
     for chain in &["input", "forward", "output"] {
-        let dir = match *chain {
-            "input" => "input",
-            "forward" => "forward",
-            "output" => "output",
-            _ => unreachable!(),
-        };
-        let comment = format!("airvpn_interface_{}_{}", dir, iface);
+        let comment = format!("airvpn_interface_{}_{}", chain, iface);
         nft_delete_by_comment(chain, &comment)?;
     }
 

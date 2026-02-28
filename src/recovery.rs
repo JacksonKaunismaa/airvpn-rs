@@ -53,26 +53,17 @@ pub struct State {
     pub resolv_was_immutable: bool,
 }
 
-/// Validate a network interface name: alphanumeric + dash + underscore, max 15 chars.
-fn is_valid_interface_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 15
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
-
 /// Validate deserialized state content to reject tampered/corrupted state files.
 fn validate_state(state: &State) -> bool {
     // Validate interface name if present
-    if !state.wg_interface.is_empty() && !is_valid_interface_name(&state.wg_interface) {
+    if !state.wg_interface.is_empty() && !crate::common::validate_interface_name(&state.wg_interface) {
         warn!("state validation failed: invalid wg_interface {:?}", state.wg_interface);
         return false;
     }
 
     // Validate blocked IPv6 interface names
     for iface in &state.blocked_ipv6_ifaces {
-        if !is_valid_interface_name(iface) {
+        if !crate::common::validate_interface_name(iface) {
             warn!("state validation failed: invalid blocked_ipv6_iface {:?}", iface);
             return false;
         }
@@ -313,8 +304,7 @@ fn recover_from_state(state: &State) -> Result<()> {
             .args(["link", "delete", &state.wg_interface])
             .output()
             .and_then(|o| if o.status.success() { Ok(()) } else {
-                Err(std::io::Error::new(std::io::ErrorKind::Other,
-                    String::from_utf8_lossy(&o.stderr).to_string()))
+                Err(std::io::Error::other(String::from_utf8_lossy(&o.stderr).to_string()))
             })
         {
             warn!("failed to delete WireGuard interface {}: {}", state.wg_interface, e);
@@ -358,10 +348,9 @@ fn recover_from_state(state: &State) -> Result<()> {
         &["ip", "-4", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
         &["ip", "-6", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
     ];
-    const MAX_RULE_DELETIONS: usize = 100;
     for cmd in routing_cleanups {
         let mut deleted = 0;
-        for _ in 0..MAX_RULE_DELETIONS {
+        for _ in 0..crate::common::MAX_RULE_DELETIONS {
             match std::process::Command::new(cmd[0]).args(&cmd[1..]).output() {
                 Ok(output) if output.status.success() => {
                     deleted += 1;
@@ -370,10 +359,10 @@ fn recover_from_state(state: &State) -> Result<()> {
                 _ => break,
             }
         }
-        if deleted >= MAX_RULE_DELETIONS {
+        if deleted >= crate::common::MAX_RULE_DELETIONS {
             warn!(
                 "hit {} rule deletions for {:?} — possible infinite loop",
-                MAX_RULE_DELETIONS,
+                crate::common::MAX_RULE_DELETIONS,
                 cmd.join(" ")
             );
         }
@@ -400,11 +389,9 @@ fn recover_from_state(state: &State) -> Result<()> {
             info!("Persistent lock: preserving base table during recovery");
             let _ = netlock::reclaim_ownership();
             netlock::release_ownership();
-        } else {
-            if let Err(e) = netlock::deactivate() {
-                warn!("failed to deactivate network lock: {}", e);
-                cleanup_failed = true;
-            }
+        } else if let Err(e) = netlock::deactivate() {
+            warn!("failed to deactivate network lock: {}", e);
+            cleanup_failed = true;
         }
     }
 
