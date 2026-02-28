@@ -1,6 +1,7 @@
 pub mod api;
 pub mod common;
 pub mod config;
+pub mod connect;
 pub mod crypto;
 pub mod dns;
 pub mod ipv6;
