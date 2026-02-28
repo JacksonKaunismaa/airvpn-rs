@@ -107,25 +107,43 @@ fn parse_provider_json(json_str: &str) -> Result<ProviderConfig> {
 ///
 /// Fails hard if neither exists — no silent fallback.
 pub fn load_provider_config() -> Result<ProviderConfig> {
-    let paths = [
-        "./resources/provider.json",
-        "/etc/airvpn-rs/provider.json",
+    let mut search_paths: Vec<std::path::PathBuf> = vec![
+        "./resources/provider.json".into(),
+        "/etc/airvpn-rs/provider.json".into(),
     ];
 
-    for path_str in &paths {
-        let path = std::path::Path::new(path_str);
+    // Also look relative to the executable (for `sudo /path/to/airvpn lock install`
+    // from a different CWD)
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            // exe is in target/release/ or target/debug/, provider.json is in resources/
+            // Try: <exe_dir>/../../resources/provider.json (for cargo builds)
+            let cargo_path = exe_dir.join("../../resources/provider.json");
+            if !search_paths.iter().any(|p| p == &cargo_path) {
+                search_paths.push(cargo_path);
+            }
+            // Also try: <exe_dir>/resources/provider.json (for installed binaries)
+            let adjacent_path = exe_dir.join("resources/provider.json");
+            if !search_paths.iter().any(|p| p == &adjacent_path) {
+                search_paths.push(adjacent_path);
+            }
+        }
+    }
+
+    for path in &search_paths {
         if path.is_file() {
             debug!("Loading provider config from {}", path.display());
             let json_str = std::fs::read_to_string(path)
-                .with_context(|| format!("failed to read {}", path_str))?;
+                .with_context(|| format!("failed to read {}", path.display()))?;
             return parse_provider_json(&json_str);
         }
     }
 
+    let searched: Vec<String> = search_paths.iter().map(|p| format!("  {}", p.display())).collect();
     bail!(
-        "provider.json not found. Searched:\n  {}\n\
+        "provider.json not found. Searched:\n{}\n\
          Copy resources/provider.json to one of these locations.",
-        paths.join("\n  ")
+        searched.join("\n")
     )
 }
 

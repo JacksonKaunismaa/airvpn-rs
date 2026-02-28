@@ -625,15 +625,15 @@ fn cmd_lock_uninstall() -> anyhow::Result<()> {
     let _ = std::fs::remove_file(netlock::PERSISTENT_SERVICE_PATH);
     let _ = std::fs::remove_file(netlock::PERSISTENT_RULES_PATH);
 
-    // Delete table if active
+    // Delete table if active — must reclaim+delete atomically (single nft -f)
     if netlock::is_active() {
-        // Try to reclaim first (in case it's orphaned+owned, need to be owner to delete)
-        let _ = netlock::reclaim_ownership();
-        let _ = netlock::deactivate();
-    }
-
-    if netlock::is_active() {
-        warn!("Table still active in kernel (owned by running VPN process). It will be removed on next disconnect.");
+        match netlock::reclaim_and_delete() {
+            Ok(()) => {}
+            Err(e) => {
+                warn!("Could not delete table: {}", e);
+                warn!("A VPN process may own it. It will be removed on next disconnect.");
+            }
+        }
     }
 
     info!("Persistent lock uninstalled.");
@@ -664,9 +664,18 @@ fn cmd_lock_disable() -> anyhow::Result<()> {
         info!("Lock table not active.");
         return Ok(());
     }
-    // Reclaim if needed (orphaned table can't be deleted by non-owner)
-    let _ = netlock::reclaim_ownership();
-    netlock::deactivate()?;
+    // Check if VPN is running — warn before deleting the table under it
+    if let Ok(Some(state)) = recovery::load() {
+        if recovery::is_pid_alive(state.pid) {
+            anyhow::bail!(
+                "VPN process (PID {}) is running. Disconnect first, or use `lock uninstall` to force.",
+                state.pid
+            );
+        }
+    }
+    // Reclaim + delete atomically in one nft -f call (separate calls fail
+    // because each nft invocation gets a new netlink portid)
+    netlock::reclaim_and_delete()?;
     info!("Persistent lock disabled (will return on next reboot if service enabled).");
     Ok(())
 }

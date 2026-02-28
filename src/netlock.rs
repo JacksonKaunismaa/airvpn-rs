@@ -447,6 +447,43 @@ pub fn deactivate() -> Result<()> {
     Ok(())
 }
 
+/// Reclaim ownership and delete the table in a single nft -f transaction.
+///
+/// Because each `nft` invocation opens a new netlink socket (new portid),
+/// reclaim and delete must happen in the SAME invocation. Otherwise:
+/// 1. reclaim_ownership() — nft opens socket, reclaims, exits → table orphaned
+/// 2. deactivate() — new nft, new portid, can't delete orphaned owner table → EPERM
+///
+/// This function writes both commands to a single tmpfile and loads atomically.
+pub fn reclaim_and_delete() -> Result<()> {
+    if !is_active() {
+        return Ok(());
+    }
+
+    let cmd = format!(
+        "add table inet {} {{ flags owner, persist; }}\ndelete table inet {}\n",
+        TABLE_NAME, TABLE_NAME
+    );
+    let mut tmpfile =
+        tempfile::NamedTempFile::new().context("failed to create temp nft file")?;
+    tmpfile
+        .write_all(cmd.as_bytes())
+        .context("failed to write nft commands")?;
+    tmpfile.flush().context("failed to flush nft commands")?;
+
+    let output = Command::new("nft")
+        .arg("-f")
+        .arg(tmpfile.path())
+        .output()
+        .context("failed to execute nft")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("nft reclaim+delete failed: {}", stderr);
+    }
+    Ok(())
+}
+
 /// Check if our nftables table exists.
 pub fn is_active() -> bool {
     let output = Command::new("nft")
