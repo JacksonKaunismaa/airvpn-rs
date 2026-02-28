@@ -101,32 +101,22 @@ fn parse_provider_json(json_str: &str) -> Result<ProviderConfig> {
 
 /// Load the provider configuration from JSON.
 ///
-/// Search order:
-/// 1. `./resources/provider.json` (relative to CWD, for development)
-/// 2. `/etc/airvpn-rs/provider.json` (system-wide install)
+/// Search order (first match wins):
+/// 1. `/etc/airvpn-rs/provider.json` (system-wide install)
+/// 2. `<exe_dir>/../../resources/provider.json` (cargo build: exe is in target/{debug,release}/)
 ///
-/// Fails hard if neither exists — no silent fallback.
+/// Never searches relative to CWD — a stray provider.json in the working
+/// directory should not silently override the real config.
 pub fn load_provider_config() -> Result<ProviderConfig> {
     let mut search_paths: Vec<std::path::PathBuf> = vec![
-        "./resources/provider.json".into(),
         "/etc/airvpn-rs/provider.json".into(),
     ];
 
-    // Also look relative to the executable (for `sudo /path/to/airvpn lock install`
-    // from a different CWD)
+    // Look relative to the executable for cargo/dev builds
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_dir) = exe.parent() {
-            // exe is in target/release/ or target/debug/, provider.json is in resources/
-            // Try: <exe_dir>/../../resources/provider.json (for cargo builds)
-            let cargo_path = exe_dir.join("../../resources/provider.json");
-            if !search_paths.iter().any(|p| p == &cargo_path) {
-                search_paths.push(cargo_path);
-            }
-            // Also try: <exe_dir>/resources/provider.json (for installed binaries)
-            let adjacent_path = exe_dir.join("resources/provider.json");
-            if !search_paths.iter().any(|p| p == &adjacent_path) {
-                search_paths.push(adjacent_path);
-            }
+            // exe is in target/release/ or target/debug/, repo root is ../../
+            search_paths.push(exe_dir.join("../../resources/provider.json"));
         }
     }
 
