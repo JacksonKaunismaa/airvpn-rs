@@ -347,7 +347,7 @@ fn main() -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 // (Ipv6Mode, ResetLevel, EventHook, run_hook, run() [formerly cmd_connect],
 // preflight_checks, cmd_disconnect_internal, partial_disconnect,
-// teardown_lock_state, extract_ip_from_url, resolve_bootstrap_host,
+// extract_ip_from_url, resolve_bootstrap_host,
 // interruptible_sleep — all moved to src/connect.rs)
 // ---------------------------------------------------------------------------
 

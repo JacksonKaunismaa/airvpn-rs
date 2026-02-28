@@ -365,9 +365,11 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
 ///
 /// The table is created with `flags owner, persist`. When the systemd oneshot
 /// loads this at boot and exits, `persist` keeps the table alive in an orphaned
-/// state (owner process exited). When airvpn-rs connects, `reclaim_ownership()`
-/// succeeds because the table is orphaned.
-/// Generate the persistent lock ruleset as a standalone `airvpn_persist` table.
+/// state (owner process exited).
+///
+/// This is a standalone `airvpn_persist` table, fully independent from the
+/// session lock (`airvpn_lock`). VPN traffic passes via `oifname "avpn-*"`
+/// (inner packets) and `meta mark 51820` (outer WireGuard packets).
 ///
 /// This table is independent of the session lock (`airvpn_lock`). It runs at
 /// priority -400 (before the session lock at -300). A packet must pass BOTH
