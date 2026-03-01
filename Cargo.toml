@@ -60,3 +60,4 @@ sha1 = "0.10"
 
 # GUI
 iced = { version = "0.14", features = ["tokio"] }
+tokio = { version = "1", features = ["time"] }

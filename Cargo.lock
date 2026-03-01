@@ -68,6 +68,7 @@ dependencies = [
  "sha2",
  "simplelog",
  "tempfile",
+ "tokio",
  "zeroize",
 ]
 
