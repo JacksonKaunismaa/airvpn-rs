@@ -90,22 +90,22 @@ tools to accidentally remove than a flushed-and-replaced ruleset.
 
 ---
 
-## 4. servers.locklast and servers.startlast default to true
+## 4. servers.startlast defaults to true
 
 **Eddie:** Both `servers.locklast` and `servers.startlast` default to `false`
 (ProfileOptions.cs lines 435-436). Users must explicitly enable them in the
 GUI.
 
-**airvpn-rs:** Both default to `true` when not set in the profile. If reading
-from an Eddie profile where these were explicitly set, those values are
-respected.
+**airvpn-rs:** `servers.locklast` now defaults to `false` (matching Eddie).
+`servers.startlast` still defaults to `true` — a laptop-first preference for
+resuming the last-used server on startup.
 
-**Why:** This is a laptop-first client where moving between WiFi networks is
-common. Defaulting to "retry the same server" avoids unnecessary rotation to
-worse servers after transient network drops. Users can disable with
-`--no-lock-last` / `--no-start-last`.
+Network-down detection (`has_default_gateway()`) handles the WiFi-drop case
+that originally motivated the `locklast=true` default: when there's no gateway,
+the server is not penalized and is retried. When the gateway exists, the server
+is penalized and rotation occurs.
 
-**Files:** `src/main.rs` — connection loop setup, `src/config.rs` — profile options
+**Files:** `src/connect.rs` — lock_last resolution, `src/config.rs` — profile options
 
 **Eddie ref:** `ProfileOptions.cs` lines 435-436
 

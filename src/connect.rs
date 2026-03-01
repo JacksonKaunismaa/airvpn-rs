@@ -581,7 +581,7 @@ fn fetch_initial_data(
     let lock_last = !config.no_lock_last
         && params.profile_options
             .get("servers.locklast")
-            .is_none_or(|v| v != "False"); // default true (Eddie defaults false)
+            .is_some_and(|v| v == "True"); // default false (matches Eddie); network-down detection handles WiFi drops
     let start_last = !config.no_start_last
         && params.profile_options
             .get("servers.startlast")
