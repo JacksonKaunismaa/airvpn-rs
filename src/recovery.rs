@@ -500,6 +500,20 @@ extern "C" fn signal_handler(sig: nix::libc::c_int) {
     let _ = sig;
 }
 
+/// Trigger the shutdown flag. Used by helper to request disconnect.
+pub fn trigger_shutdown() {
+    if let Some(flag) = SHUTDOWN_FLAG.get() {
+        flag.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Reset the shutdown flag for a new connection.
+pub fn reset_shutdown() {
+    if let Some(flag) = SHUTDOWN_FLAG.get() {
+        flag.store(false, Ordering::SeqCst);
+    }
+}
+
 // =============================================================================
 // Tests
 // =============================================================================

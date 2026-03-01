@@ -127,6 +127,8 @@ enum Commands {
         #[command(subcommand)]
         action: LockAction,
     },
+    /// Run as root helper daemon for GUI IPC
+    Helper,
 }
 
 #[derive(Subcommand)]
@@ -342,6 +344,10 @@ fn main() -> anyhow::Result<()> {
         }
         Commands::Recover => cmd_recover(),
         Commands::Lock { action } => cmd_lock(action),
+        Commands::Helper => {
+            use airvpn::helper;
+            helper::run()
+        }
     }
 }
 

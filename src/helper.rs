@@ -1,0 +1,490 @@
+//! Root helper daemon for GUI IPC over Unix socket.
+//!
+//! Runs as root (launched via pkexec), listens on a Unix socket, and bridges
+//! GUI commands to the connect engine. The connect engine runs in a thread
+//! within the helper process. Stats are polled separately every 2s.
+//!
+//! Designed for single-client use (one GUI at a time). If the client
+//! disconnects, handle_client returns and the accept loop waits for a new
+//! connection.
+
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use log::{debug, error, info, warn};
+
+use crate::{api, connect, ipc, netlock, recovery, wireguard};
+
+pub const SOCKET_PATH: &str = "/run/airvpn-rs/helper.sock";
+
+/// Run the helper daemon: bind socket, accept clients in a loop.
+pub fn run() -> Result<()> {
+    connect::preflight_checks()?;
+
+    // Remove stale socket file if it exists
+    if std::path::Path::new(SOCKET_PATH).exists() {
+        std::fs::remove_file(SOCKET_PATH)
+            .with_context(|| format!("failed to remove stale socket: {}", SOCKET_PATH))?;
+    }
+
+    // Ensure /run/airvpn-rs/ exists with mode 0o755
+    let run_dir = std::path::Path::new("/run/airvpn-rs");
+    if !run_dir.exists() {
+        std::fs::create_dir_all(run_dir).context("failed to create /run/airvpn-rs")?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(run_dir, std::fs::Permissions::from_mode(0o755))
+            .context("failed to set permissions on /run/airvpn-rs")?;
+    }
+
+    let listener = UnixListener::bind(SOCKET_PATH)
+        .with_context(|| format!("failed to bind socket: {}", SOCKET_PATH))?;
+
+    // Set socket permissions to 0o660 (owner + group read/write)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(SOCKET_PATH, std::fs::Permissions::from_mode(0o660))
+            .context("failed to set socket permissions")?;
+    }
+
+    // Chown socket group to the unprivileged user's primary group so the GUI
+    // can connect. Try $SUDO_USER first, then $PKEXEC_UID.
+    chown_socket_to_caller_group()?;
+
+    info!("Helper listening on {}", SOCKET_PATH);
+
+    // Set up signal handler so Ctrl+C / SIGTERM triggers graceful shutdown
+    let _shutdown = recovery::setup_signal_handler();
+
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                info!("Client connected");
+                if let Err(e) = handle_client(stream) {
+                    warn!("Client session ended with error: {}", e);
+                }
+                info!("Client disconnected");
+            }
+            Err(e) => {
+                error!("Failed to accept connection: {}", e);
+            }
+        }
+    }
+
+    // Clean up socket on exit
+    let _ = std::fs::remove_file(SOCKET_PATH);
+    Ok(())
+}
+
+/// Chown the socket's group to the unprivileged caller's primary group.
+///
+/// Tries $SUDO_USER first, then looks up the username for $PKEXEC_UID.
+fn chown_socket_to_caller_group() -> Result<()> {
+    let username = if let Ok(user) = std::env::var("SUDO_USER") {
+        if !user.is_empty() {
+            Some(user)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let username = username.or_else(|| {
+        std::env::var("PKEXEC_UID").ok().and_then(|uid_str| {
+            let uid = uid_str.parse::<u32>().ok()?;
+            let uid = nix::unistd::Uid::from_raw(uid);
+            nix::unistd::User::from_uid(uid).ok().flatten().map(|u| u.name)
+        })
+    });
+
+    let username = match username {
+        Some(u) => u,
+        None => {
+            warn!("Could not determine unprivileged user ($SUDO_USER / $PKEXEC_UID not set)");
+            return Ok(());
+        }
+    };
+
+    // Look up the user's primary group
+    let user = nix::unistd::User::from_name(&username)
+        .with_context(|| format!("failed to look up user: {}", username))?
+        .with_context(|| format!("user not found: {}", username))?;
+
+    nix::unistd::chown(
+        std::path::Path::new(SOCKET_PATH),
+        None,
+        Some(user.gid),
+    )
+    .with_context(|| format!("failed to chown socket group for user {}", username))?;
+
+    debug!("Socket group set to {} (gid {})", username, user.gid);
+    Ok(())
+}
+
+/// Send a HelperEvent as a JSON line to the client stream. Ignores write
+/// errors (client may have disconnected).
+fn send_event(stream: &mut UnixStream, event: &ipc::HelperEvent) {
+    match ipc::encode_line(event) {
+        Ok(line) => {
+            let _ = stream.write_all(line.as_bytes());
+            let _ = stream.flush();
+        }
+        Err(e) => {
+            debug!("Failed to encode event: {}", e);
+        }
+    }
+}
+
+/// Build a LockStatus event from current system state.
+fn build_lock_status() -> ipc::HelperEvent {
+    ipc::HelperEvent::LockStatus {
+        session_active: netlock::is_active(),
+        persistent_active: netlock::is_persist_active(),
+        persistent_installed: std::path::Path::new(netlock::PERSISTENT_RULES_PATH).exists(),
+    }
+}
+
+/// Handle a single client connection: read commands, dispatch, send events.
+fn handle_client(stream: UnixStream) -> Result<()> {
+    let mut writer = stream.try_clone().context("failed to clone stream")?;
+    let reader = BufReader::new(stream);
+
+    // Track the connect thread (if any) and its stats-polling companion
+    let mut connect_handle: Option<thread::JoinHandle<()>> = None;
+    let mut stats_handle: Option<thread::JoinHandle<()>> = None;
+
+    // Shared flag to stop the stats polling thread when connection ends.
+    // Replaced with a new Arc on each Connect so Disconnect/Shutdown can
+    // signal the correct thread.
+    let mut stats_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(e) => {
+                debug!("Read error (client disconnected?): {}", e);
+                break;
+            }
+        };
+
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let cmd: ipc::HelperCommand = match ipc::decode_line(&line) {
+            Ok(c) => c,
+            Err(e) => {
+                send_event(
+                    &mut writer,
+                    &ipc::HelperEvent::Error {
+                        message: format!("invalid command: {}", e),
+                    },
+                );
+                continue;
+            }
+        };
+
+        debug!("Received command: {:?}", cmd);
+
+        match cmd {
+            ipc::HelperCommand::Connect {
+                server,
+                no_lock,
+                allow_lan,
+                skip_ping,
+                allow_country,
+                deny_country,
+            } => {
+                // Check if already connected (connect thread alive)
+                if let Some(ref h) = connect_handle {
+                    if !h.is_finished() {
+                        send_event(
+                            &mut writer,
+                            &ipc::HelperEvent::Error {
+                                message: "already connected — disconnect first".to_string(),
+                            },
+                        );
+                        continue;
+                    }
+                }
+
+                // Reset shutdown flag for the new connection
+                recovery::reset_shutdown();
+
+                // Create mpsc channel for engine events
+                let (event_tx, event_rx) = mpsc::channel::<ipc::EngineEvent>();
+
+                // Spawn event-forwarding thread: reads EngineEvents from mpsc,
+                // translates to HelperEvents, writes to socket
+                let mut event_writer = writer.try_clone().context("failed to clone stream for events")?;
+                let event_fwd = thread::spawn(move || {
+                    for engine_event in event_rx {
+                        let helper_event = match engine_event {
+                            ipc::EngineEvent::StateChanged(state) => {
+                                ipc::HelperEvent::StateChanged { state }
+                            }
+                            ipc::EngineEvent::Log { level, message } => {
+                                ipc::HelperEvent::Log { level, message }
+                            }
+                            ipc::EngineEvent::ServerSelected {
+                                name,
+                                country,
+                                location,
+                            } => ipc::HelperEvent::StateChanged {
+                                state: ipc::ConnectionState::Connected {
+                                    server_name: name,
+                                    server_country: country,
+                                    server_location: location,
+                                },
+                            },
+                        };
+                        send_event(&mut event_writer, &helper_event);
+                    }
+                });
+
+                // Stop any previous stats poller
+                stats_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Some(h) = stats_handle.take() {
+                    let _ = h.join();
+                }
+
+                // Spawn connect thread
+                let connect_event_tx = event_tx.clone();
+                let connect_config = connect::ConnectConfig {
+                    server_name: server,
+                    no_lock,
+                    allow_lan,
+                    no_reconnect: false,
+                    cli_username: None,
+                    password_stdin: false,
+                    allow_server: vec![],
+                    deny_server: vec![],
+                    allow_country,
+                    deny_country,
+                    skip_ping,
+                    no_verify: false,
+                    no_lock_last: false,
+                    no_start_last: false,
+                    cli_ipv6_mode: None,
+                    cli_dns_servers: vec![],
+                    cli_event_pre: [None, None, None],
+                    cli_event_up: [None, None, None],
+                    cli_event_down: [None, None, None],
+                    event_tx: Some(connect_event_tx),
+                };
+
+                let mut disconnected_writer = writer.try_clone().context("failed to clone stream for connect thread")?;
+                let conn_handle = thread::spawn(move || {
+                    let result = (|| -> Result<()> {
+                        let mut provider_config = api::load_provider_config()?;
+                        api::verify_rsa_key_integrity(&provider_config);
+                        connect::run(&mut provider_config, &connect_config)?;
+                        Ok(())
+                    })();
+
+                    if let Err(e) = &result {
+                        error!("Connect thread exited with error: {}", e);
+                    }
+
+                    // Signal disconnected (drop event_tx by moving connect_config
+                    // into scope, then send Disconnected on the socket directly)
+                    drop(result);
+                    send_event(
+                        &mut disconnected_writer,
+                        &ipc::HelperEvent::StateChanged {
+                            state: ipc::ConnectionState::Disconnected,
+                        },
+                    );
+                });
+
+                connect_handle = Some(conn_handle);
+
+                // Spawn stats polling thread (every 2s)
+                stats_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let stats_stop_clone = stats_stop.clone();
+                let mut stats_writer = writer.try_clone().context("failed to clone stream for stats")?;
+                stats_handle = Some(thread::spawn(move || {
+                    loop {
+                        thread::sleep(Duration::from_secs(2));
+                        if stats_stop_clone.load(std::sync::atomic::Ordering::SeqCst) {
+                            break;
+                        }
+
+                        // Read recovery state to find the interface name
+                        let iface = match recovery::load() {
+                            Ok(Some(state)) => state.wg_interface,
+                            _ => continue,
+                        };
+
+                        if iface.is_empty() || !wireguard::is_connected(&iface) {
+                            continue;
+                        }
+
+                        match wireguard::get_transfer_stats(&iface) {
+                            Ok((rx, tx)) => {
+                                send_event(
+                                    &mut stats_writer,
+                                    &ipc::HelperEvent::Stats {
+                                        rx_bytes: rx,
+                                        tx_bytes: tx,
+                                    },
+                                );
+                            }
+                            Err(e) => {
+                                debug!("Failed to get transfer stats: {}", e);
+                            }
+                        }
+                    }
+                }));
+
+                // Wait for the event forwarder to finish in a background thread
+                // (it will exit when event_tx is dropped by the connect thread)
+                thread::spawn(move || {
+                    let _ = event_fwd.join();
+                });
+            }
+
+            ipc::HelperCommand::Disconnect => {
+                recovery::trigger_shutdown();
+                send_event(
+                    &mut writer,
+                    &ipc::HelperEvent::StateChanged {
+                        state: ipc::ConnectionState::Disconnecting,
+                    },
+                );
+            }
+
+            ipc::HelperCommand::Status => {
+                let is_connected = connect_handle
+                    .as_ref()
+                    .map(|h| !h.is_finished())
+                    .unwrap_or(false);
+
+                if is_connected {
+                    // Check recovery state for connection details
+                    match recovery::load() {
+                        Ok(Some(_state)) => {
+                            send_event(
+                                &mut writer,
+                                &ipc::HelperEvent::StateChanged {
+                                    state: ipc::ConnectionState::Connecting,
+                                },
+                            );
+                        }
+                        _ => {
+                            send_event(
+                                &mut writer,
+                                &ipc::HelperEvent::StateChanged {
+                                    state: ipc::ConnectionState::Connecting,
+                                },
+                            );
+                        }
+                    }
+                } else {
+                    send_event(
+                        &mut writer,
+                        &ipc::HelperEvent::StateChanged {
+                            state: ipc::ConnectionState::Disconnected,
+                        },
+                    );
+                }
+                send_event(&mut writer, &build_lock_status());
+            }
+
+            ipc::HelperCommand::LockEnable => {
+                match dispatch_lock_enable() {
+                    Ok(()) => {}
+                    Err(e) => {
+                        send_event(
+                            &mut writer,
+                            &ipc::HelperEvent::Error {
+                                message: format!("lock enable failed: {}", e),
+                            },
+                        );
+                    }
+                }
+                send_event(&mut writer, &build_lock_status());
+            }
+
+            ipc::HelperCommand::LockDisable => {
+                match netlock::reclaim_and_delete() {
+                    Ok(()) => {}
+                    Err(e) => {
+                        send_event(
+                            &mut writer,
+                            &ipc::HelperEvent::Error {
+                                message: format!("lock disable failed: {}", e),
+                            },
+                        );
+                    }
+                }
+                send_event(&mut writer, &build_lock_status());
+            }
+
+            ipc::HelperCommand::LockInstall | ipc::HelperCommand::LockUninstall => {
+                send_event(
+                    &mut writer,
+                    &ipc::HelperEvent::Error {
+                        message: "not yet implemented".to_string(),
+                    },
+                );
+            }
+
+            ipc::HelperCommand::LockStatus => {
+                send_event(&mut writer, &build_lock_status());
+            }
+
+            ipc::HelperCommand::Shutdown => {
+                recovery::trigger_shutdown();
+
+                // Wait for the connect thread to finish
+                if let Some(h) = connect_handle.take() {
+                    let _ = h.join();
+                }
+
+                // Stop stats poller
+                stats_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Some(h) = stats_handle.take() {
+                    let _ = h.join();
+                }
+
+                send_event(&mut writer, &ipc::HelperEvent::Shutdown);
+                break;
+            }
+        }
+    }
+
+    // Clean up: stop threads if client disconnects without Shutdown
+    stats_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    Ok(())
+}
+
+/// Enable the persistent lock by loading lock.nft rules with nft -f.
+fn dispatch_lock_enable() -> Result<()> {
+    if !std::path::Path::new(netlock::PERSISTENT_RULES_PATH).exists() {
+        anyhow::bail!("persistent lock not installed -- run `airvpn-rs lock install` first");
+    }
+    if netlock::is_persist_active() {
+        return Ok(());
+    }
+    let output = std::process::Command::new("nft")
+        .args(["-f", netlock::PERSISTENT_RULES_PATH])
+        .output()
+        .context("failed to run nft")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "nft -f failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
