@@ -330,6 +330,7 @@ fn main() -> anyhow::Result<()> {
                 cli_event_pre: [event_vpn_pre_filename, event_vpn_pre_arguments, event_vpn_pre_waitend],
                 cli_event_up: [event_vpn_up_filename, event_vpn_up_arguments, event_vpn_up_waitend],
                 cli_event_down: [event_vpn_down_filename, event_vpn_down_arguments, event_vpn_down_waitend],
+                event_tx: None,
             };
             connect::run(&mut provider_config, &connect_config)
         }

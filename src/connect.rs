@@ -37,6 +37,14 @@ pub struct ConnectConfig {
     pub cli_event_pre: [Option<String>; 3],
     pub cli_event_up: [Option<String>; 3],
     pub cli_event_down: [Option<String>; 3],
+    pub event_tx: Option<std::sync::mpsc::Sender<crate::ipc::EngineEvent>>,
+}
+
+/// Emit an engine event if the event channel is active. No-op for CLI.
+fn emit(config: &ConnectConfig, event: crate::ipc::EngineEvent) {
+    if let Some(tx) = &config.event_tx {
+        let _ = tx.send(event);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1110,6 +1118,11 @@ pub fn run(
             "Selected server: {} ({}, {})",
             server_ref.name, server_ref.location, server_ref.country_code
         );
+        emit(config, crate::ipc::EngineEvent::ServerSelected {
+            name: server_ref.name.clone(),
+            country: server_ref.country_code.clone(),
+            location: server_ref.location.clone(),
+        });
         debug!(
             "Server details: name={}, group={}, entry_ips={:?}, exit_ips={:?}, score={}, bw={}/{}, users={}/{}, ipv4={}, ipv6={}",
             server_ref.name,
@@ -1200,6 +1213,9 @@ pub fn run(
                     }
                     warn!("Penalized {}. Trying another server in 5s...", server_ref.name);
                     interruptible_sleep(&params.shutdown, 5);
+                    emit(config, crate::ipc::EngineEvent::StateChanged(
+                        crate::ipc::ConnectionState::Reconnecting,
+                    ));
                     continue;
                 }
                 ResetLevel::Retry => {
@@ -1209,6 +1225,9 @@ pub fn run(
                     }
                     warn!("Retrying in 10s...");
                     interruptible_sleep(&params.shutdown, 10);
+                    emit(config, crate::ipc::EngineEvent::StateChanged(
+                        crate::ipc::ConnectionState::Reconnecting,
+                    ));
                     continue;
                 }
                 _ => {} // None/Switch don't occur from auth
@@ -1231,6 +1250,9 @@ pub fn run(
             mode.title,
         );
         info!("Connecting to {} via mode {}...", server_ref.name, mode.title);
+        emit(config, crate::ipc::EngineEvent::StateChanged(
+            crate::ipc::ConnectionState::Connecting,
+        ));
         let (config_path, iface) = match wireguard::connect(&wg_params, ipv6_enabled) {
             Ok(result) => {
                 consecutive_failures = 0;
@@ -1247,6 +1269,9 @@ pub fn run(
                     &mut penalties, &mut forced_server, &mut consecutive_failures,
                     &params.shutdown,
                 );
+                emit(config, crate::ipc::EngineEvent::StateChanged(
+                    crate::ipc::ConnectionState::Reconnecting,
+                ));
                 continue;
             }
         };
@@ -1267,6 +1292,9 @@ pub fn run(
                 &mut penalties, &mut forced_server, &mut consecutive_failures,
                 &params.shutdown,
             );
+            emit(config, crate::ipc::EngineEvent::StateChanged(
+                crate::ipc::ConnectionState::Reconnecting,
+            ));
             continue;
         }
         info!("Handshake established.");
@@ -1306,6 +1334,9 @@ pub fn run(
                     &mut penalties, &mut forced_server, &mut consecutive_failures,
                     &params.shutdown,
                 );
+                emit(config, crate::ipc::EngineEvent::StateChanged(
+                    crate::ipc::ConnectionState::Reconnecting,
+                ));
                 continue;
             }
         }
@@ -1320,6 +1351,13 @@ pub fn run(
                 " Press Ctrl+C to disconnect. Auto-reconnect enabled."
             }
         );
+        emit(config, crate::ipc::EngineEvent::StateChanged(
+            crate::ipc::ConnectionState::Connected {
+                server_name: server_ref.name.clone(),
+                server_country: server_ref.country_code.clone(),
+                server_location: server_ref.location.clone(),
+            },
+        ));
 
         // Run vpn.up hook (Eddie: Session.cs line 799, after VPN established)
         run_hook(&params.hook_up, "vpn.up");

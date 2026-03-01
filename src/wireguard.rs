@@ -781,6 +781,28 @@ pub fn is_handshake_stale(iface: &str, max_age_secs: u64) -> bool {
     }
 }
 
+/// Get transfer statistics for a WireGuard interface.
+/// Parses `wg show <iface> transfer` output: <pubkey>\t<rx>\t<tx>
+pub fn get_transfer_stats(iface: &str) -> Result<(u64, u64)> {
+    validate_interface_name(iface)?;
+    let output = Command::new("wg")
+        .args(["show", iface, "transfer"])
+        .output()
+        .context("failed to run wg show transfer")?;
+    if !output.status.success() {
+        anyhow::bail!("wg show transfer failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout.lines().next().unwrap_or("");
+    let parts: Vec<&str> = line.split('\t').collect();
+    if parts.len() < 3 {
+        anyhow::bail!("unexpected wg show transfer output: {:?}", line);
+    }
+    let rx: u64 = parts[1].trim().parse().context("parse rx_bytes")?;
+    let tx: u64 = parts[2].trim().parse().context("parse tx_bytes")?;
+    Ok((rx, tx))
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
