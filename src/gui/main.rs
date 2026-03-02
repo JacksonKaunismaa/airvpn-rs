@@ -59,12 +59,9 @@ impl App {
             activity: String::new(),
         };
 
-        // Check if helper is already running
-        let task = if ipc::is_helper_running() {
-            Task::done(Message::HelperConnected)
-        } else {
-            Task::done(Message::LaunchHelper)
-        };
+        // Always try connecting to an existing helper first.
+        // LaunchHelper is only used as fallback if connect fails.
+        let task = Task::done(Message::HelperConnected);
 
         (app, task)
     }
@@ -134,13 +131,13 @@ impl App {
                         let _ = client.send(&HelperCommand::Status);
                         self.helper = Some(client);
                         self.helper_error = None;
+                        Task::none()
                     }
-                    Err(e) => {
-                        self.helper_error =
-                            Some(format!("Failed to connect to helper: {}", e));
+                    Err(_) => {
+                        // No running helper — try to launch one
+                        Task::done(Message::LaunchHelper)
                     }
                 }
-                Task::none()
             }
         }
     }
