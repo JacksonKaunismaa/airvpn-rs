@@ -1,14 +1,17 @@
 //! Root helper daemon for GUI IPC over Unix socket.
 //!
-//! Runs as root (launched via pkexec), listens on a Unix socket, and bridges
-//! GUI commands to the connect engine. The connect engine runs in a thread
-//! within the helper process. Stats are polled separately every 2s.
+//! Runs as root via systemd socket activation (`airvpn-helper.socket` +
+//! `airvpn-helper.service`). Inherits the pre-bound Unix socket from
+//! systemd and bridges GUI commands to the connect engine. The connect
+//! engine runs in a thread within the helper process. Stats are polled
+//! separately every 2s.
 //!
 //! Designed for single-client use (one GUI at a time). If the client
 //! disconnects, handle_client returns and the accept loop waits for a new
 //! connection.
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::FromRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::mpsc;
 use std::thread;
@@ -20,45 +23,84 @@ use log::{debug, error, info, warn};
 use crate::{api, connect, ipc, netlock, recovery, wireguard};
 
 pub const SOCKET_PATH: &str = "/run/airvpn-rs/helper.sock";
+const PID_FILE: &str = "/run/airvpn-rs/helper.pid";
 
-/// Run the helper daemon: bind socket, accept clients in a loop.
+/// Obtain the listening socket from systemd socket activation.
+///
+/// Uses `sd_notify::listen_fds()` which checks `LISTEN_PID` / `LISTEN_FDS`
+/// and returns the inherited file descriptors. We expect exactly one (fd 3).
+/// If not socket-activated, bails with a helpful error message.
+fn get_systemd_listener() -> Result<UnixListener> {
+    let mut fds = sd_notify::listen_fds()
+        .context("failed to query systemd socket activation")?;
+
+    match fds.next() {
+        Some(fd) => {
+            // SAFETY: fd 3 is passed to us by systemd and is a valid, open
+            // Unix socket file descriptor. sd_notify already set O_CLOEXEC.
+            let listener = unsafe { UnixListener::from_raw_fd(fd) };
+            Ok(listener)
+        }
+        None => {
+            anyhow::bail!(
+                "No socket passed via systemd socket activation.\n\
+                 \n\
+                 The helper must be started by systemd, not run directly.\n\
+                 Enable the socket unit:\n\
+                 \n\
+                 \x20 sudo systemctl enable --now airvpn-helper.socket\n\
+                 \n\
+                 Then the GUI will auto-start the helper on first connection."
+            );
+        }
+    }
+}
+
+/// Log the UID, GID, and PID of the connecting peer process.
+fn log_peer_credentials(stream: &UnixStream) {
+    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+
+    match getsockopt(stream, PeerCredentials) {
+        Ok(creds) => {
+            info!(
+                "Client connected: pid={} uid={} gid={}",
+                creds.pid(),
+                creds.uid(),
+                creds.gid()
+            );
+        }
+        Err(e) => {
+            warn!("Client connected (failed to get peer credentials: {})", e);
+        }
+    }
+}
+
+/// Write the current PID to the PID file (mode 0o644).
+fn write_pid_file() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let pid = std::process::id().to_string();
+    std::fs::write(PID_FILE, pid.as_bytes())
+        .with_context(|| format!("failed to write PID file: {}", PID_FILE))?;
+    std::fs::set_permissions(PID_FILE, std::fs::Permissions::from_mode(0o644))
+        .with_context(|| format!("failed to set PID file permissions: {}", PID_FILE))?;
+    Ok(())
+}
+
+/// Read and parse the PID from the PID file.
+pub fn read_pid_file() -> Option<u32> {
+    std::fs::read_to_string(PID_FILE)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// Run the helper daemon: get socket from systemd, accept clients in a loop.
 pub fn run() -> Result<()> {
     connect::preflight_checks()?;
 
-    // Remove stale socket file if it exists
-    if std::path::Path::new(SOCKET_PATH).exists() {
-        std::fs::remove_file(SOCKET_PATH)
-            .with_context(|| format!("failed to remove stale socket: {}", SOCKET_PATH))?;
-    }
+    let listener = get_systemd_listener()?;
+    info!("Helper listening on {} (systemd socket activation)", SOCKET_PATH);
 
-    // Ensure /run/airvpn-rs/ exists with mode 0o755
-    let run_dir = std::path::Path::new("/run/airvpn-rs");
-    if !run_dir.exists() {
-        std::fs::create_dir_all(run_dir).context("failed to create /run/airvpn-rs")?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(run_dir, std::fs::Permissions::from_mode(0o755))
-            .context("failed to set permissions on /run/airvpn-rs")?;
-    }
-
-    let listener = UnixListener::bind(SOCKET_PATH)
-        .with_context(|| format!("failed to bind socket: {}", SOCKET_PATH))?;
-
-    // Set socket permissions to 0o660 (owner + group read/write)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(SOCKET_PATH, std::fs::Permissions::from_mode(0o660))
-            .context("failed to set socket permissions")?;
-    }
-
-    // Chown socket group to the unprivileged user's primary group so the GUI
-    // can connect. Try $SUDO_USER first, then $PKEXEC_UID.
-    chown_socket_to_caller_group()?;
-
-    info!("Helper listening on {}", SOCKET_PATH);
+    write_pid_file()?;
 
     // Set up signal handler so Ctrl+C / SIGTERM triggers graceful shutdown.
     let shutdown = recovery::setup_signal_handler()?;
@@ -98,7 +140,7 @@ pub fn run() -> Result<()> {
             Ok((stream, _addr)) => {
                 // Switch back to blocking for the next cycle
                 listener.set_nonblocking(false).ok();
-                info!("Client connected");
+                log_peer_credentials(&stream);
                 if let Err(e) = handle_client(stream, &mut conn_state) {
                     warn!("Client session ended with error: {}", e);
                 }
@@ -115,54 +157,8 @@ pub fn run() -> Result<()> {
         }
     }
 
-    // Clean up socket on exit
-    let _ = std::fs::remove_file(SOCKET_PATH);
-    Ok(())
-}
-
-/// Chown the socket's group to the unprivileged caller's primary group.
-///
-/// Tries $SUDO_USER first, then looks up the username for $PKEXEC_UID.
-fn chown_socket_to_caller_group() -> Result<()> {
-    let username = if let Ok(user) = std::env::var("SUDO_USER") {
-        if !user.is_empty() {
-            Some(user)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let username = username.or_else(|| {
-        std::env::var("PKEXEC_UID").ok().and_then(|uid_str| {
-            let uid = uid_str.parse::<u32>().ok()?;
-            let uid = nix::unistd::Uid::from_raw(uid);
-            nix::unistd::User::from_uid(uid).ok().flatten().map(|u| u.name)
-        })
-    });
-
-    let username = match username {
-        Some(u) => u,
-        None => {
-            warn!("Could not determine unprivileged user ($SUDO_USER / $PKEXEC_UID not set)");
-            return Ok(());
-        }
-    };
-
-    // Look up the user's primary group
-    let user = nix::unistd::User::from_name(&username)
-        .with_context(|| format!("failed to look up user: {}", username))?
-        .with_context(|| format!("user not found: {}", username))?;
-
-    nix::unistd::chown(
-        std::path::Path::new(SOCKET_PATH),
-        None,
-        Some(user.gid),
-    )
-    .with_context(|| format!("failed to chown socket group for user {}", username))?;
-
-    debug!("Socket group set to {} (gid {})", username, user.gid);
+    // Clean up PID file on exit. Do NOT remove the socket — systemd owns it.
+    let _ = std::fs::remove_file(PID_FILE);
     Ok(())
 }
 
