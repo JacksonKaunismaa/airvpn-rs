@@ -410,6 +410,26 @@ fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
                         state: ipc::ConnectionState::Disconnecting,
                     },
                 );
+
+                // Wait for connect thread to finish cleanup, then send Disconnected
+                if let Some(h) = state.connect_handle.take() {
+                    let _ = h.join();
+                }
+                // Stop stats poller
+                state.stats_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Some(h) = state.stats_handle.take() {
+                    let _ = h.join();
+                }
+                // Clear server info
+                if let Ok(mut info) = state.server_info.lock() {
+                    *info = Default::default();
+                }
+                send_event(
+                    &mut writer,
+                    &ipc::HelperEvent::StateChanged {
+                        state: ipc::ConnectionState::Disconnected,
+                    },
+                );
             }
 
             ipc::HelperCommand::Status => {

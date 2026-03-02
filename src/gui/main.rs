@@ -134,9 +134,11 @@ impl App {
                         Task::none()
                     }
                     Err(e) => {
-                        // No running helper — try to launch one
                         eprintln!("[GUI] HelperClient::connect() failed: {}", e);
-                        Task::done(Message::LaunchHelper)
+                        self.helper_error = Some(format!(
+                            "Cannot connect to helper: {}. Click Retry to launch a new one.", e
+                        ));
+                        Task::none()
                     }
                 }
             }
