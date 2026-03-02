@@ -36,8 +36,8 @@ systemctl daemon-reload
 
 # Stop helper if running (so it picks up the new binary on next activation)
 if systemctl is-active --quiet airvpn-helper.service; then
-    echo "Stopping running helper..."
-    systemctl stop airvpn-helper.service
+    echo "Stopping running helper (socket stays active)..."
+    systemctl stop airvpn-helper.service 2>/dev/null
 fi
 
 # Enable socket activation
