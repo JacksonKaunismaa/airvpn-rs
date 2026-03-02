@@ -4,6 +4,8 @@ pub mod config;
 pub mod connect;
 pub mod crypto;
 pub mod dns;
+pub mod helper;
+pub mod ipc;
 pub mod ipv6;
 pub mod manifest;
 pub mod netlock;

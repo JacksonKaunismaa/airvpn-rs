@@ -37,6 +37,14 @@ pub struct ConnectConfig {
     pub cli_event_pre: [Option<String>; 3],
     pub cli_event_up: [Option<String>; 3],
     pub cli_event_down: [Option<String>; 3],
+    pub event_tx: Option<std::sync::mpsc::Sender<crate::ipc::EngineEvent>>,
+}
+
+/// Emit an engine event if the event channel is active. No-op for CLI.
+fn emit(config: &ConnectConfig, event: crate::ipc::EngineEvent) {
+    if let Some(tx) = &config.event_tx {
+        let _ = tx.send(event);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -538,7 +546,15 @@ fn fetch_initial_data(
     params: &SessionParams,
     config: &ConnectConfig,
 ) -> anyhow::Result<SessionData> {
+    emit(config, crate::ipc::EngineEvent::Log {
+        level: "info".into(),
+        message: "Fetching server list...".into(),
+    });
     let (manifest, user_info) = fetch_manifest_and_user(provider_config, params)?;
+    emit(config, crate::ipc::EngineEvent::Log {
+        level: "info".into(),
+        message: format!("Found {} servers", manifest.servers.len()),
+    });
 
     // Server filtering (Eddie: GetConnections allow/deny filtering)
     let filtered_servers: Vec<manifest::Server> = server::filter_servers(
@@ -566,18 +582,8 @@ fn fetch_initial_data(
         );
     }
 
-    // Latency measurement (Eddie: Jobs/Latency.cs)
-    let ping_results = if config.skip_ping {
-        info!("Skipping latency measurement (--skip-ping).");
-        pinger::PingResults::new()
-    } else {
-        info!("Measuring server latencies...");
-        let results = pinger::measure_all(&filtered_servers);
-        info!("Pinged {} servers.", results.latencies.len());
-        results
-    };
-
-    // Resolve lock_last / start_last from profile options
+    // Resolve lock_last / start_last from profile options BEFORE pinging,
+    // so we can skip pinging when we already know which server to use.
     let lock_last = !config.no_lock_last
         && params.profile_options
             .get("servers.locklast")
@@ -600,6 +606,40 @@ fn fetch_initial_data(
         })
     } else {
         None
+    };
+
+    // Latency measurement (Eddie: Jobs/Latency.cs).
+    // Skip when we already know which server to use (--server flag or startlast).
+    // Pinging is only needed for auto-selection by score.
+    let has_predetermined_server = config.server_name.is_some() || start_last_name.is_some();
+    let ping_results = if config.skip_ping || has_predetermined_server {
+        if has_predetermined_server && !config.skip_ping {
+            info!("Skipping latency measurement (server already determined).");
+            emit(config, crate::ipc::EngineEvent::Log {
+                level: "info".into(),
+                message: "Skipping ping (server already determined)".into(),
+            });
+        } else {
+            info!("Skipping latency measurement (--skip-ping).");
+            emit(config, crate::ipc::EngineEvent::Log {
+                level: "info".into(),
+                message: "Skipping latency measurement".into(),
+            });
+        }
+        pinger::PingResults::new()
+    } else {
+        emit(config, crate::ipc::EngineEvent::Log {
+            level: "info".into(),
+            message: format!("Measuring latency for {} servers...", filtered_servers.len()),
+        });
+        info!("Measuring server latencies...");
+        let results = pinger::measure_all(&filtered_servers);
+        info!("Pinged {} servers.", results.latencies.len());
+        emit(config, crate::ipc::EngineEvent::Log {
+            level: "info".into(),
+            message: format!("Latency measurement complete ({} servers)", results.latencies.len()),
+        });
+        results
     };
 
     Ok(SessionData {
@@ -736,6 +776,10 @@ fn activate_netlock(
     server_entry_ips: &[String],
 ) -> anyhow::Result<()> {
     info!("Activating network lock...");
+    emit(config, crate::ipc::EngineEvent::Log {
+        level: "info".into(),
+        message: "Activating network lock...".into(),
+    });
     let mut allowed_ips: Vec<String> = server_entry_ips.to_vec();
     for url in &provider_config.bootstrap_urls {
         if let Some(host) = extract_ip_from_url(url) {
@@ -808,11 +852,19 @@ fn post_connect_setup(
     effective_dns_ipv6: &str,
 ) -> anyhow::Result<()> {
     if !config.no_lock {
+        emit(config, crate::ipc::EngineEvent::Log {
+            level: "info".into(),
+            message: "Configuring network lock...".into(),
+        });
         netlock::allow_interface(iface)?;
     }
     if params.shutdown.load(Ordering::Relaxed) {
         anyhow::bail!("shutdown requested during setup");
     }
+    emit(config, crate::ipc::EngineEvent::Log {
+        level: "info".into(),
+        message: "Configuring DNS...".into(),
+    });
     debug!("Activating DNS: ipv4={}, ipv6={}, iface={}", effective_dns_ipv4, effective_dns_ipv6, iface);
     dns::activate(effective_dns_ipv4, effective_dns_ipv6, iface)?;
     info!("DNS configured: {}{}", effective_dns_ipv4,
@@ -1110,6 +1162,11 @@ pub fn run(
             "Selected server: {} ({}, {})",
             server_ref.name, server_ref.location, server_ref.country_code
         );
+        emit(config, crate::ipc::EngineEvent::ServerSelected {
+            name: server_ref.name.clone(),
+            country: server_ref.country_code.clone(),
+            location: server_ref.location.clone(),
+        });
         debug!(
             "Server details: name={}, group={}, entry_ips={:?}, exit_ips={:?}, score={}, bw={}/{}, users={}/{}, ipv4={}, ipv6={}",
             server_ref.name,
@@ -1200,6 +1257,9 @@ pub fn run(
                     }
                     warn!("Penalized {}. Trying another server in 5s...", server_ref.name);
                     interruptible_sleep(&params.shutdown, 5);
+                    emit(config, crate::ipc::EngineEvent::StateChanged(
+                        crate::ipc::ConnectionState::Reconnecting,
+                    ));
                     continue;
                 }
                 ResetLevel::Retry => {
@@ -1209,6 +1269,9 @@ pub fn run(
                     }
                     warn!("Retrying in 10s...");
                     interruptible_sleep(&params.shutdown, 10);
+                    emit(config, crate::ipc::EngineEvent::StateChanged(
+                        crate::ipc::ConnectionState::Reconnecting,
+                    ));
                     continue;
                 }
                 _ => {} // None/Switch don't occur from auth
@@ -1231,6 +1294,13 @@ pub fn run(
             mode.title,
         );
         info!("Connecting to {} via mode {}...", server_ref.name, mode.title);
+        emit(config, crate::ipc::EngineEvent::StateChanged(
+            crate::ipc::ConnectionState::Connecting,
+        ));
+        emit(config, crate::ipc::EngineEvent::Log {
+            level: "info".into(),
+            message: format!("Connecting to {} via {}...", server_ref.name, mode.title),
+        });
         let (config_path, iface) = match wireguard::connect(&wg_params, ipv6_enabled) {
             Ok(result) => {
                 consecutive_failures = 0;
@@ -1247,14 +1317,25 @@ pub fn run(
                     &mut penalties, &mut forced_server, &mut consecutive_failures,
                     &params.shutdown,
                 );
+                emit(config, crate::ipc::EngineEvent::StateChanged(
+                    crate::ipc::ConnectionState::Reconnecting,
+                ));
                 continue;
             }
         };
         save_recovery(&params, config.no_lock, &iface, &config_path, "", "", &endpoint_ip)?;
         info!("WireGuard interface: {}", iface);
+        emit(config, crate::ipc::EngineEvent::Log {
+            level: "info".into(),
+            message: format!("WireGuard interface {} created", iface),
+        });
 
         // Wait for first WireGuard handshake (Eddie: handshake_timeout_first=50s)
         info!("Waiting for handshake...");
+        emit(config, crate::ipc::EngineEvent::Log {
+            level: "info".into(),
+            message: "Waiting for WireGuard handshake...".into(),
+        });
         if let Err(e) = wireguard::wait_for_handshake(&iface, 50) {
             error!("Handshake failed: {:#}", e);
             let _ = wireguard::disconnect(&config_path, &endpoint_ip);
@@ -1267,9 +1348,16 @@ pub fn run(
                 &mut penalties, &mut forced_server, &mut consecutive_failures,
                 &params.shutdown,
             );
+            emit(config, crate::ipc::EngineEvent::StateChanged(
+                crate::ipc::ConnectionState::Reconnecting,
+            ));
             continue;
         }
         info!("Handshake established.");
+        emit(config, crate::ipc::EngineEvent::Log {
+            level: "info".into(),
+            message: "Handshake established".into(),
+        });
 
         // 9-12: Remaining setup — if any step fails, clean up and treat as fatal
         if let Err(e) = post_connect_setup(
@@ -1290,6 +1378,10 @@ pub fn run(
 
         // 10b-10c: Post-connection verification
         if !config.no_verify && !params.shutdown.load(Ordering::Relaxed) {
+            emit(config, crate::ipc::EngineEvent::Log {
+                level: "info".into(),
+                message: "Verifying tunnel and DNS...".into(),
+            });
             let verify_ok = verify_connection(
                 &params.shutdown, &data.manifest, server_ref,
                 &wg_key.wg_ipv4, &effective_dns_ipv4, dns_ipv6,
@@ -1306,6 +1398,9 @@ pub fn run(
                     &mut penalties, &mut forced_server, &mut consecutive_failures,
                     &params.shutdown,
                 );
+                emit(config, crate::ipc::EngineEvent::StateChanged(
+                    crate::ipc::ConnectionState::Reconnecting,
+                ));
                 continue;
             }
         }
@@ -1320,6 +1415,13 @@ pub fn run(
                 " Press Ctrl+C to disconnect. Auto-reconnect enabled."
             }
         );
+        emit(config, crate::ipc::EngineEvent::StateChanged(
+            crate::ipc::ConnectionState::Connected {
+                server_name: server_ref.name.clone(),
+                server_country: server_ref.country_code.clone(),
+                server_location: server_ref.location.clone(),
+            },
+        ));
 
         // Run vpn.up hook (Eddie: Session.cs line 799, after VPN established)
         run_hook(&params.hook_up, "vpn.up");

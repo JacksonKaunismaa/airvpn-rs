@@ -421,8 +421,8 @@ pub fn generate_persistent_ruleset(bootstrap_ips: &[String]) -> String {
     r.push_str("    ip6 saddr ff00::/8 ip6 daddr ff00::/8 counter accept\n");
     r.push_str("    ip6 saddr fc00::/7 ip6 daddr fc00::/7 counter accept\n");
 
-    // 6. ICMP/ICMPv6
-    r.push_str("    icmp type echo-request counter accept\n");
+    // 6. ICMP/ICMPv6 (allow ping in both directions for latency measurement)
+    r.push_str("    icmp type { echo-request, echo-reply } counter accept\n");
     r.push_str("    icmpv6 type { echo-request, echo-reply, destination-unreachable, packet-too-big, time-exceeded, parameter-problem } counter accept\n");
 
     // 7. IPv6 RH0 drop
@@ -521,8 +521,8 @@ pub fn generate_persistent_ruleset(bootstrap_ips: &[String]) -> String {
         ));
     }
 
-    // 6. ICMP/ICMPv6
-    r.push_str("    icmp type echo-reply counter accept\n");
+    // 6. ICMP/ICMPv6 (allow outgoing ping so latency measurement works)
+    r.push_str("    icmp type { echo-request, echo-reply } counter accept\n");
     r.push_str("    icmpv6 type { echo-request, echo-reply, destination-unreachable, packet-too-big, time-exceeded, parameter-problem } counter accept\n");
 
     // 7. Bootstrap IPs (allow API access without VPN)

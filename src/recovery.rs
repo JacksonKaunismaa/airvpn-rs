@@ -105,7 +105,10 @@ pub fn generate_nonce() -> u64 {
     rand::Rng::gen(&mut rand::thread_rng())
 }
 
-/// Ensure the state directory exists with mode 0o700.
+/// Ensure the state directory exists with mode 0o755.
+/// The directory needs to be world-accessible because the GUI helper socket
+/// lives here and non-root users need to connect to it. The state file itself
+/// is 0o600 (root-only) so sensitive data is still protected.
 fn ensure_state_dir() -> Result<()> {
     let dir = Path::new(STATE_DIR);
     if !dir.exists() {
@@ -115,7 +118,7 @@ fn ensure_state_dir() -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755))
             .with_context(|| format!("failed to set permissions on {}", STATE_DIR))?;
     }
     Ok(())
@@ -479,12 +482,13 @@ pub fn setup_signal_handler() -> Result<Arc<AtomicBool>> {
         .context("failed to install SIGHUP handler")?;
     }
 
-    // Store the flag in a global so the C-style handler can access it
-    SHUTDOWN_FLAG
-        .set(Arc::clone(&shutdown))
-        .map_err(|_| anyhow::anyhow!("signal handler already initialized"))?;
-
-    Ok(shutdown)
+    // Store the flag in a global so the C-style handler can access it.
+    // If already initialized (e.g. helper called us first, then connect::run()
+    // calls us again), return the existing flag instead of failing.
+    match SHUTDOWN_FLAG.set(Arc::clone(&shutdown)) {
+        Ok(()) => Ok(shutdown),
+        Err(_) => Ok(Arc::clone(SHUTDOWN_FLAG.get().unwrap())),
+    }
 }
 
 /// Global storage for the shutdown flag, accessed from the signal handler.
@@ -498,6 +502,20 @@ extern "C" fn signal_handler(sig: nix::libc::c_int) {
     // Cannot use log macros in signal handlers (not async-signal-safe).
     // Signal number is recorded; the main loop will log when it detects the flag.
     let _ = sig;
+}
+
+/// Trigger the shutdown flag. Used by helper to request disconnect.
+pub fn trigger_shutdown() {
+    if let Some(flag) = SHUTDOWN_FLAG.get() {
+        flag.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Reset the shutdown flag for a new connection.
+pub fn reset_shutdown() {
+    if let Some(flag) = SHUTDOWN_FLAG.get() {
+        flag.store(false, Ordering::SeqCst);
+    }
 }
 
 // =============================================================================

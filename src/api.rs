@@ -117,6 +117,8 @@ pub fn load_provider_config() -> Result<ProviderConfig> {
         if let Some(exe_dir) = exe.parent() {
             // exe is in target/release/ or target/debug/, repo root is ../../
             search_paths.push(exe_dir.join("../../resources/provider.json"));
+            // exe is in target/debug/deps/ for tests, repo root is ../../../
+            search_paths.push(exe_dir.join("../../../resources/provider.json"));
         }
     }
 
