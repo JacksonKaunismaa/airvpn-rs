@@ -102,7 +102,15 @@ pub fn run() -> Result<()> {
                 if let Err(e) = handle_client(stream, &mut conn_state) {
                     warn!("Client session ended with error: {}", e);
                 }
-                info!("Client disconnected");
+                // If no VPN connection is running, exit when GUI disconnects.
+                // This prevents orphaned helper processes after the GUI closes.
+                let vpn_running = conn_state.connect_handle.as_ref().map_or(false, |h| !h.is_finished());
+                if vpn_running {
+                    info!("Client disconnected, VPN still running — waiting for new client");
+                } else {
+                    info!("Client disconnected, no VPN running — shutting down helper");
+                    break;
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 listener.set_nonblocking(false).ok();
