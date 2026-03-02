@@ -30,6 +30,8 @@ pub enum HelperCommand {
         no_lock: bool,
         allow_lan: bool,
         skip_ping: bool,
+        no_reconnect: bool,
+        no_verify: bool,
         allow_country: Vec<String>,
         deny_country: Vec<String>,
     },
@@ -109,6 +111,8 @@ mod tests {
             no_lock: false,
             allow_lan: true,
             skip_ping: false,
+            no_reconnect: true,
+            no_verify: false,
             allow_country: vec!["NL".to_string(), "DE".to_string()],
             deny_country: vec!["US".to_string()],
         };
@@ -124,6 +128,8 @@ mod tests {
                 no_lock,
                 allow_lan,
                 skip_ping,
+                no_reconnect,
+                no_verify,
                 allow_country,
                 deny_country,
             } => {
@@ -131,6 +137,8 @@ mod tests {
                 assert!(!no_lock);
                 assert!(allow_lan);
                 assert!(!skip_ping);
+                assert!(no_reconnect);
+                assert!(!no_verify);
                 assert_eq!(allow_country, vec!["NL", "DE"]);
                 assert_eq!(deny_country, vec!["US"]);
             }

@@ -207,6 +207,8 @@ impl App {
                         no_lock: self.connect_no_lock,
                         allow_lan: self.connect_allow_lan,
                         skip_ping: self.connect_skip_ping,
+                        no_reconnect: self.connect_no_reconnect,
+                        no_verify: self.connect_no_verify,
                         allow_country: Vec::new(),
                         deny_country: Vec::new(),
                     };
@@ -224,6 +226,8 @@ impl App {
                         no_lock: self.connect_no_lock,
                         allow_lan: self.connect_allow_lan,
                         skip_ping: true, // server already chosen
+                        no_reconnect: self.connect_no_reconnect,
+                        no_verify: self.connect_no_verify,
                         allow_country: Vec::new(),
                         deny_country: Vec::new(),
                     };
@@ -518,6 +522,7 @@ impl App {
             }
             HelperEvent::Log { level, message } => {
                 self.activity = message.clone();
+                // UTC time-of-day (no chrono dependency; local time would need chrono)
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
