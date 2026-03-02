@@ -61,30 +61,40 @@ pub fn run() -> Result<()> {
     info!("Helper listening on {}", SOCKET_PATH);
 
     // Set up signal handler so Ctrl+C / SIGTERM triggers graceful shutdown.
-    // The signal handler sets SHUTDOWN_FLAG; we check it after each accept().
-    // Without SA_RESTART, accept() returns EINTR on signal, breaking the block.
     let shutdown = recovery::setup_signal_handler()?;
 
-    for stream in listener.incoming() {
-        // Check shutdown flag after each accept (signal interrupts accept with EINTR)
+    // Use a 1s accept timeout so we periodically check the shutdown flag.
+    // Rust's UnixListener retries on EINTR internally, so we can't rely on
+    // signals to break out of accept() — we need the timeout.
+    listener
+        .set_nonblocking(false)
+        .context("failed to set listener blocking")?;
+
+    loop {
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             info!("Shutdown signal received, exiting helper");
             break;
         }
-        match stream {
-            Ok(stream) => {
+
+        // Poll with 1s timeout: set nonblocking, try accept, sleep if no client
+        listener.set_nonblocking(true).ok();
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                // Switch back to blocking for the next cycle
+                listener.set_nonblocking(false).ok();
                 info!("Client connected");
                 if let Err(e) = handle_client(stream) {
                     warn!("Client session ended with error: {}", e);
                 }
                 info!("Client disconnected");
             }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                // EINTR from signal — loop back to check shutdown flag
-                continue;
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                listener.set_nonblocking(false).ok();
+                thread::sleep(Duration::from_secs(1));
             }
             Err(e) => {
                 error!("Failed to accept connection: {}", e);
+                thread::sleep(Duration::from_secs(1));
             }
         }
     }
