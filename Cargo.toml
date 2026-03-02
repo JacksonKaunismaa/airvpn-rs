@@ -37,7 +37,10 @@ serde_json = "1"
 quick-xml = { version = "0.37", features = ["serialize"] }
 
 # Unix / system
-nix = { version = "0.29", features = ["signal", "process", "fs", "user"] }
+nix = { version = "0.29", features = ["signal", "process", "fs", "user", "socket"] }
+
+# systemd socket activation
+sd-notify = "0.4"
 rpassword = "7"
 
 # Zeroize sensitive key material on drop
