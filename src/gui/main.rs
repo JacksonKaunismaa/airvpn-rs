@@ -29,7 +29,6 @@ struct App {
     tx_bytes: u64,
     helper: Option<ipc::HelperClient>,
     helper_error: Option<String>,
-    helper_launched: bool,
     logs: Vec<String>,
     activity: String,
 }
@@ -40,7 +39,6 @@ pub enum Message {
     Connect,
     Disconnect,
     Tick,
-    LaunchHelper,
     HelperConnected,
 }
 
@@ -56,18 +54,13 @@ impl App {
             tx_bytes: 0,
             helper: None,
             helper_error: None,
-            helper_launched: false,
             logs: Vec::new(),
             activity: String::new(),
         };
 
-        // Try connecting to an existing helper. If the socket doesn't exist,
-        // go straight to launching one (don't waste time on a failed connect).
-        let task = if std::path::Path::new("/run/airvpn-rs/helper.sock").exists() {
-            Task::done(Message::HelperConnected)
-        } else {
-            Task::done(Message::LaunchHelper)
-        };
+        // With systemd socket activation, the socket always exists.
+        // Connecting triggers systemd to start the helper on demand.
+        let task = Task::done(Message::HelperConnected);
 
         (app, task)
     }
@@ -114,35 +107,6 @@ impl App {
                 }
                 Task::none()
             }
-            Message::LaunchHelper => {
-                self.helper_launched = true;
-                self.helper_error = None;
-                self.activity = "Launching helper (waiting for authentication)...".into();
-                match ipc::launch_helper() {
-                    Ok(_child) => {
-                        // Poll for the socket to appear. pkexec blocks for password
-                        // input, so 500ms is not enough. Poll every 500ms for up to 60s.
-                        Task::future(async {
-                            let socket = std::path::Path::new("/run/airvpn-rs/helper.sock");
-                            for _ in 0..120 {
-                                tokio::time::sleep(Duration::from_millis(500)).await;
-                                if socket.exists() {
-                                    // Give it a moment to start accepting
-                                    tokio::time::sleep(Duration::from_millis(200)).await;
-                                    return Message::HelperConnected;
-                                }
-                            }
-                            Message::HelperConnected // try anyway after timeout
-                        })
-                    }
-                    Err(e) => {
-                        self.activity.clear();
-                        self.helper_error =
-                            Some(format!("Failed to launch helper: {}", e));
-                        Task::none()
-                    }
-                }
-            }
             Message::HelperConnected => {
                 match ipc::HelperClient::connect() {
                     Ok(mut client) => {
@@ -154,16 +118,13 @@ impl App {
                     }
                     Err(e) => {
                         eprintln!("[GUI] HelperClient::connect() failed: {}", e);
-                        if !self.helper_launched {
-                            // First failure — automatically try launching a helper
-                            Task::done(Message::LaunchHelper)
-                        } else {
-                            // Already tried launching — show error with retry
-                            self.helper_error = Some(format!(
-                                "Cannot connect to helper: {}. Click Retry.", e
-                            ));
-                            Task::none()
-                        }
+                        self.helper_error = Some(format!(
+                            "Cannot connect to helper: {}\n\
+                             Is airvpn-helper.socket enabled?\n\
+                             Run: sudo systemctl enable --now airvpn-helper.socket",
+                            e
+                        ));
+                        Task::none()
                     }
                 }
             }
@@ -253,7 +214,7 @@ impl App {
                 row![
                     text(format!("Error: {}", err)).color(iced::Color::from_rgb(0.91, 0.27, 0.38)),
                     Space::new().width(Fill),
-                    button(text("Retry")).on_press(Message::LaunchHelper),
+                    button(text("Retry")).on_press(Message::HelperConnected),
                 ]
                 .spacing(8),
             )

@@ -83,12 +83,3 @@ impl HelperClient {
     }
 }
 
-pub fn is_helper_running() -> bool {
-    std::path::Path::new(SOCKET_PATH).exists()
-}
-
-pub fn launch_helper() -> std::io::Result<std::process::Child> {
-    std::process::Command::new("pkexec")
-        .args(["airvpn", "helper"])
-        .spawn()
-}
