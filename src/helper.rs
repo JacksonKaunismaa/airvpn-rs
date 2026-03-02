@@ -183,6 +183,8 @@ struct ConnState {
     connect_handle: Option<thread::JoinHandle<()>>,
     stats_handle: Option<thread::JoinHandle<()>>,
     stats_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Server info captured from engine events, readable across GUI sessions.
+    server_info: std::sync::Arc<std::sync::Mutex<(String, String, String)>>,
 }
 
 impl ConnState {
@@ -191,6 +193,7 @@ impl ConnState {
             connect_handle: None,
             stats_handle: None,
             stats_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            server_info: std::sync::Arc::new(std::sync::Mutex::new((String::new(), String::new(), String::new()))),
         }
     }
 
@@ -262,13 +265,15 @@ fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
                 let (event_tx, event_rx) = mpsc::channel::<ipc::EngineEvent>();
 
                 // Spawn event-forwarding thread: reads EngineEvents from mpsc,
-                // translates to HelperEvents, writes to socket
+                // translates to HelperEvents, writes to socket.
+                // Also captures server info for GUI reconnection.
                 let mut event_writer = writer.try_clone().context("failed to clone stream for events")?;
+                let server_info = state.server_info.clone();
                 let event_fwd = thread::spawn(move || {
                     for engine_event in event_rx {
                         let helper_event = match engine_event {
-                            ipc::EngineEvent::StateChanged(state) => {
-                                ipc::HelperEvent::StateChanged { state }
+                            ipc::EngineEvent::StateChanged(s) => {
+                                ipc::HelperEvent::StateChanged { state: s }
                             }
                             ipc::EngineEvent::Log { level, message } => {
                                 ipc::HelperEvent::Log { level, message }
@@ -277,13 +282,19 @@ fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
                                 name,
                                 country,
                                 location,
-                            } => ipc::HelperEvent::StateChanged {
-                                state: ipc::ConnectionState::Connected {
-                                    server_name: name,
-                                    server_country: country,
-                                    server_location: location,
-                                },
-                            },
+                            } => {
+                                // Capture for GUI reconnection
+                                if let Ok(mut info) = server_info.lock() {
+                                    *info = (name.clone(), country.clone(), location.clone());
+                                }
+                                ipc::HelperEvent::StateChanged {
+                                    state: ipc::ConnectionState::Connected {
+                                        server_name: name,
+                                        server_country: country,
+                                        server_location: location,
+                                    },
+                                }
+                            }
                         };
                         send_event(&mut event_writer, &helper_event);
                     }
@@ -408,10 +419,14 @@ fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
                     // Connect thread alive — check if WireGuard interface is up
                     match recovery::load() {
                         Ok(Some(rec)) if wireguard::is_connected(&rec.wg_interface) => {
+                            let (name, country, location) = state.server_info
+                                .lock()
+                                .map(|info| info.clone())
+                                .unwrap_or_default();
                             ipc::ConnectionState::Connected {
-                                server_name: String::new(), // recovery state doesn't store server name
-                                server_country: String::new(),
-                                server_location: String::new(),
+                                server_name: name,
+                                server_country: country,
+                                server_location: location,
                             }
                         }
                         _ => ipc::ConnectionState::Connecting,
