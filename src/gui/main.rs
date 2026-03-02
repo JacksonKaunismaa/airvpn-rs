@@ -59,9 +59,13 @@ impl App {
             activity: String::new(),
         };
 
-        // Always try connecting to an existing helper first.
-        // LaunchHelper is only used as fallback if connect fails.
-        let task = Task::done(Message::HelperConnected);
+        // Try connecting to an existing helper. If the socket doesn't exist,
+        // go straight to launching one (don't waste time on a failed connect).
+        let task = if std::path::Path::new("/run/airvpn-rs/helper.sock").exists() {
+            Task::done(Message::HelperConnected)
+        } else {
+            Task::done(Message::LaunchHelper)
+        };
 
         (app, task)
     }
@@ -109,15 +113,27 @@ impl App {
                 Task::none()
             }
             Message::LaunchHelper => {
+                self.helper_error = None;
+                self.activity = "Launching helper (waiting for authentication)...".into();
                 match ipc::launch_helper() {
                     Ok(_child) => {
-                        // Give the helper time to start and create its socket
+                        // Poll for the socket to appear. pkexec blocks for password
+                        // input, so 500ms is not enough. Poll every 500ms for up to 60s.
                         Task::future(async {
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                            Message::HelperConnected
+                            let socket = std::path::Path::new("/run/airvpn-rs/helper.sock");
+                            for _ in 0..120 {
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                                if socket.exists() {
+                                    // Give it a moment to start accepting
+                                    tokio::time::sleep(Duration::from_millis(200)).await;
+                                    return Message::HelperConnected;
+                                }
+                            }
+                            Message::HelperConnected // try anyway after timeout
                         })
                     }
                     Err(e) => {
+                        self.activity.clear();
                         self.helper_error =
                             Some(format!("Failed to launch helper: {}", e));
                         Task::none()
