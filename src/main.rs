@@ -311,6 +311,7 @@ fn main() -> anyhow::Result<()> {
             event_vpn_down_arguments,
             event_vpn_down_waitend,
         } => {
+            refuse_if_helper_running()?;
             let mut provider_config = load_provider()?;
             let connect_config = connect::ConnectConfig {
                 server_name: server,
@@ -360,10 +361,32 @@ fn main() -> anyhow::Result<()> {
 
 
 // ---------------------------------------------------------------------------
+// Helper guard
+// ---------------------------------------------------------------------------
+
+/// Refuse CLI connect/disconnect when the GUI helper is running.
+/// The helper owns the connection state — mixing CLI and helper control
+/// leads to inconsistent state (helper doesn't know about CLI actions).
+fn refuse_if_helper_running() -> anyhow::Result<()> {
+    let socket = std::path::Path::new(airvpn::helper::SOCKET_PATH);
+    if socket.exists() {
+        // Verify it's a live socket, not a stale file
+        if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+            anyhow::bail!(
+                "The GUI helper is running. Use the GUI to connect/disconnect, \
+                 or stop the helper first (Ctrl+C in the helper terminal)."
+            );
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Disconnect
 // ---------------------------------------------------------------------------
 
 fn cmd_disconnect() -> anyhow::Result<()> {
+    refuse_if_helper_running()?;
     connect::preflight_checks()?;
     let state = recovery::load()?.ok_or_else(|| anyhow::anyhow!("No active connection found"))?;
 

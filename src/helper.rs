@@ -63,6 +63,18 @@ pub fn run() -> Result<()> {
     // Set up signal handler so Ctrl+C / SIGTERM triggers graceful shutdown.
     let shutdown = recovery::setup_signal_handler()?;
 
+    // Refuse to start if a CLI connection is already running — the helper
+    // can't manage a connection it didn't create.
+    if let Ok(Some(state)) = recovery::load() {
+        if recovery::is_pid_alive(state.pid) {
+            anyhow::bail!(
+                "A CLI connection is already running (PID {}). \
+                 Disconnect it first with `sudo airvpn disconnect`.",
+                state.pid
+            );
+        }
+    }
+
     // Connection state persists across GUI client sessions so the helper
     // knows about running VPN connections when a new GUI connects.
     let mut conn_state = ConnState::new();
