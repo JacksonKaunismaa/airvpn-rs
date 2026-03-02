@@ -56,6 +56,32 @@ struct App {
     log_filter_warn: bool,
     log_filter_error: bool,
     activity: String,
+
+    // Profile-backed settings (loaded via GetProfile, saved via SaveProfile)
+    settings_username: String,
+    settings_password: String,
+    settings_startlast: bool,
+    settings_locklast: bool,
+    settings_ipv6_mode: String,
+    settings_dns: String,
+    settings_event_pre_file: String,
+    settings_event_pre_args: String,
+    settings_event_pre_wait: bool,
+    settings_event_up_file: String,
+    settings_event_up_args: String,
+    settings_event_up_wait: bool,
+    settings_event_down_file: String,
+    settings_event_down_args: String,
+    settings_event_down_wait: bool,
+    settings_loaded: bool,
+    settings_dirty: bool,
+
+    // Per-connect flags (not profile-backed)
+    connect_no_lock: bool,
+    connect_allow_lan: bool,
+    connect_no_reconnect: bool,
+    connect_skip_ping: bool,
+    connect_no_verify: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +99,24 @@ pub enum Message {
     ServerSearchChanged(String),
     LogFilterToggle(String),
     LogClear,
+    FetchProfile,
+    SaveSettings,
+    SettingsUsernameChanged(String),
+    SettingsPasswordChanged(String),
+    SettingsStartlastToggle(bool),
+    SettingsLocklastToggle(bool),
+    SettingsIpv6ModeChanged(String),
+    SettingsDnsChanged(String),
+    SettingsEventChanged { hook: String, field: String, value: String },
+    ConnectNoLockToggle(bool),
+    ConnectAllowLanToggle(bool),
+    ConnectNoReconnectToggle(bool),
+    ConnectSkipPingToggle(bool),
+    ConnectNoVerifyToggle(bool),
+    LockInstall,
+    LockUninstall,
+    LockEnable,
+    LockDisable,
 }
 
 impl App {
@@ -107,6 +151,30 @@ impl App {
             log_filter_warn: true,
             log_filter_error: true,
             activity: String::new(),
+
+            settings_username: String::new(),
+            settings_password: String::new(),
+            settings_startlast: false,
+            settings_locklast: false,
+            settings_ipv6_mode: String::new(),
+            settings_dns: String::new(),
+            settings_event_pre_file: String::new(),
+            settings_event_pre_args: String::new(),
+            settings_event_pre_wait: true,
+            settings_event_up_file: String::new(),
+            settings_event_up_args: String::new(),
+            settings_event_up_wait: true,
+            settings_event_down_file: String::new(),
+            settings_event_down_args: String::new(),
+            settings_event_down_wait: true,
+            settings_loaded: false,
+            settings_dirty: false,
+
+            connect_no_lock: false,
+            connect_allow_lan: true,
+            connect_no_reconnect: false,
+            connect_skip_ping: false,
+            connect_no_verify: false,
         };
 
         // Try connecting to an existing helper. If the socket doesn't exist,
@@ -127,15 +195,18 @@ impl App {
                 if tab == views::Tab::Servers && self.servers.is_empty() && !self.servers_loading {
                     return Task::done(Message::FetchServers);
                 }
+                if tab == views::Tab::Settings && !self.settings_loaded {
+                    return Task::done(Message::FetchProfile);
+                }
                 Task::none()
             }
             Message::Connect => {
                 if let Some(ref mut helper) = self.helper {
                     let cmd = HelperCommand::Connect {
-                        server: None,
-                        no_lock: false,
-                        allow_lan: true,
-                        skip_ping: false,
+                        server: self.selected_server.clone(),
+                        no_lock: self.connect_no_lock,
+                        allow_lan: self.connect_allow_lan,
+                        skip_ping: self.connect_skip_ping,
                         allow_country: Vec::new(),
                         deny_country: Vec::new(),
                     };
@@ -150,9 +221,9 @@ impl App {
                 if let Some(ref mut helper) = self.helper {
                     let cmd = HelperCommand::Connect {
                         server: Some(server_name),
-                        no_lock: false,
-                        allow_lan: true,
-                        skip_ping: true,
+                        no_lock: self.connect_no_lock,
+                        allow_lan: self.connect_allow_lan,
+                        skip_ping: true, // server already chosen
                         allow_country: Vec::new(),
                         deny_country: Vec::new(),
                     };
@@ -291,6 +362,136 @@ impl App {
                 self.logs.clear();
                 Task::none()
             }
+            Message::FetchProfile => {
+                if let Some(ref mut helper) = self.helper {
+                    if let Err(e) = helper.send(&HelperCommand::GetProfile) {
+                        self.helper_error = Some(format!("Failed to send GetProfile: {}", e));
+                    }
+                }
+                Task::none()
+            }
+            Message::SaveSettings => {
+                if let Some(ref mut helper) = self.helper {
+                    let mut options = std::collections::HashMap::new();
+                    options.insert("login".into(), self.settings_username.clone());
+                    options.insert("password".into(), self.settings_password.clone());
+                    options.insert("servers.startlast".into(), if self.settings_startlast { "True" } else { "False" }.into());
+                    options.insert("servers.locklast".into(), if self.settings_locklast { "True" } else { "False" }.into());
+                    options.insert("network.ipv6.mode".into(), self.settings_ipv6_mode.clone());
+                    options.insert("dns.servers".into(), self.settings_dns.clone());
+                    options.insert("event.vpn.pre.filename".into(), self.settings_event_pre_file.clone());
+                    options.insert("event.vpn.pre.arguments".into(), self.settings_event_pre_args.clone());
+                    options.insert("event.vpn.pre.waitend".into(), if self.settings_event_pre_wait { "True" } else { "False" }.into());
+                    options.insert("event.vpn.up.filename".into(), self.settings_event_up_file.clone());
+                    options.insert("event.vpn.up.arguments".into(), self.settings_event_up_args.clone());
+                    options.insert("event.vpn.up.waitend".into(), if self.settings_event_up_wait { "True" } else { "False" }.into());
+                    options.insert("event.vpn.down.filename".into(), self.settings_event_down_file.clone());
+                    options.insert("event.vpn.down.arguments".into(), self.settings_event_down_args.clone());
+                    options.insert("event.vpn.down.waitend".into(), if self.settings_event_down_wait { "True" } else { "False" }.into());
+                    if let Err(e) = helper.send(&HelperCommand::SaveProfile { options }) {
+                        self.helper_error = Some(format!("Failed to send SaveProfile: {}", e));
+                    }
+                }
+                Task::none()
+            }
+            Message::SettingsUsernameChanged(val) => {
+                self.settings_username = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsPasswordChanged(val) => {
+                self.settings_password = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsStartlastToggle(val) => {
+                self.settings_startlast = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsLocklastToggle(val) => {
+                self.settings_locklast = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsIpv6ModeChanged(val) => {
+                self.settings_ipv6_mode = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsDnsChanged(val) => {
+                self.settings_dns = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsEventChanged { hook, field, value } => {
+                match (hook.as_str(), field.as_str()) {
+                    ("pre", "file") => self.settings_event_pre_file = value,
+                    ("pre", "args") => self.settings_event_pre_args = value,
+                    ("pre", "wait") => self.settings_event_pre_wait = value == "true",
+                    ("up", "file") => self.settings_event_up_file = value,
+                    ("up", "args") => self.settings_event_up_args = value,
+                    ("up", "wait") => self.settings_event_up_wait = value == "true",
+                    ("down", "file") => self.settings_event_down_file = value,
+                    ("down", "args") => self.settings_event_down_args = value,
+                    ("down", "wait") => self.settings_event_down_wait = value == "true",
+                    _ => {}
+                }
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::ConnectNoLockToggle(val) => {
+                self.connect_no_lock = val;
+                Task::none()
+            }
+            Message::ConnectAllowLanToggle(val) => {
+                self.connect_allow_lan = val;
+                Task::none()
+            }
+            Message::ConnectNoReconnectToggle(val) => {
+                self.connect_no_reconnect = val;
+                Task::none()
+            }
+            Message::ConnectSkipPingToggle(val) => {
+                self.connect_skip_ping = val;
+                Task::none()
+            }
+            Message::ConnectNoVerifyToggle(val) => {
+                self.connect_no_verify = val;
+                Task::none()
+            }
+            Message::LockInstall => {
+                if let Some(ref mut helper) = self.helper {
+                    if let Err(e) = helper.send(&HelperCommand::LockInstall) {
+                        self.helper_error = Some(format!("Failed to send LockInstall: {}", e));
+                    }
+                }
+                Task::none()
+            }
+            Message::LockUninstall => {
+                if let Some(ref mut helper) = self.helper {
+                    if let Err(e) = helper.send(&HelperCommand::LockUninstall) {
+                        self.helper_error = Some(format!("Failed to send LockUninstall: {}", e));
+                    }
+                }
+                Task::none()
+            }
+            Message::LockEnable => {
+                if let Some(ref mut helper) = self.helper {
+                    if let Err(e) = helper.send(&HelperCommand::LockEnable) {
+                        self.helper_error = Some(format!("Failed to send LockEnable: {}", e));
+                    }
+                }
+                Task::none()
+            }
+            Message::LockDisable => {
+                if let Some(ref mut helper) = self.helper {
+                    if let Err(e) = helper.send(&HelperCommand::LockDisable) {
+                        self.helper_error = Some(format!("Failed to send LockDisable: {}", e));
+                    }
+                }
+                Task::none()
+            }
         }
     }
 
@@ -361,8 +562,27 @@ impl App {
                 self.servers = servers;
                 self.servers_loading = false;
             }
-            HelperEvent::Profile { .. } | HelperEvent::ProfileSaved => {
-                // Handled by Settings tab (M2)
+            HelperEvent::Profile { options } => {
+                self.settings_username = options.get("login").cloned().unwrap_or_default();
+                self.settings_password = options.get("password").cloned().unwrap_or_default();
+                self.settings_startlast = options.get("servers.startlast").map(|v| v == "True").unwrap_or(false);
+                self.settings_locklast = options.get("servers.locklast").map(|v| v == "True").unwrap_or(false);
+                self.settings_ipv6_mode = options.get("network.ipv6.mode").cloned().unwrap_or_else(|| "in-block".into());
+                self.settings_dns = options.get("dns.servers").cloned().unwrap_or_default();
+                self.settings_event_pre_file = options.get("event.vpn.pre.filename").cloned().unwrap_or_default();
+                self.settings_event_pre_args = options.get("event.vpn.pre.arguments").cloned().unwrap_or_default();
+                self.settings_event_pre_wait = options.get("event.vpn.pre.waitend").map(|v| v == "True").unwrap_or(true);
+                self.settings_event_up_file = options.get("event.vpn.up.filename").cloned().unwrap_or_default();
+                self.settings_event_up_args = options.get("event.vpn.up.arguments").cloned().unwrap_or_default();
+                self.settings_event_up_wait = options.get("event.vpn.up.waitend").map(|v| v == "True").unwrap_or(true);
+                self.settings_event_down_file = options.get("event.vpn.down.filename").cloned().unwrap_or_default();
+                self.settings_event_down_args = options.get("event.vpn.down.arguments").cloned().unwrap_or_default();
+                self.settings_event_down_wait = options.get("event.vpn.down.waitend").map(|v| v == "True").unwrap_or(true);
+                self.settings_loaded = true;
+                self.settings_dirty = false;
+            }
+            HelperEvent::ProfileSaved => {
+                self.settings_dirty = false;
             }
         }
     }
@@ -413,7 +633,26 @@ impl App {
                 self.log_filter_warn,
                 self.log_filter_error,
             ),
-            views::Tab::Settings => text("Settings tab — coming soon").into(),
+            views::Tab::Settings => views::settings::view(
+                &self.settings_username,
+                &self.settings_password,
+                self.settings_startlast,
+                self.settings_locklast,
+                &self.settings_ipv6_mode,
+                &self.settings_dns,
+                (&self.settings_event_pre_file, &self.settings_event_pre_args, self.settings_event_pre_wait),
+                (&self.settings_event_up_file, &self.settings_event_up_args, self.settings_event_up_wait),
+                (&self.settings_event_down_file, &self.settings_event_down_args, self.settings_event_down_wait),
+                self.settings_loaded,
+                self.settings_dirty,
+                self.connect_no_lock,
+                self.connect_allow_lan,
+                self.connect_no_reconnect,
+                self.connect_skip_ping,
+                self.connect_no_verify,
+                self.lock_installed,
+                self.lock_persistent,
+            ),
         };
         let content = container(content).padding(16).width(Fill);
 

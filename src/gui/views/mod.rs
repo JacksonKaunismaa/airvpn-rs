@@ -1,6 +1,7 @@
 pub mod logs;
 pub mod overview;
 pub mod servers;
+pub mod settings;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Tab {
