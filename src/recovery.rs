@@ -479,12 +479,13 @@ pub fn setup_signal_handler() -> Result<Arc<AtomicBool>> {
         .context("failed to install SIGHUP handler")?;
     }
 
-    // Store the flag in a global so the C-style handler can access it
-    SHUTDOWN_FLAG
-        .set(Arc::clone(&shutdown))
-        .map_err(|_| anyhow::anyhow!("signal handler already initialized"))?;
-
-    Ok(shutdown)
+    // Store the flag in a global so the C-style handler can access it.
+    // If already initialized (e.g. helper called us first, then connect::run()
+    // calls us again), return the existing flag instead of failing.
+    match SHUTDOWN_FLAG.set(Arc::clone(&shutdown)) {
+        Ok(()) => Ok(shutdown),
+        Err(_) => Ok(Arc::clone(SHUTDOWN_FLAG.get().unwrap())),
+    }
 }
 
 /// Global storage for the shutdown flag, accessed from the signal handler.

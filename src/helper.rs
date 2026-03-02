@@ -60,10 +60,17 @@ pub fn run() -> Result<()> {
 
     info!("Helper listening on {}", SOCKET_PATH);
 
-    // Set up signal handler so Ctrl+C / SIGTERM triggers graceful shutdown
-    let _shutdown = recovery::setup_signal_handler();
+    // Set up signal handler so Ctrl+C / SIGTERM triggers graceful shutdown.
+    // The signal handler sets SHUTDOWN_FLAG; we check it after each accept().
+    // Without SA_RESTART, accept() returns EINTR on signal, breaking the block.
+    let shutdown = recovery::setup_signal_handler()?;
 
     for stream in listener.incoming() {
+        // Check shutdown flag after each accept (signal interrupts accept with EINTR)
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            info!("Shutdown signal received, exiting helper");
+            break;
+        }
         match stream {
             Ok(stream) => {
                 info!("Client connected");
@@ -71,6 +78,10 @@ pub fn run() -> Result<()> {
                     warn!("Client session ended with error: {}", e);
                 }
                 info!("Client disconnected");
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                // EINTR from signal — loop back to check shutdown flag
+                continue;
             }
             Err(e) => {
                 error!("Failed to accept connection: {}", e);

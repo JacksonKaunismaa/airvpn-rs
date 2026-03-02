@@ -127,7 +127,9 @@ impl App {
             }
             Message::HelperConnected => {
                 match ipc::HelperClient::connect() {
-                    Ok(client) => {
+                    Ok(mut client) => {
+                        // Request initial status (connection state + lock state)
+                        let _ = client.send(&HelperCommand::Status);
                         self.helper = Some(client);
                         self.helper_error = None;
                     }
