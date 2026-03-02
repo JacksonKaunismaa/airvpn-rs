@@ -29,6 +29,7 @@ struct App {
     tx_bytes: u64,
     helper: Option<ipc::HelperClient>,
     helper_error: Option<String>,
+    helper_launched: bool,
     logs: Vec<String>,
     activity: String,
 }
@@ -55,6 +56,7 @@ impl App {
             tx_bytes: 0,
             helper: None,
             helper_error: None,
+            helper_launched: false,
             logs: Vec::new(),
             activity: String::new(),
         };
@@ -113,6 +115,7 @@ impl App {
                 Task::none()
             }
             Message::LaunchHelper => {
+                self.helper_launched = true;
                 self.helper_error = None;
                 self.activity = "Launching helper (waiting for authentication)...".into();
                 match ipc::launch_helper() {
@@ -143,18 +146,24 @@ impl App {
             Message::HelperConnected => {
                 match ipc::HelperClient::connect() {
                     Ok(mut client) => {
-                        // Request initial status (connection state + lock state)
                         let _ = client.send(&HelperCommand::Status);
                         self.helper = Some(client);
                         self.helper_error = None;
+                        self.activity.clear();
                         Task::none()
                     }
                     Err(e) => {
                         eprintln!("[GUI] HelperClient::connect() failed: {}", e);
-                        self.helper_error = Some(format!(
-                            "Cannot connect to helper: {}. Click Retry to launch a new one.", e
-                        ));
-                        Task::none()
+                        if !self.helper_launched {
+                            // First failure — automatically try launching a helper
+                            Task::done(Message::LaunchHelper)
+                        } else {
+                            // Already tried launching — show error with retry
+                            self.helper_error = Some(format!(
+                                "Cannot connect to helper: {}. Click Retry.", e
+                            ));
+                            Task::none()
+                        }
                     }
                 }
             }
