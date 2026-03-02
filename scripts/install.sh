@@ -31,14 +31,16 @@ echo "Installing systemd units..."
 install -Dm644 "$SCRIPT_DIR/resources/airvpn-helper.socket" /etc/systemd/system/airvpn-helper.socket
 install -Dm644 "$SCRIPT_DIR/resources/airvpn-helper.service" /etc/systemd/system/airvpn-helper.service
 
+# Reload units first (so stop uses the current unit file)
+systemctl daemon-reload
+
 # Stop helper if running (so it picks up the new binary on next activation)
 if systemctl is-active --quiet airvpn-helper.service; then
     echo "Stopping running helper..."
     systemctl stop airvpn-helper.service
 fi
 
-# Reload and enable socket activation
-systemctl daemon-reload
+# Enable socket activation
 systemctl enable --now airvpn-helper.socket
 
 echo ""
