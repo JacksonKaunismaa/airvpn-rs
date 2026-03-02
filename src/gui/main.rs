@@ -27,6 +27,13 @@ struct App {
     lock_installed: bool,
     rx_bytes: u64,
     tx_bytes: u64,
+    prev_rx_bytes: u64,
+    prev_tx_bytes: u64,
+    rx_speed: f64,
+    tx_speed: f64,
+    connected_since: Option<std::time::Instant>,
+    connection_count: u32,
+    selected_server: Option<String>,
     helper: Option<ipc::HelperClient>,
     helper_error: Option<String>,
     helper_launched: bool,
@@ -54,6 +61,13 @@ impl App {
             lock_installed: false,
             rx_bytes: 0,
             tx_bytes: 0,
+            prev_rx_bytes: 0,
+            prev_tx_bytes: 0,
+            rx_speed: 0.0,
+            tx_speed: 0.0,
+            connected_since: None,
+            connection_count: 0,
+            selected_server: None,
             helper: None,
             helper_error: None,
             helper_launched: false,
@@ -173,6 +187,18 @@ impl App {
     fn handle_helper_event(&mut self, event: HelperEvent) {
         match event {
             HelperEvent::StateChanged { state } => {
+                // Track connection timing
+                if matches!(state, ConnectionState::Connected { .. })
+                    && !matches!(self.connection_state, ConnectionState::Connected { .. })
+                {
+                    self.connected_since = Some(std::time::Instant::now());
+                    self.connection_count += 1;
+                }
+                if matches!(state, ConnectionState::Disconnected) {
+                    self.connected_since = None;
+                    self.rx_speed = 0.0;
+                    self.tx_speed = 0.0;
+                }
                 // Clear activity text on terminal states
                 if matches!(state, ConnectionState::Connected { .. } | ConnectionState::Disconnected) {
                     self.activity.clear();
@@ -184,6 +210,12 @@ impl App {
                 self.logs.push(format!("[{}] {}", level, message));
             }
             HelperEvent::Stats { rx_bytes, tx_bytes } => {
+                if self.prev_rx_bytes > 0 {
+                    self.rx_speed = (rx_bytes.saturating_sub(self.prev_rx_bytes)) as f64 / 2.0;
+                    self.tx_speed = (tx_bytes.saturating_sub(self.prev_tx_bytes)) as f64 / 2.0;
+                }
+                self.prev_rx_bytes = rx_bytes;
+                self.prev_tx_bytes = tx_bytes;
                 self.rx_bytes = rx_bytes;
                 self.tx_bytes = tx_bytes;
             }
@@ -231,8 +263,14 @@ impl App {
                 &self.connection_state,
                 self.lock_session,
                 self.lock_persistent,
+                self.lock_installed,
                 self.rx_bytes,
                 self.tx_bytes,
+                self.rx_speed,
+                self.tx_speed,
+                self.connected_since,
+                self.connection_count,
+                &self.selected_server,
                 &self.activity,
             ),
             views::Tab::Servers => text("Servers tab — coming soon").into(),
