@@ -95,9 +95,6 @@ pub fn view<'a>(
             iced::Color::TRANSPARENT
         };
 
-        let text_alpha = if is_warning { 0.4 } else { 1.0 };
-        let _ = text_alpha; // opacity applied per-text in build_row
-
         let styled_btn = button(row_content)
             .on_press(Message::ServerClicked(display_idx))
             .width(Fill)

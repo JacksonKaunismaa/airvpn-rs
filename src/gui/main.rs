@@ -9,6 +9,13 @@ use std::time::Duration;
 
 use airvpn::ipc::{ConnectionState, HelperCommand, HelperEvent, ServerInfo};
 
+#[derive(Debug, Clone)]
+pub struct LogEntry {
+    pub timestamp: String,
+    pub level: String,
+    pub message: String,
+}
+
 fn main() -> iced::Result {
     iced::application(App::boot, App::update, App::view)
         .title("AirVPN")
@@ -43,7 +50,11 @@ struct App {
     helper: Option<ipc::HelperClient>,
     helper_error: Option<String>,
     helper_launched: bool,
-    logs: Vec<String>,
+    logs: Vec<LogEntry>,
+    log_filter_debug: bool,
+    log_filter_info: bool,
+    log_filter_warn: bool,
+    log_filter_error: bool,
     activity: String,
 }
 
@@ -60,6 +71,8 @@ pub enum Message {
     ServerClicked(usize),
     ServerSort(views::servers::SortColumn),
     ServerSearchChanged(String),
+    LogFilterToggle(String),
+    LogClear,
 }
 
 impl App {
@@ -89,6 +102,10 @@ impl App {
             helper_error: None,
             helper_launched: false,
             logs: Vec::new(),
+            log_filter_debug: false,
+            log_filter_info: true,
+            log_filter_warn: true,
+            log_filter_error: true,
             activity: String::new(),
         };
 
@@ -260,6 +277,20 @@ impl App {
                 self.selected_server_idx = None;
                 Task::none()
             }
+            Message::LogFilterToggle(level) => {
+                match level.as_str() {
+                    "debug" => self.log_filter_debug = !self.log_filter_debug,
+                    "info" => self.log_filter_info = !self.log_filter_info,
+                    "warn" => self.log_filter_warn = !self.log_filter_warn,
+                    "error" => self.log_filter_error = !self.log_filter_error,
+                    _ => {}
+                }
+                Task::none()
+            }
+            Message::LogClear => {
+                self.logs.clear();
+                Task::none()
+            }
         }
     }
 
@@ -286,7 +317,19 @@ impl App {
             }
             HelperEvent::Log { level, message } => {
                 self.activity = message.clone();
-                self.logs.push(format!("[{}] {}", level, message));
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let secs = now % 86400;
+                let h = secs / 3600;
+                let m = (secs % 3600) / 60;
+                let s = secs % 60;
+                self.logs.push(LogEntry {
+                    timestamp: format!("{:02}:{:02}:{:02}", h, m, s),
+                    level,
+                    message,
+                });
             }
             HelperEvent::Stats { rx_bytes, tx_bytes } => {
                 if self.prev_rx_bytes > 0 {
@@ -363,16 +406,13 @@ impl App {
                 &self.server_search,
                 &self.connection_state,
             ),
-            views::Tab::Logs => {
-                let mut log_col = column![].spacing(4);
-                for entry in &self.logs {
-                    log_col = log_col.push(text(entry).size(12));
-                }
-                if self.logs.is_empty() {
-                    log_col = log_col.push(text("No log entries yet."));
-                }
-                log_col.into()
-            }
+            views::Tab::Logs => views::logs::view(
+                &self.logs,
+                self.log_filter_debug,
+                self.log_filter_info,
+                self.log_filter_warn,
+                self.log_filter_error,
+            ),
             views::Tab::Settings => text("Settings tab — coming soon").into(),
         };
         let content = container(content).padding(16).width(Fill);
