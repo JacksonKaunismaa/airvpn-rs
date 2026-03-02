@@ -181,6 +181,11 @@ impl App {
                 self.helper = None;
                 self.connection_state = ConnectionState::Disconnected;
             }
+            HelperEvent::ServerList { .. }
+            | HelperEvent::Profile { .. }
+            | HelperEvent::ProfileSaved => {
+                // Handled by Servers/Settings tabs (M2)
+            }
         }
     }
 

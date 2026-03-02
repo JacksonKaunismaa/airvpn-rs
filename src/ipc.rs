@@ -5,6 +5,22 @@
 
 use serde::{Deserialize, Serialize};
 
+/// GUI-friendly server info with pre-calculated scoring.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerInfo {
+    pub name: String,
+    pub country_code: String,
+    pub location: String,
+    pub users: i64,
+    pub users_max: i64,
+    pub load_percent: f64,
+    pub score: i64,
+    pub ping_ms: Option<i64>,
+    pub warning: Option<String>,
+    pub ipv4: bool,
+    pub ipv6: bool,
+}
+
 /// Commands sent from GUI to helper.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd")]
@@ -16,17 +32,6 @@ pub enum HelperCommand {
         skip_ping: bool,
         allow_country: Vec<String>,
         deny_country: Vec<String>,
-        allow_server: Vec<String>,
-        deny_server: Vec<String>,
-        no_reconnect: bool,
-        no_verify: bool,
-        no_lock_last: bool,
-        no_start_last: bool,
-        ipv6_mode: Option<String>,
-        dns_servers: Vec<String>,
-        event_pre: [Option<String>; 3],
-        event_up: [Option<String>; 3],
-        event_down: [Option<String>; 3],
     },
     Disconnect,
     Status,
@@ -35,12 +40,10 @@ pub enum HelperCommand {
     LockEnable,
     LockDisable,
     LockStatus,
-    Recover,
-    /// Response to EddieProfileFound prompt.
-    ImportEddieProfile { accept: bool },
-    /// List available servers.
-    Servers { sort: String, debug: bool },
     Shutdown,
+    ListServers { skip_ping: bool },
+    GetProfile,
+    SaveProfile { options: std::collections::HashMap<String, String> },
 }
 
 /// Connection state machine.
@@ -70,11 +73,10 @@ pub enum HelperEvent {
         persistent_installed: bool,
     },
     Error { message: String },
-    /// Helper found an Eddie profile and asks the client whether to import it.
-    EddieProfileFound { path: String },
-    /// Server list table (formatted string) in response to Servers command.
-    ServerList { table: String },
     Shutdown,
+    ServerList { servers: Vec<ServerInfo> },
+    Profile { options: std::collections::HashMap<String, String> },
+    ProfileSaved,
 }
 
 /// Internal engine events (mpsc channel, not serialized over socket).
@@ -109,17 +111,6 @@ mod tests {
             skip_ping: false,
             allow_country: vec!["NL".to_string(), "DE".to_string()],
             deny_country: vec!["US".to_string()],
-            allow_server: vec!["Castor".to_string()],
-            deny_server: vec!["Pollux".to_string()],
-            no_reconnect: true,
-            no_verify: false,
-            no_lock_last: true,
-            no_start_last: false,
-            ipv6_mode: Some("block".to_string()),
-            dns_servers: vec!["10.128.0.1".to_string(), "10.128.0.2".to_string()],
-            event_pre: [Some("echo pre".to_string()), None, None],
-            event_up: [Some("echo up".to_string()), Some("echo up2".to_string()), None],
-            event_down: [None, None, None],
         };
 
         let encoded = encode_line(&cmd).expect("encode failed");
@@ -135,17 +126,6 @@ mod tests {
                 skip_ping,
                 allow_country,
                 deny_country,
-                allow_server,
-                deny_server,
-                no_reconnect,
-                no_verify,
-                no_lock_last,
-                no_start_last,
-                ipv6_mode,
-                dns_servers,
-                event_pre,
-                event_up,
-                event_down,
             } => {
                 assert_eq!(server, Some("Castor".to_string()));
                 assert!(!no_lock);
@@ -153,20 +133,6 @@ mod tests {
                 assert!(!skip_ping);
                 assert_eq!(allow_country, vec!["NL", "DE"]);
                 assert_eq!(deny_country, vec!["US"]);
-                assert_eq!(allow_server, vec!["Castor"]);
-                assert_eq!(deny_server, vec!["Pollux"]);
-                assert!(no_reconnect);
-                assert!(!no_verify);
-                assert!(no_lock_last);
-                assert!(!no_start_last);
-                assert_eq!(ipv6_mode, Some("block".to_string()));
-                assert_eq!(dns_servers, vec!["10.128.0.1", "10.128.0.2"]);
-                assert_eq!(event_pre, [Some("echo pre".to_string()), None, None]);
-                assert_eq!(
-                    event_up,
-                    [Some("echo up".to_string()), Some("echo up2".to_string()), None]
-                );
-                assert_eq!(event_down, [None, None, None]);
             }
             other => panic!("expected Connect, got {:?}", other),
         }
@@ -237,5 +203,137 @@ mod tests {
             }
             other => panic!("expected LockStatus, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_command_list_servers_roundtrip() {
+        let cmd = HelperCommand::ListServers { skip_ping: true };
+
+        let encoded = encode_line(&cmd).expect("encode failed");
+        assert!(encoded.contains(r#""cmd":"ListServers""#));
+        assert!(encoded.ends_with('\n'));
+
+        let decoded: HelperCommand = decode_line(&encoded).expect("decode failed");
+        match decoded {
+            HelperCommand::ListServers { skip_ping } => {
+                assert!(skip_ping);
+            }
+            other => panic!("expected ListServers, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_command_get_profile_roundtrip() {
+        let cmd = HelperCommand::GetProfile;
+
+        let encoded = encode_line(&cmd).expect("encode failed");
+        assert!(encoded.contains(r#""cmd":"GetProfile""#));
+        assert!(encoded.ends_with('\n'));
+
+        let decoded: HelperCommand = decode_line(&encoded).expect("decode failed");
+        assert!(matches!(decoded, HelperCommand::GetProfile));
+    }
+
+    #[test]
+    fn test_command_save_profile_roundtrip() {
+        let mut options = std::collections::HashMap::new();
+        options.insert("servers.locklast".to_string(), "true".to_string());
+        options.insert("servers.startlast".to_string(), "false".to_string());
+        let cmd = HelperCommand::SaveProfile { options: options.clone() };
+
+        let encoded = encode_line(&cmd).expect("encode failed");
+        assert!(encoded.contains(r#""cmd":"SaveProfile""#));
+        assert!(encoded.ends_with('\n'));
+
+        let decoded: HelperCommand = decode_line(&encoded).expect("decode failed");
+        match decoded {
+            HelperCommand::SaveProfile { options: decoded_options } => {
+                assert_eq!(decoded_options, options);
+            }
+            other => panic!("expected SaveProfile, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_event_server_list_roundtrip() {
+        let servers = vec![
+            ServerInfo {
+                name: "Castor".to_string(),
+                country_code: "NL".to_string(),
+                location: "Alblasserdam".to_string(),
+                users: 42,
+                users_max: 500,
+                load_percent: 8.4,
+                score: 150,
+                ping_ms: Some(12),
+                warning: None,
+                ipv4: true,
+                ipv6: true,
+            },
+            ServerInfo {
+                name: "Pollux".to_string(),
+                country_code: "DE".to_string(),
+                location: "Frankfurt".to_string(),
+                users: 300,
+                users_max: 500,
+                load_percent: 60.0,
+                score: 900,
+                ping_ms: None,
+                warning: Some("High load".to_string()),
+                ipv4: true,
+                ipv6: false,
+            },
+        ];
+        let event = HelperEvent::ServerList { servers };
+
+        let encoded = encode_line(&event).expect("encode failed");
+        assert!(encoded.contains(r#""event":"ServerList""#));
+        assert!(encoded.ends_with('\n'));
+
+        let decoded: HelperEvent = decode_line(&encoded).expect("decode failed");
+        match decoded {
+            HelperEvent::ServerList { servers } => {
+                assert_eq!(servers.len(), 2);
+                assert_eq!(servers[0].name, "Castor");
+                assert_eq!(servers[0].ping_ms, Some(12));
+                assert!(servers[0].warning.is_none());
+                assert_eq!(servers[1].name, "Pollux");
+                assert!(servers[1].ping_ms.is_none());
+                assert_eq!(servers[1].warning, Some("High load".to_string()));
+            }
+            other => panic!("expected ServerList, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_event_profile_roundtrip() {
+        let mut options = std::collections::HashMap::new();
+        options.insert("servers.locklast".to_string(), "false".to_string());
+        options.insert("mode.protocol".to_string(), "wireguard".to_string());
+        let event = HelperEvent::Profile { options: options.clone() };
+
+        let encoded = encode_line(&event).expect("encode failed");
+        assert!(encoded.contains(r#""event":"Profile""#));
+        assert!(encoded.ends_with('\n'));
+
+        let decoded: HelperEvent = decode_line(&encoded).expect("decode failed");
+        match decoded {
+            HelperEvent::Profile { options: decoded_options } => {
+                assert_eq!(decoded_options, options);
+            }
+            other => panic!("expected Profile, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_event_profile_saved_roundtrip() {
+        let event = HelperEvent::ProfileSaved;
+
+        let encoded = encode_line(&event).expect("encode failed");
+        assert!(encoded.contains(r#""event":"ProfileSaved""#));
+        assert!(encoded.ends_with('\n'));
+
+        let decoded: HelperEvent = decode_line(&encoded).expect("decode failed");
+        assert!(matches!(decoded, HelperEvent::ProfileSaved));
     }
 }
