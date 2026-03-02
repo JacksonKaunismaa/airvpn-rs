@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::process::Command;
 
-use log::{info, warn};
+use log::info;
 
 /// Ping results for all servers.
 #[derive(Default)]
@@ -168,42 +168,54 @@ fn median_ping(results: &[Option<u64>]) -> Option<u64> {
 ///
 /// Eddie pings `IpsEntry.FirstPreferIPv4` (Latency.cs line 75).
 pub fn measure_all(servers: &[crate::manifest::Server]) -> PingResults {
-    let mut results = PingResults::new();
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+
     let total = servers.len();
+    let completed = Arc::new(AtomicUsize::new(0));
 
-    for (i, server) in servers.iter().enumerate() {
-        // Use first IPv4 entry IP (matching Eddie: IpsEntry.FirstPreferIPv4)
-        let ip = server
-            .ips_entry
-            .iter()
-            .find(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())
-            .or_else(|| server.ips_entry.first());
+    // Spawn a thread per server. Each thread does PING_ROUNDS sequential pings
+    // and returns (server_name, latency_ms). All servers ping in parallel.
+    let handles: Vec<_> = servers
+        .iter()
+        .map(|server| {
+            let name = server.name.clone();
+            let ip = server
+                .ips_entry
+                .iter()
+                .find(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())
+                .or_else(|| server.ips_entry.first())
+                .cloned();
+            let completed = Arc::clone(&completed);
 
-        if let Some(ip) = ip {
-            // Validate IP address before passing to ping command to prevent
-            // command injection via malicious manifest data.
-            if ip.parse::<std::net::IpAddr>().is_err() {
-                warn!("skipping invalid IP for server {}: {:?}", server.name, ip);
-                results.latencies.insert(server.name.clone(), -1);
-                continue;
-            }
-            let rounds: Vec<Option<u64>> = (0..PING_ROUNDS).map(|_| ping_ip(ip)).collect();
-            match median_ping(&rounds) {
-                Some(ms) => {
-                    if (i + 1) % 25 == 0 || i + 1 == total {
-                        info!("Ping progress: {}/{} ({}ms for {})", i + 1, total, ms, server.name);
+            thread::spawn(move || {
+                let latency = match ip {
+                    Some(ref ip) if ip.parse::<std::net::IpAddr>().is_ok() => {
+                        let rounds: Vec<Option<u64>> =
+                            (0..PING_ROUNDS).map(|_| ping_ip(ip)).collect();
+                        match median_ping(&rounds) {
+                            Some(ms) => ms as i64,
+                            None => -1,
+                        }
                     }
-                    results.latencies.insert(server.name.clone(), ms as i64);
+                    _ => -1,
+                };
+
+                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                if done % 50 == 0 || done == total {
+                    info!("Ping progress: {}/{}", done, total);
                 }
-                None => {
-                    if (i + 1) % 25 == 0 || i + 1 == total {
-                        info!("Ping progress: {}/{} (timeout for {})", i + 1, total, server.name);
-                    }
-                    results.latencies.insert(server.name.clone(), -1);
-                }
-            }
-        } else {
-            results.latencies.insert(server.name.clone(), -1);
+
+                (name, latency)
+            })
+        })
+        .collect();
+
+    let mut results = PingResults::new();
+    for handle in handles {
+        if let Ok((name, latency)) = handle.join() {
+            results.latencies.insert(name, latency);
         }
     }
 
