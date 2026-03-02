@@ -7,7 +7,7 @@ use iced::{Element, Fill, Size, Subscription, Task};
 use iced::time;
 use std::time::Duration;
 
-use airvpn::ipc::{ConnectionState, HelperCommand, HelperEvent};
+use airvpn::ipc::{ConnectionState, HelperCommand, HelperEvent, ServerInfo};
 
 fn main() -> iced::Result {
     iced::application(App::boot, App::update, App::view)
@@ -34,6 +34,12 @@ struct App {
     connected_since: Option<std::time::Instant>,
     connection_count: u32,
     selected_server: Option<String>,
+    servers: Vec<ServerInfo>,
+    servers_loading: bool,
+    selected_server_idx: Option<usize>,
+    server_sort: views::servers::SortColumn,
+    server_sort_ascending: bool,
+    server_search: String,
     helper: Option<ipc::HelperClient>,
     helper_error: Option<String>,
     helper_launched: bool,
@@ -45,10 +51,15 @@ struct App {
 pub enum Message {
     TabSelected(views::Tab),
     Connect,
+    ConnectToServer(String),
     Disconnect,
     Tick,
     LaunchHelper,
     HelperConnected,
+    FetchServers,
+    ServerClicked(usize),
+    ServerSort(views::servers::SortColumn),
+    ServerSearchChanged(String),
 }
 
 impl App {
@@ -68,6 +79,12 @@ impl App {
             connected_since: None,
             connection_count: 0,
             selected_server: None,
+            servers: Vec::new(),
+            servers_loading: false,
+            selected_server_idx: None,
+            server_sort: views::servers::SortColumn::Score,
+            server_sort_ascending: true,
+            server_search: String::new(),
             helper: None,
             helper_error: None,
             helper_launched: false,
@@ -90,6 +107,9 @@ impl App {
         match message {
             Message::TabSelected(tab) => {
                 self.active_tab = tab;
+                if tab == views::Tab::Servers && self.servers.is_empty() && !self.servers_loading {
+                    return Task::done(Message::FetchServers);
+                }
                 Task::none()
             }
             Message::Connect => {
@@ -99,6 +119,23 @@ impl App {
                         no_lock: false,
                         allow_lan: true,
                         skip_ping: false,
+                        allow_country: Vec::new(),
+                        deny_country: Vec::new(),
+                    };
+                    if let Err(e) = helper.send(&cmd) {
+                        self.helper_error = Some(format!("Failed to send Connect: {}", e));
+                    }
+                }
+                Task::none()
+            }
+            Message::ConnectToServer(server_name) => {
+                self.selected_server = Some(server_name.clone());
+                if let Some(ref mut helper) = self.helper {
+                    let cmd = HelperCommand::Connect {
+                        server: Some(server_name),
+                        no_lock: false,
+                        allow_lan: true,
+                        skip_ping: true,
                         allow_country: Vec::new(),
                         deny_country: Vec::new(),
                     };
@@ -181,6 +218,48 @@ impl App {
                     }
                 }
             }
+            Message::FetchServers => {
+                if let Some(ref mut helper) = self.helper {
+                    self.servers_loading = true;
+                    let cmd = HelperCommand::ListServers { skip_ping: false };
+                    if let Err(e) = helper.send(&cmd) {
+                        self.servers_loading = false;
+                        self.helper_error =
+                            Some(format!("Failed to send ListServers: {}", e));
+                    }
+                }
+                Task::none()
+            }
+            Message::ServerClicked(idx) => {
+                self.selected_server_idx = Some(idx);
+                // Map display index to server name for use by Connect
+                let filtered = views::servers::filter_and_sort(
+                    &self.servers,
+                    &self.server_search,
+                    self.server_sort,
+                    self.server_sort_ascending,
+                );
+                if let Some(server) = filtered.get(idx) {
+                    self.selected_server = Some(server.name.clone());
+                }
+                Task::none()
+            }
+            Message::ServerSort(col) => {
+                if col == self.server_sort {
+                    self.server_sort_ascending = !self.server_sort_ascending;
+                } else {
+                    self.server_sort = col;
+                    // Score: lower is better, so default ascending
+                    self.server_sort_ascending = true;
+                }
+                self.selected_server_idx = None;
+                Task::none()
+            }
+            Message::ServerSearchChanged(query) => {
+                self.server_search = query;
+                self.selected_server_idx = None;
+                Task::none()
+            }
         }
     }
 
@@ -235,10 +314,12 @@ impl App {
                 self.helper = None;
                 self.connection_state = ConnectionState::Disconnected;
             }
-            HelperEvent::ServerList { .. }
-            | HelperEvent::Profile { .. }
-            | HelperEvent::ProfileSaved => {
-                // Handled by Servers/Settings tabs (M2)
+            HelperEvent::ServerList { servers } => {
+                self.servers = servers;
+                self.servers_loading = false;
+            }
+            HelperEvent::Profile { .. } | HelperEvent::ProfileSaved => {
+                // Handled by Settings tab (M2)
             }
         }
     }
@@ -273,7 +354,15 @@ impl App {
                 &self.selected_server,
                 &self.activity,
             ),
-            views::Tab::Servers => text("Servers tab — coming soon").into(),
+            views::Tab::Servers => views::servers::view(
+                &self.servers,
+                self.servers_loading,
+                self.selected_server_idx,
+                self.server_sort,
+                self.server_sort_ascending,
+                &self.server_search,
+                &self.connection_state,
+            ),
             views::Tab::Logs => {
                 let mut log_col = column![].spacing(4);
                 for entry in &self.logs {
