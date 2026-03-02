@@ -365,16 +365,15 @@ fn main() -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Refuse CLI connect/disconnect when the GUI helper is running.
-/// The helper owns the connection state — mixing CLI and helper control
-/// leads to inconsistent state (helper doesn't know about CLI actions).
+/// Uses PID file instead of socket connect — socket connect would trigger
+/// systemd socket activation and start the helper.
 fn refuse_if_helper_running() -> anyhow::Result<()> {
-    let socket = std::path::Path::new(airvpn::helper::SOCKET_PATH);
-    if socket.exists() {
-        // Verify it's a live socket, not a stale file
-        if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+    if let Some(pid) = airvpn::helper::read_pid_file() {
+        if recovery::is_pid_alive(pid) {
             anyhow::bail!(
-                "The GUI helper is running. Use the GUI to connect/disconnect, \
-                 or stop the helper first (Ctrl+C in the helper terminal)."
+                "The GUI helper is running (PID {}). Use the GUI to connect/disconnect, \
+                 or stop the helper first:\n  sudo systemctl stop airvpn-helper.service",
+                pid
             );
         }
     }
