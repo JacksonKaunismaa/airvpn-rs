@@ -550,14 +550,36 @@ fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
                 }
             }
 
-            ipc::HelperCommand::GetProfile
-            | ipc::HelperCommand::SaveProfile { .. } => {
-                send_event(
-                    &mut writer,
-                    &ipc::HelperEvent::Error {
-                        message: "not yet implemented".to_string(),
-                    },
-                );
+            ipc::HelperCommand::GetProfile => {
+                match dispatch_get_profile() {
+                    Ok(options) => {
+                        send_event(&mut writer, &ipc::HelperEvent::Profile { options });
+                    }
+                    Err(e) => {
+                        send_event(
+                            &mut writer,
+                            &ipc::HelperEvent::Error {
+                                message: format!("Failed to load profile: {:#}", e),
+                            },
+                        );
+                    }
+                }
+            }
+
+            ipc::HelperCommand::SaveProfile { ref options } => {
+                match dispatch_save_profile(options) {
+                    Ok(()) => {
+                        send_event(&mut writer, &ipc::HelperEvent::ProfileSaved);
+                    }
+                    Err(e) => {
+                        send_event(
+                            &mut writer,
+                            &ipc::HelperEvent::Error {
+                                message: format!("Failed to save profile: {:#}", e),
+                            },
+                        );
+                    }
+                }
             }
 
             ipc::HelperCommand::Shutdown => {
@@ -607,6 +629,19 @@ fn dispatch_lock_enable() -> Result<()> {
             "nft -f failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+    Ok(())
+}
+
+/// Load all profile options from the config file.
+fn dispatch_get_profile() -> Result<std::collections::HashMap<String, String>> {
+    Ok(config::load_profile_options())
+}
+
+/// Save profile options to the config file (one key at a time).
+fn dispatch_save_profile(options: &std::collections::HashMap<String, String>) -> Result<()> {
+    for (key, value) in options {
+        config::save_profile_option(key, value)?;
     }
     Ok(())
 }
