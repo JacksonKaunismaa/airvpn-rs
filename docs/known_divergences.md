@@ -5,7 +5,7 @@
 > code comments (search for "Eddie" or "diverge") and compare against
 > [Eddie's source](https://github.com/AirVPN/Eddie).
 >
-> Last reviewed: 2026-02-27
+> Last reviewed: 2026-03-02
 
 This codebase is a faithful Rust reimplementation of Eddie (AirVPN's official
 C# client). The vast majority of behavior — scoring formulas, penalty system,
@@ -170,7 +170,35 @@ doesn't have per-app UIDs, so the nftables approach is more appropriate).
 
 ---
 
-## 8. Persistent lock allows ICMP echo-request/reply
+## 8. systemd socket activation instead of pkexec
+
+**Eddie:** GUI launches the elevated process via pkexec (polkit authentication).
+IPC is TCP localhost on a random port (2048-65528) with session-key authentication.
+The elevated process is a separate C++ binary (`App.CLI.Linux.Elevated`).
+
+**airvpn-rs:** The helper daemon is started by systemd via socket activation
+(`airvpn-helper.socket` + `airvpn-helper.service`). systemd creates the Unix
+socket at `/run/airvpn-rs/helper.sock` with correct permissions before the
+helper starts — no pkexec, no password prompt, no filesystem permission race.
+The GUI connects directly; systemd starts the helper on demand.
+
+**Why:** Eddie's pkexec model has a race condition: the socket file appears
+(from `bind()`) before `chown()` completes, causing the GUI to get `EACCES`
+on fast startup. systemd socket activation eliminates this by creating the
+socket atomically with correct permissions before the process starts. This is
+the standard pattern used by Tailscale, Mullvad, Docker, and other Linux
+daemon-based tools.
+
+Socket permissions are `0660` with group `wheel` (any sudo-capable user).
+`SO_PEERCRED` logs the connecting UID on every accepted connection.
+
+**Files:** `src/helper.rs`, `resources/airvpn-helper.socket`, `resources/airvpn-helper.service`
+
+**Eddie ref:** `src/Lib.Core/Elevated/IElevated.cs`, `src/Lib.Core/Elevated/ISocket.cs`
+
+---
+
+## 9. Persistent lock allows ICMP echo-request/reply
 
 **Eddie:** Session lock allows ICMP when `netlock.allow_ping = true` (default).
 Input: echo-request accept. Output: echo-reply accept. No outgoing echo-request.
