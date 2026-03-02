@@ -17,7 +17,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
 
-use crate::{api, connect, ipc, netlock, recovery, wireguard};
+use crate::{api, config, connect, ipc, manifest, netlock, pinger, recovery, server, wireguard};
 
 pub const SOCKET_PATH: &str = "/run/airvpn-rs/helper.sock";
 
@@ -534,8 +534,23 @@ fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
                 send_event(&mut writer, &build_lock_status());
             }
 
-            ipc::HelperCommand::ListServers { .. }
-            | ipc::HelperCommand::GetProfile
+            ipc::HelperCommand::ListServers { skip_ping } => {
+                match dispatch_list_servers(skip_ping) {
+                    Ok(servers) => {
+                        send_event(&mut writer, &ipc::HelperEvent::ServerList { servers });
+                    }
+                    Err(e) => {
+                        send_event(
+                            &mut writer,
+                            &ipc::HelperEvent::Error {
+                                message: format!("Failed to list servers: {:#}", e),
+                            },
+                        );
+                    }
+                }
+            }
+
+            ipc::HelperCommand::GetProfile
             | ipc::HelperCommand::SaveProfile { .. } => {
                 send_event(
                     &mut writer,
@@ -594,4 +609,58 @@ fn dispatch_lock_enable() -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Fetch the server list from the API, optionally measure pings, and return
+/// scored ServerInfo structs for the GUI.
+fn dispatch_list_servers(skip_ping: bool) -> Result<Vec<ipc::ServerInfo>> {
+    let provider_config = api::load_provider_config()?;
+    let options = config::load_profile_options();
+    let (username, password) = config::resolve_credentials(None, None, &options)?;
+
+    let manifest_xml = api::fetch_manifest(&provider_config, &username, &password)?;
+    let manifest = manifest::parse_manifest(&manifest_xml)?;
+
+    let pings = if skip_ping {
+        pinger::PingResults::default()
+    } else {
+        pinger::measure_all(&manifest.servers)
+    };
+
+    let servers: Vec<ipc::ServerInfo> = manifest
+        .servers
+        .iter()
+        .map(|s| {
+            let ping_ms_raw = pings.get(&s.name);
+            let ping_ms = if ping_ms_raw < 0 {
+                None
+            } else {
+                Some(ping_ms_raw)
+            };
+            let score = server::score_with_ping(s, ping_ms_raw);
+            let load = server::load_perc(s) as f64;
+            let warning = if !s.warning_closed.is_empty() {
+                Some(s.warning_closed.clone())
+            } else if !s.warning_open.is_empty() {
+                Some(s.warning_open.clone())
+            } else {
+                None
+            };
+            ipc::ServerInfo {
+                name: s.name.clone(),
+                country_code: s.country_code.clone(),
+                location: s.location.clone(),
+                users: s.users,
+                users_max: s.users_max,
+                load_percent: load,
+                score,
+                ping_ms,
+                warning,
+                ipv4: s.support_ipv4,
+                ipv6: s.support_ipv6,
+            }
+        })
+        .collect();
+
+    Ok(servers)
 }
