@@ -17,7 +17,10 @@ pub struct HelperClient {
 
 impl HelperClient {
     pub fn connect() -> std::io::Result<Self> {
-        let stream = UnixStream::connect(SOCKET_PATH)?;
+        // Connect with a timeout to avoid hanging on stale sockets.
+        // A stale socket file (helper crashed without cleanup) causes
+        // UnixStream::connect to block indefinitely.
+        let stream = Self::connect_with_timeout(SOCKET_PATH, std::time::Duration::from_secs(2))?;
         let reader_stream = stream.try_clone()?;
         let writer = stream;
         let (tx, rx) = mpsc::channel();
@@ -56,6 +59,27 @@ impl HelperClient {
 
     pub fn try_recv(&self) -> Option<HelperEvent> {
         self.event_rx.try_recv().ok()
+    }
+
+    /// Connect to a Unix socket with a timeout.
+    /// Spawns a thread to do the blocking connect and waits with a deadline.
+    fn connect_with_timeout(
+        path: &str,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<UnixStream> {
+        let path = path.to_string();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = UnixStream::connect(&path);
+            let _ = tx.send(result);
+        });
+        match rx.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "socket connect timed out (stale socket?)",
+            )),
+        }
     }
 }
 
