@@ -105,7 +105,10 @@ pub fn generate_nonce() -> u64 {
     rand::Rng::gen(&mut rand::thread_rng())
 }
 
-/// Ensure the state directory exists with mode 0o700.
+/// Ensure the state directory exists with mode 0o755.
+/// The directory needs to be world-accessible because the GUI helper socket
+/// lives here and non-root users need to connect to it. The state file itself
+/// is 0o600 (root-only) so sensitive data is still protected.
 fn ensure_state_dir() -> Result<()> {
     let dir = Path::new(STATE_DIR);
     if !dir.exists() {
@@ -115,7 +118,7 @@ fn ensure_state_dir() -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755))
             .with_context(|| format!("failed to set permissions on {}", STATE_DIR))?;
     }
     Ok(())
