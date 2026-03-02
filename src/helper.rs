@@ -36,8 +36,9 @@ fn get_systemd_listener() -> Result<UnixListener> {
 
     match fds.next() {
         Some(fd) => {
-            // SAFETY: fd 3 is passed to us by systemd and is a valid, open
-            // Unix socket file descriptor. sd_notify already set O_CLOEXEC.
+            // SAFETY: `fd` (SD_LISTEN_FDS_START, i.e. 3 for a single-socket
+            // service) is passed by systemd and is a valid, open Unix socket
+            // file descriptor. sd_notify set O_CLOEXEC before returning.
             let listener = unsafe { UnixListener::from_raw_fd(fd) };
             Ok(listener)
         }
@@ -48,7 +49,7 @@ fn get_systemd_listener() -> Result<UnixListener> {
                  The helper must be started by systemd, not run directly.\n\
                  Enable the socket unit:\n\
                  \n\
-                 \x20 sudo systemctl enable --now airvpn-helper.socket\n\
+                   sudo systemctl enable --now airvpn-helper.socket\n\
                  \n\
                  Then the GUI will auto-start the helper on first connection."
             );
@@ -98,9 +99,8 @@ pub fn run() -> Result<()> {
     connect::preflight_checks()?;
 
     let listener = get_systemd_listener()?;
-    info!("Helper listening on {} (systemd socket activation)", SOCKET_PATH);
-
     write_pid_file()?;
+    info!("Helper listening on {} (systemd socket activation)", SOCKET_PATH);
 
     // Set up signal handler so Ctrl+C / SIGTERM triggers graceful shutdown.
     let shutdown = recovery::setup_signal_handler()?;
