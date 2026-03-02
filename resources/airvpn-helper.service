@@ -1,0 +1,13 @@
+[Unit]
+Description=AirVPN helper daemon
+Requires=airvpn-helper.socket
+After=airvpn-helper.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/airvpn helper
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
