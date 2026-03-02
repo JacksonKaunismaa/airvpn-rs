@@ -4,7 +4,6 @@ pub mod overview;
 pub enum Tab {
     Overview,
     Servers,
-    Speed,
     Logs,
     Settings,
 }
@@ -14,7 +13,6 @@ impl Tab {
         match self {
             Tab::Overview => "Overview",
             Tab::Servers => "Servers",
-            Tab::Speed => "Speed",
             Tab::Logs => "Logs",
             Tab::Settings => "Settings",
         }
@@ -24,7 +22,6 @@ impl Tab {
         &[
             Tab::Overview,
             Tab::Servers,
-            Tab::Speed,
             Tab::Logs,
             Tab::Settings,
         ]

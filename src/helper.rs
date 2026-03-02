@@ -521,13 +521,49 @@ fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
                 send_event(&mut writer, &build_lock_status());
             }
 
-            ipc::HelperCommand::LockInstall | ipc::HelperCommand::LockUninstall => {
-                send_event(
-                    &mut writer,
-                    &ipc::HelperEvent::Error {
-                        message: "not yet implemented".to_string(),
-                    },
-                );
+            ipc::HelperCommand::LockInstall => {
+                let result = (|| -> Result<()> {
+                    let provider_config = api::load_provider_config()?;
+                    let bootstrap_ips: Vec<String> = provider_config
+                        .bootstrap_urls
+                        .iter()
+                        .filter_map(|url| connect::extract_ip_from_url(url))
+                        .filter(|host| host.parse::<std::net::IpAddr>().is_ok())
+                        .collect();
+                    if bootstrap_ips.is_empty() {
+                        anyhow::bail!("no bootstrap IPs found in provider config");
+                    }
+                    netlock::install_persistent(&bootstrap_ips)
+                })();
+                match result {
+                    Ok(()) => {
+                        send_event(&mut writer, &build_lock_status());
+                    }
+                    Err(e) => {
+                        send_event(
+                            &mut writer,
+                            &ipc::HelperEvent::Error {
+                                message: format!("Lock install failed: {:#}", e),
+                            },
+                        );
+                    }
+                }
+            }
+
+            ipc::HelperCommand::LockUninstall => {
+                match netlock::uninstall_persistent() {
+                    Ok(()) => {
+                        send_event(&mut writer, &build_lock_status());
+                    }
+                    Err(e) => {
+                        send_event(
+                            &mut writer,
+                            &ipc::HelperEvent::Error {
+                                message: format!("Lock uninstall failed: {:#}", e),
+                            },
+                        );
+                    }
+                }
             }
 
             ipc::HelperCommand::LockStatus => {

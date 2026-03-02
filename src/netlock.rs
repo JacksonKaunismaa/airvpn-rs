@@ -573,6 +573,145 @@ pub fn generate_persistent_ruleset(bootstrap_ips: &[String]) -> String {
     r
 }
 
+/// Install the persistent kill switch: write rules + systemd service, enable,
+/// and load the nftables table. Called from both CLI (`cmd_lock_install`) and
+/// the helper daemon (`LockInstall` command).
+///
+/// The caller is responsible for extracting bootstrap IPs from the provider
+/// config — this function takes them as input.
+pub fn install_persistent(bootstrap_ips: &[String]) -> Result<()> {
+    use log::{info, warn};
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let ruleset = generate_persistent_ruleset(bootstrap_ips);
+
+    // Write rules file
+    std::fs::create_dir_all("/etc/airvpn-rs")
+        .context("failed to create /etc/airvpn-rs")?;
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o644)
+            .open(PERSISTENT_RULES_PATH)
+            .context("failed to write lock.nft")?;
+        std::io::Write::write_all(&mut f, ruleset.as_bytes())
+            .context("failed to write lock.nft")?;
+    }
+    info!("Wrote {}", PERSISTENT_RULES_PATH);
+
+    // Write systemd service
+    let service = "\
+[Unit]
+Description=AirVPN persistent kill switch
+DefaultDependencies=no
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/nft -f /etc/airvpn-rs/lock.nft
+ExecStop=/bin/sh -c 'printf \"add table inet airvpn_persist { flags owner, persist; }\\ndelete table inet airvpn_persist\\n\" | /usr/bin/nft -f -'
+
+[Install]
+WantedBy=sysinit.target
+";
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o644)
+            .open(PERSISTENT_SERVICE_PATH)
+            .context("failed to write systemd service")?;
+        std::io::Write::write_all(&mut f, service.as_bytes())
+            .context("failed to write systemd service")?;
+    }
+    info!("Wrote {}", PERSISTENT_SERVICE_PATH);
+
+    // Enable service
+    let output = Command::new("systemctl")
+        .args(["daemon-reload"])
+        .output()
+        .context("failed to run systemctl daemon-reload")?;
+    if !output.status.success() {
+        warn!(
+            "systemctl daemon-reload failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let output = Command::new("systemctl")
+        .args(["enable", "airvpn-lock.service"])
+        .output()
+        .context("failed to enable service")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "systemctl enable failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    info!("Enabled airvpn-lock.service");
+
+    // Load the table now. If airvpn_persist already active, delete it first
+    // (owner+persist flags can only be set at table creation time).
+    if is_persist_active() {
+        let _ = reclaim_and_delete();
+    }
+    let output = Command::new("nft")
+        .args(["-f", PERSISTENT_RULES_PATH])
+        .output()
+        .context("failed to load lock.nft")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "nft -f failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    info!("Persistent lock installed and active.");
+    info!("{} bootstrap IPs allowlisted.", bootstrap_ips.len());
+    info!("To temporarily disable: airvpn-rs lock disable");
+    Ok(())
+}
+
+/// Uninstall the persistent kill switch: stop + disable systemd service,
+/// remove files, and delete the nftables table. Called from both CLI
+/// (`cmd_lock_uninstall`) and the helper daemon (`LockUninstall` command).
+pub fn uninstall_persistent() -> Result<()> {
+    use log::{info, warn};
+
+    // Stop and disable service
+    let _ = Command::new("systemctl")
+        .args(["stop", "airvpn-lock.service"])
+        .output();
+    let _ = Command::new("systemctl")
+        .args(["disable", "airvpn-lock.service"])
+        .output();
+    let _ = Command::new("systemctl")
+        .args(["daemon-reload"])
+        .output();
+
+    // Remove files
+    let _ = std::fs::remove_file(PERSISTENT_SERVICE_PATH);
+    let _ = std::fs::remove_file(PERSISTENT_RULES_PATH);
+
+    // Delete persistent table if active. Safe even while VPN is running —
+    // airvpn_persist and airvpn_lock are independent tables.
+    if is_persist_active() {
+        match reclaim_and_delete() {
+            Ok(()) => {}
+            Err(e) => {
+                warn!("Could not delete table: {}", e);
+            }
+        }
+    }
+
+    info!("Persistent lock uninstalled.");
+    Ok(())
+}
+
 /// Activate the network lock: write ruleset to tmpfile and load via `nft -f`.
 ///
 /// If the table already exists (e.g., reconnection), performs an atomic
