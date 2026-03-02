@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::process::Command;
 
-use log::warn;
+use log::{info, warn};
 
 /// Ping results for all servers.
 #[derive(Default)]
@@ -169,8 +169,9 @@ fn median_ping(results: &[Option<u64>]) -> Option<u64> {
 /// Eddie pings `IpsEntry.FirstPreferIPv4` (Latency.cs line 75).
 pub fn measure_all(servers: &[crate::manifest::Server]) -> PingResults {
     let mut results = PingResults::new();
+    let total = servers.len();
 
-    for server in servers {
+    for (i, server) in servers.iter().enumerate() {
         // Use first IPv4 entry IP (matching Eddie: IpsEntry.FirstPreferIPv4)
         let ip = server
             .ips_entry
@@ -189,9 +190,15 @@ pub fn measure_all(servers: &[crate::manifest::Server]) -> PingResults {
             let rounds: Vec<Option<u64>> = (0..PING_ROUNDS).map(|_| ping_ip(ip)).collect();
             match median_ping(&rounds) {
                 Some(ms) => {
+                    if (i + 1) % 25 == 0 || i + 1 == total {
+                        info!("Ping progress: {}/{} ({}ms for {})", i + 1, total, ms, server.name);
+                    }
                     results.latencies.insert(server.name.clone(), ms as i64);
                 }
                 None => {
+                    if (i + 1) % 25 == 0 || i + 1 == total {
+                        info!("Ping progress: {}/{} (timeout for {})", i + 1, total, server.name);
+                    }
                     results.latencies.insert(server.name.clone(), -1);
                 }
             }
