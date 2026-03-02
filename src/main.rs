@@ -364,16 +364,25 @@ fn main() -> anyhow::Result<()> {
 // Helper guard
 // ---------------------------------------------------------------------------
 
-/// Refuse CLI connect/disconnect when the GUI helper is running.
-/// Uses PID file instead of socket connect — socket connect would trigger
-/// systemd socket activation and start the helper.
+/// Refuse CLI connect/disconnect when the GUI helper has an active VPN.
+/// Only blocks if the helper is running AND managing a VPN connection.
+/// An idle helper (waiting for GUI commands) doesn't conflict with CLI use.
 fn refuse_if_helper_running() -> anyhow::Result<()> {
-    if let Some(pid) = airvpn::helper::read_pid_file() {
-        if recovery::is_pid_alive(pid) {
+    let helper_pid = match airvpn::helper::read_pid_file() {
+        Some(pid) if recovery::is_pid_alive(pid) => pid,
+        _ => return Ok(()), // No helper running
+    };
+
+    // Check if the helper has an active VPN connection via recovery state.
+    // If the state file exists and its PID matches the helper, the helper
+    // owns a live VPN — refuse CLI to avoid conflicting management.
+    if let Ok(Some(state)) = recovery::load() {
+        if state.pid == helper_pid {
             anyhow::bail!(
-                "The GUI helper is running (PID {}). Use the GUI to connect/disconnect, \
-                 or stop the helper first:\n  sudo systemctl stop airvpn-helper.service",
-                pid
+                "The GUI helper (PID {}) has an active VPN connection. \
+                 Use the GUI to disconnect, or stop the helper first:\n  \
+                 sudo systemctl stop airvpn-helper.service",
+                helper_pid
             );
         }
     }

@@ -22,6 +22,10 @@ echo "Installing binaries to /usr/bin/..."
 install -Dm755 "$SCRIPT_DIR/target/release/airvpn" /usr/bin/airvpn
 install -Dm755 "$SCRIPT_DIR/target/release/airvpn-gui" /usr/bin/airvpn-gui
 
+# Install provider config
+echo "Installing provider config..."
+install -Dm644 "$SCRIPT_DIR/resources/provider.json" /etc/airvpn-rs/provider.json
+
 # Install systemd units
 echo "Installing systemd units..."
 install -Dm644 "$SCRIPT_DIR/resources/airvpn-helper.socket" /etc/systemd/system/airvpn-helper.socket
