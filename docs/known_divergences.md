@@ -187,26 +187,4 @@ calls to AirVPN bootstrap servers).
 
 **Files:** `src/netlock.rs` (persistent ruleset generation, input + output ICMP rules)
 
----
-
-## 9. GUI via split-process architecture (helper daemon)
-
-**Eddie:** GUI runs as user, elevated helper (`eddie-cli-elevated`) runs as root.
-They communicate over a localhost TCP socket (port 9350). Helper has "spot" mode
-(per-session) and "service" mode (persistent systemd daemon).
-
-**airvpn-rs:** GUI (`airvpn-gui`) runs as user, `airvpn helper` subcommand runs as
-root (launched via `pkexec`). They communicate over a Unix socket at
-`/run/airvpn-rs/helper.sock` using JSON-lines protocol.
-
-**Key difference:** Eddie uses TCP sockets; we use Unix sockets (simpler, no port
-conflicts, filesystem permissions for access control). Eddie's helper is a separate
-binary; ours is a subcommand of the same binary.
-
-**Known limitation (M1):** The CLI (`sudo airvpn connect`) and GUI helper are
-independent control paths. Don't mix them — if the helper is running, use the GUI;
-if using the CLI, don't start the helper. There's no coordination between them.
-
-**Files:** `src/helper.rs` (Unix socket server), `src/gui/` (iced application),
-`resources/org.airvpn.helper.policy` (polkit)
 
