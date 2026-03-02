@@ -582,30 +582,8 @@ fn fetch_initial_data(
         );
     }
 
-    // Latency measurement (Eddie: Jobs/Latency.cs)
-    let ping_results = if config.skip_ping {
-        info!("Skipping latency measurement (--skip-ping).");
-        emit(config, crate::ipc::EngineEvent::Log {
-            level: "info".into(),
-            message: "Skipping latency measurement".into(),
-        });
-        pinger::PingResults::new()
-    } else {
-        emit(config, crate::ipc::EngineEvent::Log {
-            level: "info".into(),
-            message: format!("Measuring latency for {} servers...", filtered_servers.len()),
-        });
-        info!("Measuring server latencies...");
-        let results = pinger::measure_all(&filtered_servers);
-        info!("Pinged {} servers.", results.latencies.len());
-        emit(config, crate::ipc::EngineEvent::Log {
-            level: "info".into(),
-            message: format!("Latency measurement complete ({} servers)", results.latencies.len()),
-        });
-        results
-    };
-
-    // Resolve lock_last / start_last from profile options
+    // Resolve lock_last / start_last from profile options BEFORE pinging,
+    // so we can skip pinging when we already know which server to use.
     let lock_last = !config.no_lock_last
         && params.profile_options
             .get("servers.locklast")
@@ -628,6 +606,40 @@ fn fetch_initial_data(
         })
     } else {
         None
+    };
+
+    // Latency measurement (Eddie: Jobs/Latency.cs).
+    // Skip when we already know which server to use (--server flag or startlast).
+    // Pinging is only needed for auto-selection by score.
+    let has_predetermined_server = config.server_name.is_some() || start_last_name.is_some();
+    let ping_results = if config.skip_ping || has_predetermined_server {
+        if has_predetermined_server && !config.skip_ping {
+            info!("Skipping latency measurement (server already determined).");
+            emit(config, crate::ipc::EngineEvent::Log {
+                level: "info".into(),
+                message: "Skipping ping (server already determined)".into(),
+            });
+        } else {
+            info!("Skipping latency measurement (--skip-ping).");
+            emit(config, crate::ipc::EngineEvent::Log {
+                level: "info".into(),
+                message: "Skipping latency measurement".into(),
+            });
+        }
+        pinger::PingResults::new()
+    } else {
+        emit(config, crate::ipc::EngineEvent::Log {
+            level: "info".into(),
+            message: format!("Measuring latency for {} servers...", filtered_servers.len()),
+        });
+        info!("Measuring server latencies...");
+        let results = pinger::measure_all(&filtered_servers);
+        info!("Pinged {} servers.", results.latencies.len());
+        emit(config, crate::ipc::EngineEvent::Log {
+            level: "info".into(),
+            message: format!("Latency measurement complete ({} servers)", results.latencies.len()),
+        });
+        results
     };
 
     Ok(SessionData {
