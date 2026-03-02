@@ -627,7 +627,29 @@ fn fetch_initial_data(
             message: format!("Measuring latency for {} servers...", filtered_servers.len()),
         });
         info!("Measuring server latencies...");
+
+        // Punch per-IP ICMP holes in the persistent lock so the pinger can
+        // reach server IPs. Collect all entry IPs (IPv4 preferred, like the pinger).
+        let server_ips: Vec<String> = filtered_servers
+            .iter()
+            .flat_map(|s| {
+                s.ips_entry
+                    .iter()
+                    .find(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())
+                    .or_else(|| s.ips_entry.first())
+                    .cloned()
+            })
+            .collect();
+        if let Err(e) = crate::netlock::open_ping_holes(&server_ips) {
+            warn!("Failed to open ICMP ping holes: {e} (pings may fail if persistent lock is active)");
+        }
+
         let results = pinger::measure_all(&filtered_servers);
+
+        if let Err(e) = crate::netlock::close_ping_holes() {
+            warn!("Failed to close ICMP ping holes: {e}");
+        }
+
         info!("Pinged {} servers.", results.latencies.len());
         emit(config, crate::ipc::EngineEvent::Log {
             level: "info".into(),

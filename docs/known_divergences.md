@@ -5,7 +5,7 @@
 > code comments (search for "Eddie" or "diverge") and compare against
 > [Eddie's source](https://github.com/AirVPN/Eddie).
 >
-> Last reviewed: 2026-03-02
+> Last reviewed: 2026-02-27
 
 This codebase is a faithful Rust reimplementation of Eddie (AirVPN's official
 C# client). The vast majority of behavior — scoring formulas, penalty system,
@@ -170,54 +170,24 @@ doesn't have per-app UIDs, so the nftables approach is more appropriate).
 
 ---
 
-## 8. Single control plane with systemd socket activation
-
-**Eddie:** CLI connects directly (elevated via pkexec). GUI launches a separate
-elevated C++ binary via pkexec, communicates over TCP localhost with session-key
-auth. CLI and GUI are independent VPN managers.
-
-**airvpn-rs:** Single daemon (helper) started by systemd socket activation. Both
-CLI and GUI are thin clients that send JSON-lines commands over a Unix socket at
-`/run/airvpn-rs/helper.sock`. The helper is the sole VPN control plane — it runs
-`connect::run()`, manages recovery state, and handles all privileged operations.
-
-The CLI resolves credentials interactively (the daemon can't prompt), then sends
-them in the Connect command. Status, disconnect, and lock commands all go through
-the socket. Only `servers` (read-only query) and `recover` (safety valve for dead
-helpers) bypass the daemon.
-
-**Why:** Eddie's dual-manager model requires conflict guards
-(`refuse_if_helper_running`, recovery state PID checks) to prevent CLI and GUI
-from stepping on each other. A single control plane eliminates this complexity.
-systemd socket activation eliminates Eddie's pkexec race condition (socket appears
-before `chown()` completes) by creating the socket atomically with correct
-permissions before the process starts.
-
-Socket permissions are `0660` with group `wheel` (any sudo-capable user).
-`SO_PEERCRED` logs the connecting UID on every accepted connection.
-
-**Files:** `src/helper.rs`, `src/cli_client.rs`, `resources/airvpn-helper.socket`,
-`resources/airvpn-helper.service`
-
-**Eddie ref:** `src/Lib.Core/Elevated/IElevated.cs`, `src/Lib.Core/Elevated/ISocket.cs`
-
----
-
-## 9. Persistent lock allows ICMP echo-request/reply
+## 8. Persistent lock ICMP: per-server hole-punching
 
 **Eddie:** Session lock allows ICMP when `netlock.allow_ping = true` (default).
 Input: echo-request accept. Output: echo-reply accept. No outgoing echo-request.
+Eddie's pinger runs before the session lock activates, so it never needs outbound
+ICMP during the lock.
 
-**airvpn-rs:** Persistent lock allows both echo-request and echo-reply in both
-input and output chains. This enables latency measurement (pinging server IPs)
-while the persistent lock is active — something that's impossible in Eddie
-because Eddie's ping job only runs when the lock is inactive.
+**airvpn-rs:** Persistent lock uses Eddie's ICMP model by default (inbound
+echo-request, outbound echo-reply — be pingable, but don't initiate pings).
+Before latency measurement, `open_ping_holes()` inserts per-server-IP
+echo-request rules into a `ping_allow` subchain. After pinging,
+`close_ping_holes()` flushes the subchain. Only ICMP to known AirVPN server
+IPs is allowed during the brief ping window.
 
-**Why:** The persistent lock is always active. Without outgoing echo-request,
-the pinger can't measure server latencies before connecting. The information
-leak is minimal (ICMP reveals "this IP exists" but the ISP already sees API
-calls to AirVPN bootstrap servers).
+**Why:** The persistent lock is always active, unlike Eddie's session lock.
+Blanket outbound ICMP would let any process ping any IP 24/7. Per-IP
+hole-punching limits the exposure to specific server IPs during the ~10s ping
+phase, matching `airvpn-ping.py`'s pattern of punching per-IP bypass routes.
 
-**Files:** `src/netlock.rs` (persistent ruleset generation, input + output ICMP rules)
-
-
+**Files:** `src/netlock.rs` (`generate_persistent_ruleset()`, `open_ping_holes()`,
+`close_ping_holes()`), `src/connect.rs` (ping phase)

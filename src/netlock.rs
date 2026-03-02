@@ -421,8 +421,8 @@ pub fn generate_persistent_ruleset(bootstrap_ips: &[String]) -> String {
     r.push_str("    ip6 saddr ff00::/8 ip6 daddr ff00::/8 counter accept\n");
     r.push_str("    ip6 saddr fc00::/7 ip6 daddr fc00::/7 counter accept\n");
 
-    // 6. ICMP/ICMPv6 (allow ping in both directions for latency measurement)
-    r.push_str("    icmp type { echo-request, echo-reply } counter accept\n");
+    // 6. ICMP/ICMPv6 (Eddie model: be pingable — accept inbound requests, no outbound initiation)
+    r.push_str("    icmp type echo-request counter accept\n");
     r.push_str("    icmpv6 type { echo-request, echo-reply, destination-unreachable, packet-too-big, time-exceeded, parameter-problem } counter accept\n");
 
     // 7. IPv6 RH0 drop
@@ -474,6 +474,12 @@ pub fn generate_persistent_ruleset(bootstrap_ips: &[String]) -> String {
     r.push_str("  }\n\n");
 
     // =========================================================================
+    // ping_allow subchain (empty by default — populated by open_ping_holes())
+    // =========================================================================
+    r.push_str("  chain ping_allow {\n");
+    r.push_str("  }\n\n");
+
+    // =========================================================================
     // OUTPUT chain
     // =========================================================================
     r.push_str(&format!(
@@ -521,9 +527,12 @@ pub fn generate_persistent_ruleset(bootstrap_ips: &[String]) -> String {
         ));
     }
 
-    // 6. ICMP/ICMPv6 (allow outgoing ping so latency measurement works)
-    r.push_str("    icmp type { echo-request, echo-reply } counter accept\n");
+    // 6. ICMP/ICMPv6 (Eddie model: respond to pings only — no outbound initiation)
+    r.push_str("    icmp type echo-reply counter accept\n");
     r.push_str("    icmpv6 type { echo-request, echo-reply, destination-unreachable, packet-too-big, time-exceeded, parameter-problem } counter accept\n");
+
+    // 7. Per-server ICMP hole-punching (jump to subchain, empty by default)
+    r.push_str(&format!("    jump ping_allow\n"));
 
     // 7. Bootstrap IPs (allow API access without VPN)
     for ip_str in bootstrap_ips {
@@ -684,6 +693,112 @@ pub fn is_persist_active() -> bool {
         Ok(o) => o.status.success(),
         Err(_) => false,
     }
+}
+
+/// Open per-IP ICMP holes in the persistent lock's `ping_allow` subchain.
+///
+/// Inserts one `ip daddr <ip> icmp type echo-request accept` rule per server IP
+/// so the pinger can measure latency. Only allows ICMP to the specific IPs, not
+/// blanket outbound ping. Call `close_ping_holes()` after pinging completes.
+///
+/// No-op if the persistent table is not active (users without persistent lock
+/// get blanket ICMP through the session lock's `allow_ping` setting).
+pub fn open_ping_holes(server_ips: &[String]) -> Result<()> {
+    if !is_persist_active() {
+        return Ok(());
+    }
+    if server_ips.is_empty() {
+        return Ok(());
+    }
+
+    // Build a single nft -f batch: one rule per server IP in the ping_allow chain.
+    let mut batch = String::new();
+    for ip_str in server_ips {
+        let ip_str = ip_str.trim();
+        if ip_str.is_empty() {
+            continue;
+        }
+        // Validate it's a real IP to prevent injection
+        if ip_str.parse::<IpAddr>().is_err() {
+            continue;
+        }
+        if ip_str.contains(':') {
+            // IPv6
+            batch.push_str(&format!(
+                "add rule inet {} ping_allow ip6 daddr {} icmpv6 type echo-request counter accept\n",
+                PERSIST_TABLE_NAME, ip_str
+            ));
+        } else {
+            // IPv4
+            batch.push_str(&format!(
+                "add rule inet {} ping_allow ip daddr {} icmp type echo-request counter accept\n",
+                PERSIST_TABLE_NAME, ip_str
+            ));
+        }
+    }
+
+    if batch.is_empty() {
+        return Ok(());
+    }
+
+    let mut child = Command::new("nft")
+        .args(["-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("failed to spawn nft for ping holes")?;
+
+    if let Some(ref mut stdin) = child.stdin {
+        stdin
+            .write_all(batch.as_bytes())
+            .context("failed to write ping hole rules")?;
+    }
+    let output = child
+        .wait_with_output()
+        .context("failed to wait on nft for ping holes")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("nft failed to add ping holes: {}", stderr.trim());
+    }
+
+    log::info!(
+        "Opened {} ICMP ping holes in persistent lock",
+        server_ips.len()
+    );
+    Ok(())
+}
+
+/// Close all ICMP ping holes by flushing the `ping_allow` subchain.
+///
+/// Restores the persistent lock to its default state where outbound
+/// echo-request is not allowed. Safe to call even if no holes are open.
+///
+/// No-op if the persistent table is not active.
+pub fn close_ping_holes() -> Result<()> {
+    if !is_persist_active() {
+        return Ok(());
+    }
+
+    let output = Command::new("nft")
+        .args([
+            "flush",
+            "chain",
+            "inet",
+            PERSIST_TABLE_NAME,
+            "ping_allow",
+        ])
+        .output()
+        .context("failed to flush ping_allow chain")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("nft failed to flush ping_allow: {}", stderr.trim());
+    }
+
+    log::info!("Closed ICMP ping holes in persistent lock");
+    Ok(())
 }
 
 /// Allow VPN interface traffic (called when tunnel comes up).
@@ -1583,5 +1698,98 @@ mod tests {
             "persistent ruleset should use priority -400");
         assert!(!ruleset.contains("priority -300;"),
             "persistent ruleset should NOT use priority -300");
+    }
+
+    #[test]
+    fn test_persistent_ruleset_input_allows_inbound_ping_only() {
+        let ruleset = generate_persistent_ruleset(&vec![]);
+        let input_start = ruleset.find("chain input").expect("input chain");
+        let input_end = ruleset[input_start..]
+            .find("\n  }\n")
+            .map(|p| input_start + p)
+            .expect("input chain end");
+        let input_section = &ruleset[input_start..input_end];
+
+        // Should allow inbound echo-request (others can ping us)
+        assert!(
+            input_section.contains("icmp type echo-request counter accept"),
+            "input chain should accept inbound echo-request"
+        );
+        // Should NOT have blanket echo-reply in input (that would be for outbound ping responses
+        // arriving — conntrack handles that via established state)
+        assert!(
+            !input_section.contains("icmp type { echo-request, echo-reply }"),
+            "input chain should NOT have blanket echo-request + echo-reply"
+        );
+    }
+
+    #[test]
+    fn test_persistent_ruleset_output_allows_echo_reply_only() {
+        let ruleset = generate_persistent_ruleset(&vec![]);
+        let output_start = ruleset.find("chain output").expect("output chain");
+        let output_end = ruleset[output_start..]
+            .find("\n  }\n")
+            .map(|p| output_start + p)
+            .expect("output chain end");
+        let output_section = &ruleset[output_start..output_end];
+
+        // Should allow outbound echo-reply (respond to pings)
+        assert!(
+            output_section.contains("icmp type echo-reply counter accept"),
+            "output chain should accept outbound echo-reply"
+        );
+        // Should NOT allow blanket outbound echo-request
+        assert!(
+            !output_section.contains("icmp type echo-request counter accept"),
+            "output chain should NOT have blanket outbound echo-request"
+        );
+        // Should NOT have the old blanket rule
+        assert!(
+            !output_section.contains("icmp type { echo-request, echo-reply }"),
+            "output chain should NOT have blanket echo-request + echo-reply"
+        );
+    }
+
+    #[test]
+    fn test_persistent_ruleset_has_ping_allow_subchain() {
+        let ruleset = generate_persistent_ruleset(&vec![]);
+        assert!(
+            ruleset.contains("chain ping_allow {"),
+            "persistent ruleset should have a ping_allow subchain"
+        );
+    }
+
+    #[test]
+    fn test_persistent_ruleset_output_jumps_to_ping_allow() {
+        let ruleset = generate_persistent_ruleset(&vec![]);
+        let output_start = ruleset.find("chain output").expect("output chain");
+        let output_end = ruleset[output_start..]
+            .find("\n  }\n")
+            .map(|p| output_start + p)
+            .expect("output chain end");
+        let output_section = &ruleset[output_start..output_end];
+
+        assert!(
+            output_section.contains("jump ping_allow"),
+            "output chain should jump to ping_allow subchain"
+        );
+    }
+
+    #[test]
+    fn test_persistent_ruleset_ping_allow_is_empty_by_default() {
+        let ruleset = generate_persistent_ruleset(&vec![]);
+        let chain_start = ruleset.find("chain ping_allow {").expect("ping_allow chain");
+        let chain_end = ruleset[chain_start..]
+            .find("\n  }\n")
+            .map(|p| chain_start + p)
+            .expect("ping_allow chain end");
+        let chain_body = &ruleset[chain_start + "chain ping_allow {".len()..chain_end];
+
+        // Should be empty (no rules) — just whitespace
+        assert!(
+            chain_body.trim().is_empty(),
+            "ping_allow chain should be empty by default, got: {:?}",
+            chain_body.trim()
+        );
     }
 }
