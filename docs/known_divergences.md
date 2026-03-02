@@ -168,3 +168,45 @@ doesn't have per-app UIDs, so the nftables approach is more appropriate).
 
 **Eddie ref:** `src/Lib.Core/NetworkLockManager.cs`, `src/Lib.Platform.Linux/NetworkLockNftables.cs`
 
+---
+
+## 8. Persistent lock allows ICMP echo-request/reply
+
+**Eddie:** Session lock allows ICMP when `netlock.allow_ping = true` (default).
+Input: echo-request accept. Output: echo-reply accept. No outgoing echo-request.
+
+**airvpn-rs:** Persistent lock allows both echo-request and echo-reply in both
+input and output chains. This enables latency measurement (pinging server IPs)
+while the persistent lock is active — something that's impossible in Eddie
+because Eddie's ping job only runs when the lock is inactive.
+
+**Why:** The persistent lock is always active. Without outgoing echo-request,
+the pinger can't measure server latencies before connecting. The information
+leak is minimal (ICMP reveals "this IP exists" but the ISP already sees API
+calls to AirVPN bootstrap servers).
+
+**Files:** `src/netlock.rs` (persistent ruleset generation, input + output ICMP rules)
+
+---
+
+## 9. GUI via split-process architecture (helper daemon)
+
+**Eddie:** GUI runs as user, elevated helper (`eddie-cli-elevated`) runs as root.
+They communicate over a localhost TCP socket (port 9350). Helper has "spot" mode
+(per-session) and "service" mode (persistent systemd daemon).
+
+**airvpn-rs:** GUI (`airvpn-gui`) runs as user, `airvpn helper` subcommand runs as
+root (launched via `pkexec`). They communicate over a Unix socket at
+`/run/airvpn-rs/helper.sock` using JSON-lines protocol.
+
+**Key difference:** Eddie uses TCP sockets; we use Unix sockets (simpler, no port
+conflicts, filesystem permissions for access control). Eddie's helper is a separate
+binary; ours is a subcommand of the same binary.
+
+**Known limitation (M1):** The CLI (`sudo airvpn connect`) and GUI helper are
+independent control paths. Don't mix them — if the helper is running, use the GUI;
+if using the CLI, don't start the helper. There's no coordination between them.
+
+**Files:** `src/helper.rs` (Unix socket server), `src/gui/` (iced application),
+`resources/org.airvpn.helper.policy` (polkit)
+
