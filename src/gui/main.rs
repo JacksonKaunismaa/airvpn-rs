@@ -30,6 +30,7 @@ struct App {
     helper: Option<ipc::HelperClient>,
     helper_error: Option<String>,
     logs: Vec<String>,
+    activity: String,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +56,7 @@ impl App {
             helper: None,
             helper_error: None,
             logs: Vec::new(),
+            activity: String::new(),
         };
 
         // Check if helper is already running
@@ -146,9 +148,14 @@ impl App {
     fn handle_helper_event(&mut self, event: HelperEvent) {
         match event {
             HelperEvent::StateChanged { state } => {
+                // Clear activity text on terminal states
+                if matches!(state, ConnectionState::Connected { .. } | ConnectionState::Disconnected) {
+                    self.activity.clear();
+                }
                 self.connection_state = state;
             }
             HelperEvent::Log { level, message } => {
+                self.activity = message.clone();
                 self.logs.push(format!("[{}] {}", level, message));
             }
             HelperEvent::Stats { rx_bytes, tx_bytes } => {
@@ -196,6 +203,7 @@ impl App {
                 self.lock_persistent,
                 self.rx_bytes,
                 self.tx_bytes,
+                &self.activity,
             ),
             views::Tab::Servers => text("Servers tab — coming soon").into(),
             views::Tab::Speed => text("Speed tab — coming soon").into(),

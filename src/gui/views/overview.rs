@@ -14,6 +14,7 @@ pub fn view<'a>(
     lock_persistent: bool,
     rx_bytes: u64,
     tx_bytes: u64,
+    activity: &'a str,
 ) -> Element<'a, Message> {
     let mut content = column![].spacing(12);
 
@@ -43,6 +44,15 @@ pub fn view<'a>(
             "Server: {} ({}, {})",
             server_name, server_location, server_country
         )));
+    }
+
+    // Activity status line (shows what's happening during connect)
+    if !activity.is_empty() {
+        content = content.push(
+            text(activity)
+                .size(14)
+                .color(iced::Color::from_rgb(0.53, 0.57, 0.63)),
+        );
     }
 
     // Connect / Disconnect button

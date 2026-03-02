@@ -546,7 +546,15 @@ fn fetch_initial_data(
     params: &SessionParams,
     config: &ConnectConfig,
 ) -> anyhow::Result<SessionData> {
+    emit(config, crate::ipc::EngineEvent::Log {
+        level: "info".into(),
+        message: "Fetching server list...".into(),
+    });
     let (manifest, user_info) = fetch_manifest_and_user(provider_config, params)?;
+    emit(config, crate::ipc::EngineEvent::Log {
+        level: "info".into(),
+        message: format!("Found {} servers", manifest.servers.len()),
+    });
 
     // Server filtering (Eddie: GetConnections allow/deny filtering)
     let filtered_servers: Vec<manifest::Server> = server::filter_servers(
@@ -577,11 +585,23 @@ fn fetch_initial_data(
     // Latency measurement (Eddie: Jobs/Latency.cs)
     let ping_results = if config.skip_ping {
         info!("Skipping latency measurement (--skip-ping).");
+        emit(config, crate::ipc::EngineEvent::Log {
+            level: "info".into(),
+            message: "Skipping latency measurement".into(),
+        });
         pinger::PingResults::new()
     } else {
+        emit(config, crate::ipc::EngineEvent::Log {
+            level: "info".into(),
+            message: format!("Measuring latency for {} servers...", filtered_servers.len()),
+        });
         info!("Measuring server latencies...");
         let results = pinger::measure_all(&filtered_servers);
         info!("Pinged {} servers.", results.latencies.len());
+        emit(config, crate::ipc::EngineEvent::Log {
+            level: "info".into(),
+            message: format!("Latency measurement complete ({} servers)", results.latencies.len()),
+        });
         results
     };
 
