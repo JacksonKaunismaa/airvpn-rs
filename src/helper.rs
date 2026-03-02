@@ -63,6 +63,10 @@ pub fn run() -> Result<()> {
     // Set up signal handler so Ctrl+C / SIGTERM triggers graceful shutdown.
     let shutdown = recovery::setup_signal_handler()?;
 
+    // Connection state persists across GUI client sessions so the helper
+    // knows about running VPN connections when a new GUI connects.
+    let mut conn_state = ConnState::new();
+
     // Use a 1s accept timeout so we periodically check the shutdown flag.
     // Rust's UnixListener retries on EINTR internally, so we can't rely on
     // signals to break out of accept() — we need the timeout.
@@ -83,7 +87,7 @@ pub fn run() -> Result<()> {
                 // Switch back to blocking for the next cycle
                 listener.set_nonblocking(false).ok();
                 info!("Client connected");
-                if let Err(e) = handle_client(stream) {
+                if let Err(e) = handle_client(stream, &mut conn_state) {
                     warn!("Client session ended with error: {}", e);
                 }
                 info!("Client disconnected");
@@ -173,19 +177,33 @@ fn build_lock_status() -> ipc::HelperEvent {
     }
 }
 
+/// VPN connection state that persists across GUI client sessions.
+/// Lives in run(), passed to each handle_client() by &mut reference.
+struct ConnState {
+    connect_handle: Option<thread::JoinHandle<()>>,
+    stats_handle: Option<thread::JoinHandle<()>>,
+    stats_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ConnState {
+    fn new() -> Self {
+        Self {
+            connect_handle: None,
+            stats_handle: None,
+            stats_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Is the VPN connect thread still running?
+    fn is_connected(&self) -> bool {
+        self.connect_handle.as_ref().is_some_and(|h| !h.is_finished())
+    }
+}
+
 /// Handle a single client connection: read commands, dispatch, send events.
-fn handle_client(stream: UnixStream) -> Result<()> {
+fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
     let mut writer = stream.try_clone().context("failed to clone stream")?;
     let reader = BufReader::new(stream);
-
-    // Track the connect thread (if any) and its stats-polling companion
-    let mut connect_handle: Option<thread::JoinHandle<()>> = None;
-    let mut stats_handle: Option<thread::JoinHandle<()>> = None;
-
-    // Shared flag to stop the stats polling thread when connection ends.
-    // Replaced with a new Arc on each Connect so Disconnect/Shutdown can
-    // signal the correct thread.
-    let mut stats_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     for line in reader.lines() {
         let line = match line {
@@ -225,7 +243,7 @@ fn handle_client(stream: UnixStream) -> Result<()> {
                 deny_country,
             } => {
                 // Check if already connected (connect thread alive)
-                if let Some(ref h) = connect_handle {
+                if let Some(ref h) = state.connect_handle {
                     if !h.is_finished() {
                         send_event(
                             &mut writer,
@@ -272,8 +290,8 @@ fn handle_client(stream: UnixStream) -> Result<()> {
                 });
 
                 // Stop any previous stats poller
-                stats_stop.store(true, std::sync::atomic::Ordering::SeqCst);
-                if let Some(h) = stats_handle.take() {
+                state.stats_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Some(h) = state.stats_handle.take() {
                     let _ = h.join();
                 }
 
@@ -326,13 +344,13 @@ fn handle_client(stream: UnixStream) -> Result<()> {
                     );
                 });
 
-                connect_handle = Some(conn_handle);
+                state.connect_handle = Some(conn_handle);
 
                 // Spawn stats polling thread (every 2s)
-                stats_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let stats_stop_clone = stats_stop.clone();
+                state.stats_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let stats_stop_clone = state.stats_stop.clone();
                 let mut stats_writer = writer.try_clone().context("failed to clone stream for stats")?;
-                stats_handle = Some(thread::spawn(move || {
+                state.stats_handle = Some(thread::spawn(move || {
                     loop {
                         thread::sleep(Duration::from_secs(2));
                         if stats_stop_clone.load(std::sync::atomic::Ordering::SeqCst) {
@@ -384,40 +402,47 @@ fn handle_client(stream: UnixStream) -> Result<()> {
             }
 
             ipc::HelperCommand::Status => {
-                let is_connected = connect_handle
-                    .as_ref()
-                    .map(|h| !h.is_finished())
-                    .unwrap_or(false);
-
-                if is_connected {
-                    // Check recovery state for connection details
+                // Determine connection state from connect thread + recovery state.
+                // The connect thread may be from a previous GUI session.
+                let conn_state = if state.is_connected() {
+                    // Connect thread alive — check if WireGuard interface is up
                     match recovery::load() {
-                        Ok(Some(_state)) => {
-                            send_event(
-                                &mut writer,
-                                &ipc::HelperEvent::StateChanged {
-                                    state: ipc::ConnectionState::Connecting,
-                                },
-                            );
+                        Ok(Some(rec)) if wireguard::is_connected(&rec.wg_interface) => {
+                            ipc::ConnectionState::Connected {
+                                server_name: String::new(), // recovery state doesn't store server name
+                                server_country: String::new(),
+                                server_location: String::new(),
+                            }
                         }
-                        _ => {
-                            send_event(
-                                &mut writer,
-                                &ipc::HelperEvent::StateChanged {
-                                    state: ipc::ConnectionState::Connecting,
-                                },
-                            );
-                        }
+                        _ => ipc::ConnectionState::Connecting,
                     }
                 } else {
-                    send_event(
-                        &mut writer,
-                        &ipc::HelperEvent::StateChanged {
-                            state: ipc::ConnectionState::Disconnected,
-                        },
-                    );
-                }
+                    ipc::ConnectionState::Disconnected
+                };
+                send_event(&mut writer, &ipc::HelperEvent::StateChanged { state: conn_state.clone() });
                 send_event(&mut writer, &build_lock_status());
+
+                // If VPN is connected, start a stats poller for this GUI session
+                if matches!(conn_state, ipc::ConnectionState::Connected { .. }) {
+                    state.stats_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let stop = state.stats_stop.clone();
+                    let mut sw = writer.try_clone().context("clone writer for stats")?;
+                    state.stats_handle = Some(thread::spawn(move || {
+                        loop {
+                            thread::sleep(Duration::from_secs(2));
+                            if stop.load(std::sync::atomic::Ordering::SeqCst) { break; }
+                            let iface = match recovery::load() {
+                                Ok(Some(s)) => s.wg_interface,
+                                _ => continue,
+                            };
+                            if iface.is_empty() || !wireguard::is_connected(&iface) { continue; }
+                            match wireguard::get_transfer_stats(&iface) {
+                                Ok((rx, tx)) => send_event(&mut sw, &ipc::HelperEvent::Stats { rx_bytes: rx, tx_bytes: tx }),
+                                Err(_) => {}
+                            }
+                        }
+                    }));
+                }
             }
 
             ipc::HelperCommand::LockEnable => {
@@ -467,13 +492,13 @@ fn handle_client(stream: UnixStream) -> Result<()> {
                 recovery::trigger_shutdown();
 
                 // Wait for the connect thread to finish
-                if let Some(h) = connect_handle.take() {
+                if let Some(h) = state.connect_handle.take() {
                     let _ = h.join();
                 }
 
                 // Stop stats poller
-                stats_stop.store(true, std::sync::atomic::Ordering::SeqCst);
-                if let Some(h) = stats_handle.take() {
+                state.stats_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Some(h) = state.stats_handle.take() {
                     let _ = h.join();
                 }
 
@@ -483,8 +508,12 @@ fn handle_client(stream: UnixStream) -> Result<()> {
         }
     }
 
-    // Clean up: stop threads if client disconnects without Shutdown
-    stats_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    // Stop stats poller when GUI disconnects — it writes to the now-dead socket.
+    // A new one will be started when the next GUI connects and sends Status.
+    state.stats_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    if let Some(h) = state.stats_handle.take() {
+        let _ = h.join();
+    }
 
     Ok(())
 }
