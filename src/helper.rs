@@ -349,6 +349,12 @@ fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
 
                     if let Err(e) = &result {
                         error!("Connect thread exited with error: {}", e);
+                        send_event(
+                            &mut disconnected_writer,
+                            &ipc::HelperEvent::Error {
+                                message: format!("{}", e),
+                            },
+                        );
                     }
 
                     // Signal disconnected (drop event_tx by moving connect_config
