@@ -776,6 +776,10 @@ fn activate_netlock(
     server_entry_ips: &[String],
 ) -> anyhow::Result<()> {
     info!("Activating network lock...");
+    emit(config, crate::ipc::EngineEvent::Log {
+        level: "info".into(),
+        message: "Activating network lock...".into(),
+    });
     let mut allowed_ips: Vec<String> = server_entry_ips.to_vec();
     for url in &provider_config.bootstrap_urls {
         if let Some(host) = extract_ip_from_url(url) {
@@ -848,11 +852,19 @@ fn post_connect_setup(
     effective_dns_ipv6: &str,
 ) -> anyhow::Result<()> {
     if !config.no_lock {
+        emit(config, crate::ipc::EngineEvent::Log {
+            level: "info".into(),
+            message: "Configuring network lock...".into(),
+        });
         netlock::allow_interface(iface)?;
     }
     if params.shutdown.load(Ordering::Relaxed) {
         anyhow::bail!("shutdown requested during setup");
     }
+    emit(config, crate::ipc::EngineEvent::Log {
+        level: "info".into(),
+        message: "Configuring DNS...".into(),
+    });
     debug!("Activating DNS: ipv4={}, ipv6={}, iface={}", effective_dns_ipv4, effective_dns_ipv6, iface);
     dns::activate(effective_dns_ipv4, effective_dns_ipv6, iface)?;
     info!("DNS configured: {}{}", effective_dns_ipv4,
@@ -1285,6 +1297,10 @@ pub fn run(
         emit(config, crate::ipc::EngineEvent::StateChanged(
             crate::ipc::ConnectionState::Connecting,
         ));
+        emit(config, crate::ipc::EngineEvent::Log {
+            level: "info".into(),
+            message: format!("Connecting to {} via {}...", server_ref.name, mode.title),
+        });
         let (config_path, iface) = match wireguard::connect(&wg_params, ipv6_enabled) {
             Ok(result) => {
                 consecutive_failures = 0;
@@ -1309,9 +1325,17 @@ pub fn run(
         };
         save_recovery(&params, config.no_lock, &iface, &config_path, "", "", &endpoint_ip)?;
         info!("WireGuard interface: {}", iface);
+        emit(config, crate::ipc::EngineEvent::Log {
+            level: "info".into(),
+            message: format!("WireGuard interface {} created", iface),
+        });
 
         // Wait for first WireGuard handshake (Eddie: handshake_timeout_first=50s)
         info!("Waiting for handshake...");
+        emit(config, crate::ipc::EngineEvent::Log {
+            level: "info".into(),
+            message: "Waiting for WireGuard handshake...".into(),
+        });
         if let Err(e) = wireguard::wait_for_handshake(&iface, 50) {
             error!("Handshake failed: {:#}", e);
             let _ = wireguard::disconnect(&config_path, &endpoint_ip);
@@ -1330,6 +1354,10 @@ pub fn run(
             continue;
         }
         info!("Handshake established.");
+        emit(config, crate::ipc::EngineEvent::Log {
+            level: "info".into(),
+            message: "Handshake established".into(),
+        });
 
         // 9-12: Remaining setup — if any step fails, clean up and treat as fatal
         if let Err(e) = post_connect_setup(
@@ -1350,6 +1378,10 @@ pub fn run(
 
         // 10b-10c: Post-connection verification
         if !config.no_verify && !params.shutdown.load(Ordering::Relaxed) {
+            emit(config, crate::ipc::EngineEvent::Log {
+                level: "info".into(),
+                message: "Verifying tunnel and DNS...".into(),
+            });
             let verify_ok = verify_connection(
                 &params.shutdown, &data.manifest, server_ref,
                 &wg_key.wg_ipv4, &effective_dns_ipv4, dns_ipv6,

@@ -287,12 +287,11 @@ fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
                                 if let Ok(mut info) = server_info.lock() {
                                     *info = (name.clone(), country.clone(), location.clone());
                                 }
-                                ipc::HelperEvent::StateChanged {
-                                    state: ipc::ConnectionState::Connected {
-                                        server_name: name,
-                                        server_country: country,
-                                        server_location: location,
-                                    },
+                                // Don't emit Connected here — that comes after
+                                // handshake + verification. This is just a log.
+                                ipc::HelperEvent::Log {
+                                    level: "info".to_string(),
+                                    message: format!("Selected server: {} ({}, {})", name, location, country),
                                 }
                             }
                         };
