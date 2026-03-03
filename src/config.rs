@@ -249,8 +249,8 @@ pub fn load_profile_options() -> HashMap<String, String> {
         }
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             // Can't read profile directory (non-root). The helper (root) will
-            // read it. But still try Eddie import below — the user can read
-            // their own Eddie profile for first-run credential resolution.
+            // handle credential resolution from its own profile.
+            return HashMap::new();
         }
         Err(_) => {} // File doesn't exist, fall through to Eddie import
     }

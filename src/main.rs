@@ -319,39 +319,57 @@ fn main() -> anyhow::Result<()> {
             event_vpn_down_arguments,
             event_vpn_down_waitend,
         } => {
-            // Resolve credentials: CLI handles interactive prompting (Eddie
-            // import, stdin password) since the helper daemon has no terminal.
-            // Helper will prefer its own root-owned profile if it exists.
+            // Read explicit CLI credentials (--username / --password-stdin).
+            // Don't resolve from profile here — the helper reads the root-owned
+            // profile. If the helper has no credentials, it'll error and we
+            // retry with interactively-resolved credentials.
             let stdin_password = common::read_stdin_password(password_stdin)?;
-            let profile_options = config::load_profile_options();
-            let (resolved_username, resolved_password) = config::resolve_credentials(
-                username.as_deref(),
-                stdin_password.as_deref().map(|s| s.as_str()),
-                &profile_options,
-            )?;
+            let cli_user = username.unwrap_or_default();
+            let cli_pass = stdin_password.map(|z| z.to_string()).unwrap_or_default();
 
-            let cmd = ipc::HelperCommand::Connect {
-                server,
+            let build_cmd = |user: String, pass: String| ipc::HelperCommand::Connect {
+                server: server.clone(),
                 no_lock,
                 allow_lan,
                 skip_ping,
-                allow_country,
-                deny_country,
-                username: resolved_username,
-                password: resolved_password,
-                allow_server,
-                deny_server,
+                allow_country: allow_country.clone(),
+                deny_country: deny_country.clone(),
+                username: user,
+                password: pass,
+                allow_server: allow_server.clone(),
+                deny_server: deny_server.clone(),
                 no_reconnect,
                 no_verify,
                 no_lock_last,
                 no_start_last,
-                ipv6_mode,
-                dns_servers,
-                event_pre: [event_vpn_pre_filename, event_vpn_pre_arguments, event_vpn_pre_waitend],
-                event_up: [event_vpn_up_filename, event_vpn_up_arguments, event_vpn_up_waitend],
-                event_down: [event_vpn_down_filename, event_vpn_down_arguments, event_vpn_down_waitend],
+                ipv6_mode: ipv6_mode.clone(),
+                dns_servers: dns_servers.clone(),
+                event_pre: [event_vpn_pre_filename.clone(), event_vpn_pre_arguments.clone(), event_vpn_pre_waitend.clone()],
+                event_up: [event_vpn_up_filename.clone(), event_vpn_up_arguments.clone(), event_vpn_up_waitend.clone()],
+                event_down: [event_vpn_down_filename.clone(), event_vpn_down_arguments.clone(), event_vpn_down_waitend.clone()],
             };
-            cli_client::send_command(&cmd)
+
+            // First attempt: send CLI-provided credentials (may be empty).
+            // If the helper has saved credentials in its profile, it uses those.
+            let result = cli_client::send_command(&build_cmd(cli_user.clone(), cli_pass.clone()));
+
+            match result {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    let msg = format!("{}", e);
+                    if !msg.contains("no credentials available") || !cli_user.is_empty() {
+                        // Real error or user provided credentials that failed
+                        return Err(e);
+                    }
+                    // Helper has no profile and CLI sent empty credentials.
+                    // Resolve interactively (Eddie import + prompt).
+                    let profile_options = config::load_profile_options();
+                    let (user, pass) = config::resolve_credentials(
+                        None, None, &profile_options,
+                    )?;
+                    cli_client::send_command(&build_cmd(user, pass))
+                }
+            }
         }
         Commands::Disconnect => {
             cli_client::send_command(&ipc::HelperCommand::Disconnect)
