@@ -170,29 +170,34 @@ doesn't have per-app UIDs, so the nftables approach is more appropriate).
 
 ---
 
-## 8. systemd socket activation instead of pkexec
+## 8. Single control plane with systemd socket activation
 
-**Eddie:** GUI launches the elevated process via pkexec (polkit authentication).
-IPC is TCP localhost on a random port (2048-65528) with session-key authentication.
-The elevated process is a separate C++ binary (`App.CLI.Linux.Elevated`).
+**Eddie:** CLI connects directly (elevated via pkexec). GUI launches a separate
+elevated C++ binary via pkexec, communicates over TCP localhost with session-key
+auth. CLI and GUI are independent VPN managers.
 
-**airvpn-rs:** The helper daemon is started by systemd via socket activation
-(`airvpn-helper.socket` + `airvpn-helper.service`). systemd creates the Unix
-socket at `/run/airvpn-rs/helper.sock` with correct permissions before the
-helper starts — no pkexec, no password prompt, no filesystem permission race.
-The GUI connects directly; systemd starts the helper on demand.
+**airvpn-rs:** Single daemon (helper) started by systemd socket activation. Both
+CLI and GUI are thin clients that send JSON-lines commands over a Unix socket at
+`/run/airvpn-rs/helper.sock`. The helper is the sole VPN control plane — it runs
+`connect::run()`, manages recovery state, and handles all privileged operations.
 
-**Why:** Eddie's pkexec model has a race condition: the socket file appears
-(from `bind()`) before `chown()` completes, causing the GUI to get `EACCES`
-on fast startup. systemd socket activation eliminates this by creating the
-socket atomically with correct permissions before the process starts. This is
-the standard pattern used by Tailscale, Mullvad, Docker, and other Linux
-daemon-based tools.
+The CLI resolves credentials interactively (the daemon can't prompt), then sends
+them in the Connect command. Status, disconnect, and lock commands all go through
+the socket. Only `servers` (read-only query) and `recover` (safety valve for dead
+helpers) bypass the daemon.
+
+**Why:** Eddie's dual-manager model requires conflict guards
+(`refuse_if_helper_running`, recovery state PID checks) to prevent CLI and GUI
+from stepping on each other. A single control plane eliminates this complexity.
+systemd socket activation eliminates Eddie's pkexec race condition (socket appears
+before `chown()` completes) by creating the socket atomically with correct
+permissions before the process starts.
 
 Socket permissions are `0660` with group `wheel` (any sudo-capable user).
 `SO_PEERCRED` logs the connecting UID on every accepted connection.
 
-**Files:** `src/helper.rs`, `resources/airvpn-helper.socket`, `resources/airvpn-helper.service`
+**Files:** `src/helper.rs`, `src/cli_client.rs`, `resources/airvpn-helper.socket`,
+`resources/airvpn-helper.service`
 
 **Eddie ref:** `src/Lib.Core/Elevated/IElevated.cs`, `src/Lib.Core/Elevated/ISocket.cs`
 
