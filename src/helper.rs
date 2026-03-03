@@ -20,7 +20,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
 
-use crate::{api, connect, ipc, netlock, recovery, wireguard};
+use crate::{api, config, connect, ipc, netlock, recovery, wireguard};
 
 pub const SOCKET_PATH: &str = "/run/airvpn-rs/helper.sock";
 const PID_FILE: &str = "/run/airvpn-rs/helper.pid";
@@ -142,6 +142,21 @@ pub fn run() -> Result<()> {
                 error!("Failed to accept connection: {}", e);
                 thread::sleep(Duration::from_secs(1));
             }
+        }
+    }
+
+    // If a VPN connection is active, disconnect gracefully before exiting.
+    // This handles systemctl stop / SIGTERM during an active session.
+    if conn_state.is_connected() {
+        info!("Disconnecting active VPN before shutdown...");
+        // trigger_shutdown was already called (that's how we got here),
+        // which tells connect::run() to exit its loop.
+        if let Some(h) = conn_state.connect_handle.take() {
+            let _ = h.join();
+        }
+        conn_state.stats_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(h) = conn_state.stats_handle.take() {
+            let _ = h.join();
         }
     }
 
@@ -279,6 +294,25 @@ fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
                     }
                 }
 
+                // Resolve credentials: profile (root-readable) takes priority,
+                // then CLI-provided credentials, then error.
+                let profile_options = config::load_profile_options();
+                let (resolved_username, resolved_password) = {
+                    // Try profile first
+                    let prof_user = profile_options.get("login").cloned().unwrap_or_default();
+                    let prof_pass = profile_options.get("password").cloned().unwrap_or_default();
+                    if !prof_user.is_empty() && !prof_pass.is_empty() {
+                        (prof_user, prof_pass)
+                    } else if !username.is_empty() && !password.is_empty() {
+                        (username, password)
+                    } else {
+                        send_event(&mut writer, &ipc::HelperEvent::Error {
+                            message: "no credentials available — provide --username and --password-stdin, or save credentials in profile".to_string(),
+                        });
+                        continue;
+                    }
+                };
+
                 // Reset shutdown flag for the new connection
                 recovery::reset_shutdown();
 
@@ -333,8 +367,8 @@ fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
                     no_lock,
                     allow_lan,
                     no_reconnect,
-                    username,
-                    password,
+                    username: resolved_username,
+                    password: resolved_password,
                     allow_server,
                     deny_server,
                     allow_country,

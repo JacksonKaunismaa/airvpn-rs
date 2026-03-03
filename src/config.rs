@@ -240,11 +240,20 @@ fn xml_escape(s: &str) -> String {
 pub fn load_profile_options() -> HashMap<String, String> {
     // Try our profile first (/etc/airvpn-rs/default.profile)
     let path = profile_path();
-    if path.exists() {
-        match load_options_from_path(&path) {
-            Ok(opts) => return opts,
-            Err(e) => warn!("failed to load profile: {:#}", e),
+    match std::fs::metadata(&path) {
+        Ok(_) => {
+            match load_options_from_path(&path) {
+                Ok(opts) => return opts,
+                Err(e) => warn!("failed to load profile: {:#}", e),
+            }
         }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            // Can't read profile directory (non-root). Don't fall through to
+            // Eddie import — the profile likely exists but we can't access it.
+            // The helper (root) will handle credential resolution.
+            return HashMap::new();
+        }
+        Err(_) => {} // File doesn't exist, fall through to Eddie import
     }
 
     // Offer to import Eddie's profile (~user/.config/eddie/default.profile).

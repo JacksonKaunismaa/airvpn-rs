@@ -287,7 +287,7 @@ fn main() -> anyhow::Result<()> {
     // Thin-client commands (connect, disconnect, status, lock) get their output
     // from the helper via cli_client — no log file needed.
     match &cli.command {
-        Commands::Helper | Commands::Servers { .. } | Commands::Recover => init_logging(),
+        Commands::Helper | Commands::Servers { .. } => init_logging(),
         _ => {}
     }
 
@@ -319,14 +319,10 @@ fn main() -> anyhow::Result<()> {
             event_vpn_down_arguments,
             event_vpn_down_waitend,
         } => {
-            // Resolve credentials before sending to helper
+            // Read stdin password if --password-stdin was passed.
+            // Credentials are resolved by the helper (it has root access to
+            // the profile). CLI only sends explicit --username / --password-stdin.
             let stdin_password = common::read_stdin_password(password_stdin)?;
-            let profile_options = config::load_profile_options();
-            let (resolved_username, resolved_password) = config::resolve_credentials(
-                username.as_deref(),
-                stdin_password.as_deref().map(|s| s.as_str()),
-                &profile_options,
-            )?;
 
             let cmd = ipc::HelperCommand::Connect {
                 server,
@@ -335,8 +331,8 @@ fn main() -> anyhow::Result<()> {
                 skip_ping,
                 allow_country,
                 deny_country,
-                username: resolved_username,
-                password: resolved_password,
+                username: username.unwrap_or_default(),
+                password: stdin_password.map(|z| z.to_string()).unwrap_or_default(),
                 allow_server,
                 deny_server,
                 no_reconnect,
