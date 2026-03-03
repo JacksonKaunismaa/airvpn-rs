@@ -319,10 +319,16 @@ fn main() -> anyhow::Result<()> {
             event_vpn_down_arguments,
             event_vpn_down_waitend,
         } => {
-            // Read stdin password if --password-stdin was passed.
-            // Credentials are resolved by the helper (it has root access to
-            // the profile). CLI only sends explicit --username / --password-stdin.
+            // Resolve credentials: CLI handles interactive prompting (Eddie
+            // import, stdin password) since the helper daemon has no terminal.
+            // Helper will prefer its own root-owned profile if it exists.
             let stdin_password = common::read_stdin_password(password_stdin)?;
+            let profile_options = config::load_profile_options();
+            let (resolved_username, resolved_password) = config::resolve_credentials(
+                username.as_deref(),
+                stdin_password.as_deref().map(|s| s.as_str()),
+                &profile_options,
+            )?;
 
             let cmd = ipc::HelperCommand::Connect {
                 server,
@@ -331,8 +337,8 @@ fn main() -> anyhow::Result<()> {
                 skip_ping,
                 allow_country,
                 deny_country,
-                username: username.unwrap_or_default(),
-                password: stdin_password.map(|z| z.to_string()).unwrap_or_default(),
+                username: resolved_username,
+                password: resolved_password,
                 allow_server,
                 deny_server,
                 no_reconnect,

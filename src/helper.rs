@@ -295,15 +295,20 @@ fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
                 }
 
                 // Resolve credentials: profile (root-readable) takes priority,
-                // then CLI-provided credentials, then error.
+                // then CLI-provided credentials (from Eddie import or prompt),
+                // then error.
                 let profile_options = config::load_profile_options();
                 let (resolved_username, resolved_password) = {
-                    // Try profile first
                     let prof_user = profile_options.get("login").cloned().unwrap_or_default();
                     let prof_pass = profile_options.get("password").cloned().unwrap_or_default();
                     if !prof_user.is_empty() && !prof_pass.is_empty() {
                         (prof_user, prof_pass)
                     } else if !username.is_empty() && !password.is_empty() {
+                        // CLI resolved credentials (Eddie import or interactive prompt).
+                        // Save to profile so future connects don't need prompting.
+                        if let Err(e) = config::save_credentials(&username, &password) {
+                            warn!("Could not save credentials to profile: {:#}", e);
+                        }
                         (username, password)
                     } else {
                         send_event(&mut writer, &ipc::HelperEvent::Error {
