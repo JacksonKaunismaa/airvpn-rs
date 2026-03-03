@@ -80,6 +80,19 @@ impl App {
                         skip_ping: false,
                         allow_country: Vec::new(),
                         deny_country: Vec::new(),
+                        username: String::new(),
+                        password: String::new(),
+                        allow_server: Vec::new(),
+                        deny_server: Vec::new(),
+                        no_reconnect: false,
+                        no_verify: false,
+                        no_lock_last: false,
+                        no_start_last: false,
+                        ipv6_mode: None,
+                        dns_servers: Vec::new(),
+                        event_pre: [None, None, None],
+                        event_up: [None, None, None],
+                        event_down: [None, None, None],
                     };
                     if let Err(e) = helper.send(&cmd) {
                         self.helper_error = Some(format!("Failed to send Connect: {}", e));

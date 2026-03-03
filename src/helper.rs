@@ -252,6 +252,7 @@ fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
                 skip_ping,
                 allow_country,
                 deny_country,
+                ..
             } => {
                 // Check if already connected (connect thread alive)
                 if let Some(ref h) = state.connect_handle {

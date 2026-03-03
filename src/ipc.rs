@@ -16,6 +16,19 @@ pub enum HelperCommand {
         skip_ping: bool,
         allow_country: Vec<String>,
         deny_country: Vec<String>,
+        username: String,
+        password: String,
+        allow_server: Vec<String>,
+        deny_server: Vec<String>,
+        no_reconnect: bool,
+        no_verify: bool,
+        no_lock_last: bool,
+        no_start_last: bool,
+        ipv6_mode: Option<String>,
+        dns_servers: Vec<String>,
+        event_pre: [Option<String>; 3],
+        event_up: [Option<String>; 3],
+        event_down: [Option<String>; 3],
     },
     Disconnect,
     Status,
@@ -89,6 +102,19 @@ mod tests {
             skip_ping: false,
             allow_country: vec!["NL".to_string(), "DE".to_string()],
             deny_country: vec!["US".to_string()],
+            username: "testuser".to_string(),
+            password: "testpass".to_string(),
+            allow_server: vec!["Castor".to_string()],
+            deny_server: vec!["Pollux".to_string()],
+            no_reconnect: true,
+            no_verify: false,
+            no_lock_last: true,
+            no_start_last: false,
+            ipv6_mode: Some("block".to_string()),
+            dns_servers: vec!["10.128.0.1".to_string(), "10.128.0.2".to_string()],
+            event_pre: [Some("echo pre".to_string()), None, None],
+            event_up: [Some("echo up".to_string()), Some("echo up2".to_string()), None],
+            event_down: [None, None, None],
         };
 
         let encoded = encode_line(&cmd).expect("encode failed");
@@ -104,6 +130,19 @@ mod tests {
                 skip_ping,
                 allow_country,
                 deny_country,
+                username,
+                password,
+                allow_server,
+                deny_server,
+                no_reconnect,
+                no_verify,
+                no_lock_last,
+                no_start_last,
+                ipv6_mode,
+                dns_servers,
+                event_pre,
+                event_up,
+                event_down,
             } => {
                 assert_eq!(server, Some("Castor".to_string()));
                 assert!(!no_lock);
@@ -111,6 +150,22 @@ mod tests {
                 assert!(!skip_ping);
                 assert_eq!(allow_country, vec!["NL", "DE"]);
                 assert_eq!(deny_country, vec!["US"]);
+                assert_eq!(username, "testuser");
+                assert_eq!(password, "testpass");
+                assert_eq!(allow_server, vec!["Castor"]);
+                assert_eq!(deny_server, vec!["Pollux"]);
+                assert!(no_reconnect);
+                assert!(!no_verify);
+                assert!(no_lock_last);
+                assert!(!no_start_last);
+                assert_eq!(ipv6_mode, Some("block".to_string()));
+                assert_eq!(dns_servers, vec!["10.128.0.1", "10.128.0.2"]);
+                assert_eq!(event_pre, [Some("echo pre".to_string()), None, None]);
+                assert_eq!(
+                    event_up,
+                    [Some("echo up".to_string()), Some("echo up2".to_string()), None]
+                );
+                assert_eq!(event_down, [None, None, None]);
             }
             other => panic!("expected Connect, got {:?}", other),
         }
