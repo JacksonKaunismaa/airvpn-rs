@@ -79,7 +79,11 @@ pub fn send_status() -> Result<()> {
             HelperEvent::StateChanged { state } => {
                 match state {
                     ConnectionState::Connected { server_name, server_country, server_location } => {
-                        println!("Connected to {} ({}, {})", server_name, server_location, server_country);
+                        if server_location.is_empty() && server_country.is_empty() {
+                            println!("Connected via {}", server_name);
+                        } else {
+                            println!("Connected to {} ({}, {})", server_name, server_location, server_country);
+                        }
                     }
                     ConnectionState::Connecting => println!("Connecting..."),
                     ConnectionState::Reconnecting => println!("Reconnecting..."),

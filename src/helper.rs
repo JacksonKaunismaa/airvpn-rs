@@ -492,7 +492,7 @@ fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
                     match recovery::load() {
                         Ok(Some(rec)) if wireguard::is_connected(&rec.wg_interface) => {
                             ipc::ConnectionState::Connected {
-                                server_name: "unknown (orphaned)".to_string(),
+                                server_name: rec.wg_interface.clone(),
                                 server_country: String::new(),
                                 server_location: String::new(),
                             }
