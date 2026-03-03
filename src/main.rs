@@ -346,9 +346,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Disconnect => {
             cli_client::send_command(&ipc::HelperCommand::Disconnect)
         }
-        Commands::Status => {
-            cli_client::send_command(&ipc::HelperCommand::Status)
-        }
+        Commands::Status => cli_client::send_status(),
         Commands::Servers { sort, debug, username, password_stdin, skip_ping } => {
             let mut provider_config = load_provider()?;
             cmd_servers(&mut provider_config, &sort, debug, username, password_stdin, skip_ping)

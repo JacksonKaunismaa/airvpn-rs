@@ -230,7 +230,18 @@ fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
             }
         };
 
-        debug!("Received command: {:?}", cmd);
+        // Log command variant without payload (Connect contains credentials).
+        debug!("Received command: {}", match &cmd {
+            ipc::HelperCommand::Connect { .. } => "Connect",
+            ipc::HelperCommand::Disconnect => "Disconnect",
+            ipc::HelperCommand::Status => "Status",
+            ipc::HelperCommand::LockInstall => "LockInstall",
+            ipc::HelperCommand::LockUninstall => "LockUninstall",
+            ipc::HelperCommand::LockEnable => "LockEnable",
+            ipc::HelperCommand::LockDisable => "LockDisable",
+            ipc::HelperCommand::LockStatus => "LockStatus",
+            ipc::HelperCommand::Shutdown => "Shutdown",
+        });
 
         match cmd {
             ipc::HelperCommand::Connect {
@@ -438,12 +449,8 @@ fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
                 if let Ok(mut info) = state.server_info.lock() {
                     *info = Default::default();
                 }
-                send_event(
-                    &mut writer,
-                    &ipc::HelperEvent::StateChanged {
-                        state: ipc::ConnectionState::Disconnected,
-                    },
-                );
+                // Note: connect thread sends Disconnected on exit, so we don't
+                // duplicate it here.
             }
 
             ipc::HelperCommand::Status => {
@@ -473,6 +480,11 @@ fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
 
                 // If VPN is connected, start a stats poller for this GUI session
                 if matches!(conn_state, ipc::ConnectionState::Connected { .. }) {
+                    // Stop any existing stats poller first (avoids thread leak on reconnect)
+                    state.stats_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                    if let Some(h) = state.stats_handle.take() {
+                        let _ = h.join();
+                    }
                     state.stats_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let stop = state.stats_stop.clone();
                     let mut sw = writer.try_clone().context("clone writer for stats")?;

@@ -53,6 +53,63 @@ pub fn send_command(cmd: &HelperCommand) -> Result<()> {
     anyhow::bail!("helper closed connection unexpectedly")
 }
 
+/// Send a Status command and render both StateChanged + LockStatus events.
+/// Unlike send_command, this reads a fixed number of events (Status always
+/// returns exactly 2: StateChanged + LockStatus) to avoid Disconnected
+/// being treated as terminal before LockStatus is read.
+pub fn send_status() -> Result<()> {
+    let stream = connect_to_helper()?;
+    let mut writer = stream.try_clone().context("clone socket")?;
+    let reader = BufReader::new(stream);
+
+    let line = ipc::encode_line(&HelperCommand::Status).context("encode command")?;
+    writer.write_all(line.as_bytes()).context("write command")?;
+    writer.flush().context("flush command")?;
+
+    let mut events_read = 0;
+    for line in reader.lines() {
+        let line = line.context("read event")?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: HelperEvent =
+            ipc::decode_line(&line).with_context(|| format!("decode event: {}", line))?;
+
+        match &event {
+            HelperEvent::StateChanged { state } => {
+                match state {
+                    ConnectionState::Connected { server_name, server_country, server_location } => {
+                        println!("Connected to {} ({}, {})", server_name, server_location, server_country);
+                    }
+                    ConnectionState::Connecting => println!("Connecting..."),
+                    ConnectionState::Reconnecting => println!("Reconnecting..."),
+                    ConnectionState::Disconnecting => println!("Disconnecting..."),
+                    ConnectionState::Disconnected => println!("Not connected."),
+                }
+                events_read += 1;
+            }
+            HelperEvent::LockStatus { session_active, persistent_active, persistent_installed } => {
+                println!("Lock status:");
+                println!("  Session lock:    {}", if *session_active { "active" } else { "inactive" });
+                println!("  Persistent lock: {}", if *persistent_active { "active" } else { "inactive" });
+                println!("  Installed:       {}", if *persistent_installed { "yes" } else { "no" });
+                events_read += 1;
+            }
+            HelperEvent::Error { message } => anyhow::bail!("{}", message),
+            _ => {} // ignore unexpected events
+        }
+
+        if events_read >= 2 {
+            return Ok(());
+        }
+    }
+
+    if events_read > 0 {
+        return Ok(());
+    }
+    anyhow::bail!("helper closed connection without response")
+}
+
 enum EventAction {
     Continue,
     Done,
