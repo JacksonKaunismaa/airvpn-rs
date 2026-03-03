@@ -364,7 +364,7 @@ fn preflight_and_cleanup() -> anyhow::Result<()> {
         if let Ok(entries) = std::fs::read_dir("/run/airvpn-rs") {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with("avpn-") && name.ends_with(".conf") {
+                if (name == "avpn0.conf" || name.starts_with("avpn-")) && name.ends_with(".conf") {
                     let _ = std::fs::remove_file(entry.path());
                 }
             }

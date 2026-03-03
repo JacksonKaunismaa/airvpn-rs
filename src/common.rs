@@ -66,7 +66,7 @@ mod tests {
     #[test]
     fn test_validate_interface_name_valid() {
         assert!(validate_interface_name("wg0"));
-        assert!(validate_interface_name("avpn-abc123"));
+        assert!(validate_interface_name("avpn0"));
         assert!(validate_interface_name("eth_0"));
         assert!(validate_interface_name("a")); // single char
         assert!(validate_interface_name("123456789012345")); // exactly 15 chars

@@ -635,7 +635,7 @@ AllowedIPs = 0.0.0.0/0
         .flatten()
         .any(|e| {
             let name = e.file_name().to_string_lossy().to_string();
-            name.starts_with("avpn-") && name.ends_with(".conf")
+            (name == "avpn0.conf" || name.starts_with("avpn-")) && name.ends_with(".conf")
         });
     assert!(
         !has_orphan,

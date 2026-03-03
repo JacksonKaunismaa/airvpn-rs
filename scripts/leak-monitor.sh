@@ -227,7 +227,7 @@ echo -e "${GREEN}Total allowlisted: ${#ALLOWED_IPS[@]} IPs${NC}"
 if [[ ${#IFACES[@]} -eq 0 ]]; then
     mapfile -t IFACES < <(
         ip -o link show | awk -F': ' '{print $2}' | \
-        grep -v -E '^(lo|docker|veth|br-|virbr|tun|tap|wg|avpn-)' | \
+        grep -v -E '^(lo|docker|veth|br-|virbr|tun|tap|wg|avpn)' | \
         grep -v '@' || true
     )
 fi

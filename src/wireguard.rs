@@ -18,6 +18,12 @@ const WG_CONFIG_DIR: &str = "/run/airvpn-rs";
 /// MTU for the WireGuard interface. Matches Eddie's WireGuard MTU.
 const WG_MTU: u16 = 1320;
 
+/// Fixed WireGuard interface name. Using a constant instead of a random
+/// tempfile-derived name enables exact nftables matching (`oifname "avpn0"`)
+/// rather than wildcard matching (`oifname "avpn-*"`), which is more secure
+/// and easier to debug.
+pub const VPN_INTERFACE: &str = "avpn0";
+
 /// Parameters for establishing a WireGuard connection.
 ///
 /// Returned by `generate_config()` with the wg-native config and the
@@ -281,17 +287,8 @@ pub fn connect(params: &WgConnectParams, ipv6_enabled: bool) -> Result<(String, 
         }
     }
 
-    // Interface name = basename without .conf
-    let iface = match Path::new(&config_path)
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-    {
-        Some(name) => name,
-        None => {
-            cleanup_config(&config_path);
-            anyhow::bail!("failed to derive interface name from config path");
-        }
-    };
+    // Fixed interface name (decoupled from config file naming)
+    let iface = VPN_INTERFACE.to_string();
 
     // Pre-cleanup: if interface already exists from a crash, remove it
     if is_connected(&iface) {
@@ -661,18 +658,14 @@ pub fn disconnect(config_path: &str, endpoint_ip: &str) -> Result<()> {
         }
     }
 
-    // Derive interface name from config path (basename without .conf)
-    let iface = Path::new(config_path)
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string());
+    // Fixed interface name (decoupled from config file naming)
+    let iface = VPN_INTERFACE;
 
     // 1. Tear down routing rules before removing the interface
-    if let Some(ref iface) = iface {
-        teardown_routing(iface, endpoint_ip);
-    }
+    teardown_routing(iface, endpoint_ip);
 
     // 2. Delete the WireGuard interface
-    if let Some(ref iface) = iface {
+    {
         let output = Command::new("ip")
             .args(["link", "delete", "dev", iface])
             .output()
@@ -1058,8 +1051,8 @@ mod tests {
 
     #[test]
     fn test_is_connected_nonexistent_iface() {
-        // A random but valid interface name (max 15 chars) should not exist
-        assert!(!is_connected("avpn-noexist"));
+        // A valid interface name that doesn't exist on this system
+        assert!(!is_connected("avpn0"));
     }
 
     // -------------------------------------------------------------------
@@ -1281,12 +1274,12 @@ mod tests {
     #[test]
     fn test_is_connected_too_long() {
         // Names longer than 15 chars fail validation
-        assert!(!is_connected("avpn-toolongname1234"));
+        assert!(!is_connected("avpn0toolongname1234"));
     }
 
     #[test]
     fn test_validate_interface_name_valid() {
-        assert!(validate_interface_name("avpn-abc123").is_ok());
+        assert!(validate_interface_name("avpn0").is_ok());
         assert!(validate_interface_name("wg0").is_ok());
         assert!(validate_interface_name("eth_0").is_ok());
     }

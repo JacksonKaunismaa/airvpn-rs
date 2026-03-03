@@ -246,7 +246,7 @@ fi
 # -----------------------------------------------------------------------------
 # Check for interface allowlist (wg/avpn interface)
 # -----------------------------------------------------------------------------
-WG_IFACE_RULES=$(echo "$RULES" | grep -E '(iifname|oifname).*"(wg|avpn)-' || true)
+WG_IFACE_RULES=$(echo "$RULES" | grep -E '(iifname|oifname).*"(wg|avpn)' || true)
 if [[ -n "$WG_IFACE_RULES" && $VERBOSE -eq 1 ]]; then
     echo -e "${CYAN}WireGuard interface rules found${NC}"
 fi

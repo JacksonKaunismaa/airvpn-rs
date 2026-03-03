@@ -319,7 +319,7 @@ fn recover_from_state(state: &State) -> Result<()> {
     if let Ok(entries) = std::fs::read_dir(STATE_DIR) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("avpn-") && name.ends_with(".conf") {
+            if (name == "avpn0.conf" || name.starts_with("avpn-")) && name.ends_with(".conf") {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
@@ -530,8 +530,8 @@ mod tests {
     fn test_state_serialization_roundtrip() {
         let state = State {
             lock_active: true,
-            wg_interface: "avpn-abc123".to_string(),
-            wg_config_path: "/run/airvpn-rs/avpn-abc123.conf".to_string(),
+            wg_interface: "avpn0".to_string(),
+            wg_config_path: "/run/airvpn-rs/avpn0.conf".to_string(),
             dns_ipv4: "10.128.0.1".to_string(),
             dns_ipv6: "fd7d:76ee:3c49:9950::1".to_string(),
             pid: 12345,
@@ -660,8 +660,8 @@ mod tests {
     fn test_validate_state_valid() {
         let state = State {
             lock_active: true,
-            wg_interface: "avpn-abc123".to_string(),
-            wg_config_path: "/run/airvpn-rs/avpn-abc123.conf".to_string(),
+            wg_interface: "avpn0".to_string(),
+            wg_config_path: "/run/airvpn-rs/avpn0.conf".to_string(),
             dns_ipv4: "10.0.0.1".to_string(),
             dns_ipv6: "fd00::1".to_string(),
             pid: 12345,
@@ -787,8 +787,8 @@ mod tests {
     fn test_validate_state_valid_wg_config_path() {
         let state = State {
             lock_active: true,
-            wg_interface: "avpn-abc123".to_string(),
-            wg_config_path: "/run/airvpn-rs/avpn-abc123.conf".to_string(),
+            wg_interface: "avpn0".to_string(),
+            wg_config_path: "/run/airvpn-rs/avpn0.conf".to_string(),
             dns_ipv4: "10.0.0.1".to_string(),
             dns_ipv6: String::new(),
             pid: 12345,
