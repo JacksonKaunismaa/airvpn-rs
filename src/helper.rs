@@ -240,6 +240,7 @@ fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
             ipc::HelperCommand::LockEnable => "LockEnable",
             ipc::HelperCommand::LockDisable => "LockDisable",
             ipc::HelperCommand::LockStatus => "LockStatus",
+            ipc::HelperCommand::Recover => "Recover",
             ipc::HelperCommand::Shutdown => "Shutdown",
         });
 
@@ -597,6 +598,23 @@ fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
 
             ipc::HelperCommand::LockStatus => {
                 send_event(&mut writer, &build_lock_status());
+            }
+
+            ipc::HelperCommand::Recover => {
+                match recovery::force_recover() {
+                    Ok(()) => {
+                        send_event(&mut writer, &ipc::HelperEvent::Log {
+                            level: "info".to_string(),
+                            message: "Recovery complete.".to_string(),
+                        });
+                    }
+                    Err(e) => {
+                        send_event(&mut writer, &ipc::HelperEvent::Error {
+                            message: format!("recovery failed: {}", e),
+                        });
+                    }
+                }
+                send_event(&mut writer, &ipc::HelperEvent::Shutdown);
             }
 
             ipc::HelperCommand::Shutdown => {

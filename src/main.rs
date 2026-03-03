@@ -1,4 +1,4 @@
-use airvpn::{api, cli_client, common, config, connect, ipc, manifest, recovery, server};
+use airvpn::{api, cli_client, common, config, ipc, manifest, server};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -359,7 +359,7 @@ fn main() -> anyhow::Result<()> {
             let mut provider_config = load_provider()?;
             cmd_servers(&mut provider_config, &sort, debug, username, password_stdin, skip_ping)
         }
-        Commands::Recover => cmd_recover(),
+        Commands::Recover => cli_client::send_command(&ipc::HelperCommand::Recover),
         Commands::Lock { action } => {
             let cmd = match action {
                 LockAction::Install => ipc::HelperCommand::LockInstall,
@@ -445,15 +445,6 @@ fn cmd_servers(
 
     println!("\n{} servers total.", servers.len());
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Recover
-// ---------------------------------------------------------------------------
-
-fn cmd_recover() -> anyhow::Result<()> {
-    connect::preflight_checks()?;
-    recovery::force_recover()
 }
 
 // ---------------------------------------------------------------------------

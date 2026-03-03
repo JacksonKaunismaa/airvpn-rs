@@ -37,6 +37,7 @@ pub enum HelperCommand {
     LockEnable,
     LockDisable,
     LockStatus,
+    Recover,
     Shutdown,
 }
 
