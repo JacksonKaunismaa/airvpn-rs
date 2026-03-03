@@ -348,7 +348,7 @@ fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
                     cli_event_pre: event_pre,
                     cli_event_up: event_up,
                     cli_event_down: event_down,
-                    event_tx: Some(connect_event_tx),
+                    event_tx: connect_event_tx,
                 };
 
                 let mut disconnected_writer = writer.try_clone().context("failed to clone stream for connect thread")?;

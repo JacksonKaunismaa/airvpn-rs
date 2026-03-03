@@ -37,14 +37,14 @@ pub struct ConnectConfig {
     pub cli_event_pre: [Option<String>; 3],
     pub cli_event_up: [Option<String>; 3],
     pub cli_event_down: [Option<String>; 3],
-    pub event_tx: Option<std::sync::mpsc::Sender<crate::ipc::EngineEvent>>,
+    pub event_tx: std::sync::mpsc::Sender<crate::ipc::EngineEvent>,
 }
 
-/// Emit an engine event if the event channel is active. No-op for CLI.
+/// Emit an engine event to the event channel.
+/// For CLI the receiver is immediately dropped, so send() returns Err — ignored.
+/// For the helper daemon the receiver forwards events to the GUI over IPC.
 fn emit(config: &ConnectConfig, event: crate::ipc::EngineEvent) {
-    if let Some(tx) = &config.event_tx {
-        let _ = tx.send(event);
-    }
+    let _ = config.event_tx.send(event);
 }
 
 // ---------------------------------------------------------------------------
