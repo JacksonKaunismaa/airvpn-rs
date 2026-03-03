@@ -1,8 +1,8 @@
-use airvpn::{api, common, config, connect, manifest, netlock, recovery, server, wireguard};
+use airvpn::{api, cli_client, common, config, connect, ipc, manifest, recovery, server};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use log::{info, warn};
+use log::warn;
 use zeroize::Zeroizing;
 
 #[derive(Parser)]
@@ -311,9 +311,7 @@ fn main() -> anyhow::Result<()> {
             event_vpn_down_arguments,
             event_vpn_down_waitend,
         } => {
-            refuse_if_helper_running()?;
-            // Resolve credentials before entering connect::run() — the connect
-            // engine can't do interactive prompting (needed for helper/daemon use).
+            // Resolve credentials before sending to helper
             let stdin_password = common::read_stdin_password(password_stdin)?;
             let profile_options = config::load_profile_options();
             let (resolved_username, resolved_password) = config::resolve_credentials(
@@ -321,141 +319,56 @@ fn main() -> anyhow::Result<()> {
                 stdin_password.as_deref().map(|s| s.as_str()),
                 &profile_options,
             )?;
-            let mut provider_config = load_provider()?;
-            // Create a channel for engine events. CLI doesn't consume events —
-            // the receiver is dropped immediately, so send() returns Err (ignored by emit()).
-            let (event_tx, _event_rx) = std::sync::mpsc::channel();
-            let connect_config = connect::ConnectConfig {
-                server_name: server,
+
+            let cmd = ipc::HelperCommand::Connect {
+                server,
                 no_lock,
                 allow_lan,
-                no_reconnect,
+                skip_ping,
+                allow_country,
+                deny_country,
                 username: resolved_username,
                 password: resolved_password,
                 allow_server,
                 deny_server,
-                allow_country,
-                deny_country,
-                skip_ping,
+                no_reconnect,
                 no_verify,
                 no_lock_last,
                 no_start_last,
-                cli_ipv6_mode: ipv6_mode,
-                cli_dns_servers: dns_servers,
-                cli_event_pre: [event_vpn_pre_filename, event_vpn_pre_arguments, event_vpn_pre_waitend],
-                cli_event_up: [event_vpn_up_filename, event_vpn_up_arguments, event_vpn_up_waitend],
-                cli_event_down: [event_vpn_down_filename, event_vpn_down_arguments, event_vpn_down_waitend],
-                event_tx,
+                ipv6_mode,
+                dns_servers,
+                event_pre: [event_vpn_pre_filename, event_vpn_pre_arguments, event_vpn_pre_waitend],
+                event_up: [event_vpn_up_filename, event_vpn_up_arguments, event_vpn_up_waitend],
+                event_down: [event_vpn_down_filename, event_vpn_down_arguments, event_vpn_down_waitend],
             };
-            connect::run(&mut provider_config, &connect_config)
+            cli_client::send_command(&cmd)
         }
-        Commands::Disconnect => cmd_disconnect(),
-        Commands::Status => cmd_status(),
+        Commands::Disconnect => {
+            cli_client::send_command(&ipc::HelperCommand::Disconnect)
+        }
+        Commands::Status => {
+            cli_client::send_command(&ipc::HelperCommand::Status)
+        }
         Commands::Servers { sort, debug, username, password_stdin, skip_ping } => {
             let mut provider_config = load_provider()?;
             cmd_servers(&mut provider_config, &sort, debug, username, password_stdin, skip_ping)
         }
         Commands::Recover => cmd_recover(),
-        Commands::Lock { action } => cmd_lock(action),
+        Commands::Lock { action } => {
+            let cmd = match action {
+                LockAction::Install => ipc::HelperCommand::LockInstall,
+                LockAction::Uninstall => ipc::HelperCommand::LockUninstall,
+                LockAction::Enable => ipc::HelperCommand::LockEnable,
+                LockAction::Disable => ipc::HelperCommand::LockDisable,
+                LockAction::Status => ipc::HelperCommand::LockStatus,
+            };
+            cli_client::send_command(&cmd)
+        }
         Commands::Helper => {
             use airvpn::helper;
             helper::run()
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// (Ipv6Mode, ResetLevel, EventHook, run_hook, run() [formerly cmd_connect],
-// preflight_checks, cmd_disconnect_internal, partial_disconnect,
-// extract_ip_from_url, resolve_bootstrap_host,
-// interruptible_sleep — all moved to src/connect.rs)
-// ---------------------------------------------------------------------------
-
-
-// ---------------------------------------------------------------------------
-// Helper guard
-// ---------------------------------------------------------------------------
-
-/// Refuse CLI connect/disconnect when the GUI helper has an active VPN.
-/// Only blocks if the helper is running AND managing a VPN connection.
-/// An idle helper (waiting for GUI commands) doesn't conflict with CLI use.
-fn refuse_if_helper_running() -> anyhow::Result<()> {
-    let helper_pid = match airvpn::helper::read_pid_file() {
-        Some(pid) if recovery::is_pid_alive(pid) => pid,
-        _ => return Ok(()), // No helper running
-    };
-
-    // Check if the helper has an active VPN connection via recovery state.
-    // If the state file exists and its PID matches the helper, the helper
-    // owns a live VPN — refuse CLI to avoid conflicting management.
-    if let Ok(Some(state)) = recovery::load() {
-        if state.pid == helper_pid {
-            anyhow::bail!(
-                "The GUI helper (PID {}) has an active VPN connection. \
-                 Use the GUI to disconnect, or stop the helper first:\n  \
-                 sudo systemctl stop airvpn-helper.service",
-                helper_pid
-            );
-        }
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Disconnect
-// ---------------------------------------------------------------------------
-
-fn cmd_disconnect() -> anyhow::Result<()> {
-    refuse_if_helper_running()?;
-    connect::preflight_checks()?;
-    let state = recovery::load()?.ok_or_else(|| anyhow::anyhow!("No active connection found"))?;
-
-    // Resolve vpn.down hook from profile (no CLI flags in disconnect path)
-    let profile_options = config::load_profile_options();
-    let hook_down = connect::EventHook::resolve("vpn.down", &None, &None, &None, &profile_options);
-
-    // If the connect process is still running, signal it to shut down gracefully
-    if recovery::is_pid_alive(state.pid) && state.pid != std::process::id() {
-        info!("Signaling PID {} to disconnect...", state.pid);
-        let _ = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(state.pid as i32),
-            nix::sys::signal::Signal::SIGTERM,
-        );
-        // Wait up to 5 seconds for graceful shutdown
-        for _ in 0..50 {
-            if !recovery::is_pid_alive(state.pid) {
-                info!("Disconnected.");
-                return Ok(());
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        warn!("PID {} did not exit, forcing cleanup...", state.pid);
-    }
-
-    connect::cmd_disconnect_internal(&state.wg_config_path, &state.wg_interface, state.lock_active, &state.blocked_ipv6_ifaces, &state.endpoint_ip, &hook_down)
-}
-
-
-// ---------------------------------------------------------------------------
-// Status
-// ---------------------------------------------------------------------------
-
-fn cmd_status() -> anyhow::Result<()> {
-    match recovery::load()? {
-        Some(state) => {
-            let connected = wireguard::is_connected(&state.wg_interface);
-            println!(
-                "Interface: {} ({})",
-                state.wg_interface,
-                if connected { "up" } else { "down" }
-            );
-            println!("Lock active: {}", state.lock_active);
-            println!("DNS: {}, {}", state.dns_ipv4, state.dns_ipv6);
-            println!("PID: {}", state.pid);
-        }
-        None => println!("Not connected."),
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -535,211 +448,6 @@ fn cmd_servers(
 fn cmd_recover() -> anyhow::Result<()> {
     connect::preflight_checks()?;
     recovery::force_recover()
-}
-
-// ---------------------------------------------------------------------------
-// Lock — persistent kill switch management
-// ---------------------------------------------------------------------------
-
-fn cmd_lock(action: LockAction) -> anyhow::Result<()> {
-    // lock commands need root (nft access)
-    if !nix::unistd::geteuid().is_root() {
-        anyhow::bail!("must run as root");
-    }
-    match action {
-        LockAction::Install => cmd_lock_install(),
-        LockAction::Uninstall => cmd_lock_uninstall(),
-        LockAction::Enable => cmd_lock_enable(),
-        LockAction::Disable => cmd_lock_disable(),
-        LockAction::Status => cmd_lock_status(),
-    }
-}
-
-fn cmd_lock_install() -> anyhow::Result<()> {
-    let provider_config = api::load_provider_config()?;
-
-    // Extract bootstrap IPs from provider.json (skip hostnames — can't resolve
-    // without DNS, and that's the whole point of the persistent lock)
-    let bootstrap_ips: Vec<String> = provider_config
-        .bootstrap_urls
-        .iter()
-        .filter_map(|url| connect::extract_ip_from_url(url))
-        .filter(|host| host.parse::<std::net::IpAddr>().is_ok())
-        .collect();
-
-    if bootstrap_ips.is_empty() {
-        anyhow::bail!("no bootstrap IPs found in provider config");
-    }
-
-    let ruleset = netlock::generate_persistent_ruleset(&bootstrap_ips);
-
-    // Write rules file
-    std::fs::create_dir_all("/etc/airvpn-rs")
-        .context("failed to create /etc/airvpn-rs")?;
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o644)
-            .open(netlock::PERSISTENT_RULES_PATH)
-            .context("failed to write lock.nft")?;
-        std::io::Write::write_all(&mut f, ruleset.as_bytes())
-            .context("failed to write lock.nft")?;
-    }
-    info!("Wrote {}", netlock::PERSISTENT_RULES_PATH);
-
-    // Write systemd service
-    let service = "\
-[Unit]
-Description=AirVPN persistent kill switch
-DefaultDependencies=no
-Before=network-pre.target
-Wants=network-pre.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/bin/nft -f /etc/airvpn-rs/lock.nft
-ExecStop=/bin/sh -c 'printf \"add table inet airvpn_persist { flags owner, persist; }\\ndelete table inet airvpn_persist\\n\" | /usr/bin/nft -f -'
-
-[Install]
-WantedBy=sysinit.target
-";
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o644)
-            .open(netlock::PERSISTENT_SERVICE_PATH)
-            .context("failed to write systemd service")?;
-        std::io::Write::write_all(&mut f, service.as_bytes())
-            .context("failed to write systemd service")?;
-    }
-    info!("Wrote {}", netlock::PERSISTENT_SERVICE_PATH);
-
-    // Enable service
-    let output = std::process::Command::new("systemctl")
-        .args(["daemon-reload"])
-        .output()
-        .context("failed to run systemctl daemon-reload")?;
-    if !output.status.success() {
-        warn!("systemctl daemon-reload failed: {}", String::from_utf8_lossy(&output.stderr));
-    }
-    let output = std::process::Command::new("systemctl")
-        .args(["enable", "airvpn-lock.service"])
-        .output()
-        .context("failed to enable service")?;
-    if !output.status.success() {
-        anyhow::bail!("systemctl enable failed: {}", String::from_utf8_lossy(&output.stderr));
-    }
-    info!("Enabled airvpn-lock.service");
-
-    // Load the table now. If airvpn_persist already active, delete it first
-    // (owner+persist flags can only be set at table creation time).
-    if netlock::is_persist_active() {
-        let _ = netlock::reclaim_and_delete();
-    }
-    let output = std::process::Command::new("nft")
-        .args(["-f", netlock::PERSISTENT_RULES_PATH])
-        .output()
-        .context("failed to load lock.nft")?;
-    if !output.status.success() {
-        anyhow::bail!("nft -f failed: {}", String::from_utf8_lossy(&output.stderr));
-    }
-
-    info!("Persistent lock installed and active.");
-    info!("{} bootstrap IPs allowlisted.", bootstrap_ips.len());
-    info!("To temporarily disable: airvpn-rs lock disable");
-    Ok(())
-}
-
-fn cmd_lock_uninstall() -> anyhow::Result<()> {
-    // Stop and disable service
-    let _ = std::process::Command::new("systemctl")
-        .args(["stop", "airvpn-lock.service"])
-        .output();
-    let _ = std::process::Command::new("systemctl")
-        .args(["disable", "airvpn-lock.service"])
-        .output();
-    let _ = std::process::Command::new("systemctl")
-        .args(["daemon-reload"])
-        .output();
-
-    // Remove files
-    let _ = std::fs::remove_file(netlock::PERSISTENT_SERVICE_PATH);
-    let _ = std::fs::remove_file(netlock::PERSISTENT_RULES_PATH);
-
-    // Delete persistent table if active. Safe even while VPN is running —
-    // airvpn_persist and airvpn_lock are independent tables.
-    if netlock::is_persist_active() {
-        match netlock::reclaim_and_delete() {
-            Ok(()) => {}
-            Err(e) => {
-                warn!("Could not delete table: {}", e);
-            }
-        }
-    }
-
-    info!("Persistent lock uninstalled.");
-    Ok(())
-}
-
-fn cmd_lock_enable() -> anyhow::Result<()> {
-    if !std::path::Path::new(netlock::PERSISTENT_RULES_PATH).exists() {
-        anyhow::bail!("persistent lock not installed — run `airvpn-rs lock install` first");
-    }
-    if netlock::is_persist_active() {
-        info!("Persistent lock table already active.");
-        return Ok(());
-    }
-    let output = std::process::Command::new("nft")
-        .args(["-f", netlock::PERSISTENT_RULES_PATH])
-        .output()
-        .context("failed to load lock.nft")?;
-    if !output.status.success() {
-        anyhow::bail!("nft -f failed: {}", String::from_utf8_lossy(&output.stderr));
-    }
-    info!("Persistent lock re-enabled.");
-    Ok(())
-}
-
-fn cmd_lock_disable() -> anyhow::Result<()> {
-    if !netlock::is_persist_active() {
-        info!("Persistent lock table not active.");
-        return Ok(());
-    }
-    // Safe even while VPN is running — airvpn_persist and airvpn_lock are
-    // independent tables. Deleting airvpn_persist doesn't affect the session lock.
-    netlock::reclaim_and_delete()?;
-    info!("Persistent lock disabled (will return on next reboot if service enabled).");
-    Ok(())
-}
-
-fn cmd_lock_status() -> anyhow::Result<()> {
-    let table_active = netlock::is_persist_active();
-    let rules_exist = std::path::Path::new(netlock::PERSISTENT_RULES_PATH).exists();
-    let service_exists = std::path::Path::new(netlock::PERSISTENT_SERVICE_PATH).exists();
-
-    // Check if service is enabled
-    let service_enabled = std::process::Command::new("systemctl")
-        .args(["is-enabled", "airvpn-lock.service"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    println!("Persistent lock:");
-    println!("  Table active:     {}", if table_active { "yes" } else { "no" });
-    println!("  Rules file:       {}", if rules_exist { netlock::PERSISTENT_RULES_PATH } else { "not installed" });
-    println!("  Service enabled:  {}", if service_enabled { "yes" } else { "no" });
-
-    if !rules_exist && !service_exists {
-        println!("\nNot installed. Run `airvpn-rs lock install` to set up.");
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
