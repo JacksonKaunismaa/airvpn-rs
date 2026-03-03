@@ -22,8 +22,8 @@ pub struct ConnectConfig {
     pub no_lock: bool,
     pub allow_lan: bool,
     pub no_reconnect: bool,
-    pub cli_username: Option<String>,
-    pub password_stdin: bool,
+    pub username: String,
+    pub password: String,
     pub allow_server: Vec<String>,
     pub deny_server: Vec<String>,
     pub allow_country: Vec<String>,
@@ -388,10 +388,12 @@ fn resolve_session(config: &ConnectConfig) -> anyhow::Result<SessionParams> {
     let shutdown = recovery::setup_signal_handler()?;
     let nonce = recovery::generate_nonce();
 
-    // Resolve credentials (password via profile, interactive prompt, or --password-stdin)
+    // Credentials arrive pre-resolved from the caller (CLI or helper daemon).
     // Wrapped in Zeroizing to clear from memory on drop.
-    let stdin_password = common::read_stdin_password(config.password_stdin)?;
-    // Load profile options once (used for credentials + locklast/startlast)
+    let username = Zeroizing::new(config.username.clone());
+    let password = Zeroizing::new(config.password.clone());
+
+    // Load profile options once (used for event hooks, locklast/startlast, ipv6 mode, etc.)
     let profile_options = config::load_profile_options();
 
     // Resolve event hooks (Eddie: Engine.RunEventCommand, CLI overrides profile).
@@ -401,14 +403,6 @@ fn resolve_session(config: &ConnectConfig) -> anyhow::Result<SessionParams> {
         "vpn.up", &config.cli_event_up[0], &config.cli_event_up[1], &config.cli_event_up[2], &profile_options);
     let hook_down = EventHook::resolve(
         "vpn.down", &config.cli_event_down[0], &config.cli_event_down[1], &config.cli_event_down[2], &profile_options);
-
-    let (username, password) = config::resolve_credentials(
-        config.cli_username.as_deref(),
-        stdin_password.as_deref().map(|s| s.as_str()),
-        &profile_options,
-    )?;
-    let username = Zeroizing::new(username);
-    let password = Zeroizing::new(password);
 
     // Resolve IPv6 mode: CLI --ipv6-mode overrides profile (Eddie: network.ipv6.mode)
     let ipv6_mode = {

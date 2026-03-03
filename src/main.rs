@@ -312,14 +312,23 @@ fn main() -> anyhow::Result<()> {
             event_vpn_down_waitend,
         } => {
             refuse_if_helper_running()?;
+            // Resolve credentials before entering connect::run() — the connect
+            // engine can't do interactive prompting (needed for helper/daemon use).
+            let stdin_password = common::read_stdin_password(password_stdin)?;
+            let profile_options = config::load_profile_options();
+            let (resolved_username, resolved_password) = config::resolve_credentials(
+                username.as_deref(),
+                stdin_password.as_deref().map(|s| s.as_str()),
+                &profile_options,
+            )?;
             let mut provider_config = load_provider()?;
             let connect_config = connect::ConnectConfig {
                 server_name: server,
                 no_lock,
                 allow_lan,
                 no_reconnect,
-                cli_username: username,
-                password_stdin,
+                username: resolved_username,
+                password: resolved_password,
                 allow_server,
                 deny_server,
                 allow_country,
