@@ -487,7 +487,18 @@ fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
                         _ => ipc::ConnectionState::Connecting,
                     }
                 } else {
-                    ipc::ConnectionState::Disconnected
+                    // No connect thread — check recovery state for orphaned
+                    // connections (e.g. helper restarted while VPN was active).
+                    match recovery::load() {
+                        Ok(Some(rec)) if wireguard::is_connected(&rec.wg_interface) => {
+                            ipc::ConnectionState::Connected {
+                                server_name: "unknown (orphaned)".to_string(),
+                                server_country: String::new(),
+                                server_location: String::new(),
+                            }
+                        }
+                        _ => ipc::ConnectionState::Disconnected,
+                    }
                 };
                 send_event(&mut writer, &ipc::HelperEvent::StateChanged { state: conn_state.clone() });
                 send_event(&mut writer, &build_lock_status());

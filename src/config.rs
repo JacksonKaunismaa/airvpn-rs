@@ -265,7 +265,11 @@ pub fn load_profile_options() -> HashMap<String, String> {
         if import {
             match load_eddie_profile(&eddie_path) {
                 Ok(opts) => {
-                    info!("Imported {} settings from Eddie profile.", opts.len());
+                    eprintln!("Imported {} settings from Eddie profile.", opts.len());
+                    // Save to our profile so we don't re-prompt next time.
+                    if let Err(e) = save_options(&path, &opts) {
+                        warn!("Could not save imported profile: {:#} (will re-prompt next time)", e);
+                    }
                     return opts;
                 }
                 Err(e) => warn!("Could not import Eddie profile: {:#}", e),
