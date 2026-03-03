@@ -428,6 +428,13 @@ fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
             }
 
             ipc::HelperCommand::Disconnect => {
+                if !state.is_connected() {
+                    send_event(&mut writer, &ipc::HelperEvent::Error {
+                        message: "no active connection".to_string(),
+                    });
+                    continue;
+                }
+
                 recovery::trigger_shutdown();
                 send_event(
                     &mut writer,
@@ -436,7 +443,7 @@ fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
                     },
                 );
 
-                // Wait for connect thread to finish cleanup, then send Disconnected
+                // Wait for connect thread to finish cleanup
                 if let Some(h) = state.connect_handle.take() {
                     let _ = h.join();
                 }
