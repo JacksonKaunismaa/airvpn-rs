@@ -281,8 +281,16 @@ fn load_provider() -> anyhow::Result<api::ProviderConfig> {
 }
 
 fn main() -> anyhow::Result<()> {
-    init_logging();
     let cli = Cli::parse();
+
+    // Only init full logging (file + stderr) for commands that run in-process.
+    // Thin-client commands (connect, disconnect, status, lock) get their output
+    // from the helper via cli_client — no log file needed.
+    match &cli.command {
+        Commands::Helper | Commands::Servers { .. } | Commands::Recover => init_logging(),
+        _ => {}
+    }
+
     match cli.command {
         Commands::Connect {
             server,

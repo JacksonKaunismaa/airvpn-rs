@@ -456,8 +456,15 @@ fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
                 if let Ok(mut info) = state.server_info.lock() {
                     *info = Default::default();
                 }
-                // Note: connect thread sends Disconnected on exit, so we don't
-                // duplicate it here.
+                // Send Disconnected on THIS socket (the one that sent Disconnect).
+                // The connect thread also sends Disconnected on its own writer clone,
+                // but that goes to the original Connect client (possibly a dead socket).
+                send_event(
+                    &mut writer,
+                    &ipc::HelperEvent::StateChanged {
+                        state: ipc::ConnectionState::Disconnected,
+                    },
+                );
             }
 
             ipc::HelperCommand::Status => {
