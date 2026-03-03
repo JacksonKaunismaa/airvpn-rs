@@ -529,12 +529,14 @@ pub fn generate_persistent_ruleset(bootstrap_ips: &[String]) -> String {
 
     // 6. ICMP/ICMPv6 (Eddie model: respond to pings only — no outbound initiation)
     r.push_str("    icmp type echo-reply counter accept\n");
-    r.push_str("    icmpv6 type { echo-request, echo-reply, destination-unreachable, packet-too-big, time-exceeded, parameter-problem } counter accept\n");
+    // ICMPv6: no echo-request in output (matches IPv4 treatment). Outbound echo-request
+    // for IPv6 servers is handled by per-IP rules in the ping_allow subchain.
+    r.push_str("    icmpv6 type { echo-reply, destination-unreachable, packet-too-big, time-exceeded, parameter-problem } counter accept\n");
 
     // 7. Per-server ICMP hole-punching (jump to subchain, empty by default)
-    r.push_str(&format!("    jump ping_allow\n"));
+    r.push_str("    jump ping_allow\n");
 
-    // 7. Bootstrap IPs (allow API access without VPN)
+    // 8. Bootstrap IPs (allow API access without VPN)
     for ip_str in bootstrap_ips {
         let cidr = ensure_cidr(ip_str);
         match classify_ip(&cidr) {
@@ -554,10 +556,10 @@ pub fn generate_persistent_ruleset(bootstrap_ips: &[String]) -> String {
         }
     }
 
-    // 8. VPN tunnel interface (inner packets going into tunnel)
+    // 9. VPN tunnel interface (inner packets going into tunnel)
     r.push_str("    oifname \"avpn-*\" counter accept\n");
 
-    // 9. WireGuard outer packets (marked by routing policy table 51820)
+    // 10. WireGuard outer packets (marked by routing policy table 51820)
     r.push_str("    meta mark 51820 counter accept\n");
 
     // Final drop sentinel
@@ -695,6 +697,47 @@ pub fn is_persist_active() -> bool {
     }
 }
 
+/// Build the nft batch commands for per-IP ICMP ping holes.
+///
+/// Returns the batch string and the count of valid rules generated.
+/// Pure function — no side effects, testable without root.
+fn build_ping_hole_rules(server_ips: &[String]) -> (String, usize) {
+    let mut batch = String::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut count = 0;
+
+    for ip_str in server_ips {
+        let ip_str = ip_str.trim();
+        if ip_str.is_empty() {
+            continue;
+        }
+        // Validate it's a real IP to prevent injection
+        if ip_str.parse::<IpAddr>().is_err() {
+            continue;
+        }
+        // Deduplicate (multiple servers can share entry IPs)
+        if !seen.insert(ip_str.to_string()) {
+            continue;
+        }
+        if ip_str.contains(':') {
+            // IPv6
+            batch.push_str(&format!(
+                "add rule inet {} ping_allow ip6 daddr {} icmpv6 type echo-request counter accept\n",
+                PERSIST_TABLE_NAME, ip_str
+            ));
+        } else {
+            // IPv4
+            batch.push_str(&format!(
+                "add rule inet {} ping_allow ip daddr {} icmp type echo-request counter accept\n",
+                PERSIST_TABLE_NAME, ip_str
+            ));
+        }
+        count += 1;
+    }
+
+    (batch, count)
+}
+
 /// Open per-IP ICMP holes in the persistent lock's `ping_allow` subchain.
 ///
 /// Inserts one `ip daddr <ip> icmp type echo-request accept` rule per server IP
@@ -711,32 +754,7 @@ pub fn open_ping_holes(server_ips: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    // Build a single nft -f batch: one rule per server IP in the ping_allow chain.
-    let mut batch = String::new();
-    for ip_str in server_ips {
-        let ip_str = ip_str.trim();
-        if ip_str.is_empty() {
-            continue;
-        }
-        // Validate it's a real IP to prevent injection
-        if ip_str.parse::<IpAddr>().is_err() {
-            continue;
-        }
-        if ip_str.contains(':') {
-            // IPv6
-            batch.push_str(&format!(
-                "add rule inet {} ping_allow ip6 daddr {} icmpv6 type echo-request counter accept\n",
-                PERSIST_TABLE_NAME, ip_str
-            ));
-        } else {
-            // IPv4
-            batch.push_str(&format!(
-                "add rule inet {} ping_allow ip daddr {} icmp type echo-request counter accept\n",
-                PERSIST_TABLE_NAME, ip_str
-            ));
-        }
-    }
-
+    let (batch, count) = build_ping_hole_rules(server_ips);
     if batch.is_empty() {
         return Ok(());
     }
@@ -765,7 +783,7 @@ pub fn open_ping_holes(server_ips: &[String]) -> Result<()> {
 
     log::info!(
         "Opened {} ICMP ping holes in persistent lock",
-        server_ips.len()
+        count
     );
     Ok(())
 }
@@ -1791,5 +1809,102 @@ mod tests {
             "ping_allow chain should be empty by default, got: {:?}",
             chain_body.trim()
         );
+    }
+
+    // -------------------------------------------------------------------
+    // build_ping_hole_rules tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_build_ping_hole_rules_ipv4() {
+        let ips = vec!["1.2.3.4".to_string(), "5.6.7.8".to_string()];
+        let (batch, count) = build_ping_hole_rules(&ips);
+        assert_eq!(count, 2);
+        assert!(batch.contains("ip daddr 1.2.3.4 icmp type echo-request"));
+        assert!(batch.contains("ip daddr 5.6.7.8 icmp type echo-request"));
+    }
+
+    #[test]
+    fn test_build_ping_hole_rules_ipv6() {
+        let ips = vec!["2001:db8::1".to_string()];
+        let (batch, count) = build_ping_hole_rules(&ips);
+        assert_eq!(count, 1);
+        assert!(batch.contains("ip6 daddr 2001:db8::1 icmpv6 type echo-request"));
+    }
+
+    #[test]
+    fn test_build_ping_hole_rules_mixed() {
+        let ips = vec!["1.2.3.4".to_string(), "2001:db8::1".to_string()];
+        let (batch, count) = build_ping_hole_rules(&ips);
+        assert_eq!(count, 2);
+        assert!(batch.contains("ip daddr 1.2.3.4 icmp type echo-request"));
+        assert!(batch.contains("ip6 daddr 2001:db8::1 icmpv6 type echo-request"));
+    }
+
+    #[test]
+    fn test_build_ping_hole_rules_deduplicates() {
+        let ips = vec![
+            "1.2.3.4".to_string(),
+            "1.2.3.4".to_string(),
+            "5.6.7.8".to_string(),
+        ];
+        let (batch, count) = build_ping_hole_rules(&ips);
+        assert_eq!(count, 2);
+        assert_eq!(batch.matches("1.2.3.4").count(), 1);
+    }
+
+    #[test]
+    fn test_build_ping_hole_rules_skips_invalid() {
+        let ips = vec![
+            "1.2.3.4".to_string(),
+            "not-an-ip".to_string(),
+            "".to_string(),
+            "  ".to_string(),
+            "5.6.7.8".to_string(),
+        ];
+        let (batch, count) = build_ping_hole_rules(&ips);
+        assert_eq!(count, 2);
+        assert!(!batch.contains("not-an-ip"));
+    }
+
+    #[test]
+    fn test_build_ping_hole_rules_empty_input() {
+        let ips: Vec<String> = vec![];
+        let (batch, count) = build_ping_hole_rules(&ips);
+        assert_eq!(count, 0);
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn test_build_ping_hole_rules_rejects_injection() {
+        let ips = vec![
+            "1.2.3.4; drop table".to_string(),
+            "1.2.3.4\ndrop table".to_string(),
+        ];
+        let (batch, count) = build_ping_hole_rules(&ips);
+        assert_eq!(count, 0);
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn test_persistent_ruleset_output_icmpv6_no_echo_request() {
+        let ruleset = generate_persistent_ruleset(&vec![]);
+        let output_start = ruleset.find("chain output").expect("output chain");
+        let output_end = ruleset[output_start..]
+            .find("\n  }\n")
+            .map(|p| output_start + p)
+            .expect("output chain end");
+        let output_section = &ruleset[output_start..output_end];
+
+        // Find the ICMPv6 rule in output and verify no echo-request
+        for line in output_section.lines() {
+            if line.contains("icmpv6 type") && !line.contains("jump") {
+                assert!(
+                    !line.contains("echo-request"),
+                    "output ICMPv6 should NOT contain echo-request, got: {}",
+                    line.trim()
+                );
+            }
+        }
     }
 }

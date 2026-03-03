@@ -644,11 +644,20 @@ fn fetch_initial_data(
             warn!("Failed to open ICMP ping holes: {e} (pings may fail if persistent lock is active)");
         }
 
+        // Drop guard ensures ping holes are closed even if measure_all panics.
+        struct PingHoleGuard;
+        impl Drop for PingHoleGuard {
+            fn drop(&mut self) {
+                if let Err(e) = crate::netlock::close_ping_holes() {
+                    log::error!("Failed to close ICMP ping holes on cleanup: {e}");
+                }
+            }
+        }
+        let _guard = PingHoleGuard;
+
         let results = pinger::measure_all(&filtered_servers);
 
-        if let Err(e) = crate::netlock::close_ping_holes() {
-            warn!("Failed to close ICMP ping holes: {e}");
-        }
+        drop(_guard);
 
         info!("Pinged {} servers.", results.latencies.len());
         emit(config, crate::ipc::EngineEvent::Log {
