@@ -531,43 +531,83 @@ fn handle_client(stream: UnixStream, state: &mut ConnState, peer_uid: Option<u32
             }
 
             ipc::HelperCommand::Disconnect => {
-                if !state.is_connected() {
+                if state.is_connected() {
+                    // Normal disconnect: connect thread is alive, signal it to stop.
+                    recovery::trigger_shutdown();
+                    send_event(
+                        &mut writer,
+                        &ipc::HelperEvent::StateChanged {
+                            state: ipc::ConnectionState::Disconnecting,
+                        },
+                    );
+
+                    // Wait for connect thread to finish cleanup
+                    if let Some(h) = state.connect_handle.take() {
+                        let _ = h.join();
+                    }
+                    // Stop stats poller
+                    state.stats_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                    if let Some(h) = state.stats_handle.take() {
+                        let _ = h.join();
+                    }
+                    // Clear server info
+                    if let Ok(mut info) = state.server_info.lock() {
+                        *info = Default::default();
+                    }
+                    // Send Disconnected on THIS socket (the one that sent Disconnect).
+                    // The connect thread also sends Disconnected on its own writer clone,
+                    // but that goes to the original Connect client (possibly a dead socket).
+                    send_event(
+                        &mut writer,
+                        &ipc::HelperEvent::StateChanged {
+                            state: ipc::ConnectionState::Disconnected,
+                        },
+                    );
+                } else if matches!(
+                    recovery::load(),
+                    Ok(Some(ref rec)) if wireguard::is_connected(&rec.wg_interface)
+                ) {
+                    // Orphaned connection: no connect thread (e.g. helper restarted)
+                    // but WireGuard interface is still up. Use force_recover() to tear
+                    // down the interface, restore DNS, IPv6, netlock, and state file.
+                    info!("no connect thread but orphaned WireGuard interface found, recovering");
+                    send_event(
+                        &mut writer,
+                        &ipc::HelperEvent::StateChanged {
+                            state: ipc::ConnectionState::Disconnecting,
+                        },
+                    );
+
+                    if let Err(e) = recovery::force_recover() {
+                        error!("orphaned disconnect recovery failed: {}", e);
+                        send_event(
+                            &mut writer,
+                            &ipc::HelperEvent::Error {
+                                message: format!("orphaned disconnect failed: {}", e),
+                            },
+                        );
+                    }
+
+                    // Stop stats poller (may have been started by Status handler)
+                    state.stats_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                    if let Some(h) = state.stats_handle.take() {
+                        let _ = h.join();
+                    }
+                    // Clear server info
+                    if let Ok(mut info) = state.server_info.lock() {
+                        *info = Default::default();
+                    }
+                    send_event(
+                        &mut writer,
+                        &ipc::HelperEvent::StateChanged {
+                            state: ipc::ConnectionState::Disconnected,
+                        },
+                    );
+                } else {
                     send_event(&mut writer, &ipc::HelperEvent::Error {
                         message: "no active connection".to_string(),
                     });
-                    continue;
                 }
-
-                recovery::trigger_shutdown();
-                send_event(
-                    &mut writer,
-                    &ipc::HelperEvent::StateChanged {
-                        state: ipc::ConnectionState::Disconnecting,
-                    },
-                );
-
-                // Wait for connect thread to finish cleanup
-                if let Some(h) = state.connect_handle.take() {
-                    let _ = h.join();
-                }
-                // Stop stats poller
-                state.stats_stop.store(true, std::sync::atomic::Ordering::SeqCst);
-                if let Some(h) = state.stats_handle.take() {
-                    let _ = h.join();
-                }
-                // Clear server info
-                if let Ok(mut info) = state.server_info.lock() {
-                    *info = Default::default();
-                }
-                // Send Disconnected on THIS socket (the one that sent Disconnect).
-                // The connect thread also sends Disconnected on its own writer clone,
-                // but that goes to the original Connect client (possibly a dead socket).
-                send_event(
-                    &mut writer,
-                    &ipc::HelperEvent::StateChanged {
-                        state: ipc::ConnectionState::Disconnected,
-                    },
-                );
             }
 
             ipc::HelperCommand::Status => {
