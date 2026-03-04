@@ -555,14 +555,11 @@ impl App {
             HelperEvent::EddieProfileFound { .. } => {
                 // GUI doesn't handle Eddie import yet
             }
-            HelperEvent::ServerList { .. } => {
-                // CLI text table — GUI ignores this
-            }
             HelperEvent::Shutdown => {
                 self.helper = None;
                 self.connection_state = ConnectionState::Disconnected;
             }
-            HelperEvent::ServerListDetailed { servers } => {
+            HelperEvent::ServerList { servers } => {
                 self.servers = servers;
                 self.servers_loading = false;
             }

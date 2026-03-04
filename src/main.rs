@@ -95,12 +95,9 @@ enum Commands {
     Status,
     /// List available servers
     Servers {
-        /// Sort by: score, load, users, name
-        #[arg(long, default_value = "score")]
-        sort: String,
-        /// Dump raw manifest XML instead of table
+        /// Skip latency measurement (faster, uses score without ping)
         #[arg(long)]
-        debug: bool,
+        skip_ping: bool,
     },
     /// Clean up stale state after crash
     Recover,
@@ -252,8 +249,9 @@ fn init_logging() {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Only init full logging for the helper daemon process.
-    // All other commands are thin socket clients — output comes from the helper.
+    // Only init full logging (file + stderr) for commands that run in-process.
+    // Thin-client commands (connect, disconnect, status, lock) get their output
+    // from the helper via cli_client — no log file needed.
     match &cli.command {
         Commands::Helper => init_logging(),
         _ => {}
@@ -285,8 +283,8 @@ fn main() -> anyhow::Result<()> {
             event_vpn_down_arguments,
             event_vpn_down_waitend,
         } => {
-            // Credentials resolved by helper: saved profile → Eddie import (prompts
-            // client for yes/no) → error. No credentials enter CLI process memory.
+            // Credentials are resolved by the helper daemon (root), never by the CLI.
+            // Helper reads saved profile → Eddie import → error.
             let cmd = ipc::HelperCommand::Connect {
                 server,
                 no_lock,
@@ -312,8 +310,8 @@ fn main() -> anyhow::Result<()> {
             cli_client::send_command(&ipc::HelperCommand::Disconnect)
         }
         Commands::Status => cli_client::send_status(),
-        Commands::Servers { sort, debug } => {
-            cli_client::send_command(&ipc::HelperCommand::Servers { sort, debug })
+        Commands::Servers { skip_ping } => {
+            cli_client::send_command(&ipc::HelperCommand::ListServers { skip_ping })
         }
         Commands::Recover => cli_client::send_command(&ipc::HelperCommand::Recover),
         Commands::Lock { action } => {

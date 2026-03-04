@@ -219,8 +219,24 @@ fn render_event(event: &HelperEvent) -> EventAction {
             );
             EventAction::Done
         }
-        HelperEvent::ServerList { table } => {
-            println!("{}", table);
+        HelperEvent::ServerList { servers } => {
+            println!(
+                "{:<20} {:<6} {:<12} {:>6} {:>6} {:>8}",
+                "NAME", "CC", "LOCATION", "USERS", "LOAD%", "SCORE"
+            );
+            println!("{}", "-".repeat(64));
+            for s in servers {
+                println!(
+                    "{:<20} {:<6} {:<12} {:>6} {:>5.0}% {:>8}",
+                    s.name,
+                    s.country_code,
+                    s.location,
+                    s.users,
+                    s.load_percent,
+                    s.score
+                );
+            }
+            println!("\n{} servers total.", servers.len());
             EventAction::Done
         }
         HelperEvent::Error { message } => EventAction::Error(message.clone()),
@@ -230,8 +246,7 @@ fn render_event(event: &HelperEvent) -> EventAction {
         }
         HelperEvent::Shutdown => EventAction::Done,
         // GUI-only events — CLI ignores these
-        HelperEvent::ServerListDetailed { .. }
-        | HelperEvent::Profile { .. }
+        HelperEvent::Profile { .. }
         | HelperEvent::ProfileSaved => EventAction::Continue,
     }
 }
