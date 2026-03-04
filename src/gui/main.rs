@@ -552,8 +552,13 @@ impl App {
             HelperEvent::Error { message } => {
                 self.helper_error = Some(message);
             }
-            HelperEvent::EddieProfileFound { .. } => {
-                // GUI doesn't handle Eddie import yet
+            HelperEvent::EddieProfileFound { path } => {
+                // Auto-accept Eddie profile import. The helper runs as root
+                // and safely copies credentials to the root-owned profile.
+                self.activity = format!("Importing Eddie profile from {}...", path);
+                if let Some(ref mut helper) = self.helper {
+                    let _ = helper.send(&HelperCommand::ImportEddieProfile { accept: true });
+                }
             }
             HelperEvent::Shutdown => {
                 self.helper = None;
