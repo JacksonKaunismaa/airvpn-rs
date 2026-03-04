@@ -327,7 +327,8 @@ pub fn load_eddie_profile(path: &Path) -> Result<HashMap<String, String>> {
 }
 
 /// Load Eddie profile using a specific UID for keyring access (helper daemon use).
-pub fn load_eddie_profile_for_uid(path: &Path, uid: u32) -> Result<HashMap<String, String>> {
+/// Returns (options, is_v2n) where is_v2n indicates the profile uses fake encryption.
+pub fn load_eddie_profile_for_uid(path: &Path, uid: u32) -> Result<(HashMap<String, String>, bool)> {
     let keyring_reader = move |id: &str| crate::profile::eddie_keyring_read_for_uid(id, uid);
 
     let (format, _id, data) = crate::profile::load_profile_with_keyring(
@@ -336,16 +337,18 @@ pub fn load_eddie_profile_for_uid(path: &Path, uid: u32) -> Result<HashMap<Strin
         keyring_reader,
     )?;
 
+    let is_v2n = format == crate::profile::ProfileFormat::V2N;
     warn_if_insecure_v2n(path, format);
 
     let trimmed = data.iter().position(|&b| !b.is_ascii_whitespace());
     let is_xml = trimmed.is_some_and(|i| data[i] == b'<');
 
-    if is_xml {
-        parse_xml_options(&data)
+    let opts = if is_xml {
+        parse_xml_options(&data)?
     } else {
-        parse_json_options(&data)
-    }
+        parse_json_options(&data)?
+    };
+    Ok((opts, is_v2n))
 }
 
 /// Load options from a specific profile path.

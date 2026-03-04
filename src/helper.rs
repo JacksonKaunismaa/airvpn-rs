@@ -347,7 +347,7 @@ fn handle_client(stream: UnixStream, state: &mut ConnState, peer_uid: Option<u32
 
                     // Import Eddie profile as root (can read user files + keyring via UID)
                     match config::load_eddie_profile_for_uid(&eddie_path, peer_uid.unwrap()) {
-                        Ok(opts) => {
+                        Ok((opts, is_v2n)) => {
                             let eddie_user = opts.get("login").cloned().unwrap_or_default();
                             let eddie_pass = opts.get("password").cloned().unwrap_or_default();
                             if eddie_user.is_empty() || eddie_pass.is_empty() {
@@ -362,8 +362,20 @@ fn handle_client(stream: UnixStream, state: &mut ConnState, peer_uid: Option<u32
                             }
                             send_event(&mut writer, &ipc::HelperEvent::Log {
                                 level: "info".to_string(),
-                                message: format!("Imported credentials from Eddie profile."),
+                                message: "Imported credentials from Eddie profile.".to_string(),
                             });
+                            if is_v2n {
+                                send_event(&mut writer, &ipc::HelperEvent::Log {
+                                    level: "warn".to_string(),
+                                    message: format!(
+                                        "Your Eddie profile at {} uses v2n format (no real encryption). \
+                                         Credentials are readable by any process running as your user. \
+                                         They are now saved in the root-owned airvpn-rs profile (0600). \
+                                         Consider deleting the Eddie profile if you no longer use Eddie.",
+                                        eddie_path.display()
+                                    ),
+                                });
+                            }
                             (eddie_user, eddie_pass)
                         }
                         Err(e) => {
