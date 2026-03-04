@@ -49,7 +49,6 @@ struct App {
     server_search: String,
     helper: Option<ipc::HelperClient>,
     helper_error: Option<String>,
-    helper_launched: bool,
     logs: Vec<LogEntry>,
     log_filter_debug: bool,
     log_filter_info: bool,
@@ -91,7 +90,6 @@ pub enum Message {
     ConnectToServer(String),
     Disconnect,
     Tick,
-    LaunchHelper,
     HelperConnected,
     FetchServers,
     ServerClicked(usize),
@@ -144,7 +142,6 @@ impl App {
             server_search: String::new(),
             helper: None,
             helper_error: None,
-            helper_launched: false,
             logs: Vec::new(),
             log_filter_debug: false,
             log_filter_info: true,
@@ -177,13 +174,9 @@ impl App {
             connect_no_verify: false,
         };
 
-        // Try connecting to an existing helper. If the socket doesn't exist,
-        // go straight to launching one (don't waste time on a failed connect).
-        let task = if std::path::Path::new("/run/airvpn-rs/helper.sock").exists() {
-            Task::done(Message::HelperConnected)
-        } else {
-            Task::done(Message::LaunchHelper)
-        };
+        // With systemd socket activation, the socket always exists.
+        // Connecting triggers systemd to start the helper on demand.
+        let task = Task::done(Message::HelperConnected);
 
         (app, task)
     }
@@ -201,16 +194,32 @@ impl App {
                 Task::none()
             }
             Message::Connect => {
+                let ipv6_mode = if self.settings_ipv6_mode.is_empty() { None } else { Some(self.settings_ipv6_mode.clone()) };
+                let dns_servers = if self.settings_dns.is_empty() { Vec::new() } else {
+                    self.settings_dns.split(',').map(|s| s.trim().to_string()).collect()
+                };
+                let event_pre = self.build_event_hook(&self.settings_event_pre_file, &self.settings_event_pre_args, self.settings_event_pre_wait);
+                let event_up = self.build_event_hook(&self.settings_event_up_file, &self.settings_event_up_args, self.settings_event_up_wait);
+                let event_down = self.build_event_hook(&self.settings_event_down_file, &self.settings_event_down_args, self.settings_event_down_wait);
                 if let Some(ref mut helper) = self.helper {
                     let cmd = HelperCommand::Connect {
                         server: self.selected_server.clone(),
                         no_lock: self.connect_no_lock,
                         allow_lan: self.connect_allow_lan,
                         skip_ping: self.connect_skip_ping,
-                        no_reconnect: self.connect_no_reconnect,
-                        no_verify: self.connect_no_verify,
                         allow_country: Vec::new(),
                         deny_country: Vec::new(),
+                        allow_server: Vec::new(),
+                        deny_server: Vec::new(),
+                        no_reconnect: self.connect_no_reconnect,
+                        no_verify: self.connect_no_verify,
+                        no_lock_last: false,
+                        no_start_last: false,
+                        ipv6_mode,
+                        dns_servers,
+                        event_pre,
+                        event_up,
+                        event_down,
                     };
                     if let Err(e) = helper.send(&cmd) {
                         self.helper_error = Some(format!("Failed to send Connect: {}", e));
@@ -220,16 +229,32 @@ impl App {
             }
             Message::ConnectToServer(server_name) => {
                 self.selected_server = Some(server_name.clone());
+                let ipv6_mode = if self.settings_ipv6_mode.is_empty() { None } else { Some(self.settings_ipv6_mode.clone()) };
+                let dns_servers = if self.settings_dns.is_empty() { Vec::new() } else {
+                    self.settings_dns.split(',').map(|s| s.trim().to_string()).collect()
+                };
+                let event_pre = self.build_event_hook(&self.settings_event_pre_file, &self.settings_event_pre_args, self.settings_event_pre_wait);
+                let event_up = self.build_event_hook(&self.settings_event_up_file, &self.settings_event_up_args, self.settings_event_up_wait);
+                let event_down = self.build_event_hook(&self.settings_event_down_file, &self.settings_event_down_args, self.settings_event_down_wait);
                 if let Some(ref mut helper) = self.helper {
                     let cmd = HelperCommand::Connect {
                         server: Some(server_name),
                         no_lock: self.connect_no_lock,
                         allow_lan: self.connect_allow_lan,
                         skip_ping: true, // server already chosen
-                        no_reconnect: self.connect_no_reconnect,
-                        no_verify: self.connect_no_verify,
                         allow_country: Vec::new(),
                         deny_country: Vec::new(),
+                        allow_server: Vec::new(),
+                        deny_server: Vec::new(),
+                        no_reconnect: self.connect_no_reconnect,
+                        no_verify: self.connect_no_verify,
+                        no_lock_last: false,
+                        no_start_last: false,
+                        ipv6_mode,
+                        dns_servers,
+                        event_pre,
+                        event_up,
+                        event_down,
                     };
                     if let Err(e) = helper.send(&cmd) {
                         self.helper_error = Some(format!("Failed to send Connect: {}", e));
@@ -257,35 +282,6 @@ impl App {
                 }
                 Task::none()
             }
-            Message::LaunchHelper => {
-                self.helper_launched = true;
-                self.helper_error = None;
-                self.activity = "Launching helper (waiting for authentication)...".into();
-                match ipc::launch_helper() {
-                    Ok(_child) => {
-                        // Poll for the socket to appear. pkexec blocks for password
-                        // input, so 500ms is not enough. Poll every 500ms for up to 60s.
-                        Task::future(async {
-                            let socket = std::path::Path::new("/run/airvpn-rs/helper.sock");
-                            for _ in 0..120 {
-                                tokio::time::sleep(Duration::from_millis(500)).await;
-                                if socket.exists() {
-                                    // Give it a moment to start accepting
-                                    tokio::time::sleep(Duration::from_millis(200)).await;
-                                    return Message::HelperConnected;
-                                }
-                            }
-                            Message::HelperConnected // try anyway after timeout
-                        })
-                    }
-                    Err(e) => {
-                        self.activity.clear();
-                        self.helper_error =
-                            Some(format!("Failed to launch helper: {}", e));
-                        Task::none()
-                    }
-                }
-            }
             Message::HelperConnected => {
                 match ipc::HelperClient::connect() {
                     Ok(mut client) => {
@@ -297,16 +293,13 @@ impl App {
                     }
                     Err(e) => {
                         eprintln!("[GUI] HelperClient::connect() failed: {}", e);
-                        if !self.helper_launched {
-                            // First failure — automatically try launching a helper
-                            Task::done(Message::LaunchHelper)
-                        } else {
-                            // Already tried launching — show error with retry
-                            self.helper_error = Some(format!(
-                                "Cannot connect to helper: {}. Click Retry.", e
-                            ));
-                            Task::none()
-                        }
+                        self.helper_error = Some(format!(
+                            "Cannot connect to helper: {}\n\
+                             Is airvpn-helper.socket enabled?\n\
+                             Run: sudo systemctl enable --now airvpn-helper.socket",
+                            e
+                        ));
+                        Task::none()
                     }
                 }
             }
@@ -559,11 +552,17 @@ impl App {
             HelperEvent::Error { message } => {
                 self.helper_error = Some(message);
             }
+            HelperEvent::EddieProfileFound { .. } => {
+                // GUI doesn't handle Eddie import yet
+            }
+            HelperEvent::ServerList { .. } => {
+                // CLI text table — GUI ignores this
+            }
             HelperEvent::Shutdown => {
                 self.helper = None;
                 self.connection_state = ConnectionState::Disconnected;
             }
-            HelperEvent::ServerList { servers } => {
+            HelperEvent::ServerListDetailed { servers } => {
                 self.servers = servers;
                 self.servers_loading = false;
             }
@@ -590,6 +589,15 @@ impl App {
                 self.settings_dirty = false;
             }
         }
+    }
+
+    /// Build an event hook array [filename, arguments, waitend] from settings.
+    fn build_event_hook(&self, file: &str, args: &str, wait: bool) -> [Option<String>; 3] {
+        [
+            if file.is_empty() { None } else { Some(file.to_string()) },
+            if args.is_empty() { None } else { Some(args.to_string()) },
+            if wait { Some("True".into()) } else { None },
+        ]
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -668,7 +676,7 @@ impl App {
                 row![
                     text(format!("Error: {}", err)).color(iced::Color::from_rgb(0.91, 0.27, 0.38)),
                     Space::new().width(Fill),
-                    button(text("Retry")).on_press(Message::LaunchHelper),
+                    button(text("Retry")).on_press(Message::HelperConnected),
                 ]
                 .spacing(8),
             )
