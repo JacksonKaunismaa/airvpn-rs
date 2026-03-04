@@ -174,6 +174,9 @@ impl App {
             HelperEvent::EddieProfileFound { .. } => {
                 // GUI doesn't handle Eddie import yet
             }
+            HelperEvent::ServerList { .. } => {
+                // GUI doesn't use ServerList (will have its own server tab)
+            }
             HelperEvent::Shutdown => {
                 self.helper = None;
                 self.connection_state = ConnectionState::Disconnected;

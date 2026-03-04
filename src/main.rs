@@ -1,9 +1,6 @@
-use airvpn::{api, cli_client, common, config, ipc, manifest, server};
+use airvpn::{cli_client, ipc};
 
-use anyhow::Context;
 use clap::{Parser, Subcommand};
-use log::warn;
-use zeroize::Zeroizing;
 
 #[derive(Parser)]
 #[command(name = "airvpn", about = "AirVPN WireGuard client")]
@@ -104,15 +101,6 @@ enum Commands {
         /// Dump raw manifest XML instead of table
         #[arg(long)]
         debug: bool,
-        /// AirVPN username (overrides saved credentials)
-        #[arg(long)]
-        username: Option<String>,
-        /// Read password from stdin (one line, for scripted use)
-        #[arg(long)]
-        password_stdin: bool,
-        /// Skip server latency measurement (faster startup, uses score without ping)
-        #[arg(long)]
-        skip_ping: bool,
     },
     /// Clean up stale state after crash
     Recover,
@@ -261,19 +249,6 @@ fn init_logging() {
     });
 }
 
-/// Load provider.json and verify RSA key integrity.
-/// Only needed for commands that talk to the AirVPN API (connect, servers).
-fn load_provider() -> anyhow::Result<api::ProviderConfig> {
-    let config = api::load_provider_config()
-        .context("failed to load provider configuration")?;
-    // Verify the provider.json RSA key hasn't been tampered with (binary integrity).
-    // This check only applies to the initial bootstrap key. Once the manifest
-    // provides a rotated RSA key (Fix 1), that key is authenticated by the
-    // RSA+AES envelope and doesn't need integrity checking.
-    api::verify_rsa_key_integrity(&config);
-    Ok(config)
-}
-
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -281,7 +256,7 @@ fn main() -> anyhow::Result<()> {
     // Thin-client commands (connect, disconnect, status, lock) get their output
     // from the helper via cli_client — no log file needed.
     match &cli.command {
-        Commands::Helper | Commands::Servers { .. } => init_logging(),
+        Commands::Helper => init_logging(),
         _ => {}
     }
 
@@ -338,9 +313,8 @@ fn main() -> anyhow::Result<()> {
             cli_client::send_command(&ipc::HelperCommand::Disconnect)
         }
         Commands::Status => cli_client::send_status(),
-        Commands::Servers { sort, debug, username, password_stdin, skip_ping } => {
-            let mut provider_config = load_provider()?;
-            cmd_servers(&mut provider_config, &sort, debug, username, password_stdin, skip_ping)
+        Commands::Servers { sort, debug } => {
+            cli_client::send_command(&ipc::HelperCommand::Servers { sort, debug })
         }
         Commands::Recover => cli_client::send_command(&ipc::HelperCommand::Recover),
         Commands::Lock { action } => {
@@ -358,76 +332,6 @@ fn main() -> anyhow::Result<()> {
             helper::run()
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Servers
-// ---------------------------------------------------------------------------
-
-fn cmd_servers(
-    provider_config: &mut api::ProviderConfig,
-    sort: &str,
-    debug: bool,
-    cli_username: Option<String>,
-    password_stdin: bool,
-    _skip_ping: bool,
-) -> anyhow::Result<()> {
-    let stdin_password = common::read_stdin_password(password_stdin)?;
-    let profile_options = config::load_profile_options();
-    let (username, password) = config::resolve_credentials(
-        cli_username.as_deref(),
-        stdin_password.as_deref().map(|s| s.as_str()),
-        &profile_options,
-    )?;
-    let password = Zeroizing::new(password);
-    let xml = Zeroizing::new(api::fetch_manifest(provider_config, &username, &password)?);
-
-    if debug {
-        // Redact credentials from the raw XML before printing
-        let redacted = xml
-            .replace(&username, "[REDACTED_USER]")
-            .replace(password.as_str(), "[REDACTED_PASS]");
-        println!("{}", redacted);
-        return Ok(());
-    }
-
-    let manifest = manifest::parse_manifest(&xml)?;
-
-    let mut servers: Vec<&manifest::Server> = manifest.servers.iter().collect();
-    match sort {
-        "score" => servers.sort_by_key(|s| server::score(s)),
-        "load" => servers.sort_by(|a, b| {
-            server::load_perc(a).cmp(&server::load_perc(b))
-        }),
-        "users" => servers.sort_by(|a, b| a.users.cmp(&b.users)),
-        "name" => servers.sort_by(|a, b| a.name.cmp(&b.name)),
-        _ => {
-            warn!("Unknown sort key '{}', defaulting to score", sort);
-            servers.sort_by_key(|s| server::score(s));
-        }
-    }
-
-    println!(
-        "{:<20} {:<6} {:<12} {:>6} {:>6} {:>8}",
-        "NAME", "CC", "LOCATION", "USERS", "LOAD%", "SCORE"
-    );
-    println!("{}", "-".repeat(64));
-
-    for s in &servers {
-        let load = server::load_perc(s);
-        println!(
-            "{:<20} {:<6} {:<12} {:>6} {:>5}% {:>8}",
-            s.name,
-            s.country_code,
-            s.location,
-            s.users,
-            load,
-            server::score(s)
-        );
-    }
-
-    println!("\n{} servers total.", servers.len());
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

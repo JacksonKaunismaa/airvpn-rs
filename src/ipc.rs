@@ -38,6 +38,8 @@ pub enum HelperCommand {
     Recover,
     /// Response to EddieProfileFound prompt.
     ImportEddieProfile { accept: bool },
+    /// List available servers.
+    Servers { sort: String, debug: bool },
     Shutdown,
 }
 
@@ -70,6 +72,8 @@ pub enum HelperEvent {
     Error { message: String },
     /// Helper found an Eddie profile and asks the client whether to import it.
     EddieProfileFound { path: String },
+    /// Server list table (formatted string) in response to Servers command.
+    ServerList { table: String },
     Shutdown,
 }
 

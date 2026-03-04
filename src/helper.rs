@@ -20,7 +20,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
 
-use crate::{api, config, connect, ipc, netlock, recovery, wireguard};
+use crate::{api, config, connect, ipc, manifest, netlock, recovery, server, wireguard};
 
 pub const SOCKET_PATH: &str = "/run/airvpn-rs/helper.sock";
 const PID_FILE: &str = "/run/airvpn-rs/helper.pid";
@@ -262,6 +262,7 @@ fn handle_client(stream: UnixStream, state: &mut ConnState, peer_uid: Option<u32
             ipc::HelperCommand::LockStatus => "LockStatus",
             ipc::HelperCommand::Recover => "Recover",
             ipc::HelperCommand::ImportEddieProfile { .. } => "ImportEddieProfile",
+            ipc::HelperCommand::Servers { .. } => "Servers",
             ipc::HelperCommand::Shutdown => "Shutdown",
         });
 
@@ -759,6 +760,20 @@ fn handle_client(stream: UnixStream, state: &mut ConnState, peer_uid: Option<u32
                 send_event(&mut writer, &ipc::HelperEvent::Shutdown);
             }
 
+            ipc::HelperCommand::Servers { sort, debug: debug_xml } => {
+                match dispatch_servers(&sort, debug_xml) {
+                    Ok(table) => {
+                        send_event(&mut writer, &ipc::HelperEvent::ServerList { table });
+                    }
+                    Err(e) => {
+                        send_event(&mut writer, &ipc::HelperEvent::Error {
+                            message: format!("{:#}", e),
+                        });
+                    }
+                }
+                send_event(&mut writer, &ipc::HelperEvent::Shutdown);
+            }
+
             ipc::HelperCommand::ImportEddieProfile { .. } => {
                 // Only valid as a response during Connect's Eddie import flow.
                 // Ignore if received out of context.
@@ -948,4 +963,71 @@ fn dispatch_lock_uninstall() -> Result<String> {
     }
 
     Ok("Persistent lock uninstalled.".to_string())
+}
+
+/// Fetch the server manifest and format it as a table string (or redacted XML
+/// in debug mode). Credentials come from the saved profile — the helper runs
+/// as root and can read `/etc/airvpn-rs/default.profile`.
+fn dispatch_servers(sort: &str, debug_xml: bool) -> Result<String> {
+    use std::fmt::Write;
+    use zeroize::Zeroizing;
+
+    let mut provider_config = api::load_provider_config()?;
+    api::verify_rsa_key_integrity(&provider_config);
+
+    // Resolve credentials from saved profile (helper is root).
+    let profile_options = config::load_profile_options();
+    let username = profile_options.get("login").cloned().unwrap_or_default();
+    let password = profile_options.get("password").cloned().unwrap_or_default();
+    if username.is_empty() || password.is_empty() {
+        anyhow::bail!(
+            "no credentials available — run `sudo airvpn connect` first to set up a profile"
+        );
+    }
+    let password = Zeroizing::new(password);
+
+    let xml = Zeroizing::new(api::fetch_manifest(&mut provider_config, &username, &password)?);
+
+    if debug_xml {
+        let redacted = xml
+            .replace(&username, "[REDACTED_USER]")
+            .replace(password.as_str(), "[REDACTED_PASS]");
+        return Ok(redacted);
+    }
+
+    let m = manifest::parse_manifest(&xml)?;
+    let mut servers: Vec<&manifest::Server> = m.servers.iter().collect();
+    match sort {
+        "score" => servers.sort_by_key(|s| server::score(s)),
+        "load" => servers.sort_by(|a, b| server::load_perc(a).cmp(&server::load_perc(b))),
+        "users" => servers.sort_by(|a, b| a.users.cmp(&b.users)),
+        "name" => servers.sort_by(|a, b| a.name.cmp(&b.name)),
+        _ => {
+            warn!("Unknown sort key '{}', defaulting to score", sort);
+            servers.sort_by_key(|s| server::score(s));
+        }
+    }
+
+    let mut table = String::new();
+    writeln!(
+        table,
+        "{:<20} {:<6} {:<12} {:>6} {:>6} {:>8}",
+        "NAME", "CC", "LOCATION", "USERS", "LOAD%", "SCORE"
+    )?;
+    writeln!(table, "{}", "-".repeat(64))?;
+    for s in &servers {
+        let load = server::load_perc(s);
+        writeln!(
+            table,
+            "{:<20} {:<6} {:<12} {:>6} {:>5}% {:>8}",
+            s.name,
+            s.country_code,
+            s.location,
+            s.users,
+            load,
+            server::score(s)
+        )?;
+    }
+    write!(table, "\n{} servers total.", servers.len())?;
+    Ok(table)
 }

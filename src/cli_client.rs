@@ -219,6 +219,10 @@ fn render_event(event: &HelperEvent) -> EventAction {
             );
             EventAction::Done
         }
+        HelperEvent::ServerList { table } => {
+            println!("{}", table);
+            EventAction::Done
+        }
         HelperEvent::Error { message } => EventAction::Error(message.clone()),
         HelperEvent::EddieProfileFound { .. } => {
             // Handled in send_command before reaching render_event
