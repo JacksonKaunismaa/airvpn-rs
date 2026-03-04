@@ -1,6 +1,6 @@
 # Single Control Plane Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **Status:** Completed (2026-03-04)
 
 **Goal:** Make the CLI a thin socket client — all VPN operations go through the helper daemon.
 

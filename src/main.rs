@@ -252,9 +252,8 @@ fn init_logging() {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Only init full logging (file + stderr) for commands that run in-process.
-    // Thin-client commands (connect, disconnect, status, lock) get their output
-    // from the helper via cli_client — no log file needed.
+    // Only init full logging for the helper daemon process.
+    // All other commands are thin socket clients — output comes from the helper.
     match &cli.command {
         Commands::Helper => init_logging(),
         _ => {}
@@ -286,8 +285,8 @@ fn main() -> anyhow::Result<()> {
             event_vpn_down_arguments,
             event_vpn_down_waitend,
         } => {
-            // Credentials are resolved by the helper daemon (root), never by the CLI.
-            // Helper reads saved profile → Eddie import → error.
+            // Credentials resolved by helper: saved profile → Eddie import (prompts
+            // client for yes/no) → error. No credentials enter CLI process memory.
             let cmd = ipc::HelperCommand::Connect {
                 server,
                 no_lock,

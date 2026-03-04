@@ -1,14 +1,16 @@
 # airvpn-rs
 
 Rust reimplementation of Eddie (AirVPN's official C# client). WireGuard-only, Linux-only, CLI.
-Runs as root via `sudo`. Profile at `/etc/airvpn-rs/default.profile`.
+Single control plane: helper daemon (root, systemd socket-activated) manages all VPN operations.
+CLI and GUI are thin socket clients over `/run/airvpn-rs/helper.sock` (0660 root:wheel).
+Profile at `/etc/airvpn-rs/default.profile` (0600 root:root).
 
 ## Always Do
 
 - Build both debug and release: `cargo build && cargo build --release`
 - Rebuild before telling user to test — they don't rebuild themselves
 - Check `docs/known_divergences.md` before claiming Eddie parity
-- Use `$SUDO_USER` (not `$HOME`) to find user paths when running as root
+- Helper uses peer UID (SO_PEERCRED) to find user's Eddie profile; `sudo airvpn connect` uses `$SUDO_USER`
 
 ## Key Gotchas
 
@@ -52,14 +54,14 @@ Runs as root via `sudo`. Profile at `/etc/airvpn-rs/default.profile`.
 - Persistent table uses `flags owner, persist` + `oifname "avpn-*"` (inner) + `meta mark 51820` (outer WireGuard). No server IP knowledge needed (2026-02-28)
 - `nft -f` ownership is ephemeral (new portid per invocation). `reclaim_and_delete()` must do both in single nft -f call. Owner flag protection is transient — persist flag is the real value (2026-02-28)
 - Eddie has same resolve-then-lock leak window (NetworkLockManager.cs:127) — persistent lock eliminates it entirely (2026-02-28)
-- Connect lifecycle lives in `src/connect.rs` (run, preflight, session, data fetch, reconnection loop). `main.rs` is CLI parsing + dispatch only (2026-02-28)
+- Connect lifecycle lives in `src/connect.rs` (run, preflight, session, data fetch, reconnection loop). `main.rs` is thin socket client dispatching to helper via `cli_client.rs` (2026-03-04)
 - Shared utils in `src/common.rs`: validate_interface_name, read_stdin_password, backoff_secs, MAX_RULE_DELETIONS (2026-02-28)
 - `pub(crate)` doesn't work for lib→bin visibility — this crate has separate lib.rs and main.rs, so library items called from main.rs must be `pub` (2026-02-28)
 - Backoff formula max is 192s (not 300) — exponent capped at 6 via `.min(6)`, so `3 * 2^6 = 192`. The 300 cap is a dead safety net (2026-02-28)
 - `servers.locklast` now defaults false (matching Eddie). `has_default_gateway()` handles WiFi-drop case correctly — locklast=true was redundant and prevented server rotation when server died with WiFi up (2026-03-01)
 - DNS deadlock during reconnection: resolv.conf points to VPN DNS, which is unreachable without tunnel, so `bootme.org` can't resolve. Bootstrap IPs bypass this since they use direct HTTP. Eddie has same issue (2026-03-01)
-- Single control plane: helper daemon is the sole VPN manager. CLI (`src/cli_client.rs`) and GUI are both thin socket clients. All connect/disconnect/status/lock ops go through `/run/airvpn-rs/helper.sock`. Only `servers` and `recover` bypass the helper (2026-03-03)
-- CLI resolves credentials before sending Connect command — helper daemon can't do interactive prompting. ConnectConfig takes pre-resolved username/password strings (2026-03-03)
+- Single control plane: helper daemon is the sole VPN manager. CLI (`src/cli_client.rs`) and GUI are both thin socket clients. ALL commands go through `/run/airvpn-rs/helper.sock` — no direct CLI operations remain (2026-03-04)
+- Helper resolves credentials (saved profile → Eddie import via peer UID → error). No credentials enter non-root memory or transit the socket. First-time setup: `sudo airvpn connect` prompts in root process, helper saves to profile (2026-03-04)
 - GUI uses iced 0.14 with split-process architecture: `airvpn-gui` (user) + `airvpn helper` (root via systemd socket activation). JSON-lines over Unix socket (2026-03-02)
 - Helper uses systemd socket activation — no manual bind/chown. Dev testing: `systemd-socket-activate -l /run/airvpn-rs/helper.sock -- ./target/debug/airvpn helper`. Unit files in `resources/` (2026-03-02)
 - SO_PEERCRED logs connecting UID on every accept(). Socket is 0660/wheel — migrate to dedicated airvpn group for AUR packaging (2026-03-02)

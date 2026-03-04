@@ -5,7 +5,7 @@
 > code comments (search for "Eddie" or "diverge") and compare against
 > [Eddie's source](https://github.com/AirVPN/Eddie).
 >
-> Last reviewed: 2026-02-27
+> Last reviewed: 2026-03-04
 
 This codebase is a faithful Rust reimplementation of Eddie (AirVPN's official
 C# client). The vast majority of behavior — scoring formulas, penalty system,
@@ -170,7 +170,44 @@ doesn't have per-app UIDs, so the nftables approach is more appropriate).
 
 ---
 
-## 8. Persistent lock ICMP: per-server hole-punching
+## 8. Single control plane with systemd socket activation
+
+**Eddie:** CLI connects directly (elevated via pkexec). GUI launches a separate
+elevated C++ binary via pkexec, communicates over TCP localhost with session-key
+auth. CLI and GUI are independent VPN managers.
+
+**airvpn-rs:** Single daemon (helper) started by systemd socket activation. Both
+CLI and GUI are thin clients that send JSON-lines commands over a Unix socket at
+`/run/airvpn-rs/helper.sock`. The helper is the sole VPN control plane — it runs
+`connect::run()`, manages recovery state, and handles all privileged operations.
+All commands (connect, disconnect, status, servers, lock, recover) go through the
+socket. The CLI has no direct operations.
+
+The helper resolves credentials from its root-owned profile (`/etc/airvpn-rs/`,
+0600). For Eddie profile import, the helper reads the user's file using the peer
+UID from `SO_PEERCRED` and asks the client to confirm (only "yes/no" transits the
+socket — no credentials). First-time setup without an Eddie profile requires
+`sudo airvpn connect` so interactive password entry stays in root process memory.
+
+**Why:** Eddie's dual-manager model requires conflict guards
+(`refuse_if_helper_running`, recovery state PID checks) to prevent CLI and GUI
+from stepping on each other. A single control plane eliminates this complexity.
+systemd socket activation eliminates Eddie's pkexec race condition (socket appears
+before `chown()` completes) by creating the socket atomically with correct
+permissions before the process starts.
+
+Socket permissions are `0660` with group `wheel`. Any wheel user can connect
+without sudo. `SO_PEERCRED` captures the connecting UID on every accept (used for
+Eddie profile discovery and audit logging).
+
+**Files:** `src/helper.rs`, `src/cli_client.rs`, `resources/airvpn-helper.socket`,
+`resources/airvpn-helper.service`
+
+**Eddie ref:** `src/Lib.Core/Elevated/IElevated.cs`, `src/Lib.Core/Elevated/ISocket.cs`
+
+---
+
+## 9. Persistent lock ICMP: per-server hole-punching
 
 **Eddie:** Session lock allows ICMP when `netlock.allow_ping = true` (default).
 Input: echo-request accept. Output: echo-reply accept. No outgoing echo-request.
