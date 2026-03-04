@@ -339,7 +339,7 @@ fn handle_client(stream: UnixStream, state: &mut ConnState, peer_uid: Option<u32
 
                     // Import Eddie profile as root (can read user files + keyring via UID)
                     match config::load_eddie_profile_for_uid(&eddie_path, peer_uid.unwrap()) {
-                        Ok((opts, is_v2n)) => {
+                        Ok((opts, _is_v2n)) => {
                             let eddie_user = opts.get("login").cloned().unwrap_or_default();
                             let eddie_pass = opts.get("password").cloned().unwrap_or_default();
                             if eddie_user.is_empty() || eddie_pass.is_empty() {
