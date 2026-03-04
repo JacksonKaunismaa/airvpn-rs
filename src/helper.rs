@@ -581,7 +581,19 @@ fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
             }
 
             ipc::HelperCommand::ListServers { skip_ping, sort } => {
-                match dispatch_list_servers(skip_ping, sort.as_deref()) {
+                // Resolve credentials from profile (same as Connect, but no Eddie import)
+                let profile_options = config::load_profile_options();
+                let prof_user = profile_options.get("login").cloned().unwrap_or_default();
+                let prof_pass = profile_options.get("password").cloned().unwrap_or_default();
+
+                if prof_user.is_empty() || prof_pass.is_empty() {
+                    send_event(&mut writer, &ipc::HelperEvent::Error {
+                        message: "No credentials configured. Run `sudo airvpn connect` first to set up credentials.".into(),
+                    });
+                    continue;
+                }
+
+                match dispatch_list_servers(skip_ping, sort.as_deref(), &prof_user, &prof_pass) {
                     Ok(servers) => {
                         send_event(&mut writer, &ipc::HelperEvent::ServerList { servers });
                     }
@@ -694,12 +706,10 @@ fn dispatch_save_profile(options: &std::collections::HashMap<String, String>) ->
 
 /// Fetch the server list from the API, optionally measure pings, and return
 /// scored ServerInfo structs for the GUI.
-fn dispatch_list_servers(skip_ping: bool, sort: Option<&str>) -> Result<Vec<ipc::ServerInfo>> {
+fn dispatch_list_servers(skip_ping: bool, sort: Option<&str>, username: &str, password: &str) -> Result<Vec<ipc::ServerInfo>> {
     let provider_config = api::load_provider_config()?;
-    let options = config::load_profile_options();
-    let (username, password) = config::resolve_credentials(None, None, &options)?;
 
-    let manifest_xml = api::fetch_manifest(&provider_config, &username, &password)?;
+    let manifest_xml = api::fetch_manifest(&provider_config, username, password)?;
     let manifest = manifest::parse_manifest(&manifest_xml)?;
 
     let pings = if skip_ping {
