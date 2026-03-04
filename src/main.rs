@@ -319,76 +319,35 @@ fn main() -> anyhow::Result<()> {
             event_vpn_down_arguments,
             event_vpn_down_waitend,
         } => {
-            // Read explicit CLI credentials (--username / --password-stdin).
-            // Don't resolve from profile here — the helper reads the root-owned
-            // profile. If the helper has no credentials, it'll error and we
-            // retry with interactively-resolved credentials.
+            // Send explicit CLI credentials if provided (--username / --password-stdin).
+            // The helper resolves credentials: saved profile → CLI-provided → Eddie
+            // import (prompts client via EddieProfileFound event) → error.
+            // No credentials enter non-root process memory unless the user explicitly
+            // passes --username/--password-stdin.
             let stdin_password = common::read_stdin_password(password_stdin)?;
-            let cli_user = username.unwrap_or_default();
-            let cli_pass = stdin_password.map(|z| z.to_string()).unwrap_or_default();
 
-            let build_cmd = |user: String, pass: String| ipc::HelperCommand::Connect {
-                server: server.clone(),
+            let cmd = ipc::HelperCommand::Connect {
+                server,
                 no_lock,
                 allow_lan,
                 skip_ping,
-                allow_country: allow_country.clone(),
-                deny_country: deny_country.clone(),
-                username: user,
-                password: pass,
-                allow_server: allow_server.clone(),
-                deny_server: deny_server.clone(),
+                allow_country,
+                deny_country,
+                username: username.unwrap_or_default(),
+                password: stdin_password.map(|z| z.to_string()).unwrap_or_default(),
+                allow_server,
+                deny_server,
                 no_reconnect,
                 no_verify,
                 no_lock_last,
                 no_start_last,
-                ipv6_mode: ipv6_mode.clone(),
-                dns_servers: dns_servers.clone(),
-                event_pre: [event_vpn_pre_filename.clone(), event_vpn_pre_arguments.clone(), event_vpn_pre_waitend.clone()],
-                event_up: [event_vpn_up_filename.clone(), event_vpn_up_arguments.clone(), event_vpn_up_waitend.clone()],
-                event_down: [event_vpn_down_filename.clone(), event_vpn_down_arguments.clone(), event_vpn_down_waitend.clone()],
+                ipv6_mode,
+                dns_servers,
+                event_pre: [event_vpn_pre_filename, event_vpn_pre_arguments, event_vpn_pre_waitend],
+                event_up: [event_vpn_up_filename, event_vpn_up_arguments, event_vpn_up_waitend],
+                event_down: [event_vpn_down_filename, event_vpn_down_arguments, event_vpn_down_waitend],
             };
-
-            // First attempt: send CLI-provided credentials (may be empty).
-            // If the helper has saved credentials in its profile, it uses those.
-            let result = cli_client::send_command(&build_cmd(cli_user.clone(), cli_pass.clone()));
-
-            match result {
-                Ok(()) => Ok(()),
-                Err(e) => {
-                    let msg = format!("{}", e);
-                    if !msg.contains("no credentials available") || !cli_user.is_empty() {
-                        // Real error or user provided credentials that failed
-                        return Err(e);
-                    }
-                    // Helper has no profile and CLI sent empty credentials.
-                    // Try Eddie import (credentials already on disk — acceptable
-                    // to send over socket). If no Eddie profile, require sudo
-                    // so interactive password entry stays in root process memory.
-                    let profile_options = config::load_profile_options();
-                    let has_profile_creds = profile_options.get("login")
-                        .is_some_and(|v| !v.is_empty());
-
-                    if has_profile_creds {
-                        // Eddie import succeeded — send imported credentials
-                        let (user, pass) = config::resolve_credentials(
-                            None, None, &profile_options,
-                        )?;
-                        cli_client::send_command(&build_cmd(user, pass))
-                    } else if nix::unistd::geteuid().is_root() {
-                        // Running as root — safe to prompt interactively
-                        let (user, pass) = config::resolve_credentials(
-                            None, None, &profile_options,
-                        )?;
-                        cli_client::send_command(&build_cmd(user, pass))
-                    } else {
-                        anyhow::bail!(
-                            "No saved credentials. Run `sudo airvpn connect` for first-time setup \
-                             (password entry requires root for security)."
-                        )
-                    }
-                }
-            }
+            cli_client::send_command(&cmd)
         }
         Commands::Disconnect => {
             cli_client::send_command(&ipc::HelperCommand::Disconnect)

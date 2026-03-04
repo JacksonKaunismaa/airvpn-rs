@@ -38,6 +38,8 @@ pub enum HelperCommand {
     LockDisable,
     LockStatus,
     Recover,
+    /// Response to EddieProfileFound prompt.
+    ImportEddieProfile { accept: bool },
     Shutdown,
 }
 
@@ -68,6 +70,8 @@ pub enum HelperEvent {
         persistent_installed: bool,
     },
     Error { message: String },
+    /// Helper found an Eddie profile and asks the client whether to import it.
+    EddieProfileFound { path: String },
     Shutdown,
 }
 

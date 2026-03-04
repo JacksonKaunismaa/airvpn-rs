@@ -557,6 +557,37 @@ pub fn eddie_keyring_read(id: &str) -> Result<Option<String>> {
     }
 }
 
+/// Read Eddie keyring entry using a specific UID (for helper daemon use).
+/// Drops to the target user via sudo -u to access their D-Bus keyring.
+pub fn eddie_keyring_read_for_uid(id: &str, uid: u32) -> Result<Option<String>> {
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+        .context("failed to look up user by UID")?
+        .context("UID not found in /etc/passwd")?;
+    let username = user.name;
+    let dbus_addr = format!("unix:path=/run/user/{}/bus", uid);
+
+    let output = std::process::Command::new("timeout")
+        .args(["10", "sudo", "-u", &username])
+        .arg(format!("DBUS_SESSION_BUS_ADDRESS={}", dbus_addr))
+        .args(["secret-tool", "lookup", "Eddie Profile", id])
+        .output()
+        .context("failed to run secret-tool as user for Eddie keyring lookup")?;
+
+    if output.status.success() {
+        let password = String::from_utf8(output.stdout)
+            .context("keyring value is not valid UTF-8")?
+            .trim_end_matches('\n')
+            .to_string();
+        if password.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(password))
+        }
+    } else {
+        Ok(None)
+    }
+}
+
 /// Write a password to the system keyring for the given profile ID.
 /// Uses `timeout` to prevent indefinite hangs (gnome-keyring issue #116).
 pub fn keyring_write(id: &str, password: &str) -> Result<()> {

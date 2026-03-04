@@ -56,6 +56,14 @@ fn eddie_profile_path() -> Option<PathBuf> {
     if path.exists() { Some(path) } else { None }
 }
 
+/// Find Eddie profile for a specific user by UID (for helper daemon use).
+/// Resolves the user's home directory from /etc/passwd via the UID.
+pub fn eddie_profile_path_for_uid(uid: u32) -> Option<PathBuf> {
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)).ok()??;
+    let path = user.dir.join(".config/eddie/default.profile");
+    if path.exists() { Some(path) } else { None }
+}
+
 /// Warn if a profile uses v2n format on a non-root-owned file.
 ///
 /// v2n uses a hardcoded password (no real encryption). This is fine for
@@ -294,7 +302,7 @@ pub fn load_profile_options() -> HashMap<String, String> {
 ///
 /// Eddie stores keyring passwords under attribute `"Eddie Profile" = "<profile_id>"`
 /// instead of our `application=airvpn-rs, profile-id=<id>`.
-fn load_eddie_profile(path: &Path) -> Result<HashMap<String, String>> {
+pub fn load_eddie_profile(path: &Path) -> Result<HashMap<String, String>> {
     let password_provider = || {
         rpassword::prompt_password("Eddie profile password: ")
             .context("failed to read profile password from stdin")
@@ -304,6 +312,28 @@ fn load_eddie_profile(path: &Path) -> Result<HashMap<String, String>> {
         path,
         password_provider,
         crate::profile::eddie_keyring_read,
+    )?;
+
+    warn_if_insecure_v2n(path, format);
+
+    let trimmed = data.iter().position(|&b| !b.is_ascii_whitespace());
+    let is_xml = trimmed.is_some_and(|i| data[i] == b'<');
+
+    if is_xml {
+        parse_xml_options(&data)
+    } else {
+        parse_json_options(&data)
+    }
+}
+
+/// Load Eddie profile using a specific UID for keyring access (helper daemon use).
+pub fn load_eddie_profile_for_uid(path: &Path, uid: u32) -> Result<HashMap<String, String>> {
+    let keyring_reader = move |id: &str| crate::profile::eddie_keyring_read_for_uid(id, uid);
+
+    let (format, _id, data) = crate::profile::load_profile_with_keyring(
+        path,
+        || anyhow::bail!("Eddie profile requires a password (v2p format) — run sudo airvpn connect"),
+        keyring_reader,
     )?;
 
     warn_if_insecure_v2n(path, format);

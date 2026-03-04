@@ -58,7 +58,8 @@ fn get_systemd_listener() -> Result<UnixListener> {
 }
 
 /// Log the UID, GID, and PID of the connecting peer process.
-fn log_peer_credentials(stream: &UnixStream) {
+/// Returns the peer UID (needed for Eddie profile discovery).
+fn log_peer_credentials(stream: &UnixStream) -> Option<u32> {
     use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 
     match getsockopt(stream, PeerCredentials) {
@@ -69,9 +70,11 @@ fn log_peer_credentials(stream: &UnixStream) {
                 creds.uid(),
                 creds.gid()
             );
+            Some(creds.uid())
         }
         Err(e) => {
             warn!("Client connected (failed to get peer credentials: {})", e);
+            None
         }
     }
 }
@@ -128,8 +131,8 @@ pub fn run() -> Result<()> {
             Ok((stream, _addr)) => {
                 // Switch back to blocking for the next cycle
                 listener.set_nonblocking(false).ok();
-                log_peer_credentials(&stream);
-                if let Err(e) = handle_client(stream, &mut conn_state) {
+                let peer_uid = log_peer_credentials(&stream);
+                if let Err(e) = handle_client(stream, &mut conn_state, peer_uid) {
                     warn!("Client session ended with error: {}", e);
                 }
                 info!("Client disconnected");
@@ -215,18 +218,20 @@ impl ConnState {
 }
 
 /// Handle a single client connection: read commands, dispatch, send events.
-fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
+fn handle_client(stream: UnixStream, state: &mut ConnState, peer_uid: Option<u32>) -> Result<()> {
     let mut writer = stream.try_clone().context("failed to clone stream")?;
-    let reader = BufReader::new(stream);
+    let mut reader = BufReader::new(stream);
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => break, // EOF
+            Ok(_) => {}
             Err(e) => {
                 debug!("Read error (client disconnected?): {}", e);
                 break;
             }
-        };
+        }
 
         if line.trim().is_empty() {
             continue;
@@ -256,6 +261,7 @@ fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
             ipc::HelperCommand::LockDisable => "LockDisable",
             ipc::HelperCommand::LockStatus => "LockStatus",
             ipc::HelperCommand::Recover => "Recover",
+            ipc::HelperCommand::ImportEddieProfile { .. } => "ImportEddieProfile",
             ipc::HelperCommand::Shutdown => "Shutdown",
         });
 
@@ -294,28 +300,84 @@ fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
                     }
                 }
 
-                // Resolve credentials: profile (root-readable) takes priority,
-                // then CLI-provided credentials (from Eddie import or prompt),
-                // then error.
+                // Resolve credentials:
+                // 1. Our saved profile (root-readable)
+                // 2. CLI-provided (--username / --password-stdin)
+                // 3. Eddie profile import (helper reads as root, asks client to confirm)
+                // 4. Error
                 let profile_options = config::load_profile_options();
-                let (resolved_username, resolved_password) = {
-                    let prof_user = profile_options.get("login").cloned().unwrap_or_default();
-                    let prof_pass = profile_options.get("password").cloned().unwrap_or_default();
-                    if !prof_user.is_empty() && !prof_pass.is_empty() {
-                        (prof_user, prof_pass)
-                    } else if !username.is_empty() && !password.is_empty() {
-                        // CLI resolved credentials (Eddie import or interactive prompt).
-                        // Save to profile so future connects don't need prompting.
-                        if let Err(e) = config::save_credentials(&username, &password) {
-                            warn!("Could not save credentials to profile: {:#}", e);
+                let prof_user = profile_options.get("login").cloned().unwrap_or_default();
+                let prof_pass = profile_options.get("password").cloned().unwrap_or_default();
+
+                let (resolved_username, resolved_password) = if !prof_user.is_empty() && !prof_pass.is_empty() {
+                    (prof_user, prof_pass)
+                } else if !username.is_empty() && !password.is_empty() {
+                    // CLI provided explicit credentials. Save for future use.
+                    if let Err(e) = config::save_credentials(&username, &password) {
+                        warn!("Could not save credentials to profile: {:#}", e);
+                    }
+                    (username, password)
+                } else if let Some(eddie_path) = peer_uid.and_then(config::eddie_profile_path_for_uid) {
+                    // Found Eddie profile for the connecting user. Ask them to confirm.
+                    send_event(&mut writer, &ipc::HelperEvent::EddieProfileFound {
+                        path: eddie_path.display().to_string(),
+                    });
+
+                    // Wait for ImportEddieProfile response from the client
+                    let mut accepted = false;
+                    loop {
+                        let mut resp = String::new();
+                        match reader.read_line(&mut resp) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
                         }
-                        (username, password)
-                    } else {
+                        if resp.trim().is_empty() { continue; }
+                        if let Ok(ipc::HelperCommand::ImportEddieProfile { accept }) = ipc::decode_line(&resp) {
+                            accepted = accept;
+                            break;
+                        }
+                    }
+
+                    if !accepted {
                         send_event(&mut writer, &ipc::HelperEvent::Error {
-                            message: "no credentials available — provide --username and --password-stdin, or save credentials in profile".to_string(),
+                            message: "no credentials available — run `sudo airvpn connect` for first-time setup".to_string(),
                         });
                         continue;
                     }
+
+                    // Import Eddie profile as root (can read user files + keyring via UID)
+                    match config::load_eddie_profile_for_uid(&eddie_path, peer_uid.unwrap()) {
+                        Ok(opts) => {
+                            let eddie_user = opts.get("login").cloned().unwrap_or_default();
+                            let eddie_pass = opts.get("password").cloned().unwrap_or_default();
+                            if eddie_user.is_empty() || eddie_pass.is_empty() {
+                                send_event(&mut writer, &ipc::HelperEvent::Error {
+                                    message: "Eddie profile has no credentials".to_string(),
+                                });
+                                continue;
+                            }
+                            // Save imported credentials + other settings
+                            if let Err(e) = config::save_credentials(&eddie_user, &eddie_pass) {
+                                warn!("Could not save credentials to profile: {:#}", e);
+                            }
+                            send_event(&mut writer, &ipc::HelperEvent::Log {
+                                level: "info".to_string(),
+                                message: format!("Imported credentials from Eddie profile."),
+                            });
+                            (eddie_user, eddie_pass)
+                        }
+                        Err(e) => {
+                            send_event(&mut writer, &ipc::HelperEvent::Error {
+                                message: format!("Failed to import Eddie profile: {:#}", e),
+                            });
+                            continue;
+                        }
+                    }
+                } else {
+                    send_event(&mut writer, &ipc::HelperEvent::Error {
+                        message: "no credentials available — run `sudo airvpn connect` for first-time setup".to_string(),
+                    });
+                    continue;
                 };
 
                 // Reset shutdown flag for the new connection
@@ -654,6 +716,12 @@ fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
                     }
                 }
                 send_event(&mut writer, &ipc::HelperEvent::Shutdown);
+            }
+
+            ipc::HelperCommand::ImportEddieProfile { .. } => {
+                // Only valid as a response during Connect's Eddie import flow.
+                // Ignore if received out of context.
+                debug!("ImportEddieProfile received outside Connect flow, ignoring");
             }
 
             ipc::HelperCommand::Shutdown => {

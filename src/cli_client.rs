@@ -23,6 +23,7 @@ fn connect_to_helper() -> Result<UnixStream> {
 
 /// Send a command and consume the event stream, printing each event.
 /// Returns when a terminal event is received (Disconnected, Error, Shutdown).
+/// Handles interactive prompts from the helper (e.g. Eddie profile import).
 pub fn send_command(cmd: &HelperCommand) -> Result<()> {
     let stream = connect_to_helper()?;
     let mut writer = stream.try_clone().context("clone socket")?;
@@ -42,6 +43,16 @@ pub fn send_command(cmd: &HelperCommand) -> Result<()> {
         let event: HelperEvent =
             ipc::decode_line(&line).with_context(|| format!("decode event: {}", line))?;
 
+        // Handle interactive prompts from the helper
+        if let HelperEvent::EddieProfileFound { ref path } = event {
+            let accept = prompt_eddie_import(path);
+            let resp = ipc::HelperCommand::ImportEddieProfile { accept };
+            let resp_line = ipc::encode_line(&resp).context("encode response")?;
+            writer.write_all(resp_line.as_bytes()).context("write response")?;
+            writer.flush().context("flush response")?;
+            continue;
+        }
+
         match render_event(&event) {
             EventAction::Continue => {}
             EventAction::Done => return Ok(()),
@@ -51,6 +62,21 @@ pub fn send_command(cmd: &HelperCommand) -> Result<()> {
 
     // Socket closed without terminal event
     anyhow::bail!("helper closed connection unexpectedly")
+}
+
+/// Prompt the user whether to import an Eddie profile.
+fn prompt_eddie_import(path: &str) -> bool {
+    use std::io::Write;
+    eprint!("Eddie profile detected at {}. Import settings? [Y/n] ", path);
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    match std::io::stdin().read_line(&mut answer) {
+        Ok(_) => {
+            let trimmed = answer.trim().to_lowercase();
+            trimmed.is_empty() || trimmed == "y" || trimmed == "yes"
+        }
+        Err(_) => false,
+    }
 }
 
 /// Send a Status command and render both StateChanged + LockStatus events.
@@ -194,6 +220,10 @@ fn render_event(event: &HelperEvent) -> EventAction {
             EventAction::Done
         }
         HelperEvent::Error { message } => EventAction::Error(message.clone()),
+        HelperEvent::EddieProfileFound { .. } => {
+            // Handled in send_command before reaching render_event
+            EventAction::Continue
+        }
         HelperEvent::Shutdown => EventAction::Done,
     }
 }

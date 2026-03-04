@@ -173,6 +173,9 @@ impl App {
             HelperEvent::Error { message } => {
                 self.helper_error = Some(message);
             }
+            HelperEvent::EddieProfileFound { .. } => {
+                // GUI doesn't handle Eddie import yet
+            }
             HelperEvent::Shutdown => {
                 self.helper = None;
                 self.connection_state = ConnectionState::Disconnected;
