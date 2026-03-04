@@ -306,7 +306,7 @@ impl App {
             Message::FetchServers => {
                 if let Some(ref mut helper) = self.helper {
                     self.servers_loading = true;
-                    let cmd = HelperCommand::ListServers { skip_ping: false, sort: None };
+                    let cmd = HelperCommand::ListServers { skip_ping: true, sort: None };
                     if let Err(e) = helper.send(&cmd) {
                         self.servers_loading = false;
                         self.helper_error =
