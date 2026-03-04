@@ -95,6 +95,9 @@ enum Commands {
     Status,
     /// List available servers
     Servers {
+        /// Sort order: score (default), name, load, users
+        #[arg(long, default_value = "score")]
+        sort: String,
         /// Skip latency measurement (faster, uses score without ping)
         #[arg(long)]
         skip_ping: bool,
@@ -310,8 +313,11 @@ fn main() -> anyhow::Result<()> {
             cli_client::send_command(&ipc::HelperCommand::Disconnect)
         }
         Commands::Status => cli_client::send_status(),
-        Commands::Servers { skip_ping } => {
-            cli_client::send_command(&ipc::HelperCommand::ListServers { skip_ping })
+        Commands::Servers { sort, skip_ping } => {
+            cli_client::send_command(&ipc::HelperCommand::ListServers {
+                skip_ping,
+                sort: Some(sort),
+            })
         }
         Commands::Recover => cli_client::send_command(&ipc::HelperCommand::Recover),
         Commands::Lock { action } => {

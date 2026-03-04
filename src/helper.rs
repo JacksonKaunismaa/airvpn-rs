@@ -580,8 +580,8 @@ fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
                 send_event(&mut writer, &build_lock_status());
             }
 
-            ipc::HelperCommand::ListServers { skip_ping } => {
-                match dispatch_list_servers(skip_ping) {
+            ipc::HelperCommand::ListServers { skip_ping, sort } => {
+                match dispatch_list_servers(skip_ping, sort.as_deref()) {
                     Ok(servers) => {
                         send_event(&mut writer, &ipc::HelperEvent::ServerList { servers });
                     }
@@ -694,7 +694,7 @@ fn dispatch_save_profile(options: &std::collections::HashMap<String, String>) ->
 
 /// Fetch the server list from the API, optionally measure pings, and return
 /// scored ServerInfo structs for the GUI.
-fn dispatch_list_servers(skip_ping: bool) -> Result<Vec<ipc::ServerInfo>> {
+fn dispatch_list_servers(skip_ping: bool, sort: Option<&str>) -> Result<Vec<ipc::ServerInfo>> {
     let provider_config = api::load_provider_config()?;
     let options = config::load_profile_options();
     let (username, password) = config::resolve_credentials(None, None, &options)?;
@@ -708,7 +708,7 @@ fn dispatch_list_servers(skip_ping: bool) -> Result<Vec<ipc::ServerInfo>> {
         pinger::measure_all(&manifest.servers)
     };
 
-    let servers: Vec<ipc::ServerInfo> = manifest
+    let mut servers: Vec<ipc::ServerInfo> = manifest
         .servers
         .iter()
         .map(|s| {
@@ -742,6 +742,20 @@ fn dispatch_list_servers(skip_ping: bool) -> Result<Vec<ipc::ServerInfo>> {
             }
         })
         .collect();
+
+    // Sort the results (None = no sorting, GUI sorts client-side)
+    if let Some(sort_field) = sort {
+        match sort_field {
+            "name" => servers.sort_by(|a, b| a.name.cmp(&b.name)),
+            "load" => servers.sort_by(|a, b| {
+                a.load_percent
+                    .partial_cmp(&b.load_percent)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+            "users" => servers.sort_by_key(|s| s.users),
+            _ => servers.sort_by_key(|s| s.score), // "score" or default
+        }
+    }
 
     Ok(servers)
 }

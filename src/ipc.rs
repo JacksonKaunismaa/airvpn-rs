@@ -55,7 +55,7 @@ pub enum HelperCommand {
     /// Response to EddieProfileFound prompt.
     ImportEddieProfile { accept: bool },
     Shutdown,
-    ListServers { skip_ping: bool },
+    ListServers { skip_ping: bool, sort: Option<String> },
     GetProfile,
     SaveProfile { options: std::collections::HashMap<String, String> },
 }
@@ -260,7 +260,7 @@ mod tests {
 
     #[test]
     fn test_command_list_servers_roundtrip() {
-        let cmd = HelperCommand::ListServers { skip_ping: true };
+        let cmd = HelperCommand::ListServers { skip_ping: true, sort: Some("name".to_string()) };
 
         let encoded = encode_line(&cmd).expect("encode failed");
         assert!(encoded.contains(r#""cmd":"ListServers""#));
@@ -268,8 +268,9 @@ mod tests {
 
         let decoded: HelperCommand = decode_line(&encoded).expect("decode failed");
         match decoded {
-            HelperCommand::ListServers { skip_ping } => {
+            HelperCommand::ListServers { skip_ping, sort } => {
                 assert!(skip_ping);
+                assert_eq!(sort, Some("name".to_string()));
             }
             other => panic!("expected ListServers, got {:?}", other),
         }
