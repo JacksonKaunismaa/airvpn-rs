@@ -2,21 +2,19 @@
 # leak-monitor.sh — Real-time traffic leak detector
 #
 # Monitors physical interface(s) for any non-local IP traffic that isn't
-# going to a known AirVPN destination.
+# going to a known AirVPN destination. Detects both IP leaks and DNS leaks
+# (including DoH/DoQ bypass via public resolver detection on any port).
 #
 # Default mode:
-# - Uses a broad static allowlist (bootstrap IPs + all server IPs)
-# - Optimized for low noise during development
+# - Allowlists bootstrap IPs + all AirVPN server IPs (from server_ips.txt)
+# - Flags DNS on 53/853 + traffic to public DNS resolvers on any port
+# - Runs active leak probes (can be disabled with --no-active-probe)
 #
 # Strict mode (--strict):
-# - Uses strict auto interface discovery (all non-loopback, non-VPN interfaces)
-# - Uses minimal allowlist: endpoint(s) + bootstrap IPs (+ --allow extras)
-# - Flags any DNS on 53/853, plus traffic to common public DNS resolvers on any port
-# - Runs active leak probes by default (can be disabled with --no-active-probe)
-# - Exits with setup error if endpoint is unknown and cannot be inferred
-#
-# Also monitors for DNS leaks: any DNS traffic (port 53/853) leaving via a
-# physical interface is flagged, since VPN-routed DNS should use the tunnel.
+# - Minimal allowlist: only current endpoint + bootstrap IPs (+ --allow extras)
+# - Same DNS and probe behavior as default
+# - Useful for verifying only the connected endpoint gets physical traffic
+# - Requires endpoint IP (--endpoint or state.json)
 #
 # Works regardless of VPN state — no restart needed on connect/disconnect/switch.
 #
@@ -24,9 +22,9 @@
 #   sudo ./leak-monitor.sh [--strict] [--endpoint IP] [--allow IP] [--iface IFACE] [--duration SECS]
 #
 # Examples:
-#   sudo ./leak-monitor.sh                             # Default mode (broad allowlist)
-#   sudo ./leak-monitor.sh --strict --iface eth0       # Strict mode (recommended)
-#   sudo ./leak-monitor.sh --strict --endpoint 1.2.3.4 --iface eth0
+#   sudo ./leak-monitor.sh                             # Full detection (recommended)
+#   sudo ./leak-monitor.sh --no-active-probe           # Passive monitoring only
+#   sudo ./leak-monitor.sh --strict --endpoint 1.2.3.4 # Endpoint-only allowlist
 #   sudo ./leak-monitor.sh --allow 1.2.3.4             # Extra allowlisted IP
 #   sudo ./leak-monitor.sh --iface eth0                # Specific interface
 #   sudo ./leak-monitor.sh --duration 60               # Run for 60 seconds
@@ -48,7 +46,7 @@ STATE_FILE="/run/airvpn-rs/state.json"
 LOG_DIR="/tmp/leak-monitor"
 DURATION=0  # 0 = indefinite
 STRICT_MODE=0
-ACTIVE_PROBE=-1  # -1 = auto (on in strict mode), 0 = off, 1 = on
+ACTIVE_PROBE=-1  # -1 = auto (on by default), 0 = off, 1 = on
 PROBE_INTERVAL=1
 
 # ANSI colors
@@ -72,20 +70,21 @@ Usage:
   sudo ./leak-monitor.sh [--strict] [--active-probe|--no-active-probe] [--probe-interval SECS] [--endpoint IP] [--allow IP] [--iface IFACE] [--duration SECS]
 
 Options:
-  --strict         Tight mode: minimal allowlist with auto interface discovery
-  --active-probe   Generate active leak-attempt traffic in background
+  --strict         Endpoint-only allowlist (requires --endpoint or state.json)
+  --active-probe   Generate active leak-attempt traffic in background (default: on)
   --no-active-probe Disable active probes
   --probe-interval Probe loop interval in seconds (default: 1)
-  --endpoint IP    Allowlist endpoint IP (repeatable). In strict mode, required unless state.json provides endpoint_ip
+  --endpoint IP    Allowlist endpoint IP (repeatable). Required in strict mode
   --allow IP       Extra allowlisted destination IP/CIDR (repeatable)
   --iface IFACE    Interface to monitor (repeatable). Overrides auto interface discovery
   --duration SECS  Exit after N seconds (default: run indefinitely)
   --help, -h       Show this help
 
 Examples:
-  sudo ./leak-monitor.sh
-  sudo ./leak-monitor.sh --strict --iface eth0 --endpoint 203.0.113.10
-  sudo ./leak-monitor.sh --strict --iface eth0 --iface wlan0
+  sudo ./leak-monitor.sh                                    # Full detection
+  sudo ./leak-monitor.sh --no-active-probe                  # Passive only
+  sudo ./leak-monitor.sh --strict --endpoint 203.0.113.10   # Endpoint-only
+  sudo ./leak-monitor.sh --iface eth0 --iface wlan0
 EOF
 }
 
@@ -135,11 +134,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ $ACTIVE_PROBE -lt 0 ]]; then
-    if [[ $STRICT_MODE -eq 1 ]]; then
-        ACTIVE_PROBE=1
-    else
-        ACTIVE_PROBE=0
-    fi
+    ACTIVE_PROBE=1
 fi
 
 # -----------------------------------------------------------------------------
@@ -194,6 +189,7 @@ else
 fi
 
 if [[ $STRICT_MODE -eq 1 ]]; then
+    # Strict: only current endpoint + bootstrap (no broad server list)
     if [[ ${#ENDPOINT_IPS[@]} -eq 0 ]]; then
         STATE_ENDPOINT="$(load_endpoint_from_state || true)"
         if [[ -n "${STATE_ENDPOINT:-}" ]]; then
@@ -210,7 +206,7 @@ if [[ $STRICT_MODE -eq 1 ]]; then
     ALLOWED_IPS+=("${ENDPOINT_IPS[@]}")
     echo -e "${GREEN}Strict mode endpoint allowlist: ${#ENDPOINT_IPS[@]} IP(s)${NC}"
 else
-    # Source 2: All AirVPN server entry IPs (static file, not committed)
+    # Default: all AirVPN server entry IPs (covers latency pings, server switching, etc.)
     if [[ -f "$SERVER_IPS_FILE" ]]; then
         mapfile -t SERVER_IPS < "$SERVER_IPS_FILE"
         ALLOWED_IPS+=("${SERVER_IPS[@]}")
@@ -242,9 +238,6 @@ if [[ ${#IFACES[@]} -eq 0 ]]; then
 fi
 
 echo -e "${GREEN}Monitoring interfaces: ${IFACES[*]}${NC}"
-if [[ $STRICT_MODE -eq 1 ]]; then
-    echo -e "${GREEN}Strict mode auto-discovery selected ${#IFACES[@]} interface(s).${NC}"
-fi
 
 # -----------------------------------------------------------------------------
 # Build tcpdump filter
@@ -288,25 +281,23 @@ FILTER=$(build_filter "${ALLOWED_IPS[@]}" | tr '\n' ' ')
 # common VPN leak vector and the main filter excludes RFC1918 traffic.
 DNS_FILTER="(dst port 53 or dst port 853) and not (dst host 127.0.0.1 or dst host ::1)"
 
-PUBLIC_DNS_FILTER=""
-if [[ $STRICT_MODE -eq 1 ]]; then
-    COMMON_DNS_IPS=(
-        "8.8.8.8" "8.8.4.4"
-        "1.1.1.1" "1.0.0.1"
-        "9.9.9.9" "149.112.112.112"
-        "208.67.222.222" "208.67.220.220"
-        "2620:fe::fe" "2620:fe::9"
-        "2606:4700:4700::1111" "2606:4700:4700::1001"
-        "2001:4860:4860::8888" "2001:4860:4860::8844"
-        "2620:119:35::35" "2620:119:53::53"
-    )
-    dns_clause=""
-    for ip in "${COMMON_DNS_IPS[@]}"; do
-        dns_clause="${dns_clause}dst host $ip or "
-    done
-    dns_clause="${dns_clause% or }"
-    PUBLIC_DNS_FILTER="(${dns_clause}) and not (dst host 127.0.0.1 or dst host ::1)"
-fi
+# Public DNS resolver filter: catches DoH/DoQ bypass attempts on any port.
+COMMON_DNS_IPS=(
+    "8.8.8.8" "8.8.4.4"
+    "1.1.1.1" "1.0.0.1"
+    "9.9.9.9" "149.112.112.112"
+    "208.67.222.222" "208.67.220.220"
+    "2620:fe::fe" "2620:fe::9"
+    "2606:4700:4700::1111" "2606:4700:4700::1001"
+    "2001:4860:4860::8888" "2001:4860:4860::8844"
+    "2620:119:35::35" "2620:119:53::53"
+)
+dns_clause=""
+for ip in "${COMMON_DNS_IPS[@]}"; do
+    dns_clause="${dns_clause}dst host $ip or "
+done
+dns_clause="${dns_clause% or }"
+PUBLIC_DNS_FILTER="(${dns_clause}) and not (dst host 127.0.0.1 or dst host ::1)"
 
 # -----------------------------------------------------------------------------
 # Setup log directory
@@ -319,7 +310,7 @@ LEAK_TXT="$LOG_DIR/leaks-${RUN_TS}.txt"
 echo -e "${YELLOW}Leak capture: ${LEAK_LOG}${NC}"
 echo -e "${YELLOW}Leak summary: ${LEAK_TXT}${NC}"
 if [[ $STRICT_MODE -eq 1 ]]; then
-    echo -e "${YELLOW}Mode: STRICT${NC}"
+    echo -e "${YELLOW}Mode: STRICT (endpoint-only allowlist)${NC}"
 fi
 echo ""
 
@@ -487,21 +478,19 @@ for iface in "${IFACES[@]}"; do
     ) &
     TCPDUMP_PIDS+=($!)
 
-    if [[ $STRICT_MODE -eq 1 ]]; then
-        # Strict DNS bypass detector: catches DoH/DoQ-to-public-resolver attempts.
-        # shellcheck disable=SC2086
-        tcpdump -i "$iface" -w "${LEAK_LOG%.pcap}-${iface}-public-dns.pcap" $PUBLIC_DNS_FILTER 2>"$LOG_DIR/tcpdump-${iface}-public-dns.err" &
-        TCPDUMP_PIDS+=($!)
+    # Public DNS bypass detector: catches DoH/DoQ-to-public-resolver attempts.
+    # shellcheck disable=SC2086
+    tcpdump -i "$iface" -w "${LEAK_LOG%.pcap}-${iface}-public-dns.pcap" $PUBLIC_DNS_FILTER 2>"$LOG_DIR/tcpdump-${iface}-public-dns.err" &
+    TCPDUMP_PIDS+=($!)
 
-        # shellcheck disable=SC2086
-        tcpdump -i "$iface" -l -n $PUBLIC_DNS_FILTER 2>/dev/null | (
-            while read -r line; do
-                [[ -z "$line" ]] && continue
-                handle_leak "[PUBLIC-DNS $iface] $line"
-            done
-        ) &
-        TCPDUMP_PIDS+=($!)
-    fi
+    # shellcheck disable=SC2086
+    tcpdump -i "$iface" -l -n $PUBLIC_DNS_FILTER 2>/dev/null | (
+        while read -r line; do
+            [[ -z "$line" ]] && continue
+            handle_leak "[PUBLIC-DNS $iface] $line"
+        done
+    ) &
+    TCPDUMP_PIDS+=($!)
 done
 
 # Verify at least one tcpdump is still running
@@ -526,9 +515,7 @@ echo ""
 echo -e "${GREEN}Monitoring active ($ALIVE capture processes). Press Ctrl+C to stop.${NC}"
 echo -e "${YELLOW}Any traffic to non-AirVPN IPs will trigger an alert.${NC}"
 echo -e "${YELLOW}DNS traffic (port 53/853) on physical interfaces is flagged separately.${NC}"
-if [[ $STRICT_MODE -eq 1 ]]; then
-    echo -e "${YELLOW}Strict mode: traffic to common public DNS resolvers on any port is also flagged.${NC}"
-fi
+echo -e "${YELLOW}Traffic to public DNS resolvers (8.8.8.8, 1.1.1.1, etc.) on any port is also flagged.${NC}"
 if [[ $ACTIVE_PROBE -eq 1 ]]; then
     echo -e "${YELLOW}Active probes: periodic DNS/TCP/UDP/HTTP leak-attempt traffic is being generated.${NC}"
 fi
