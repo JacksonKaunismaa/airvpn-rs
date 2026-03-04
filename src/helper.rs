@@ -364,18 +364,16 @@ fn handle_client(stream: UnixStream, state: &mut ConnState, peer_uid: Option<u32
                                 level: "info".to_string(),
                                 message: "Imported credentials from Eddie profile.".to_string(),
                             });
-                            if is_v2n {
-                                send_event(&mut writer, &ipc::HelperEvent::Log {
-                                    level: "warn".to_string(),
-                                    message: format!(
-                                        "Your Eddie profile at {} uses v2n format (no real encryption). \
-                                         Credentials are readable by any process running as your user. \
-                                         They are now saved in the root-owned airvpn-rs profile (0600). \
-                                         Consider deleting the Eddie profile if you no longer use Eddie.",
-                                        eddie_path.display()
-                                    ),
-                                });
-                            }
+                            send_event(&mut writer, &ipc::HelperEvent::Log {
+                                level: "warn".to_string(),
+                                message: format!(
+                                    "Your Eddie profile at {} stores credentials accessible to your \
+                                     user account (v2n = plaintext, v2s = user keyring). \
+                                     They are now saved in the root-owned airvpn-rs profile (0600). \
+                                     Consider deleting the Eddie profile if you no longer use Eddie.",
+                                    eddie_path.display()
+                                ),
+                            });
                             (eddie_user, eddie_pass)
                         }
                         Err(e) => {
