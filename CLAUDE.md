@@ -70,3 +70,6 @@ Profile at `/etc/airvpn-rs/default.profile` (0600 root:root).
 - Rust's `UnixListener` retries on EINTR internally — signals don't break `accept()`. Use nonblocking accept + 1s sleep loop to check shutdown flag (2026-03-02)
 - ConnState (connect/stats thread handles) must live outside `handle_client()` — persists across GUI reconnections so the helper knows about running VPN from previous GUI session (2026-03-02)
 - Skip ping when server is predetermined (--server or startlast) — saves ~10s on every connect (2026-03-02)
+- Fixed VPN interface name `avpn0` (`VPN_INTERFACE` constant in `wireguard.rs`) — enables exact nft matching instead of wildcard `avpn-*` (2026-03-04)
+- DNS leaks through LAN rules during reconnection: both IPs in same RFC1918 /8 (WiFi 10.73.x.x → VPN DNS 10.128.0.1). Fix: `oifname != "avpn0" dport { 53, 853 } drop` before LAN accept rules in both locks (2026-03-04)
+- `partial_disconnect()` intentionally keeps DNS pointing to VPN DNS during reconnection — restoring original would leak to local resolver. The DNS block rules handle the remaining leak vector (2026-03-04)
