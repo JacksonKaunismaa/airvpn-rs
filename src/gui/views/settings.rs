@@ -69,8 +69,7 @@ fn event_hook_group<'a>(
 /// Render the settings tab.
 #[allow(clippy::too_many_arguments)]
 pub fn view<'a>(
-    username: &str,
-    password: &str,
+    credentials_configured: bool,
     startlast: bool,
     locklast: bool,
     ipv6_mode: &str,
@@ -98,28 +97,24 @@ pub fn view<'a>(
 
     // ── Credentials ──────────────────────────────────────
     content = content.push(section_header("Credentials"));
-    content = content.push(
-        column![
-            row![
-                label("Username").width(120),
-                text_input("AirVPN username", username)
-                    .on_input(Message::SettingsUsernameChanged)
-                    .width(Fill),
+    if credentials_configured {
+        content = content.push(
+            text("Credentials: Configured")
+                .size(14)
+                .color(iced::Color::from_rgb(0.3, 0.75, 0.4)),
+        );
+    } else {
+        content = content.push(
+            column![
+                text("Credentials: Not configured")
+                    .size(14)
+                    .color(iced::Color::from_rgb(0.91, 0.65, 0.2)),
+                text("Run `sudo airvpn connect` to set up credentials, or import from Eddie profile.")
+                    .size(12),
             ]
-            .spacing(8)
-            .align_y(iced::Alignment::Center),
-            row![
-                label("Password").width(120),
-                text_input("Password", password)
-                    .on_input(Message::SettingsPasswordChanged)
-                    .secure(true)
-                    .width(Fill),
-            ]
-            .spacing(8)
-            .align_y(iced::Alignment::Center),
-        ]
-        .spacing(8),
-    );
+            .spacing(4),
+        );
+    }
 
     // ── Server Preferences ───────────────────────────────
     content = content.push(section_header("Server Preferences"));
