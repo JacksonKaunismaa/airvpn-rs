@@ -16,8 +16,6 @@ pub enum HelperCommand {
         skip_ping: bool,
         allow_country: Vec<String>,
         deny_country: Vec<String>,
-        username: String,
-        password: String,
         allow_server: Vec<String>,
         deny_server: Vec<String>,
         no_reconnect: bool,
@@ -107,8 +105,6 @@ mod tests {
             skip_ping: false,
             allow_country: vec!["NL".to_string(), "DE".to_string()],
             deny_country: vec!["US".to_string()],
-            username: "testuser".to_string(),
-            password: "testpass".to_string(),
             allow_server: vec!["Castor".to_string()],
             deny_server: vec!["Pollux".to_string()],
             no_reconnect: true,
@@ -135,8 +131,6 @@ mod tests {
                 skip_ping,
                 allow_country,
                 deny_country,
-                username,
-                password,
                 allow_server,
                 deny_server,
                 no_reconnect,
@@ -155,8 +149,6 @@ mod tests {
                 assert!(!skip_ping);
                 assert_eq!(allow_country, vec!["NL", "DE"]);
                 assert_eq!(deny_country, vec!["US"]);
-                assert_eq!(username, "testuser");
-                assert_eq!(password, "testpass");
                 assert_eq!(allow_server, vec!["Castor"]);
                 assert_eq!(deny_server, vec!["Pollux"]);
                 assert!(no_reconnect);

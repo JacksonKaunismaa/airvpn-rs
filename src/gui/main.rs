@@ -80,8 +80,6 @@ impl App {
                         skip_ping: false,
                         allow_country: Vec::new(),
                         deny_country: Vec::new(),
-                        username: String::new(),
-                        password: String::new(),
                         allow_server: Vec::new(),
                         deny_server: Vec::new(),
                         no_reconnect: false,

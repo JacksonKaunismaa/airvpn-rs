@@ -29,12 +29,6 @@ enum Commands {
         /// Disable auto-reconnection (single-shot mode)
         #[arg(long)]
         no_reconnect: bool,
-        /// AirVPN username (overrides saved credentials)
-        #[arg(long)]
-        username: Option<String>,
-        /// Read password from stdin (one line, for scripted use)
-        #[arg(long)]
-        password_stdin: bool,
         /// Only connect to these servers (repeatable)
         #[arg(long)]
         allow_server: Vec<String>,
@@ -297,8 +291,6 @@ fn main() -> anyhow::Result<()> {
             no_lock,
             allow_lan,
             no_reconnect,
-            username,
-            password_stdin,
             allow_server,
             deny_server,
             allow_country,
@@ -319,13 +311,8 @@ fn main() -> anyhow::Result<()> {
             event_vpn_down_arguments,
             event_vpn_down_waitend,
         } => {
-            // Send explicit CLI credentials if provided (--username / --password-stdin).
-            // The helper resolves credentials: saved profile → CLI-provided → Eddie
-            // import (prompts client via EddieProfileFound event) → error.
-            // No credentials enter non-root process memory unless the user explicitly
-            // passes --username/--password-stdin.
-            let stdin_password = common::read_stdin_password(password_stdin)?;
-
+            // Credentials are resolved by the helper daemon (root), never by the CLI.
+            // Helper reads saved profile → Eddie import → error.
             let cmd = ipc::HelperCommand::Connect {
                 server,
                 no_lock,
@@ -333,8 +320,6 @@ fn main() -> anyhow::Result<()> {
                 skip_ping,
                 allow_country,
                 deny_country,
-                username: username.unwrap_or_default(),
-                password: stdin_password.map(|z| z.to_string()).unwrap_or_default(),
                 allow_server,
                 deny_server,
                 no_reconnect,

@@ -273,8 +273,6 @@ fn handle_client(stream: UnixStream, state: &mut ConnState, peer_uid: Option<u32
                 skip_ping,
                 allow_country,
                 deny_country,
-                username,
-                password,
                 allow_server,
                 deny_server,
                 no_reconnect,
@@ -302,21 +300,14 @@ fn handle_client(stream: UnixStream, state: &mut ConnState, peer_uid: Option<u32
 
                 // Resolve credentials:
                 // 1. Our saved profile (root-readable)
-                // 2. CLI-provided (--username / --password-stdin)
-                // 3. Eddie profile import (helper reads as root, asks client to confirm)
-                // 4. Error
+                // 2. Eddie profile import (helper reads as root, asks client to confirm)
+                // 3. Error — user must run `sudo airvpn connect` for first-time setup
                 let profile_options = config::load_profile_options();
                 let prof_user = profile_options.get("login").cloned().unwrap_or_default();
                 let prof_pass = profile_options.get("password").cloned().unwrap_or_default();
 
                 let (resolved_username, resolved_password) = if !prof_user.is_empty() && !prof_pass.is_empty() {
                     (prof_user, prof_pass)
-                } else if !username.is_empty() && !password.is_empty() {
-                    // CLI provided explicit credentials. Save for future use.
-                    if let Err(e) = config::save_credentials(&username, &password) {
-                        warn!("Could not save credentials to profile: {:#}", e);
-                    }
-                    (username, password)
                 } else if let Some(eddie_path) = peer_uid.and_then(config::eddie_profile_path_for_uid) {
                     // Found Eddie profile for the connecting user. Ask them to confirm.
                     send_event(&mut writer, &ipc::HelperEvent::EddieProfileFound {
