@@ -362,12 +362,31 @@ fn main() -> anyhow::Result<()> {
                         return Err(e);
                     }
                     // Helper has no profile and CLI sent empty credentials.
-                    // Resolve interactively (Eddie import + prompt).
+                    // Try Eddie import (credentials already on disk — acceptable
+                    // to send over socket). If no Eddie profile, require sudo
+                    // so interactive password entry stays in root process memory.
                     let profile_options = config::load_profile_options();
-                    let (user, pass) = config::resolve_credentials(
-                        None, None, &profile_options,
-                    )?;
-                    cli_client::send_command(&build_cmd(user, pass))
+                    let has_profile_creds = profile_options.get("login")
+                        .is_some_and(|v| !v.is_empty());
+
+                    if has_profile_creds {
+                        // Eddie import succeeded — send imported credentials
+                        let (user, pass) = config::resolve_credentials(
+                            None, None, &profile_options,
+                        )?;
+                        cli_client::send_command(&build_cmd(user, pass))
+                    } else if nix::unistd::geteuid().is_root() {
+                        // Running as root — safe to prompt interactively
+                        let (user, pass) = config::resolve_credentials(
+                            None, None, &profile_options,
+                        )?;
+                        cli_client::send_command(&build_cmd(user, pass))
+                    } else {
+                        anyhow::bail!(
+                            "No saved credentials. Run `sudo airvpn connect` for first-time setup \
+                             (password entry requires root for security)."
+                        )
+                    }
                 }
             }
         }
