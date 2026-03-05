@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::os::fd::FromRawFd;
 use std::os::unix::net::UnixListener;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -45,6 +46,7 @@ fn json_response(status: StatusCode, body: &impl serde::Serialize) -> Response<H
     Response::builder()
         .status(status)
         .header("Content-Type", "application/json")
+        // Infallible → Infallible: Full<Bytes> never errors
         .body(Full::new(Bytes::from(json)).map_err(|never| match never {}).boxed())
         .unwrap()
 }
@@ -58,7 +60,7 @@ fn error_response(status: StatusCode, msg: &str) -> Response<HyperBody> {
 }
 
 // ---------------------------------------------------------------------------
-// Query string parser (moved from deleted http.rs)
+// Query string parser
 // ---------------------------------------------------------------------------
 
 /// Parse a `key=value&key2=value2` query string into a map.
@@ -85,7 +87,7 @@ fn parse_query_string(qs: &str) -> HashMap<String, String> {
 struct ConnState {
     connect_handle: Option<thread::JoinHandle<()>>,
     stats_handle: Option<thread::JoinHandle<()>>,
-    stats_stop: Arc<std::sync::atomic::AtomicBool>,
+    stats_stop: Arc<AtomicBool>,
     /// Server info captured from engine events, readable across sessions.
     server_info: Arc<Mutex<(String, String, String)>>,
 }
@@ -95,7 +97,7 @@ impl ConnState {
         Self {
             connect_handle: None,
             stats_handle: None,
-            stats_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stats_stop: Arc::new(AtomicBool::new(false)),
             server_info: Arc::new(Mutex::new((String::new(), String::new(), String::new()))),
         }
     }
@@ -229,6 +231,7 @@ async fn async_run(std_listener: std::os::unix::net::UnixListener) -> Result<()>
                                 async move { Ok::<_, Infallible>(router(req, state, peer_uid).await) }
                             });
 
+                            // One request per connection — CLI/GUI clients don't reuse connections
                             if let Err(e) = http1::Builder::new()
                                 .keep_alive(false)
                                 .serve_connection(io, service)
@@ -245,7 +248,7 @@ async fn async_run(std_listener: std::os::unix::net::UnixListener) -> Result<()>
             }
             // Check shutdown flag every second (signal handler sets it)
             _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                if shutdown.load(Ordering::Relaxed) {
                     info!("Shutdown signal received, exiting helper");
                     break;
                 }
@@ -259,7 +262,7 @@ async fn async_run(std_listener: std::os::unix::net::UnixListener) -> Result<()>
         if st.conn.is_connected() {
             info!("Disconnecting active VPN before shutdown...");
             let connect_handle = st.conn.connect_handle.take();
-            st.conn.stats_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            st.conn.stats_stop.store(true, Ordering::SeqCst);
             let stats_handle = st.conn.stats_handle.take();
             drop(st);
             if let Some(h) = connect_handle { let _ = h.join(); }
@@ -341,11 +344,9 @@ fn build_lock_status_info() -> ipc::LockStatusInfo {
     }
 }
 
-/// GET /status — return connection state + lock status.
-fn handle_status(state: &State) -> Response<HyperBody> {
-    let st = state.lock().unwrap();
-
-    let conn_state = if st.conn.is_connected() {
+/// Determine the current connection state from shared state + recovery + wireguard.
+fn current_connection_state(st: &SharedState) -> ipc::ConnectionState {
+    if st.conn.is_connected() {
         match recovery::load() {
             Ok(Some(rec)) if wireguard::is_connected(&rec.wg_interface) => {
                 let (name, country, location) = st.conn.server_info
@@ -371,7 +372,13 @@ fn handle_status(state: &State) -> Response<HyperBody> {
             }
             _ => ipc::ConnectionState::Disconnected,
         }
-    };
+    }
+}
+
+/// GET /status — return connection state + lock status.
+fn handle_status(state: &State) -> Response<HyperBody> {
+    let st = state.lock().unwrap();
+    let conn_state = current_connection_state(&st);
     drop(st);
 
     let status = ipc::StatusResponse {
@@ -458,7 +465,7 @@ async fn handle_connect_async(
     // Stop any previous stats poller
     {
         let mut st = state.lock().unwrap();
-        st.conn.stats_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        st.conn.stats_stop.store(true, Ordering::SeqCst);
         let prev_stats = st.conn.stats_handle.take();
         drop(st);
         if let Some(h) = prev_stats {
@@ -509,7 +516,6 @@ async fn handle_connect_async(
         }
 
         // Signal disconnected
-        drop(result);
         if let Ok(mut st) = connect_broadcast_state.lock() {
             st.broadcast(&ipc::HelperEvent::StateChanged {
                 state: ipc::ConnectionState::Disconnected,
@@ -519,12 +525,12 @@ async fn handle_connect_async(
 
     // Spawn stats polling thread
     let stats_state = Arc::clone(&state);
-    let stats_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stats_stop = Arc::new(AtomicBool::new(false));
     let stats_stop_clone = stats_stop.clone();
     let stats_handle = thread::spawn(move || {
         loop {
             thread::sleep(Duration::from_secs(2));
-            if stats_stop_clone.load(std::sync::atomic::Ordering::SeqCst) {
+            if stats_stop_clone.load(Ordering::SeqCst) {
                 break;
             }
 
@@ -561,7 +567,7 @@ async fn handle_connect_async(
         st.conn.stats_handle = Some(stats_handle);
     }
 
-    // Wait for the event forwarder in a background thread
+    // Detach: event_fwd exits when event_rx drops (connect thread finishes)
     thread::spawn(move || {
         let _ = event_fwd.join();
     });
@@ -642,7 +648,7 @@ fn handle_disconnect(state: &State) -> Response<HyperBody> {
         let (connect_handle, stats_handle) = {
             let mut st = state.lock().unwrap();
             let ch = st.conn.connect_handle.take();
-            st.conn.stats_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            st.conn.stats_stop.store(true, Ordering::SeqCst);
             let sh = st.conn.stats_handle.take();
             (ch, sh)
         };
@@ -685,7 +691,7 @@ fn handle_disconnect(state: &State) -> Response<HyperBody> {
         // Stop stats poller and clear server info
         {
             let mut st = state.lock().unwrap();
-            st.conn.stats_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            st.conn.stats_stop.store(true, Ordering::SeqCst);
             let sh = st.conn.stats_handle.take();
             drop(st);
             if let Some(h) = sh {
@@ -717,33 +723,7 @@ async fn handle_events_async(state: State) -> Response<HyperBody> {
 
     {
         let st = state.lock().unwrap();
-        initial_state = if st.conn.is_connected() {
-            match recovery::load() {
-                Ok(Some(rec)) if wireguard::is_connected(&rec.wg_interface) => {
-                    let (name, country, location) = st.conn.server_info
-                        .lock()
-                        .map(|info| info.clone())
-                        .unwrap_or_default();
-                    ipc::ConnectionState::Connected {
-                        server_name: name,
-                        server_country: country,
-                        server_location: location,
-                    }
-                }
-                _ => ipc::ConnectionState::Connecting,
-            }
-        } else {
-            match recovery::load() {
-                Ok(Some(rec)) if wireguard::is_connected(&rec.wg_interface) => {
-                    ipc::ConnectionState::Connected {
-                        server_name: rec.wg_interface.clone(),
-                        server_country: String::new(),
-                        server_location: String::new(),
-                    }
-                }
-                _ => ipc::ConnectionState::Disconnected,
-            }
-        };
+        initial_state = current_connection_state(&st);
     }
 
     // Create subscriber channel
@@ -756,11 +736,10 @@ async fn handle_events_async(state: State) -> Response<HyperBody> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(32);
 
     // Spawn blocking thread that reads from sub_rx and sends to tokio tx
-    let tx_clone = tx.clone();
     tokio::task::spawn_blocking(move || {
         // Send initial events
-        let _ = send_event_frame(&tx_clone, &ipc::HelperEvent::StateChanged { state: initial_state });
-        let _ = send_event_frame(&tx_clone, &ipc::HelperEvent::LockStatus {
+        let _ = send_event_frame(&tx, &ipc::HelperEvent::StateChanged { state: initial_state });
+        let _ = send_event_frame(&tx, &ipc::HelperEvent::LockStatus {
             session_active: lock_info.session_active,
             persistent_active: lock_info.persistent_active,
             persistent_installed: lock_info.persistent_installed,
@@ -770,10 +749,10 @@ async fn handle_events_async(state: State) -> Response<HyperBody> {
         loop {
             match sub_rx.recv_timeout(Duration::from_secs(30)) {
                 Ok(event) => {
-                    if send_event_frame(&tx_clone, &event).is_err() { break; }
+                    if send_event_frame(&tx, &event).is_err() { break; }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if send_event_frame(&tx_clone, &json!({"keepalive": true})).is_err() { break; }
+                    if send_event_frame(&tx, &json!({"keepalive": true})).is_err() { break; }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
@@ -928,7 +907,7 @@ fn handle_shutdown(state: &State) -> Response<HyperBody> {
     // Take handles — drop lock before joining
     let (connect_handle, stats_handle) = {
         let mut st = state.lock().unwrap();
-        st.conn.stats_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        st.conn.stats_stop.store(true, Ordering::SeqCst);
         (st.conn.connect_handle.take(), st.conn.stats_handle.take())
     };
 
