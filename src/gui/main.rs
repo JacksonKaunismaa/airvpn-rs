@@ -57,8 +57,7 @@ struct App {
     activity: String,
 
     // Profile-backed settings (loaded via GetProfile, saved via SaveProfile)
-    settings_username: String,
-    settings_password: String,
+    settings_credentials_configured: bool,
     settings_startlast: bool,
     settings_locklast: bool,
     settings_ipv6_mode: String,
@@ -99,8 +98,6 @@ pub enum Message {
     LogClear,
     FetchProfile,
     SaveSettings,
-    SettingsUsernameChanged(String),
-    SettingsPasswordChanged(String),
     SettingsStartlastToggle(bool),
     SettingsLocklastToggle(bool),
     SettingsIpv6ModeChanged(String),
@@ -149,8 +146,7 @@ impl App {
             log_filter_error: true,
             activity: String::new(),
 
-            settings_username: String::new(),
-            settings_password: String::new(),
+            settings_credentials_configured: false,
             settings_startlast: false,
             settings_locklast: false,
             settings_ipv6_mode: String::new(),
@@ -306,7 +302,7 @@ impl App {
             Message::FetchServers => {
                 if let Some(ref mut helper) = self.helper {
                     self.servers_loading = true;
-                    let cmd = HelperCommand::ListServers { skip_ping: true, sort: None };
+                    let cmd = HelperCommand::ListServers { skip_ping: false };
                     if let Err(e) = helper.send(&cmd) {
                         self.servers_loading = false;
                         self.helper_error =
@@ -370,8 +366,6 @@ impl App {
             Message::SaveSettings => {
                 if let Some(ref mut helper) = self.helper {
                     let mut options = std::collections::HashMap::new();
-                    options.insert("login".into(), self.settings_username.clone());
-                    options.insert("password".into(), self.settings_password.clone());
                     options.insert("servers.startlast".into(), if self.settings_startlast { "True" } else { "False" }.into());
                     options.insert("servers.locklast".into(), if self.settings_locklast { "True" } else { "False" }.into());
                     options.insert("network.ipv6.mode".into(), self.settings_ipv6_mode.clone());
@@ -389,16 +383,6 @@ impl App {
                         self.helper_error = Some(format!("Failed to send SaveProfile: {}", e));
                     }
                 }
-                Task::none()
-            }
-            Message::SettingsUsernameChanged(val) => {
-                self.settings_username = val;
-                self.settings_dirty = true;
-                Task::none()
-            }
-            Message::SettingsPasswordChanged(val) => {
-                self.settings_password = val;
-                self.settings_dirty = true;
                 Task::none()
             }
             Message::SettingsStartlastToggle(val) => {
@@ -552,13 +536,8 @@ impl App {
             HelperEvent::Error { message } => {
                 self.helper_error = Some(message);
             }
-            HelperEvent::EddieProfileFound { path } => {
-                // Auto-accept Eddie profile import. The helper runs as root
-                // and safely copies credentials to the root-owned profile.
-                self.activity = format!("Importing Eddie profile from {}...", path);
-                if let Some(ref mut helper) = self.helper {
-                    let _ = helper.send(&HelperCommand::ImportEddieProfile { accept: true });
-                }
+            HelperEvent::EddieProfileFound { .. } => {
+                // GUI doesn't handle Eddie import yet
             }
             HelperEvent::Shutdown => {
                 self.helper = None;
@@ -568,9 +547,8 @@ impl App {
                 self.servers = servers;
                 self.servers_loading = false;
             }
-            HelperEvent::Profile { options } => {
-                self.settings_username = options.get("login").cloned().unwrap_or_default();
-                self.settings_password = options.get("password").cloned().unwrap_or_default();
+            HelperEvent::Profile { options, credentials_configured } => {
+                self.settings_credentials_configured = credentials_configured;
                 self.settings_startlast = options.get("servers.startlast").map(|v| v == "True").unwrap_or(false);
                 self.settings_locklast = options.get("servers.locklast").map(|v| v == "True").unwrap_or(false);
                 self.settings_ipv6_mode = options.get("network.ipv6.mode").cloned().unwrap_or_else(|| "in-block".into());
@@ -649,8 +627,7 @@ impl App {
                 self.log_filter_error,
             ),
             views::Tab::Settings => views::settings::view(
-                &self.settings_username,
-                &self.settings_password,
+                self.settings_credentials_configured,
                 self.settings_startlast,
                 self.settings_locklast,
                 &self.settings_ipv6_mode,

@@ -610,8 +610,14 @@ fn handle_client(stream: UnixStream, state: &mut ConnState) -> Result<()> {
 
             ipc::HelperCommand::GetProfile => {
                 match dispatch_get_profile() {
-                    Ok(options) => {
-                        send_event(&mut writer, &ipc::HelperEvent::Profile { options });
+                    Ok(mut options) => {
+                        // Check credential status before stripping — credentials
+                        // must stay in the root process, never sent to GUI.
+                        let credentials_configured = options.get("login").map_or(false, |v| !v.is_empty())
+                            && options.get("password").map_or(false, |v| !v.is_empty());
+                        options.remove("login");
+                        options.remove("password");
+                        send_event(&mut writer, &ipc::HelperEvent::Profile { options, credentials_configured });
                     }
                     Err(e) => {
                         send_event(

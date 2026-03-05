@@ -92,7 +92,10 @@ pub enum HelperEvent {
     Shutdown,
     /// Server list in response to ListServers command.
     ServerList { servers: Vec<ServerInfo> },
-    Profile { options: std::collections::HashMap<String, String> },
+    Profile {
+        options: std::collections::HashMap<String, String>,
+        credentials_configured: bool,
+    },
     ProfileSaved,
 }
 
@@ -364,7 +367,7 @@ mod tests {
         let mut options = std::collections::HashMap::new();
         options.insert("servers.locklast".to_string(), "false".to_string());
         options.insert("mode.protocol".to_string(), "wireguard".to_string());
-        let event = HelperEvent::Profile { options: options.clone() };
+        let event = HelperEvent::Profile { options: options.clone(), credentials_configured: true };
 
         let encoded = encode_line(&event).expect("encode failed");
         assert!(encoded.contains(r#""event":"Profile""#));
@@ -372,8 +375,9 @@ mod tests {
 
         let decoded: HelperEvent = decode_line(&encoded).expect("decode failed");
         match decoded {
-            HelperEvent::Profile { options: decoded_options } => {
+            HelperEvent::Profile { options: decoded_options, credentials_configured } => {
                 assert_eq!(decoded_options, options);
+                assert!(credentials_configured);
             }
             other => panic!("expected Profile, got {:?}", other),
         }
