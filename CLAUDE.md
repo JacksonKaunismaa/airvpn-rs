@@ -12,6 +12,7 @@ Profile at `/etc/airvpn-rs/default.profile` (0600 root:root).
 - Rebuild before telling user to test — they don't rebuild themselves
 - Check `docs/known_divergences.md` before claiming Eddie parity
 - Helper uses peer UID (SO_PEERCRED) to find user's Eddie profile; `sudo airvpn connect` uses `$SUDO_USER`
+- Update `scripts/install.sh` when adding new components (binaries, systemd units, config files, directories) to the installation
 
 ## Key Gotchas
 

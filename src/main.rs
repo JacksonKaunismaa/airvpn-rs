@@ -1,7 +1,7 @@
 use airvpn::{cli_client, ipc};
 
-
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 
 #[derive(Parser)]
 #[command(name = "airvpn", about = "AirVPN WireGuard client")]
@@ -112,6 +112,12 @@ enum Commands {
     },
     /// Run as root helper daemon for GUI IPC
     Helper,
+    /// Generate shell completions
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: Shell,
+    },
 }
 
 #[derive(Subcommand)]
@@ -326,6 +332,10 @@ fn main() -> anyhow::Result<()> {
         Commands::Helper => {
             use airvpn::helper;
             helper::run()
+        }
+        Commands::Completions { shell } => {
+            clap_complete::generate(shell, &mut Cli::command(), "airvpn", &mut std::io::stdout());
+            Ok(())
         }
     }
 }

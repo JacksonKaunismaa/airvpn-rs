@@ -45,6 +45,12 @@ if systemctl is-active --quiet airvpn-helper.service; then
     systemctl stop airvpn-helper.service
 fi
 
+# Install shell completions
+echo "Installing shell completions..."
+/usr/bin/airvpn completions zsh > /usr/share/zsh/site-functions/_airvpn 2>/dev/null || true
+/usr/bin/airvpn completions fish > /usr/share/fish/vendor_completions.d/airvpn.fish 2>/dev/null || true
+/usr/bin/airvpn completions bash > /usr/share/bash-completion/completions/airvpn 2>/dev/null || true
+
 # Enable socket activation
 systemctl enable --now airvpn-helper.socket
 
@@ -54,6 +60,9 @@ echo "  /usr/bin/airvpn"
 echo "  /usr/bin/airvpn-gui"
 echo "  /usr/share/applications/airvpn-gui.desktop"
 echo "  /usr/share/icons/hicolor/scalable/apps/airvpn.svg"
+echo "  /usr/share/zsh/site-functions/_airvpn"
+echo "  /usr/share/fish/vendor_completions.d/airvpn.fish"
+echo "  /usr/share/bash-completion/completions/airvpn"
 echo "  /etc/systemd/system/airvpn-helper.socket (enabled)"
 echo "  /etc/systemd/system/airvpn-helper.service"
 echo ""

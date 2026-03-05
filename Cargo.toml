@@ -18,6 +18,7 @@ path = "src/gui/main.rs"
 [dependencies]
 # CLI
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 
 # HTTP
 reqwest = { version = "0.12", features = ["blocking"] }
