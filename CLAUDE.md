@@ -2,7 +2,8 @@
 
 Rust reimplementation of Eddie (AirVPN's official C# client). WireGuard-only, Linux-only, CLI.
 Single control plane: helper daemon (root, systemd socket-activated) manages all VPN operations.
-CLI and GUI are thin socket clients over `/run/airvpn-rs/helper.sock` (0660 root:wheel).
+CLI and GUI are thin HTTP clients over `/run/airvpn-rs/helper.sock` (0660 root:wheel).
+HTTP/1.1 over Unix socket, thread-per-connection — multiple clients work concurrently.
 Profile at `/etc/airvpn-rs/default.profile` (0600 root:root).
 
 ## Always Do
@@ -62,7 +63,7 @@ Profile at `/etc/airvpn-rs/default.profile` (0600 root:root).
 - DNS deadlock during reconnection: resolv.conf points to VPN DNS, which is unreachable without tunnel, so `bootme.org` can't resolve. Bootstrap IPs bypass this since they use direct HTTP. Eddie has same issue (2026-03-01)
 - Single control plane: helper daemon is the sole VPN manager. CLI (`src/cli_client.rs`) and GUI are both thin socket clients. ALL commands go through `/run/airvpn-rs/helper.sock` — no direct CLI operations remain (2026-03-04)
 - Helper resolves credentials (saved profile → Eddie import via peer UID → error). No credentials enter non-root memory or transit the socket. First-time setup: `sudo airvpn connect` prompts in root process, helper saves to profile (2026-03-04)
-- GUI uses iced 0.14 with split-process architecture: `airvpn-gui` (user) + `airvpn helper` (root via systemd socket activation). JSON-lines over Unix socket (2026-03-02)
+- GUI uses iced 0.14 with split-process architecture: `airvpn-gui` (user) + `airvpn helper` (root via systemd socket activation). HTTP/1.1 over Unix socket (2026-03-05)
 - Helper uses systemd socket activation — no manual bind/chown. Dev testing: `systemd-socket-activate -l /run/airvpn-rs/helper.sock -- ./target/debug/airvpn helper`. Unit files in `resources/` (2026-03-02)
 - SO_PEERCRED logs connecting UID on every accept(). Socket is 0660/wheel — migrate to dedicated airvpn group for AUR packaging (2026-03-02)
 - `/run/airvpn-rs/` created by systemd (`DirectoryMode=0755` in .socket unit). `recovery::ensure_state_dir()` still creates it for standalone CLI use (2026-03-02)
@@ -73,3 +74,7 @@ Profile at `/etc/airvpn-rs/default.profile` (0600 root:root).
 - Fixed VPN interface name `avpn0` (`VPN_INTERFACE` constant in `wireguard.rs`) — enables exact nft matching instead of wildcard `avpn-*` (2026-03-04)
 - DNS leaks through LAN rules during reconnection: both IPs in same RFC1918 /8 (WiFi 10.73.x.x → VPN DNS 10.128.0.1). Fix: `oifname != "avpn0" dport { 53, 853 } drop` before LAN accept rules in both locks (2026-03-04)
 - `partial_disconnect()` intentionally keeps DNS pointing to VPN DNS during reconnection — restoring original would leak to local resolver. The DNS block rules handle the remaining leak vector (2026-03-04)
+- Helper uses HTTP/1.1 over Unix socket (not JSON-lines). Thread-per-connection enables multiple concurrent clients (CLI + GUI). `curl --unix-socket /run/airvpn-rs/helper.sock http://localhost/status` works for debugging (2026-03-05)
+- Event streaming via `GET /events` (chunked transfer encoding). Fan-out pattern: `Vec<mpsc::Sender>` in SharedState, dead subscribers pruned on send failure (2026-03-05)
+- Two-phase connect for Eddie import: POST /connect returns 409 + EddieImportNeeded if no creds; client POSTs /import-eddie then retries. No inline back-and-forth on same connection (2026-03-05)
+- `src/http.rs`: minimal HTTP parser (~120 lines, no dependencies). Handles request parsing, JSON responses, and chunked streaming. Tested with `UnixStream::pair()` (2026-03-05)
