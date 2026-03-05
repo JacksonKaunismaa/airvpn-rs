@@ -877,6 +877,50 @@ fn build_ping_hole_rules(server_ips: &[String]) -> (String, usize) {
     (batch, count)
 }
 
+/// Build the nft batch commands for per-IP all-protocol allowlist rules.
+///
+/// Unlike `build_ping_hole_rules` (ICMP-only), this generates `ip daddr <ip> accept`
+/// rules that allow all protocols — matching Eddie's outgoing server allowlist behavior.
+///
+/// Returns the batch string and the count of valid rules generated.
+/// Pure function — no side effects, testable without root.
+fn build_server_allowlist_rules(server_ips: &[String]) -> (String, usize) {
+    let mut batch = String::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut count = 0;
+
+    for ip_str in server_ips {
+        let ip_str = ip_str.trim();
+        if ip_str.is_empty() {
+            continue;
+        }
+        // Validate it's a real IP to prevent injection
+        if ip_str.parse::<IpAddr>().is_err() {
+            continue;
+        }
+        // Deduplicate (multiple servers can share entry IPs)
+        if !seen.insert(ip_str.to_string()) {
+            continue;
+        }
+        if ip_str.contains(':') {
+            // IPv6
+            batch.push_str(&format!(
+                "add rule inet {} ping_allow ip6 daddr {} counter accept\n",
+                PERSIST_TABLE_NAME, ip_str
+            ));
+        } else {
+            // IPv4
+            batch.push_str(&format!(
+                "add rule inet {} ping_allow ip daddr {} counter accept\n",
+                PERSIST_TABLE_NAME, ip_str
+            ));
+        }
+        count += 1;
+    }
+
+    (batch, count)
+}
+
 /// Open per-IP ICMP holes in the persistent lock's `ping_allow` subchain.
 ///
 /// Inserts one `ip daddr <ip> icmp type echo-request accept` rule per server IP
@@ -955,6 +999,62 @@ pub fn close_ping_holes() -> Result<()> {
     }
 
     log::info!("Closed ICMP ping holes in persistent lock");
+    Ok(())
+}
+
+/// Allow all outbound traffic to server IPs through the persistent lock.
+///
+/// Uses the existing `ping_allow` subchain. Flushes any previous rules first.
+/// No-op if the persistent table is not active.
+///
+/// Unlike `open_ping_holes` (ICMP-only), this allows all protocols to
+/// server IPs — matching Eddie's outgoing allowlist behavior. The background
+/// pinger uses this so it can reach servers outside the tunnel when only
+/// the persistent lock is active.
+///
+/// Call `close_ping_holes()` to remove these rules when done.
+pub fn open_server_allowlist(server_ips: &[String]) -> Result<()> {
+    if !is_persist_active() {
+        return Ok(());
+    }
+    if server_ips.is_empty() {
+        return Ok(());
+    }
+
+    // Flush existing rules first (ping holes or previous allowlist)
+    close_ping_holes()?;
+
+    let (batch, count) = build_server_allowlist_rules(server_ips);
+    if batch.is_empty() {
+        return Ok(());
+    }
+
+    let mut child = Command::new("nft")
+        .args(["-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("failed to spawn nft for server allowlist")?;
+
+    if let Some(ref mut stdin) = child.stdin {
+        stdin
+            .write_all(batch.as_bytes())
+            .context("failed to write server allowlist rules")?;
+    }
+    let output = child
+        .wait_with_output()
+        .context("failed to wait on nft for server allowlist")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("nft failed to add server allowlist: {}", stderr.trim());
+    }
+
+    log::info!(
+        "Opened server allowlist in persistent lock ({} IPs)",
+        count
+    );
     Ok(())
 }
 
@@ -1890,6 +1990,83 @@ mod tests {
         let (batch, count) = build_ping_hole_rules(&ips);
         assert_eq!(count, 0);
         assert!(batch.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // build_server_allowlist_rules tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_build_server_allowlist_rules_ipv4() {
+        let ips = vec!["1.2.3.4".to_string(), "5.6.7.8".to_string()];
+        let (batch, count) = build_server_allowlist_rules(&ips);
+        assert_eq!(count, 2);
+        // All-protocol: "ip daddr X counter accept" with NO icmp restriction
+        assert!(batch.contains("ip daddr 1.2.3.4 counter accept"));
+        assert!(batch.contains("ip daddr 5.6.7.8 counter accept"));
+        assert!(!batch.contains("icmp"), "allowlist rules must not restrict to ICMP");
+    }
+
+    #[test]
+    fn test_build_server_allowlist_rules_ipv6() {
+        let ips = vec!["2001:db8::1".to_string()];
+        let (batch, count) = build_server_allowlist_rules(&ips);
+        assert_eq!(count, 1);
+        assert!(batch.contains("ip6 daddr 2001:db8::1 counter accept"));
+        assert!(!batch.contains("icmp"), "allowlist rules must not restrict to ICMP");
+    }
+
+    #[test]
+    fn test_build_server_allowlist_rules_deduplicates() {
+        let ips = vec![
+            "1.2.3.4".to_string(),
+            "1.2.3.4".to_string(),
+            "5.6.7.8".to_string(),
+        ];
+        let (batch, count) = build_server_allowlist_rules(&ips);
+        assert_eq!(count, 2);
+        assert_eq!(batch.matches("1.2.3.4").count(), 1);
+    }
+
+    #[test]
+    fn test_build_server_allowlist_rules_skips_invalid() {
+        let ips = vec![
+            "1.2.3.4".to_string(),
+            "not-an-ip".to_string(),
+            "".to_string(),
+            "  ".to_string(),
+            "5.6.7.8".to_string(),
+        ];
+        let (batch, count) = build_server_allowlist_rules(&ips);
+        assert_eq!(count, 2);
+        assert!(!batch.contains("not-an-ip"));
+    }
+
+    #[test]
+    fn test_build_server_allowlist_rules_rejects_injection() {
+        let ips = vec![
+            "1.2.3.4; drop table".to_string(),
+            "1.2.3.4\ndrop table".to_string(),
+        ];
+        let (batch, count) = build_server_allowlist_rules(&ips);
+        assert_eq!(count, 0);
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn test_server_allowlist_vs_ping_holes_differ() {
+        // Verify the two builders produce different rule types
+        let ips = vec!["10.0.0.1".to_string()];
+        let (ping_batch, _) = build_ping_hole_rules(&ips);
+        let (allow_batch, _) = build_server_allowlist_rules(&ips);
+
+        assert!(ping_batch.contains("icmp type echo-request"),
+            "ping holes must be ICMP-only");
+        assert!(!allow_batch.contains("icmp"),
+            "server allowlist must be all-protocol");
+        // Both target the same chain
+        assert!(ping_batch.contains("ping_allow"));
+        assert!(allow_batch.contains("ping_allow"));
     }
 
     #[test]
