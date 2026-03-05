@@ -207,24 +207,61 @@ Eddie profile discovery and audit logging).
 
 ---
 
-## 9. Persistent lock ICMP: per-server hole-punching
+## 9. Persistent lock: per-server allowlist for background pinger
 
 **Eddie:** Session lock allows ICMP when `netlock.allow_ping = true` (default).
 Input: echo-request accept. Output: echo-reply accept. No outgoing echo-request.
 Eddie's pinger runs before the session lock activates, so it never needs outbound
-ICMP during the lock.
+ICMP during the lock. Eddie does not have a persistent lock.
 
 **airvpn-rs:** Persistent lock uses Eddie's ICMP model by default (inbound
 echo-request, outbound echo-reply — be pingable, but don't initiate pings).
-Before latency measurement, `open_ping_holes()` inserts per-server-IP
-echo-request rules into a `ping_allow` subchain. After pinging,
-`close_ping_holes()` flushes the subchain. Only ICMP to known AirVPN server
-IPs is allowed during the brief ping window.
+The background pinger uses `open_server_allowlist()` to add all-protocol
+`ip daddr <server-ip> accept` rules to the `ping_allow` subchain, matching
+the session lock's allowlist approach. After pinging, `close_ping_holes()`
+flushes the subchain.
 
 **Why:** The persistent lock is always active, unlike Eddie's session lock.
-Blanket outbound ICMP would let any process ping any IP 24/7. Per-IP
-hole-punching limits the exposure to specific server IPs during the ~10s ping
-phase, matching `airvpn-ping.py`'s pattern of punching per-IP bypass routes.
+The background pinger needs to reach server IPs outside the tunnel for latency
+measurement. All-protocol allowlist (not just ICMP) matches Eddie's outgoing
+allowlist pattern.
 
-**Files:** `src/netlock.rs` (`generate_persistent_ruleset()`, `open_ping_holes()`,
-`close_ping_holes()`), `src/connect.rs` (ping phase)
+**Files:** `src/netlock.rs` (`open_server_allowlist()`, `open_ping_holes()`,
+`close_ping_holes()`), `src/helper.rs` (background pinger loop)
+
+---
+
+## 10. Background pinger with EWMA smoothing
+
+**Eddie:** Background `Jobs/Latency.cs` pings one server at a time, every 180s
+(success) or 5s (retry). Uses running average `(old + new) / 2`. Stops pinging
+while connected. Ping results are in-memory only (lost on restart). Allowlists
+ALL server IPs in the session lock outgoing allowlist (for reconnection
+readiness, not pinging).
+
+**airvpn-rs:** Background pinger in the helper daemon pings ALL servers in
+parallel every 3 minutes. Uses EWMA (α=0.3) instead of simple running average.
+**Continues pinging while connected** — connected server is pinged through the
+tunnel (accurate path latency), all others via host routes outside the tunnel.
+Results are persisted to `/var/lib/airvpn-rs/latency.json` (survive restarts).
+
+Matches Eddie's all-server allowlist: session lock allowlists all server entry
+IPs (not just the selected server), activated once before the reconnection loop
+instead of per-iteration. Persistent lock uses `open_server_allowlist()` for
+the same effect. Host routes (`/32` via physical gateway) bypass tunnel routing
+for outside-tunnel pings.
+
+**Why:**
+- EWMA α=0.3 gives more control over smoothing than `(old + new) / 2` (which
+  is equivalent to α=0.5). A spike takes ~3 cycles (~9min) to decay.
+- Pinging while connected keeps data fresh for server re-selection on reconnect.
+- Parallel pinging is faster (~30s for all servers vs Eddie's sequential approach).
+- Persistence means data is available immediately after restart.
+
+**Files:** `src/pinger.rs` (`LatencyCache`, `ping_cycle`, `measure_all_from_ips`),
+`src/helper.rs` (`background_pinger_loop`), `src/wireguard.rs`
+(`add_server_host_routes`), `src/netlock.rs` (`open_server_allowlist`),
+`src/connect.rs` (cached latency, all-server allowlist)
+
+**Eddie ref:** `src/Lib.Core/Jobs/Latency.cs`, `src/Lib.Core/NetworkLockPlugin.cs`
+(`GetIpsAllowlistOutgoing`)
