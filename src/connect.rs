@@ -465,7 +465,7 @@ struct SessionData {
     manifest: manifest::Manifest,
     user_info: manifest::UserInfo,
     filtered_servers: Vec<manifest::Server>,
-    ping_results: pinger::PingResults,
+    ping_results: pinger::LatencyCache,
     lock_last: bool,
     start_last_name: Option<String>,
 }
@@ -620,7 +620,7 @@ fn fetch_initial_data(
                 message: "Skipping latency measurement".into(),
             });
         }
-        pinger::PingResults::new()
+        pinger::LatencyCache::new()
     } else {
         emit(config, crate::ipc::EngineEvent::Log {
             level: "info".into(),
@@ -659,10 +659,10 @@ fn fetch_initial_data(
 
         drop(_guard);
 
-        info!("Pinged {} servers.", results.latencies.len());
+        info!("Pinged {} servers.", results.len());
         emit(config, crate::ipc::EngineEvent::Log {
             level: "info".into(),
-            message: format!("Latency measurement complete ({} servers)", results.latencies.len()),
+            message: format!("Latency measurement complete ({} servers)", results.len()),
         });
         results
     };

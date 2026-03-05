@@ -4,7 +4,7 @@ use std::time::Instant;
 use anyhow::{bail, Context};
 
 use crate::manifest::Server;
-use crate::pinger::PingResults;
+use crate::pinger::LatencyCache;
 
 // ---------------------------------------------------------------------------
 // Eddie-compatible scoring (ConnectionInfo.cs Score(), LoadPerc(), UsersPerc())
@@ -295,7 +295,7 @@ pub fn select_server_with_penalties<'a>(
     servers: &'a [Server],
     server_name: Option<&str>,
     penalties: &ServerPenalties,
-    pings: &PingResults,
+    pings: &LatencyCache,
 ) -> anyhow::Result<&'a Server> {
     if servers.is_empty() {
         bail!("no servers available");
@@ -578,9 +578,9 @@ mod tests {
         ];
         let mut penalties = ServerPenalties::new();
         // Ping results: both measured with same low ping
-        let mut pings = PingResults::new();
-        pings.latencies.insert("Best".to_string(), 5);
-        pings.latencies.insert("Second".to_string(), 5);
+        let mut pings = LatencyCache::new();
+        pings.update("Best", 5);
+        pings.update("Second", 5);
 
         // Without penalty, "Best" wins (score 35 vs 165)
         let selected = select_server_with_penalties(&servers, None, &penalties, &pings).unwrap();
@@ -600,7 +600,7 @@ mod tests {
         ];
         let mut penalties = ServerPenalties::new();
         penalties.penalize("Alpha", 30);
-        let pings = PingResults::new();
+        let pings = LatencyCache::new();
         // Explicit name should still find Alpha despite penalty
         let selected =
             select_server_with_penalties(&servers, Some("Alpha"), &penalties, &pings).unwrap();
@@ -614,9 +614,9 @@ mod tests {
             make_server("Near", 500_000, 1000, 50, 250, 10, "", ""),
         ];
         let penalties = ServerPenalties::new();
-        let mut pings = PingResults::new();
-        pings.latencies.insert("Far".to_string(), 200);
-        pings.latencies.insert("Near".to_string(), 5);
+        let mut pings = LatencyCache::new();
+        pings.update("Far", 200);
+        pings.update("Near", 5);
 
         let selected = select_server_with_penalties(&servers, None, &penalties, &pings).unwrap();
         assert_eq!(selected.name, "Near");
@@ -632,9 +632,9 @@ mod tests {
             make_server("Measured", 500_000, 1000, 50, 250, 10, "", ""),
         ];
         let penalties = ServerPenalties::new();
-        let mut pings = PingResults::new();
+        let mut pings = LatencyCache::new();
         // Only "Measured" has a ping result; "Unmeasured" defaults to -1 (→ 0 contribution)
-        pings.latencies.insert("Measured".to_string(), 50);
+        pings.update("Measured", 50);
 
         let selected = select_server_with_penalties(&servers, None, &penalties, &pings).unwrap();
         // Unmeasured: base 30 + ping 0 = 30
@@ -652,7 +652,7 @@ mod tests {
             make_server("Geminorum", 500_000, 1000, 50, 250, 10, "", ""),
         ];
         let mut penalties = ServerPenalties::new();
-        let pings = PingResults::new(); // No pings (--skip-ping)
+        let pings = LatencyCache::new(); // No pings (--skip-ping)
 
         // Without penalty, both score 30; min_by picks first (Achernar)
         let selected = select_server_with_penalties(&servers, None, &penalties, &pings).unwrap();
