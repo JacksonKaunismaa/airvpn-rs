@@ -204,54 +204,52 @@ async fn async_run(std_listener: std::os::unix::net::UnixListener) -> Result<()>
     let listener = TokioUnixListener::from_std(std_listener)
         .context("failed to create tokio UnixListener")?;
 
+    // Signal handler: sets the recovery shutdown flag AND notifies the accept loop.
     let shutdown = recovery::setup_signal_handler()?;
     let state: State = Arc::new(Mutex::new(SharedState::new()));
 
     loop {
-        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            info!("Shutdown signal received, exiting helper");
-            break;
-        }
+        tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, _addr)) => {
+                        let peer_uid = stream.peer_cred()
+                            .ok()
+                            .map(|cred| {
+                                info!("Client connected: uid={} pid={}", cred.uid(), cred.pid().unwrap_or(0));
+                                cred.uid()
+                            });
 
-        // Use tokio::select with a timeout to periodically check shutdown flag
-        let accept_result = tokio::time::timeout(
-            Duration::from_secs(1),
-            listener.accept()
-        ).await;
-
-        match accept_result {
-            Ok(Ok((stream, _addr))) => {
-                // Get peer credentials from the tokio UnixStream
-                let peer_uid = stream.peer_cred()
-                    .ok()
-                    .map(|cred| {
-                        info!("Client connected: uid={} pid={}", cred.uid(), cred.pid().unwrap_or(0));
-                        cred.uid()
-                    });
-
-                let io = TokioIo::new(stream);
-                let state = Arc::clone(&state);
-
-                tokio::task::spawn(async move {
-                    let service = service_fn(move |req| {
+                        let io = TokioIo::new(stream);
                         let state = Arc::clone(&state);
-                        async move { Ok::<_, Infallible>(router(req, state, peer_uid).await) }
-                    });
 
-                    if let Err(e) = http1::Builder::new()
-                        .keep_alive(false)
-                        .serve_connection(io, service)
-                        .await
-                    {
-                        debug!("Connection error: {}", e);
+                        tokio::task::spawn(async move {
+                            let service = service_fn(move |req| {
+                                let state = Arc::clone(&state);
+                                async move { Ok::<_, Infallible>(router(req, state, peer_uid).await) }
+                            });
+
+                            if let Err(e) = http1::Builder::new()
+                                .keep_alive(false)
+                                .serve_connection(io, service)
+                                .await
+                            {
+                                debug!("Connection error: {}", e);
+                            }
+                        });
                     }
-                });
+                    Err(e) => {
+                        error!("Failed to accept connection: {}", e);
+                    }
+                }
             }
-            Ok(Err(e)) => {
-                error!("Failed to accept connection: {}", e);
-                tokio::time::sleep(Duration::from_secs(1)).await;
+            // Check shutdown flag every second (signal handler sets it)
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    info!("Shutdown signal received, exiting helper");
+                    break;
+                }
             }
-            Err(_) => {} // Timeout, loop back to check shutdown
         }
     }
 
