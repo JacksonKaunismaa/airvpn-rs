@@ -7,7 +7,7 @@ use iced::{Element, Fill, Size, Subscription, Task};
 use iced::time;
 use std::time::Duration;
 
-use airvpn::ipc::{ConnectionState, HelperCommand, HelperEvent, ServerInfo};
+use airvpn::ipc::{ConnectionState, ConnectRequest, HelperEvent, SaveProfileRequest, ServerInfo};
 
 #[derive(Debug, Clone)]
 pub struct LogEntry {
@@ -190,77 +190,18 @@ impl App {
                 Task::none()
             }
             Message::Connect => {
-                let ipv6_mode = if self.settings_ipv6_mode.is_empty() { None } else { Some(self.settings_ipv6_mode.clone()) };
-                let dns_servers = if self.settings_dns.is_empty() { Vec::new() } else {
-                    self.settings_dns.split(',').map(|s| s.trim().to_string()).collect()
-                };
-                let event_pre = self.build_event_hook(&self.settings_event_pre_file, &self.settings_event_pre_args, self.settings_event_pre_wait);
-                let event_up = self.build_event_hook(&self.settings_event_up_file, &self.settings_event_up_args, self.settings_event_up_wait);
-                let event_down = self.build_event_hook(&self.settings_event_down_file, &self.settings_event_down_args, self.settings_event_down_wait);
-                if let Some(ref mut helper) = self.helper {
-                    let cmd = HelperCommand::Connect {
-                        server: self.selected_server.clone(),
-                        no_lock: self.connect_no_lock,
-                        allow_lan: self.connect_allow_lan,
-                        skip_ping: self.connect_skip_ping,
-                        allow_country: Vec::new(),
-                        deny_country: Vec::new(),
-                        allow_server: Vec::new(),
-                        deny_server: Vec::new(),
-                        no_reconnect: self.connect_no_reconnect,
-                        no_verify: self.connect_no_verify,
-                        no_lock_last: false,
-                        no_start_last: false,
-                        ipv6_mode,
-                        dns_servers,
-                        event_pre,
-                        event_up,
-                        event_down,
-                    };
-                    if let Err(e) = helper.send(&cmd) {
-                        self.helper_error = Some(format!("Failed to send Connect: {}", e));
-                    }
-                }
+                let server = self.selected_server.clone();
+                self.send_connect(server);
                 Task::none()
             }
             Message::ConnectToServer(server_name) => {
                 self.selected_server = Some(server_name.clone());
-                let ipv6_mode = if self.settings_ipv6_mode.is_empty() { None } else { Some(self.settings_ipv6_mode.clone()) };
-                let dns_servers = if self.settings_dns.is_empty() { Vec::new() } else {
-                    self.settings_dns.split(',').map(|s| s.trim().to_string()).collect()
-                };
-                let event_pre = self.build_event_hook(&self.settings_event_pre_file, &self.settings_event_pre_args, self.settings_event_pre_wait);
-                let event_up = self.build_event_hook(&self.settings_event_up_file, &self.settings_event_up_args, self.settings_event_up_wait);
-                let event_down = self.build_event_hook(&self.settings_event_down_file, &self.settings_event_down_args, self.settings_event_down_wait);
-                if let Some(ref mut helper) = self.helper {
-                    let cmd = HelperCommand::Connect {
-                        server: Some(server_name),
-                        no_lock: self.connect_no_lock,
-                        allow_lan: self.connect_allow_lan,
-                        skip_ping: true, // server already chosen
-                        allow_country: Vec::new(),
-                        deny_country: Vec::new(),
-                        allow_server: Vec::new(),
-                        deny_server: Vec::new(),
-                        no_reconnect: self.connect_no_reconnect,
-                        no_verify: self.connect_no_verify,
-                        no_lock_last: false,
-                        no_start_last: false,
-                        ipv6_mode,
-                        dns_servers,
-                        event_pre,
-                        event_up,
-                        event_down,
-                    };
-                    if let Err(e) = helper.send(&cmd) {
-                        self.helper_error = Some(format!("Failed to send Connect: {}", e));
-                    }
-                }
+                self.send_connect(Some(server_name));
                 Task::none()
             }
             Message::Disconnect => {
-                if let Some(ref mut helper) = self.helper {
-                    if let Err(e) = helper.send(&HelperCommand::Disconnect) {
+                if let Some(ref helper) = self.helper {
+                    if let Err(e) = helper.send_command("POST", "/disconnect", None) {
                         self.helper_error = Some(format!("Failed to send Disconnect: {}", e));
                     }
                 }
@@ -280,8 +221,8 @@ impl App {
             }
             Message::HelperConnected => {
                 match ipc::HelperClient::connect() {
-                    Ok(mut client) => {
-                        let _ = client.send(&HelperCommand::Status);
+                    Ok(client) => {
+                        // GET /events automatically delivers initial state + lock status
                         self.helper = Some(client);
                         self.helper_error = None;
                         self.activity.clear();
@@ -300,13 +241,28 @@ impl App {
                 }
             }
             Message::FetchServers => {
-                if let Some(ref mut helper) = self.helper {
+                if let Some(ref helper) = self.helper {
                     self.servers_loading = true;
-                    let cmd = HelperCommand::ListServers { skip_ping: false };
-                    if let Err(e) = helper.send(&cmd) {
-                        self.servers_loading = false;
-                        self.helper_error =
-                            Some(format!("Failed to send ListServers: {}", e));
+                    match helper.send_command("GET", "/servers?skip_ping=true", None) {
+                        Ok((status, body)) => {
+                            if status == 200 {
+                                // Parse {"servers": [...]}
+                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
+                                    if let Some(arr) = parsed.get("servers") {
+                                        if let Ok(servers) = serde_json::from_value::<Vec<ServerInfo>>(arr.clone()) {
+                                            self.servers = servers;
+                                        }
+                                    }
+                                }
+                            } else {
+                                self.helper_error = Some(format!("Server list error: {}", body));
+                            }
+                            self.servers_loading = false;
+                        }
+                        Err(e) => {
+                            self.servers_loading = false;
+                            self.helper_error = Some(format!("Failed to fetch servers: {}", e));
+                        }
                     }
                 }
                 Task::none()
@@ -356,15 +312,33 @@ impl App {
                 Task::none()
             }
             Message::FetchProfile => {
-                if let Some(ref mut helper) = self.helper {
-                    if let Err(e) = helper.send(&HelperCommand::GetProfile) {
-                        self.helper_error = Some(format!("Failed to send GetProfile: {}", e));
+                if let Some(ref helper) = self.helper {
+                    match helper.send_command("GET", "/profile", None) {
+                        Ok((status, body)) => {
+                            if status == 200 {
+                                // Parse {"options": {...}, "credentials_configured": bool}
+                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
+                                    let credentials_configured = parsed.get("credentials_configured")
+                                        .and_then(|v| v.as_bool()).unwrap_or(false);
+                                    if let Some(opts) = parsed.get("options") {
+                                        if let Ok(options) = serde_json::from_value::<std::collections::HashMap<String, String>>(opts.clone()) {
+                                            self.handle_helper_event(HelperEvent::Profile { options, credentials_configured });
+                                        }
+                                    }
+                                }
+                            } else {
+                                self.helper_error = Some(format!("Profile error: {}", body));
+                            }
+                        }
+                        Err(e) => {
+                            self.helper_error = Some(format!("Failed to fetch profile: {}", e));
+                        }
                     }
                 }
                 Task::none()
             }
             Message::SaveSettings => {
-                if let Some(ref mut helper) = self.helper {
+                if let Some(ref helper) = self.helper {
                     let mut options = std::collections::HashMap::new();
                     options.insert("servers.startlast".into(), if self.settings_startlast { "True" } else { "False" }.into());
                     options.insert("servers.locklast".into(), if self.settings_locklast { "True" } else { "False" }.into());
@@ -379,8 +353,23 @@ impl App {
                     options.insert("event.vpn.down.filename".into(), self.settings_event_down_file.clone());
                     options.insert("event.vpn.down.arguments".into(), self.settings_event_down_args.clone());
                     options.insert("event.vpn.down.waitend".into(), if self.settings_event_down_wait { "True" } else { "False" }.into());
-                    if let Err(e) = helper.send(&HelperCommand::SaveProfile { options }) {
-                        self.helper_error = Some(format!("Failed to send SaveProfile: {}", e));
+                    let req = SaveProfileRequest { options };
+                    match serde_json::to_vec(&req) {
+                        Ok(body) => match helper.send_command("POST", "/profile", Some(&body)) {
+                            Ok((status, _body)) => {
+                                if status == 200 {
+                                    self.settings_dirty = false;
+                                } else {
+                                    self.helper_error = Some(format!("Failed to save profile (HTTP {})", status));
+                                }
+                            }
+                            Err(e) => {
+                                self.helper_error = Some(format!("Failed to save profile: {}", e));
+                            }
+                        },
+                        Err(e) => {
+                            self.helper_error = Some(format!("Failed to serialize profile: {}", e));
+                        }
                     }
                 }
                 Task::none()
@@ -442,32 +431,32 @@ impl App {
                 Task::none()
             }
             Message::LockInstall => {
-                if let Some(ref mut helper) = self.helper {
-                    if let Err(e) = helper.send(&HelperCommand::LockInstall) {
+                if let Some(ref helper) = self.helper {
+                    if let Err(e) = helper.send_command("POST", "/lock/install", None) {
                         self.helper_error = Some(format!("Failed to send LockInstall: {}", e));
                     }
                 }
                 Task::none()
             }
             Message::LockUninstall => {
-                if let Some(ref mut helper) = self.helper {
-                    if let Err(e) = helper.send(&HelperCommand::LockUninstall) {
+                if let Some(ref helper) = self.helper {
+                    if let Err(e) = helper.send_command("POST", "/lock/uninstall", None) {
                         self.helper_error = Some(format!("Failed to send LockUninstall: {}", e));
                     }
                 }
                 Task::none()
             }
             Message::LockEnable => {
-                if let Some(ref mut helper) = self.helper {
-                    if let Err(e) = helper.send(&HelperCommand::LockEnable) {
+                if let Some(ref helper) = self.helper {
+                    if let Err(e) = helper.send_command("POST", "/lock/enable", None) {
                         self.helper_error = Some(format!("Failed to send LockEnable: {}", e));
                     }
                 }
                 Task::none()
             }
             Message::LockDisable => {
-                if let Some(ref mut helper) = self.helper {
-                    if let Err(e) = helper.send(&HelperCommand::LockDisable) {
+                if let Some(ref helper) = self.helper {
+                    if let Err(e) = helper.send_command("POST", "/lock/disable", None) {
                         self.helper_error = Some(format!("Failed to send LockDisable: {}", e));
                     }
                 }
@@ -536,8 +525,9 @@ impl App {
             HelperEvent::Error { message } => {
                 self.helper_error = Some(message);
             }
-            HelperEvent::EddieProfileFound { .. } => {
-                // GUI doesn't handle Eddie import yet
+            HelperEvent::EddieProfileFound { path: _ } => {
+                // Eddie import is now handled via HTTP 409 response in send_connect().
+                // This event should not arrive via /events, but ignore it gracefully.
             }
             HelperEvent::Shutdown => {
                 self.helper = None;
@@ -578,6 +568,83 @@ impl App {
             if args.is_empty() { None } else { Some(args.to_string()) },
             if wait { Some("True".into()) } else { None },
         ]
+    }
+
+    /// Build a ConnectRequest from current settings.
+    fn build_connect_request(&self, server: Option<String>) -> ConnectRequest {
+        let ipv6_mode = if self.settings_ipv6_mode.is_empty() { None } else { Some(self.settings_ipv6_mode.clone()) };
+        let dns_servers = if self.settings_dns.is_empty() { Vec::new() } else {
+            self.settings_dns.split(',').map(|s| s.trim().to_string()).collect()
+        };
+        let skip_ping = server.is_some() || self.connect_skip_ping;
+        ConnectRequest {
+            server,
+            no_lock: self.connect_no_lock,
+            allow_lan: self.connect_allow_lan,
+            skip_ping,
+            allow_country: Vec::new(),
+            deny_country: Vec::new(),
+            allow_server: Vec::new(),
+            deny_server: Vec::new(),
+            no_reconnect: self.connect_no_reconnect,
+            no_verify: self.connect_no_verify,
+            no_lock_last: false,
+            no_start_last: false,
+            ipv6_mode,
+            dns_servers,
+            event_pre: self.build_event_hook(&self.settings_event_pre_file, &self.settings_event_pre_args, self.settings_event_pre_wait),
+            event_up: self.build_event_hook(&self.settings_event_up_file, &self.settings_event_up_args, self.settings_event_up_wait),
+            event_down: self.build_event_hook(&self.settings_event_down_file, &self.settings_event_down_args, self.settings_event_down_wait),
+        }
+    }
+
+    /// Send POST /connect via HTTP. Handles 409 Eddie import by auto-accepting and retrying.
+    fn send_connect(&mut self, server: Option<String>) {
+        let req = self.build_connect_request(server);
+        let body = match serde_json::to_vec(&req) {
+            Ok(b) => b,
+            Err(e) => {
+                self.helper_error = Some(format!("Failed to serialize ConnectRequest: {}", e));
+                return;
+            }
+        };
+
+        let helper = match self.helper {
+            Some(ref h) => h,
+            None => return,
+        };
+
+        match helper.send_command("POST", "/connect", Some(&body)) {
+            Ok((status, resp_body)) => {
+                if status == 409 {
+                    // Check if Eddie import needed
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&resp_body) {
+                        if parsed.get("eddie_profile").is_some() {
+                            self.activity = "Importing Eddie profile...".into();
+                            // Auto-accept Eddie import
+                            let import_body = b"{\"accept\":true}";
+                            if let Err(e) = helper.send_command("POST", "/import-eddie", Some(import_body)) {
+                                self.helper_error = Some(format!("Failed to import Eddie profile: {}", e));
+                                return;
+                            }
+                            // Retry connect
+                            if let Err(e) = helper.send_command("POST", "/connect", Some(&body)) {
+                                self.helper_error = Some(format!("Failed to connect after Eddie import: {}", e));
+                            }
+                            return;
+                        }
+                    }
+                    // 409 but not Eddie — already connected or other error
+                    self.helper_error = Some(format!("Connect failed: {}", resp_body));
+                } else if status != 200 {
+                    self.helper_error = Some(format!("Connect failed (HTTP {}): {}", status, resp_body));
+                }
+                // 200 = connect started, events arrive via /events stream
+            }
+            Err(e) => {
+                self.helper_error = Some(format!("Failed to send Connect: {}", e));
+            }
+        }
     }
 
     fn view(&self) -> Element<'_, Message> {
