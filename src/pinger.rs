@@ -27,7 +27,7 @@ pub const LATENCY_CACHE_PATH: &str = "/var/lib/airvpn-rs/latency.json";
 /// Each server's latency is tracked as an exponentially weighted moving
 /// average. The cache also stores the entry IP for each server so the
 /// background pinger knows which IPs to allowlist.
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct LatencyCache {
     ewma: HashMap<String, f64>,
     server_ips: HashMap<String, String>,

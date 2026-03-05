@@ -38,6 +38,13 @@ pub struct ConnectConfig {
     pub cli_event_up: [Option<String>; 3],
     pub cli_event_down: [Option<String>; 3],
     pub event_tx: std::sync::mpsc::Sender<crate::ipc::EngineEvent>,
+    /// Pre-populated latency cache from the background pinger. If this has
+    /// data, `fetch_initial_data` uses it instead of running a full ping sweep.
+    pub cached_latency: Option<pinger::LatencyCache>,
+    /// Callback to update the background pinger's server IP list after manifest
+    /// fetch. Called with `(name, entry_ip)` pairs so the pinger knows which
+    /// IPs to measure. `None` when running outside the helper (standalone CLI).
+    pub on_server_ips: Option<Box<dyn Fn(Vec<(String, String)>) + Send>>,
 }
 
 /// Emit an engine event to the event channel.
@@ -540,6 +547,56 @@ fn fetch_manifest_and_user(
     Ok((manifest, user_info))
 }
 
+/// One-shot latency measurement for all servers (fallback when no cached data).
+fn measure_all_inline(
+    filtered_servers: &[manifest::Server],
+    config: &ConnectConfig,
+) -> pinger::LatencyCache {
+    emit(config, crate::ipc::EngineEvent::Log {
+        level: "info".into(),
+        message: format!("Measuring latency for {} servers...", filtered_servers.len()),
+    });
+    info!("Measuring server latencies...");
+
+    // Punch per-IP ICMP holes in the persistent lock so the pinger can
+    // reach server IPs. Collect all entry IPs (IPv4 preferred, like the pinger).
+    let server_ips: Vec<String> = filtered_servers
+        .iter()
+        .flat_map(|s| {
+            s.ips_entry
+                .iter()
+                .find(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())
+                .or_else(|| s.ips_entry.first())
+                .cloned()
+        })
+        .collect();
+    if let Err(e) = crate::netlock::open_ping_holes(&server_ips) {
+        warn!("Failed to open ICMP ping holes: {e} (pings may fail if persistent lock is active)");
+    }
+
+    // Drop guard ensures ping holes are closed even if measure_all panics.
+    struct PingHoleGuard;
+    impl Drop for PingHoleGuard {
+        fn drop(&mut self) {
+            if let Err(e) = crate::netlock::close_ping_holes() {
+                log::error!("Failed to close ICMP ping holes on cleanup: {e}");
+            }
+        }
+    }
+    let _guard = PingHoleGuard;
+
+    let results = pinger::measure_all(filtered_servers);
+
+    drop(_guard);
+
+    info!("Pinged {} servers.", results.len());
+    emit(config, crate::ipc::EngineEvent::Log {
+        level: "info".into(),
+        message: format!("Latency measurement complete ({} servers)", results.len()),
+    });
+    results
+}
+
 /// Fetch initial data, filter servers, measure latencies, resolve preferences.
 fn fetch_initial_data(
     provider_config: &mut api::ProviderConfig,
@@ -608,6 +665,24 @@ fn fetch_initial_data(
         None
     };
 
+    // Notify the background pinger of server IPs from this manifest.
+    // This must happen before latency checks so the pinger can start
+    // measuring even if we skip the inline ping below.
+    {
+        let server_ip_pairs: Vec<(String, String)> = filtered_servers
+            .iter()
+            .filter_map(|s| {
+                let ip = s.ips_entry.iter()
+                    .find(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())
+                    .or_else(|| s.ips_entry.first());
+                ip.map(|ip| (s.name.clone(), ip.clone()))
+            })
+            .collect();
+        if let Some(ref cb) = config.on_server_ips {
+            cb(server_ip_pairs);
+        }
+    }
+
     // Latency measurement (Eddie: Jobs/Latency.cs).
     // Skip when we already know which server to use (--server flag or startlast).
     // Pinging is only needed for auto-selection by score.
@@ -627,50 +702,20 @@ fn fetch_initial_data(
             });
         }
         pinger::LatencyCache::new()
+    } else if let Some(ref cached) = config.cached_latency {
+        if cached.has_data() {
+            info!("Using cached latency data ({} servers measured by background pinger).", cached.len());
+            emit(config, crate::ipc::EngineEvent::Log {
+                level: "info".into(),
+                message: format!("Using cached latency ({} servers)", cached.len()),
+            });
+            cached.clone()
+        } else {
+            info!("Background pinger cache empty, falling back to one-shot measurement.");
+            measure_all_inline(&filtered_servers, config)
+        }
     } else {
-        emit(config, crate::ipc::EngineEvent::Log {
-            level: "info".into(),
-            message: format!("Measuring latency for {} servers...", filtered_servers.len()),
-        });
-        info!("Measuring server latencies...");
-
-        // Punch per-IP ICMP holes in the persistent lock so the pinger can
-        // reach server IPs. Collect all entry IPs (IPv4 preferred, like the pinger).
-        let server_ips: Vec<String> = filtered_servers
-            .iter()
-            .flat_map(|s| {
-                s.ips_entry
-                    .iter()
-                    .find(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())
-                    .or_else(|| s.ips_entry.first())
-                    .cloned()
-            })
-            .collect();
-        if let Err(e) = crate::netlock::open_ping_holes(&server_ips) {
-            warn!("Failed to open ICMP ping holes: {e} (pings may fail if persistent lock is active)");
-        }
-
-        // Drop guard ensures ping holes are closed even if measure_all panics.
-        struct PingHoleGuard;
-        impl Drop for PingHoleGuard {
-            fn drop(&mut self) {
-                if let Err(e) = crate::netlock::close_ping_holes() {
-                    log::error!("Failed to close ICMP ping holes on cleanup: {e}");
-                }
-            }
-        }
-        let _guard = PingHoleGuard;
-
-        let results = pinger::measure_all(&filtered_servers);
-
-        drop(_guard);
-
-        info!("Pinged {} servers.", results.len());
-        emit(config, crate::ipc::EngineEvent::Log {
-            level: "info".into(),
-            message: format!("Latency measurement complete ({} servers)", results.len()),
-        });
-        results
+        measure_all_inline(&filtered_servers, config)
     };
 
     Ok(SessionData {

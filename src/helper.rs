@@ -470,6 +470,22 @@ async fn handle_connect_async(
 
     // Spawn connect thread
     let connect_broadcast_state = Arc::clone(&state);
+    // Clone cached latency data from the background pinger
+    let cached_latency = {
+        let st = state.lock().unwrap();
+        let cache = st.latency.clone();
+        if cache.has_data() { Some(cache) } else { None }
+    };
+
+    // Callback to update the background pinger's server IP list
+    let state_for_ips = Arc::clone(&state);
+    let on_server_ips: Box<dyn Fn(Vec<(String, String)>) + Send> = Box::new(move |pairs| {
+        if !pairs.is_empty() {
+            let mut st = state_for_ips.lock().unwrap();
+            st.latency.set_server_ips(pairs);
+        }
+    });
+
     let connect_config = connect::ConnectConfig {
         server_name: connect_req.server,
         no_lock: connect_req.no_lock,
@@ -491,6 +507,8 @@ async fn handle_connect_async(
         cli_event_up: connect_req.event_up,
         cli_event_down: connect_req.event_down,
         event_tx: event_tx.clone(),
+        cached_latency,
+        on_server_ips: Some(on_server_ips),
     };
 
     let conn_handle = thread::spawn(move || {
