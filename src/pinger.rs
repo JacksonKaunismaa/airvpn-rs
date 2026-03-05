@@ -90,6 +90,11 @@ impl LatencyCache {
         self.server_ips.values().map(|s| s.as_str()).collect()
     }
 
+    /// All (name, entry_ip) pairs for the background pinger.
+    pub fn server_ips(&self) -> &HashMap<String, String> {
+        &self.server_ips
+    }
+
     /// Persist the cache to a JSON file.
     pub fn save(&self, path: &str) -> anyhow::Result<()> {
         let parent = std::path::Path::new(path).parent();
@@ -308,6 +313,57 @@ fn median_ping(results: &[Option<u64>]) -> Option<u64> {
         return None;
     }
     Some(successes[successes.len() / 2])
+}
+
+/// Measure latency for a list of (name, ip) pairs.
+///
+/// Used by the background pinger which already has extracted IPs from the
+/// LatencyCache. Returns `Vec<(name, latency_ms)>` where latency is -1 on
+/// failure. All servers are pinged in parallel.
+pub fn measure_all_from_ips(pairs: &[(String, String)]) -> Vec<(String, i64)> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+
+    let total = pairs.len();
+    if total == 0 {
+        return Vec::new();
+    }
+
+    let completed = Arc::new(AtomicUsize::new(0));
+
+    let handles: Vec<_> = pairs
+        .iter()
+        .map(|(name, ip)| {
+            let name = name.clone();
+            let ip = ip.clone();
+            let completed = Arc::clone(&completed);
+
+            thread::spawn(move || {
+                let rounds: Vec<Option<u64>> =
+                    (0..PING_ROUNDS).map(|_| ping_ip(&ip)).collect();
+                let latency = match median_ping(&rounds) {
+                    Some(ms) => ms as i64,
+                    None => -1,
+                };
+
+                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                if done % 50 == 0 || done == total {
+                    info!("Ping cycle progress: {}/{}", done, total);
+                }
+
+                (name, latency)
+            })
+        })
+        .collect();
+
+    let mut results = Vec::with_capacity(total);
+    for handle in handles {
+        if let Ok(pair) = handle.join() {
+            results.push(pair);
+        }
+    }
+    results
 }
 
 /// Measure latency for all servers (pings first IPv4 entry IP of each).
