@@ -1,5 +1,6 @@
 use airvpn::{cli_client, ipc};
 
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -252,9 +253,8 @@ fn init_logging() {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Only init full logging (file + stderr) for commands that run in-process.
-    // Thin-client commands (connect, disconnect, status, lock) get their output
-    // from the helper via cli_client — no log file needed.
+    // Only init full logging for the helper daemon process.
+    // All other commands are thin socket clients — output comes from the helper.
     match &cli.command {
         Commands::Helper => init_logging(),
         _ => {}
@@ -286,9 +286,7 @@ fn main() -> anyhow::Result<()> {
             event_vpn_down_arguments,
             event_vpn_down_waitend,
         } => {
-            // Credentials are resolved by the helper daemon (root), never by the CLI.
-            // Helper reads saved profile → Eddie import → error.
-            let cmd = ipc::HelperCommand::Connect {
+            let req = ipc::ConnectRequest {
                 server,
                 no_lock,
                 allow_lan,
@@ -307,28 +305,23 @@ fn main() -> anyhow::Result<()> {
                 event_up: [event_vpn_up_filename, event_vpn_up_arguments, event_vpn_up_waitend],
                 event_down: [event_vpn_down_filename, event_vpn_down_arguments, event_vpn_down_waitend],
             };
-            cli_client::send_command(&cmd)
+            cli_client::send_connect(&req)
         }
-        Commands::Disconnect => {
-            cli_client::send_command(&ipc::HelperCommand::Disconnect)
-        }
+        Commands::Disconnect => cli_client::send_simple("POST", "/disconnect", None),
         Commands::Status => cli_client::send_status(),
         Commands::Servers { sort, skip_ping } => {
-            cli_client::send_command(&ipc::HelperCommand::ListServers {
-                skip_ping,
-                sort: Some(sort),
-            })
+            cli_client::send_list_servers(skip_ping, &sort)
         }
-        Commands::Recover => cli_client::send_command(&ipc::HelperCommand::Recover),
+        Commands::Recover => cli_client::send_simple("POST", "/recover", None),
         Commands::Lock { action } => {
-            let cmd = match action {
-                LockAction::Install => ipc::HelperCommand::LockInstall,
-                LockAction::Uninstall => ipc::HelperCommand::LockUninstall,
-                LockAction::Enable => ipc::HelperCommand::LockEnable,
-                LockAction::Disable => ipc::HelperCommand::LockDisable,
-                LockAction::Status => ipc::HelperCommand::LockStatus,
+            let (method, path) = match action {
+                LockAction::Install => ("POST", "/lock/install"),
+                LockAction::Uninstall => ("POST", "/lock/uninstall"),
+                LockAction::Enable => ("POST", "/lock/enable"),
+                LockAction::Disable => ("POST", "/lock/disable"),
+                LockAction::Status => ("GET", "/lock/status"),
             };
-            cli_client::send_command(&cmd)
+            cli_client::send_simple(method, path, None)
         }
         Commands::Helper => {
             use airvpn::helper;
