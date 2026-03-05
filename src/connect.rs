@@ -197,10 +197,16 @@ pub fn preflight_checks() -> anyhow::Result<()> {
 /// Full disconnect: tear down WireGuard, DNS, netlock, and IPv6 blocking.
 ///
 /// Used by both `cmd_connect` (on clean shutdown) and `cmd_disconnect` (external command).
-pub fn cmd_disconnect_internal(config_path: &str, iface: &str, lock_active: bool, blocked_ipv6: &[String], endpoint_ip: &str, hook_down: &EventHook) -> anyhow::Result<()> {
+/// `server_route_ips` and `original_gw` are used to clean up the /32 host routes
+/// added for the background pinger. Pass empty slices/strings if not available.
+pub fn cmd_disconnect_internal(config_path: &str, iface: &str, lock_active: bool, blocked_ipv6: &[String], endpoint_ip: &str, hook_down: &EventHook, server_route_ips: &[String], original_gw: &str) -> anyhow::Result<()> {
     // 1. Remove interface-specific nft rules before deactivating table
     if lock_active && !iface.is_empty() {
         let _ = netlock::deallow_interface(iface);
+    }
+    // 1b. Remove /32 server host routes (background pinger routes)
+    if !server_route_ips.is_empty() && !original_gw.is_empty() {
+        let _ = wireguard::remove_server_host_routes(server_route_ips, original_gw);
     }
     // 2. Tear down WireGuard (also tears down routing + endpoint host route)
     let _ = wireguard::disconnect(config_path, endpoint_ip);
@@ -1046,15 +1052,17 @@ fn handle_reset_level(
     penalties: &mut server::ServerPenalties,
     forced_server: &mut Option<String>,
     consecutive_failures: &mut u32,
+    server_route_ips: &[String],
+    original_gw: &str,
 ) -> anyhow::Result<bool> {
     match reset_level {
         ResetLevel::None | ResetLevel::Fatal => {
-            cmd_disconnect_internal(config_path, iface, !config.no_lock, &params.blocked_ipv6_ifaces, endpoint_ip, &params.hook_down)?;
+            cmd_disconnect_internal(config_path, iface, !config.no_lock, &params.blocked_ipv6_ifaces, endpoint_ip, &params.hook_down, server_route_ips, original_gw)?;
             Ok(true)
         }
         ResetLevel::Error => {
             if config.no_reconnect {
-                cmd_disconnect_internal(config_path, iface, !config.no_lock, &params.blocked_ipv6_ifaces, endpoint_ip, &params.hook_down)?;
+                cmd_disconnect_internal(config_path, iface, !config.no_lock, &params.blocked_ipv6_ifaces, endpoint_ip, &params.hook_down, server_route_ips, original_gw)?;
                 warn!("Connection lost (--no-reconnect, exiting).");
                 return Ok(true);
             }
@@ -1068,7 +1076,7 @@ fn handle_reset_level(
         }
         ResetLevel::Retry => {
             if config.no_reconnect {
-                cmd_disconnect_internal(config_path, iface, !config.no_lock, &params.blocked_ipv6_ifaces, endpoint_ip, &params.hook_down)?;
+                cmd_disconnect_internal(config_path, iface, !config.no_lock, &params.blocked_ipv6_ifaces, endpoint_ip, &params.hook_down, server_route_ips, original_gw)?;
                 warn!("Connection lost (--no-reconnect, exiting).");
                 return Ok(true);
             }
@@ -1079,7 +1087,7 @@ fn handle_reset_level(
         }
         ResetLevel::Switch => {
             if config.no_reconnect {
-                cmd_disconnect_internal(config_path, iface, !config.no_lock, &params.blocked_ipv6_ifaces, endpoint_ip, &params.hook_down)?;
+                cmd_disconnect_internal(config_path, iface, !config.no_lock, &params.blocked_ipv6_ifaces, endpoint_ip, &params.hook_down, server_route_ips, original_gw)?;
                 warn!("Server switch requested (--no-reconnect, exiting).");
                 return Ok(true);
             }
@@ -1346,7 +1354,7 @@ pub fn run(
             level: "info".into(),
             message: format!("Connecting to {} via {}...", server_ref.name, mode.title),
         });
-        let (config_path, iface) = match wireguard::connect(&wg_params, ipv6_enabled) {
+        let (config_path, iface, original_gw) = match wireguard::connect(&wg_params, ipv6_enabled) {
             Ok(result) => {
                 consecutive_failures = 0;
                 result
@@ -1375,6 +1383,12 @@ pub fn run(
             message: format!("WireGuard interface {} created", iface),
         });
 
+        // Add /32 host routes for all server entry IPs via physical gateway.
+        // These let the background pinger reach servers outside the tunnel.
+        if let Err(e) = wireguard::add_server_host_routes(&all_entry_ips, &original_gw) {
+            warn!("Failed to add server host routes (pinger may not work): {e}");
+        }
+
         // Wait for first WireGuard handshake (Eddie: handshake_timeout_first=50s)
         info!("Waiting for handshake...");
         emit(config, crate::ipc::EngineEvent::Log {
@@ -1385,6 +1399,7 @@ pub fn run(
             error!("Handshake failed: {:#}", e);
             let _ = wireguard::disconnect(&config_path, &endpoint_ip);
             if config.no_reconnect {
+                let _ = wireguard::remove_server_host_routes(&all_entry_ips, &original_gw);
                 cleanup_and_bail(config.no_lock, &params.blocked_ipv6_ifaces);
                 return Err(e);
             }
@@ -1412,12 +1427,12 @@ pub fn run(
         ) {
             if params.shutdown.load(Ordering::Relaxed) {
                 warn!("Setup interrupted by shutdown signal, disconnecting...");
-                let _ = cmd_disconnect_internal(&config_path, &iface, !config.no_lock, &params.blocked_ipv6_ifaces, &endpoint_ip, &params.hook_down);
+                let _ = cmd_disconnect_internal(&config_path, &iface, !config.no_lock, &params.blocked_ipv6_ifaces, &endpoint_ip, &params.hook_down, &all_entry_ips, &original_gw);
                 break;
             }
             error!("Setup failed after WireGuard connected: {:#}", e);
             warn!("Cleaning up...");
-            let _ = cmd_disconnect_internal(&config_path, &iface, !config.no_lock, &params.blocked_ipv6_ifaces, &endpoint_ip, &params.hook_down);
+            let _ = cmd_disconnect_internal(&config_path, &iface, !config.no_lock, &params.blocked_ipv6_ifaces, &endpoint_ip, &params.hook_down, &all_entry_ips, &original_gw);
             return Err(e);
         }
 
@@ -1435,6 +1450,7 @@ pub fn run(
                 warn!("Verification failed, treating as connection failure, reconnecting...");
                 let _ = partial_disconnect(&config_path, &iface, !config.no_lock, &endpoint_ip);
                 if config.no_reconnect {
+                    let _ = wireguard::remove_server_host_routes(&all_entry_ips, &original_gw);
                     cleanup_and_bail(config.no_lock, &params.blocked_ipv6_ifaces);
                     anyhow::bail!("Verification failed (--no-reconnect)");
                 }
@@ -1486,6 +1502,7 @@ pub fn run(
             &config_path, &iface, &endpoint_ip,
             &server_ref.name, data.lock_last,
             &mut penalties, &mut forced_server, &mut consecutive_failures,
+            &all_entry_ips, &original_gw,
         )?;
         if should_break {
             break;
