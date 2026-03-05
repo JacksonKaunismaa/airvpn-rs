@@ -99,6 +99,65 @@ pub enum HelperEvent {
     ProfileSaved,
 }
 
+// ---------------------------------------------------------------------------
+// HTTP-specific request/response types (Tasks 2–4)
+// ---------------------------------------------------------------------------
+
+/// Request body for POST /connect.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectRequest {
+    pub server: Option<String>,
+    pub no_lock: bool,
+    pub allow_lan: bool,
+    pub skip_ping: bool,
+    pub allow_country: Vec<String>,
+    pub deny_country: Vec<String>,
+    pub allow_server: Vec<String>,
+    pub deny_server: Vec<String>,
+    pub no_reconnect: bool,
+    pub no_verify: bool,
+    pub no_lock_last: bool,
+    pub no_start_last: bool,
+    pub ipv6_mode: Option<String>,
+    pub dns_servers: Vec<String>,
+    pub event_pre: [Option<String>; 3],
+    pub event_up: [Option<String>; 3],
+    pub event_down: [Option<String>; 3],
+}
+
+/// Response for GET /status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusResponse {
+    pub state: ConnectionState,
+    pub lock: LockStatusInfo,
+}
+
+/// Lock status info (reusable across responses).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LockStatusInfo {
+    pub session_active: bool,
+    pub persistent_active: bool,
+    pub persistent_installed: bool,
+}
+
+/// Request body for POST /import-eddie.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportEddieRequest {
+    pub accept: bool,
+}
+
+/// Response when connect needs Eddie import (409).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EddieImportNeeded {
+    pub eddie_profile: String,
+}
+
+/// Request body for POST /profile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SaveProfileRequest {
+    pub options: std::collections::HashMap<String, String>,
+}
+
 /// Internal engine events (mpsc channel, not serialized over socket).
 /// Helper translates these into HelperEvents for the GUI.
 #[derive(Debug, Clone)]
