@@ -6,7 +6,6 @@ pub mod connect;
 pub mod crypto;
 pub mod dns;
 pub mod helper;
-pub mod http;
 pub mod ipc;
 pub mod ipv6;
 pub mod manifest;

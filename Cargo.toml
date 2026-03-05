@@ -22,6 +22,12 @@ clap = { version = "4", features = ["derive"] }
 # HTTP
 reqwest = { version = "0.12", features = ["blocking"] }
 
+# HTTP server (helper daemon)
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+
 # Crypto (API envelope)
 rsa = "0.9"
 aes = "0.8"
@@ -63,4 +69,5 @@ sha1 = "0.10"
 
 # GUI
 iced = { version = "0.14", features = ["tokio"] }
-tokio = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["time", "rt-multi-thread", "net", "sync", "macros"] }
+tokio-stream = "0.1"

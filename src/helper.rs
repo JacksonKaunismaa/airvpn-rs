@@ -1,29 +1,81 @@
-//! HTTP/1.1 helper daemon over Unix socket — multi-client, thread-per-connection.
+//! HTTP/1.1 helper daemon over Unix socket — multi-client, powered by hyper v1.
 //!
 //! Runs as root via systemd socket activation (`airvpn-helper.socket` +
 //! `airvpn-helper.service`). Inherits the pre-bound Unix socket from
-//! systemd and accepts multiple concurrent HTTP connections. Each connection
-//! is handled in its own thread.
+//! systemd and accepts multiple concurrent HTTP connections via hyper.
 //!
 //! The connect engine runs in a thread within the helper process. Stats are
-//! polled separately every 2s. Long-lived streaming connections (SSE-style
+//! polled separately every 2s. Long-lived streaming connections (NDJSON
 //! chunked responses) are used for `/connect` and `/events`.
 
+use std::collections::HashMap;
+use std::convert::Infallible;
 use std::os::fd::FromRawFd;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixListener;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
+use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
+use hyper::body::Frame;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
 use log::{debug, error, info, warn};
 use serde_json::json;
+use tokio::net::UnixListener as TokioUnixListener;
 
-use crate::{api, config, connect, http, ipc, manifest, netlock, pinger, recovery, server, wireguard};
+use crate::{api, config, connect, ipc, manifest, netlock, pinger, recovery, server, wireguard};
 
 pub const SOCKET_PATH: &str = "/run/airvpn-rs/helper.sock";
 const PID_FILE: &str = "/run/airvpn-rs/helper.pid";
+
+// ---------------------------------------------------------------------------
+// Hyper body helpers
+// ---------------------------------------------------------------------------
+
+type HyperBody = BoxBody<Bytes, Infallible>;
+
+fn json_response(status: StatusCode, body: &impl serde::Serialize) -> Response<HyperBody> {
+    let json = serde_json::to_vec(body).unwrap_or_default();
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .body(Full::new(Bytes::from(json)).map_err(|never| match never {}).boxed())
+        .unwrap()
+}
+
+fn error_response(status: StatusCode, msg: &str) -> Response<HyperBody> {
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "text/plain")
+        .body(Full::new(Bytes::from(msg.to_string())).map_err(|never| match never {}).boxed())
+        .unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// Query string parser (moved from deleted http.rs)
+// ---------------------------------------------------------------------------
+
+/// Parse a `key=value&key2=value2` query string into a map.
+fn parse_query_string(qs: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for pair in qs.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = pair.split_once('=') {
+            map.insert(k.to_string(), v.to_string());
+        } else {
+            map.insert(pair.to_string(), String::new());
+        }
+    }
+    map
+}
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -113,28 +165,6 @@ fn get_systemd_listener() -> Result<UnixListener> {
     }
 }
 
-/// Log the UID, GID, and PID of the connecting peer process.
-/// Returns the peer UID (needed for Eddie profile discovery).
-fn log_peer_credentials(stream: &UnixStream) -> Option<u32> {
-    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
-
-    match getsockopt(stream, PeerCredentials) {
-        Ok(creds) => {
-            info!(
-                "Client connected: pid={} uid={} gid={}",
-                creds.pid(),
-                creds.uid(),
-                creds.gid()
-            );
-            Some(creds.uid())
-        }
-        Err(e) => {
-            warn!("Client connected (failed to get peer credentials: {})", e);
-            None
-        }
-    }
-}
-
 /// Write the current PID to the PID file (mode 0o644).
 fn write_pid_file() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -154,20 +184,27 @@ pub fn read_pid_file() -> Option<u32> {
 }
 
 // ---------------------------------------------------------------------------
-// Accept loop (multi-client, thread-per-connection)
+// Accept loop (hyper v1, async)
 // ---------------------------------------------------------------------------
 
-/// Run the helper daemon: get socket from systemd, accept clients in a loop.
+/// Run the helper daemon: get socket from systemd, accept clients via hyper.
 pub fn run() -> Result<()> {
     connect::preflight_checks()?;
 
-    let listener = get_systemd_listener()?;
+    let std_listener = get_systemd_listener()?;
+    std_listener.set_nonblocking(true)?; // Required for tokio
     write_pid_file()?;
-    info!("Helper listening on {} (systemd socket activation, HTTP/1.1)", SOCKET_PATH);
+    info!("Helper listening on {} (hyper, systemd socket activation)", SOCKET_PATH);
 
-    // Set up signal handler so Ctrl+C / SIGTERM triggers graceful shutdown.
+    let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+    rt.block_on(async_run(std_listener))
+}
+
+async fn async_run(std_listener: std::os::unix::net::UnixListener) -> Result<()> {
+    let listener = TokioUnixListener::from_std(std_listener)
+        .context("failed to create tokio UnixListener")?;
+
     let shutdown = recovery::setup_signal_handler()?;
-
     let state: State = Arc::new(Mutex::new(SharedState::new()));
 
     loop {
@@ -176,91 +213,121 @@ pub fn run() -> Result<()> {
             break;
         }
 
-        // Poll with 1s timeout: set nonblocking, try accept, sleep if no client
-        listener.set_nonblocking(true).ok();
-        match listener.accept() {
-            Ok((stream, _addr)) => {
-                listener.set_nonblocking(false).ok();
-                let peer_uid = log_peer_credentials(&stream);
+        // Use tokio::select with a timeout to periodically check shutdown flag
+        let accept_result = tokio::time::timeout(
+            Duration::from_secs(1),
+            listener.accept()
+        ).await;
+
+        match accept_result {
+            Ok(Ok((stream, _addr))) => {
+                // Get peer credentials from the tokio UnixStream
+                let peer_uid = stream.peer_cred()
+                    .ok()
+                    .map(|cred| {
+                        info!("Client connected: uid={} pid={}", cred.uid(), cred.pid().unwrap_or(0));
+                        cred.uid()
+                    });
+
+                let io = TokioIo::new(stream);
                 let state = Arc::clone(&state);
-                thread::spawn(move || {
-                    if let Err(e) = handle_connection(stream, state, peer_uid) {
-                        debug!("Connection ended: {}", e);
+
+                tokio::task::spawn(async move {
+                    let service = service_fn(move |req| {
+                        let state = Arc::clone(&state);
+                        async move { Ok::<_, Infallible>(router(req, state, peer_uid).await) }
+                    });
+
+                    if let Err(e) = http1::Builder::new()
+                        .keep_alive(false)
+                        .serve_connection(io, service)
+                        .await
+                    {
+                        debug!("Connection error: {}", e);
                     }
                 });
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                listener.set_nonblocking(false).ok();
-                thread::sleep(Duration::from_secs(1));
-            }
-            Err(e) => {
+            Ok(Err(e)) => {
                 error!("Failed to accept connection: {}", e);
-                thread::sleep(Duration::from_secs(1));
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
+            Err(_) => {} // Timeout, loop back to check shutdown
         }
     }
 
-    // If a VPN connection is active, disconnect gracefully before exiting.
+    // Graceful shutdown
     {
         let mut st = state.lock().unwrap();
         if st.conn.is_connected() {
             info!("Disconnecting active VPN before shutdown...");
-            // Take handles before dropping lock
             let connect_handle = st.conn.connect_handle.take();
             st.conn.stats_stop.store(true, std::sync::atomic::Ordering::SeqCst);
             let stats_handle = st.conn.stats_handle.take();
-            drop(st); // Drop lock before joining threads
-
-            if let Some(h) = connect_handle {
-                let _ = h.join();
-            }
-            if let Some(h) = stats_handle {
-                let _ = h.join();
-            }
+            drop(st);
+            if let Some(h) = connect_handle { let _ = h.join(); }
+            if let Some(h) = stats_handle { let _ = h.join(); }
         }
     }
-
-    // Clean up PID file on exit. Do NOT remove the socket — systemd owns it.
     let _ = std::fs::remove_file(PID_FILE);
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Connection handler — parse HTTP request, dispatch to route
+// Router
 // ---------------------------------------------------------------------------
 
-/// Handle a single HTTP connection: parse request, route, respond.
-fn handle_connection(stream: UnixStream, state: State, peer_uid: Option<u32>) -> Result<()> {
-    let mut req = http::parse_request(&stream)?;
-    req.peer_uid = peer_uid;
+async fn router(req: Request<hyper::body::Incoming>, state: State, peer_uid: Option<u32>) -> Response<HyperBody> {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let query: HashMap<String, String> = req.uri().query()
+        .map(|q| parse_query_string(q))
+        .unwrap_or_default();
 
-    debug!("HTTP {} {}", req.method, req.path);
+    debug!("HTTP {} {}", method, path);
 
-    let mut resp = http::ResponseWriter::new(
-        stream.try_clone().context("failed to clone stream for response writer")?,
-    );
+    // Read body for all requests (no-op for GET with empty body)
+    let body_bytes = match req.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "failed to read body"),
+    };
 
-    match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/status") => handle_status(&state, &mut resp),
-        ("POST", "/connect") => handle_connect(&req, state, resp),
-        ("POST", "/disconnect") => handle_disconnect(&state, &mut resp),
-        ("GET", "/events") => handle_events(state, resp),
-        ("POST", "/import-eddie") => handle_import_eddie(&req, &mut resp),
-        ("GET", "/servers") => handle_list_servers(&req, &mut resp),
-        ("GET", "/profile") => handle_get_profile(&mut resp),
-        ("POST", "/profile") => handle_save_profile(&req, &mut resp),
-        ("POST", "/lock/enable") => handle_lock_enable(&mut resp),
-        ("POST", "/lock/disable") => handle_lock_disable(&mut resp),
-        ("POST", "/lock/install") => handle_lock_install(&mut resp),
-        ("POST", "/lock/uninstall") => handle_lock_uninstall(&mut resp),
-        ("GET", "/lock/status") => handle_lock_status(&mut resp),
-        ("POST", "/recover") => handle_recover(&mut resp),
-        ("POST", "/shutdown") => handle_shutdown(&state, &mut resp),
+    // Dispatch to handlers — streaming handlers (events, connect) are async,
+    // all others are sync and run in spawn_blocking
+    match (method.as_str(), path.as_str()) {
+        ("GET", "/events") => handle_events_async(state).await,
+        ("POST", "/connect") => handle_connect_async(body_bytes, state, peer_uid).await,
         _ => {
-            resp.error(404, &format!("not found: {} {}", req.method, req.path))?;
-            Ok(())
+            let state = state.clone();
+            tokio::task::spawn_blocking(move || {
+                match (method.as_str(), path.as_str()) {
+                    ("GET", "/status") => handle_status(&state),
+                    ("POST", "/disconnect") => handle_disconnect(&state),
+                    ("GET", "/servers") => handle_list_servers(&query),
+                    ("GET", "/profile") => handle_get_profile(),
+                    ("POST", "/profile") => handle_save_profile(&body_bytes),
+                    ("POST", "/import-eddie") => handle_import_eddie(&body_bytes, peer_uid),
+                    ("POST", "/lock/enable") => handle_lock_enable(),
+                    ("POST", "/lock/disable") => handle_lock_disable(),
+                    ("POST", "/lock/install") => handle_lock_install(),
+                    ("POST", "/lock/uninstall") => handle_lock_uninstall(),
+                    ("GET", "/lock/status") => handle_lock_status(),
+                    ("POST", "/recover") => handle_recover(),
+                    ("POST", "/shutdown") => handle_shutdown(&state),
+                    _ => error_response(StatusCode::NOT_FOUND, &format!("not found: {} {}", method, path)),
+                }
+            }).await.unwrap_or_else(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "handler panicked"))
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming event helper
+// ---------------------------------------------------------------------------
+
+fn send_event_frame(tx: &tokio::sync::mpsc::Sender<Result<Frame<Bytes>, Infallible>>, event: &impl serde::Serialize) -> Result<(), ()> {
+    let mut json = serde_json::to_vec(event).map_err(|_| ())?;
+    json.push(b'\n');
+    tx.blocking_send(Ok(Frame::data(Bytes::from(json)))).map_err(|_| ())
 }
 
 // ---------------------------------------------------------------------------
@@ -277,7 +344,7 @@ fn build_lock_status_info() -> ipc::LockStatusInfo {
 }
 
 /// GET /status — return connection state + lock status.
-fn handle_status(state: &State, resp: &mut http::ResponseWriter) -> Result<()> {
+fn handle_status(state: &State) -> Response<HyperBody> {
     let st = state.lock().unwrap();
 
     let conn_state = if st.conn.is_connected() {
@@ -313,25 +380,25 @@ fn handle_status(state: &State, resp: &mut http::ResponseWriter) -> Result<()> {
         state: conn_state,
         lock: build_lock_status_info(),
     };
-    resp.json(200, &status)
+    json_response(StatusCode::OK, &status)
 }
 
 /// POST /connect — start VPN connection, stream events via chunked response.
-fn handle_connect(
-    req: &http::Request,
+async fn handle_connect_async(
+    body_bytes: Bytes,
     state: State,
-    mut resp: http::ResponseWriter,
-) -> Result<()> {
-    let connect_req: ipc::ConnectRequest = serde_json::from_slice(&req.body)
-        .context("invalid ConnectRequest JSON")?;
+    peer_uid: Option<u32>,
+) -> Response<HyperBody> {
+    let connect_req: ipc::ConnectRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(r) => r,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("invalid ConnectRequest JSON: {}", e)),
+    };
 
-    let peer_uid = req.peer_uid;
-
-    // Lock briefly to check if already connected and set up state
+    // Lock briefly to check if already connected
     {
         let st = state.lock().unwrap();
         if st.conn.is_connected() {
-            return resp.json(409, &json!({"error": "already connected — disconnect first"}));
+            return json_response(StatusCode::CONFLICT, &json!({"error": "already connected — disconnect first"}));
         }
     }
 
@@ -343,12 +410,11 @@ fn handle_connect(
     let (resolved_username, resolved_password) = if !prof_user.is_empty() && !prof_pass.is_empty() {
         (prof_user, prof_pass)
     } else if let Some(eddie_path) = peer_uid.and_then(config::eddie_profile_path_for_uid) {
-        // Found Eddie profile — tell client to import first via POST /import-eddie
-        return resp.json(409, &ipc::EddieImportNeeded {
+        return json_response(StatusCode::CONFLICT, &ipc::EddieImportNeeded {
             eddie_profile: eddie_path.display().to_string(),
         });
     } else {
-        return resp.error(400, "no credentials available — run `sudo airvpn connect` for first-time setup");
+        return error_response(StatusCode::BAD_REQUEST, "no credentials available — run `sudo airvpn connect` for first-time setup");
     };
 
     // Reset shutdown flag for the new connection
@@ -363,8 +429,7 @@ fn handle_connect(
         st.conn.server_info.clone()
     };
 
-    // Spawn engine→broadcast forwarder thread: reads EngineEvents from mpsc,
-    // translates to HelperEvents, broadcasts to all subscribers.
+    // Spawn engine→broadcast forwarder thread
     let broadcast_state = Arc::clone(&state);
     let fwd_server_info = server_info.clone();
     let event_fwd = thread::spawn(move || {
@@ -503,49 +568,55 @@ fn handle_connect(
         let _ = event_fwd.join();
     });
 
-    // Subscribe to events and stream them back as chunked response
+    // Subscribe to events and stream them back as chunked NDJSON response
     let (sub_tx, sub_rx) = mpsc::channel::<ipc::HelperEvent>();
     {
         let mut st = state.lock().unwrap();
         st.subscribers.push(sub_tx);
     }
 
-    resp.begin_chunked(200)?;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(32);
 
-    // Stream events until Disconnected or client disconnects
-    loop {
-        match sub_rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(event) => {
-                let is_disconnected = matches!(
-                    event,
-                    ipc::HelperEvent::StateChanged { state: ipc::ConnectionState::Disconnected }
-                );
-                if resp.send_chunk(&event).is_err() {
-                    break; // Client disconnected
+    // Spawn blocking thread that reads from sub_rx and sends to tokio tx
+    tokio::task::spawn_blocking(move || {
+        // Stream events until Disconnected or client disconnects
+        loop {
+            match sub_rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(event) => {
+                    let is_disconnected = matches!(
+                        event,
+                        ipc::HelperEvent::StateChanged { state: ipc::ConnectionState::Disconnected }
+                    );
+                    if send_event_frame(&tx, &event).is_err() {
+                        break;
+                    }
+                    if is_disconnected {
+                        break;
+                    }
                 }
-                if is_disconnected {
-                    break;
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if send_event_frame(&tx, &json!({"keepalive": true})).is_err() {
+                        break;
+                    }
                 }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Send a keepalive comment chunk to detect dead connections
-                // (empty JSON object)
-                if resp.send_chunk(&json!({"keepalive": true})).is_err() {
-                    break;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                break; // All senders dropped
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
-    }
+    });
 
-    let _ = resp.end_chunked();
-    Ok(())
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let body = StreamBody::new(stream).boxed();
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/x-ndjson")
+        .header("Transfer-Encoding", "chunked")
+        .body(body)
+        .unwrap()
 }
 
 /// POST /disconnect — stop VPN connection.
-fn handle_disconnect(state: &State, resp: &mut http::ResponseWriter) -> Result<()> {
+fn handle_disconnect(state: &State) -> Response<HyperBody> {
     let is_connected;
     let has_orphan;
 
@@ -596,7 +667,7 @@ fn handle_disconnect(state: &State, resp: &mut http::ResponseWriter) -> Result<(
             });
         }
 
-        resp.json(200, &json!({"disconnected": true}))
+        json_response(StatusCode::OK, &json!({"disconnected": true}))
     } else if has_orphan {
         // Orphaned connection: no connect thread but WireGuard interface is still up.
         info!("no connect thread but orphaned WireGuard interface found, recovering");
@@ -610,7 +681,7 @@ fn handle_disconnect(state: &State, resp: &mut http::ResponseWriter) -> Result<(
 
         if let Err(e) = recovery::force_recover() {
             error!("orphaned disconnect recovery failed: {}", e);
-            return resp.error(500, &format!("orphaned disconnect failed: {}", e));
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("orphaned disconnect failed: {}", e));
         }
 
         // Stop stats poller and clear server info
@@ -634,14 +705,14 @@ fn handle_disconnect(state: &State, resp: &mut http::ResponseWriter) -> Result<(
             });
         }
 
-        resp.json(200, &json!({"disconnected": true}))
+        json_response(StatusCode::OK, &json!({"disconnected": true}))
     } else {
-        resp.error(400, "no active connection")
+        error_response(StatusCode::BAD_REQUEST, "no active connection")
     }
 }
 
 /// GET /events — long-lived chunked stream of helper events (for GUI).
-fn handle_events(state: State, mut resp: http::ResponseWriter) -> Result<()> {
+async fn handle_events_async(state: State) -> Response<HyperBody> {
     // Send initial status + lock info
     let initial_state;
     let lock_info = build_lock_status_info();
@@ -684,54 +755,59 @@ fn handle_events(state: State, mut resp: http::ResponseWriter) -> Result<()> {
         st.subscribers.push(sub_tx);
     }
 
-    resp.begin_chunked(200)?;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(32);
 
-    // Send initial state
-    resp.send_chunk(&ipc::HelperEvent::StateChanged { state: initial_state })?;
-    resp.send_chunk(&ipc::HelperEvent::LockStatus {
-        session_active: lock_info.session_active,
-        persistent_active: lock_info.persistent_active,
-        persistent_installed: lock_info.persistent_installed,
-    })?;
+    // Spawn blocking thread that reads from sub_rx and sends to tokio tx
+    let tx_clone = tx.clone();
+    tokio::task::spawn_blocking(move || {
+        // Send initial events
+        let _ = send_event_frame(&tx_clone, &ipc::HelperEvent::StateChanged { state: initial_state });
+        let _ = send_event_frame(&tx_clone, &ipc::HelperEvent::LockStatus {
+            session_active: lock_info.session_active,
+            persistent_active: lock_info.persistent_active,
+            persistent_installed: lock_info.persistent_installed,
+        });
 
-    // Stream events until client disconnects
-    loop {
-        match sub_rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(event) => {
-                if resp.send_chunk(&event).is_err() {
-                    break; // Client disconnected
+        // Stream events
+        loop {
+            match sub_rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(event) => {
+                    if send_event_frame(&tx_clone, &event).is_err() { break; }
                 }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Keepalive
-                if resp.send_chunk(&json!({"keepalive": true})).is_err() {
-                    break;
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if send_event_frame(&tx_clone, &json!({"keepalive": true})).is_err() { break; }
                 }
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                break;
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
-    }
+    });
 
-    let _ = resp.end_chunked();
-    Ok(())
+    // Build streaming response from receiver
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let body = StreamBody::new(stream).boxed();
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/x-ndjson")
+        .header("Transfer-Encoding", "chunked")
+        .body(body)
+        .unwrap()
 }
 
 /// POST /import-eddie — import credentials from Eddie profile.
-fn handle_import_eddie(req: &http::Request, resp: &mut http::ResponseWriter) -> Result<()> {
-    let import_req: ipc::ImportEddieRequest = serde_json::from_slice(&req.body)
-        .context("invalid ImportEddieRequest JSON")?;
-
-    let peer_uid = req.peer_uid;
+fn handle_import_eddie(body_bytes: &Bytes, peer_uid: Option<u32>) -> Response<HyperBody> {
+    let import_req: ipc::ImportEddieRequest = match serde_json::from_slice(body_bytes) {
+        Ok(r) => r,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("invalid ImportEddieRequest JSON: {}", e)),
+    };
 
     if !import_req.accept {
-        return resp.json(200, &json!({"imported": false}));
+        return json_response(StatusCode::OK, &json!({"imported": false}));
     }
 
     let eddie_path = match peer_uid.and_then(config::eddie_profile_path_for_uid) {
         Some(p) => p,
-        None => return resp.error(400, "no Eddie profile found for peer UID"),
+        None => return error_response(StatusCode::BAD_REQUEST, "no Eddie profile found for peer UID"),
     };
 
     match config::load_eddie_profile_for_uid(&eddie_path, peer_uid.unwrap()) {
@@ -739,23 +815,23 @@ fn handle_import_eddie(req: &http::Request, resp: &mut http::ResponseWriter) -> 
             let eddie_user = opts.get("login").cloned().unwrap_or_default();
             let eddie_pass = opts.get("password").cloned().unwrap_or_default();
             if eddie_user.is_empty() || eddie_pass.is_empty() {
-                return resp.error(400, "Eddie profile has no credentials");
+                return error_response(StatusCode::BAD_REQUEST, "Eddie profile has no credentials");
             }
             if let Err(e) = config::save_credentials(&eddie_user, &eddie_pass) {
                 warn!("Could not save credentials to profile: {:#}", e);
             }
-            resp.json(200, &json!({"imported": true}))
+            json_response(StatusCode::OK, &json!({"imported": true}))
         }
         Err(e) => {
-            resp.error(500, &format!("Failed to import Eddie profile: {:#}", e))
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to import Eddie profile: {:#}", e))
         }
     }
 }
 
 /// GET /servers — fetch and return scored server list.
-fn handle_list_servers(req: &http::Request, resp: &mut http::ResponseWriter) -> Result<()> {
-    let skip_ping = req.query.get("skip_ping").map_or(false, |v| v == "true");
-    let sort = req.query.get("sort").map(|s| s.as_str());
+fn handle_list_servers(query: &HashMap<String, String>) -> Response<HyperBody> {
+    let skip_ping = query.get("skip_ping").map_or(false, |v| v == "true");
+    let sort = query.get("sort").map(|s| s.as_str());
 
     // Resolve credentials from profile
     let profile_options = config::load_profile_options();
@@ -763,92 +839,92 @@ fn handle_list_servers(req: &http::Request, resp: &mut http::ResponseWriter) -> 
     let prof_pass = profile_options.get("password").cloned().unwrap_or_default();
 
     if prof_user.is_empty() || prof_pass.is_empty() {
-        return resp.error(400, "No credentials configured. Run `sudo airvpn connect` first to set up credentials.");
+        return error_response(StatusCode::BAD_REQUEST, "No credentials configured. Run `sudo airvpn connect` first to set up credentials.");
     }
 
     match dispatch_list_servers(skip_ping, sort, &prof_user, &prof_pass) {
-        Ok(servers) => resp.json(200, &json!({"servers": servers})),
-        Err(e) => resp.error(500, &format!("Failed to list servers: {:#}", e)),
+        Ok(servers) => json_response(StatusCode::OK, &json!({"servers": servers})),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to list servers: {:#}", e)),
     }
 }
 
 /// GET /profile — return profile options (credentials stripped).
-fn handle_get_profile(resp: &mut http::ResponseWriter) -> Result<()> {
+fn handle_get_profile() -> Response<HyperBody> {
     match dispatch_get_profile() {
         Ok(mut options) => {
             let credentials_configured = options.get("login").map_or(false, |v| !v.is_empty())
                 && options.get("password").map_or(false, |v| !v.is_empty());
             options.remove("login");
             options.remove("password");
-            resp.json(200, &json!({
+            json_response(StatusCode::OK, &json!({
                 "options": options,
                 "credentials_configured": credentials_configured,
             }))
         }
-        Err(e) => resp.error(500, &format!("Failed to load profile: {:#}", e)),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to load profile: {:#}", e)),
     }
 }
 
 /// POST /profile — save profile options.
-fn handle_save_profile(req: &http::Request, resp: &mut http::ResponseWriter) -> Result<()> {
-    let save_req: ipc::SaveProfileRequest = serde_json::from_slice(&req.body)
-        .context("invalid SaveProfileRequest JSON")?;
+fn handle_save_profile(body_bytes: &Bytes) -> Response<HyperBody> {
+    let save_req: ipc::SaveProfileRequest = match serde_json::from_slice(body_bytes) {
+        Ok(r) => r,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("invalid SaveProfileRequest JSON: {}", e)),
+    };
 
     match dispatch_save_profile(&save_req.options) {
-        Ok(()) => resp.json(200, &json!({"saved": true})),
-        Err(e) => resp.error(500, &format!("Failed to save profile: {:#}", e)),
+        Ok(()) => json_response(StatusCode::OK, &json!({"saved": true})),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to save profile: {:#}", e)),
     }
 }
 
 /// POST /lock/enable
-fn handle_lock_enable(resp: &mut http::ResponseWriter) -> Result<()> {
+fn handle_lock_enable() -> Response<HyperBody> {
     if let Err(e) = dispatch_lock_enable() {
-        resp.error(500, &format!("lock enable failed: {}", e))?;
-        return Ok(());
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("lock enable failed: {}", e));
     }
-    resp.json(200, &build_lock_status_info())
+    json_response(StatusCode::OK, &build_lock_status_info())
 }
 
 /// POST /lock/disable
-fn handle_lock_disable(resp: &mut http::ResponseWriter) -> Result<()> {
+fn handle_lock_disable() -> Response<HyperBody> {
     if let Err(e) = netlock::reclaim_and_delete() {
-        resp.error(500, &format!("lock disable failed: {}", e))?;
-        return Ok(());
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("lock disable failed: {}", e));
     }
-    resp.json(200, &build_lock_status_info())
+    json_response(StatusCode::OK, &build_lock_status_info())
 }
 
 /// POST /lock/install
-fn handle_lock_install(resp: &mut http::ResponseWriter) -> Result<()> {
+fn handle_lock_install() -> Response<HyperBody> {
     match dispatch_lock_install() {
-        Ok(msg) => resp.json(200, &json!({"message": msg, "lock": build_lock_status_info()})),
-        Err(e) => resp.error(500, &format!("lock install failed: {}", e)),
+        Ok(msg) => json_response(StatusCode::OK, &json!({"message": msg, "lock": build_lock_status_info()})),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("lock install failed: {}", e)),
     }
 }
 
 /// POST /lock/uninstall
-fn handle_lock_uninstall(resp: &mut http::ResponseWriter) -> Result<()> {
+fn handle_lock_uninstall() -> Response<HyperBody> {
     match dispatch_lock_uninstall() {
-        Ok(msg) => resp.json(200, &json!({"message": msg, "lock": build_lock_status_info()})),
-        Err(e) => resp.error(500, &format!("lock uninstall failed: {}", e)),
+        Ok(msg) => json_response(StatusCode::OK, &json!({"message": msg, "lock": build_lock_status_info()})),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("lock uninstall failed: {}", e)),
     }
 }
 
 /// GET /lock/status
-fn handle_lock_status(resp: &mut http::ResponseWriter) -> Result<()> {
-    resp.json(200, &build_lock_status_info())
+fn handle_lock_status() -> Response<HyperBody> {
+    json_response(StatusCode::OK, &build_lock_status_info())
 }
 
 /// POST /recover
-fn handle_recover(resp: &mut http::ResponseWriter) -> Result<()> {
+fn handle_recover() -> Response<HyperBody> {
     match recovery::force_recover() {
-        Ok(()) => resp.json(200, &json!({"recovered": true})),
-        Err(e) => resp.error(500, &format!("recovery failed: {}", e)),
+        Ok(()) => json_response(StatusCode::OK, &json!({"recovered": true})),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("recovery failed: {}", e)),
     }
 }
 
 /// POST /shutdown — trigger shutdown and exit helper.
-fn handle_shutdown(state: &State, resp: &mut http::ResponseWriter) -> Result<()> {
+fn handle_shutdown(state: &State) -> Response<HyperBody> {
     recovery::trigger_shutdown();
 
     // Take handles — drop lock before joining
@@ -865,7 +941,7 @@ fn handle_shutdown(state: &State, resp: &mut http::ResponseWriter) -> Result<()>
         let _ = h.join();
     }
 
-    resp.json(200, &json!({"shutdown": true}))
+    json_response(StatusCode::OK, &json!({"shutdown": true}))
 }
 
 // ---------------------------------------------------------------------------
@@ -1104,4 +1180,33 @@ fn dispatch_list_servers(skip_ping: bool, sort: Option<&str>, username: &str, pa
     }
 
     Ok(servers)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_query_string_basic() {
+        let qs = parse_query_string("skip_ping=true&sort=name");
+        assert_eq!(qs.get("skip_ping").unwrap(), "true");
+        assert_eq!(qs.get("sort").unwrap(), "name");
+    }
+
+    #[test]
+    fn test_parse_query_string_empty() {
+        let qs = parse_query_string("");
+        assert!(qs.is_empty());
+    }
+
+    #[test]
+    fn test_parse_query_string_no_value() {
+        let qs = parse_query_string("flag&key=val");
+        assert_eq!(qs.get("flag").unwrap(), "");
+        assert_eq!(qs.get("key").unwrap(), "val");
+    }
 }
