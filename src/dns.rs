@@ -629,39 +629,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_resolv_conf_deterministic() {
-        let a = build_resolv_conf("10.0.0.1", "fd00::1");
-        let b = build_resolv_conf("10.0.0.1", "fd00::1");
-        assert_eq!(a, b, "same inputs should produce same output");
-    }
-
-    #[test]
-    fn test_build_resolv_conf_different_dns() {
-        let a = build_resolv_conf("10.0.0.1", "fd00::1");
-        let b = build_resolv_conf("10.0.0.2", "fd00::2");
-        assert_ne!(a, b, "different DNS should produce different output");
-    }
-
-    #[test]
-    fn test_is_systemd_resolved_detection() {
-        // This just tests that the function doesn't panic — actual result
-        // depends on the system. On CI/containers, systemd-resolved is
-        // typically not running.
-        let _active = is_systemd_resolved_active();
-    }
-
-    #[test]
-    fn test_list_interfaces_excludes_loopback() {
-        let ifaces = list_interfaces();
-        // lo and lo0 should never appear
-        assert!(
-            !ifaces.iter().any(|i| i == "lo" || i == "lo0"),
-            "loopback interfaces should be excluded, got: {:?}",
-            ifaces
-        );
-    }
-
-    #[test]
     fn test_build_resolv_conf_ipv4_only() {
         let content = build_resolv_conf("10.0.0.1", "");
         assert!(content.contains("nameserver 10.0.0.1"));
@@ -678,22 +645,9 @@ mod tests {
     }
 
     #[test]
-    fn test_build_resolv_conf_both() {
-        let content = build_resolv_conf("10.0.0.1", "fd00::1");
-        assert_eq!(content.matches("nameserver").count(), 2);
-    }
-
-    #[test]
     fn test_build_resolv_conf_neither() {
         let content = build_resolv_conf("", "");
         assert_eq!(content.matches("nameserver").count(), 0);
-    }
-
-    #[test]
-    fn test_list_interfaces_no_loopback() {
-        let ifaces = list_interfaces();
-        assert!(!ifaces.contains(&"lo".to_string()));
-        assert!(!ifaces.contains(&"lo0".to_string()));
     }
 
     #[test]

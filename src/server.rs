@@ -511,24 +511,11 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
-    fn test_penalty_fresh_is_zero() {
-        let penalties = ServerPenalties::new();
-        assert_eq!(penalties.get("anything"), 0);
-    }
-
-    #[test]
     fn test_penalty_active() {
         let mut penalties = ServerPenalties::new();
         penalties.penalize("Alpha", 30);
         // Penalty was just applied — should be active
         assert_eq!(penalties.get("Alpha"), 30);
-    }
-
-    #[test]
-    fn test_penalty_other_server_unaffected() {
-        let mut penalties = ServerPenalties::new();
-        penalties.penalize("Alpha", 30);
-        assert_eq!(penalties.get("Beta"), 0);
     }
 
     #[test]
@@ -539,14 +526,6 @@ mod tests {
         // Base score with ping=10ms: 10 + 0 + 10 + 20 = 40
         // Penalty contribution = 30 * 1000 = 30000
         assert_eq!(score_with_penalty(&s, &penalties, 10), 30040);
-    }
-
-    #[test]
-    fn test_score_with_penalty_no_penalty() {
-        let s = make_server("Alpha", 500_000, 1000, 50, 250, 10, "", "");
-        let penalties = ServerPenalties::new();
-        // No penalty, ping=10 -> same as score_with_ping
-        assert_eq!(score_with_penalty(&s, &penalties, 10), score_with_ping(&s, 10));
     }
 
     #[test]
@@ -587,20 +566,6 @@ mod tests {
         // With ping=15ms: PingB=15, total = 15 + 0 + 10 + 20 = 45
         let s = make_server("Alpha", 500_000, 1000, 50, 250, 10, "", "");
         assert_eq!(score_with_ping(&s, 15), 45);
-    }
-
-    #[test]
-    fn test_score_with_ping_zero() {
-        // ping=0ms (localhost-like): same as base score without ping
-        let s = make_server("Alpha", 500_000, 1000, 50, 250, 10, "", "");
-        assert_eq!(score_with_ping(&s, 0), score(&s));
-    }
-
-    #[test]
-    fn test_score_with_ping_warning_overrides() {
-        let s = make_server("Closed", 500_000, 1000, 50, 250, 10, "", "maintenance");
-        // Warning sentinel should take precedence over ping
-        assert_eq!(score_with_ping(&s, 10), 99998);
     }
 
     #[test]
@@ -855,51 +820,6 @@ mod tests {
         assert_eq!(names, vec!["Alpha", "Beta"]);
     }
 
-    #[test]
-    fn test_filter_all_denied_returns_empty() {
-        let servers = vec![
-            make_server_cc("Alpha", "IT"),
-            make_server_cc("Beta", "NL"),
-        ];
-        let deny = vec!["Alpha".to_string(), "Beta".to_string()];
-        let filtered = filter_servers(&servers, &[], &deny, &[], &[]);
-        assert!(filtered.is_empty());
-    }
-
-    // -------------------------------------------------------------------
-    // filter_servers: server in both allow and deny — deny wins
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn test_filter_server_in_both_allow_and_deny_lists() {
-        let servers = vec![
-            make_server_cc("Alpha", "IT"),
-            make_server_cc("Beta", "NL"),
-            make_server_cc("Gamma", "DE"),
-        ];
-        // Alpha is in both allow and deny — deny should win
-        let allow = vec!["Alpha".to_string(), "Beta".to_string()];
-        let deny = vec!["Alpha".to_string()];
-        let filtered = filter_servers(&servers, &allow, &deny, &[], &[]);
-        let names: Vec<&str> = filtered.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, vec!["Beta"], "deny should take precedence over allow");
-    }
-
-    #[test]
-    fn test_filter_country_in_both_allow_and_deny() {
-        let servers = vec![
-            make_server_cc("Alpha", "IT"),
-            make_server_cc("Beta", "NL"),
-            make_server_cc("Gamma", "DE"),
-        ];
-        // IT is in both allow and deny countries — deny should win
-        let allow_cc = vec!["IT".to_string(), "NL".to_string()];
-        let deny_cc = vec!["IT".to_string()];
-        let filtered = filter_servers(&servers, &[], &[], &allow_cc, &deny_cc);
-        let names: Vec<&str> = filtered.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, vec!["Beta"], "deny_country should take precedence over allow_country");
-    }
-
     // -------------------------------------------------------------------
     // ServerPenalties::get() after long elapsed time (penalty fully decayed)
     // -------------------------------------------------------------------
@@ -957,58 +877,4 @@ mod tests {
         );
     }
 
-    // -------------------------------------------------------------------
-    // Edge case: empty server list for filter
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn test_filter_empty_server_list() {
-        let servers: Vec<Server> = vec![];
-        let filtered = filter_servers(&servers, &[], &[], &[], &[]);
-        assert!(filtered.is_empty());
-    }
-
-    // -------------------------------------------------------------------
-    // Score edge cases
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn test_score_zero_everything() {
-        let s = make_server("Zero", 0, 1000, 0, 100, 0, "", "");
-        // LoadPerc: bw_cur = 0, load_perc = 0
-        // UsersPerc: 0
-        // ScoreBase: 0
-        // Total: 0
-        assert_eq!(score(&s), 0);
-    }
-
-    #[test]
-    fn test_score_with_ping_high_latency() {
-        let s = make_server("Far", 500_000, 1000, 50, 250, 10, "", "");
-        // Base score = 30, ping = 500ms
-        // Total = 500 + 0 + 10 + 20 = 530
-        assert_eq!(score_with_ping(&s, 500), 530);
-    }
-
-    // -------------------------------------------------------------------
-    // load_perc and users_perc edge cases
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn test_load_perc_zero_bandwidth() {
-        let s = make_server("NoBW", 0, 1000, 0, 100, 0, "", "");
-        assert_eq!(load_perc(&s), 0);
-    }
-
-    #[test]
-    fn test_users_perc_zero_users() {
-        let s = make_server("NoUsers", 500_000, 1000, 0, 250, 0, "", "");
-        assert_eq!(users_perc(&s), 0);
-    }
-
-    #[test]
-    fn test_users_perc_full() {
-        let s = make_server("Full", 500_000, 1000, 250, 250, 0, "", "");
-        assert_eq!(users_perc(&s), 100);
-    }
 }

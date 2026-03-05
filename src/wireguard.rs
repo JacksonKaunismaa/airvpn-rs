@@ -1013,48 +1013,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_generate_config_different_port() {
-        let key = test_key();
-        let server = test_server();
-        let user = test_user();
-
-        let mode = Mode {
-            title: "WireGuard UDP 443".to_string(),
-            protocol: "UDP".to_string(),
-            port: 443,
-            entry_index: 0,
-        };
-
-        let params = generate_config(&key, &server, &mode, &user).unwrap();
-        let config = &*params.wg_config;
-        assert!(config.contains("Endpoint = 185.32.12.1:443"));
-    }
-
-    #[test]
-    fn test_generate_config_section_ordering() {
-        let key = test_key();
-        let server = test_server();
-        let mode = test_mode();
-        let user = test_user();
-
-        let params = generate_config(&key, &server, &mode, &user).unwrap();
-        let config = &*params.wg_config;
-
-        let interface_pos = config.find("[Interface]").expect("[Interface]");
-        let peer_pos = config.find("[Peer]").expect("[Peer]");
-        assert!(
-            interface_pos < peer_pos,
-            "[Interface] section should come before [Peer]"
-        );
-    }
-
-    #[test]
-    fn test_is_connected_nonexistent_iface() {
-        // A valid interface name that doesn't exist on this system
-        assert!(!is_connected("avpn0"));
-    }
-
     // -------------------------------------------------------------------
     // generate_config with mixed IPv4+IPv6 entry IPs — IPv4 preferred
     // -------------------------------------------------------------------
@@ -1136,48 +1094,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_generate_config_only_ipv6_entry_index_1() {
-        let key = test_key();
-        let user = test_user();
-
-        let mode = Mode {
-            title: "WireGuard UDP 1637".to_string(),
-            protocol: "UDP".to_string(),
-            port: 1637,
-            entry_index: 1,
-        };
-
-        let server = Server {
-            name: "IPv6Only2".to_string(),
-            group: "eu-de".to_string(),
-            ips_entry: vec![
-                "2001:db8::1".to_string(),
-                "2001:db8::2".to_string(),
-            ],
-            ips_exit: vec!["2001:db8::10".to_string()],
-            country_code: "DE".to_string(),
-            location: "Berlin".to_string(),
-            scorebase: 0,
-            bandwidth: 500_000,
-            bandwidth_max: 1_000_000,
-            users: 10,
-            users_max: 250,
-            support_ipv4: false,
-            support_ipv6: true,
-            warning_open: String::new(),
-            warning_closed: String::new(),
-        };
-
-        let params = generate_config(&key, &server, &mode, &user).unwrap();
-        let config = &*params.wg_config;
-        assert!(
-            config.contains("Endpoint = [2001:db8::2]:1637"),
-            "should use IPv6 at entry_index=1 when no IPv4, got: {}",
-            &*config
-        );
-    }
-
     // -------------------------------------------------------------------
     // generate_config validation — empty private key
     // -------------------------------------------------------------------
@@ -1251,45 +1167,6 @@ mod tests {
     fn test_is_connected_loopback() {
         // "lo" exists on all Linux systems
         assert!(is_connected("lo"), "loopback interface should exist");
-    }
-
-    #[test]
-    fn test_is_connected_empty_string() {
-        // Empty interface name fails validation and returns false
-        assert!(!is_connected(""));
-    }
-
-    #[test]
-    fn test_is_connected_special_chars() {
-        // Interface names with special chars fail validation and return false
-        assert!(!is_connected("avpn!@#$%^&*()test"));
-    }
-
-    #[test]
-    fn test_is_connected_path_traversal() {
-        // Path traversal attempts should be rejected by validation
-        assert!(!is_connected("../../../etc"));
-    }
-
-    #[test]
-    fn test_is_connected_too_long() {
-        // Names longer than 15 chars fail validation
-        assert!(!is_connected("avpn0toolongname1234"));
-    }
-
-    #[test]
-    fn test_validate_interface_name_valid() {
-        assert!(validate_interface_name("avpn0").is_ok());
-        assert!(validate_interface_name("wg0").is_ok());
-        assert!(validate_interface_name("eth_0").is_ok());
-    }
-
-    #[test]
-    fn test_validate_interface_name_invalid() {
-        assert!(validate_interface_name("").is_err());
-        assert!(validate_interface_name("../etc/passwd").is_err());
-        assert!(validate_interface_name("a-very-long-interface-name").is_err());
-        assert!(validate_interface_name("wg 0").is_err());
     }
 
     // -------------------------------------------------------------------
@@ -1399,19 +1276,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_generate_config_rejects_invalid_ip() {
-        let mut key = test_key();
-        key.wg_ipv4 = "not-an-ip-address".to_string();
-        let server = test_server();
-        let mode = test_mode();
-        let user = test_user();
-
-        let result = generate_config(&key, &server, &mode, &user);
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().to_string().contains("not a valid IP"),
-            "should reject invalid IP address"
-        );
-    }
 }

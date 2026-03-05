@@ -1,102 +1,50 @@
 //! HTTP IPC client for communicating with the airvpn helper daemon.
 //!
-//! Two mechanisms:
-//! 1. GET /events — long-lived chunked HTTP response for receiving events
+//! Uses hyper v1 client over Unix socket. Two mechanisms:
+//! 1. GET /events — long-lived streaming response for receiving events
 //! 2. Separate HTTP requests for sending commands (each opens a new connection)
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
+use std::io;
 use std::sync::mpsc;
-use std::thread;
 use std::time::Duration;
 
 use airvpn::ipc::{self, HelperEvent};
+use bytes::{Bytes, BytesMut};
+use http_body_util::{BodyExt, Full};
+use hyper::client::conn::http1;
+use hyper::Request;
+use hyper_util::rt::TokioIo;
+use tokio::net::UnixStream;
 
 const SOCKET_PATH: &str = "/run/airvpn-rs/helper.sock";
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct HelperClient {
     event_rx: mpsc::Receiver<HelperEvent>,
-    _reader_thread: thread::JoinHandle<()>,
+    rt: tokio::runtime::Runtime,
 }
 
 impl HelperClient {
     /// Connect to helper — opens GET /events for event streaming.
     /// The event stream automatically delivers initial StatusResponse + LockStatus.
-    pub fn connect() -> std::io::Result<Self> {
-        let stream = Self::connect_with_timeout(SOCKET_PATH, Duration::from_secs(2))?;
+    pub fn connect() -> io::Result<Self> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()?;
+
         let (tx, rx) = mpsc::channel();
 
-        let reader_thread = thread::spawn(move || {
-            if let Err(e) = Self::event_stream_loop(stream, tx) {
-                eprintln!("[GUI] Event stream error: {}", e);
+        rt.spawn(async move {
+            eprintln!("[GUI-IPC] Event stream starting (hyper client)");
+            if let Err(e) = event_stream(tx).await {
+                eprintln!("[GUI-IPC] Event stream error: {}", e);
             }
+            eprintln!("[GUI-IPC] Event stream ended");
         });
 
-        Ok(Self {
-            event_rx: rx,
-            _reader_thread: reader_thread,
-        })
-    }
-
-    /// Send GET /events, skip HTTP headers, read chunked events into channel.
-    fn event_stream_loop(
-        mut stream: UnixStream,
-        tx: mpsc::Sender<HelperEvent>,
-    ) -> std::io::Result<()> {
-        write!(stream, "GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n")?;
-        stream.flush()?;
-
-        let mut reader = BufReader::new(stream);
-
-        // Skip status line + headers
-        loop {
-            let mut line = String::new();
-            reader.read_line(&mut line)?;
-            if line.trim().is_empty() {
-                break;
-            }
-        }
-
-        // Read chunked events
-        loop {
-            let mut size_line = String::new();
-            if reader.read_line(&mut size_line)? == 0 {
-                break;
-            }
-            let size = usize::from_str_radix(size_line.trim(), 16).unwrap_or(0);
-            if size == 0 {
-                // Terminal chunk — consume trailing CRLF
-                let mut trailing = String::new();
-                let _ = reader.read_line(&mut trailing);
-                break;
-            }
-
-            let mut chunk = vec![0u8; size];
-            reader.read_exact(&mut chunk)?;
-            // Consume trailing CRLF after chunk data
-            let mut crlf = [0u8; 2];
-            let _ = reader.read_exact(&mut crlf);
-
-            let text = String::from_utf8_lossy(&chunk);
-            for line in text.lines() {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                // Skip keepalive messages
-                if line.contains("\"keepalive\"") {
-                    continue;
-                }
-                match ipc::decode_line::<HelperEvent>(line) {
-                    Ok(event) => {
-                        if tx.send(event).is_err() {
-                            return Ok(());
-                        }
-                    }
-                    Err(e) => eprintln!("[GUI] Event decode error: {} — line: {}", e, line),
-                }
-            }
-        }
-        Ok(())
+        Ok(Self { event_rx: rx, rt })
     }
 
     /// Send a command via a separate short-lived HTTP request. Returns (status, body).
@@ -105,78 +53,142 @@ impl HelperClient {
         method: &str,
         path: &str,
         body: Option<&[u8]>,
-    ) -> std::io::Result<(u16, String)> {
-        let mut stream = Self::connect_with_timeout(SOCKET_PATH, Duration::from_secs(5))?;
+    ) -> io::Result<(u16, String)> {
+        let method = method.to_string();
+        let path = path.to_string();
+        let body_owned = body.map(|b| Bytes::copy_from_slice(b));
 
-        if let Some(b) = body {
-            write!(
-                stream,
-                "{} {} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-                method, path, b.len()
-            )?;
-            stream.write_all(b)?;
-        } else {
-            write!(
-                stream,
-                "{} {} HTTP/1.1\r\nHost: localhost\r\n\r\n",
-                method, path
-            )?;
-        }
-        stream.flush()?;
+        let (resp_tx, resp_rx) = mpsc::channel();
+        self.rt.spawn(async move {
+            let result = send_request(method, path, body_owned).await;
+            let _ = resp_tx.send(result);
+        });
 
-        let mut reader = BufReader::new(stream);
-
-        // Read status line
-        let mut status_line = String::new();
-        reader.read_line(&mut status_line)?;
-        let status: u16 = status_line
-            .splitn(3, ' ')
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-
-        // Read headers, extract Content-Length
-        let mut content_length: usize = 0;
-        loop {
-            let mut line = String::new();
-            reader.read_line(&mut line)?;
-            if line.trim().is_empty() {
-                break;
-            }
-            if let Some((name, value)) = line.split_once(':') {
-                if name.trim().eq_ignore_ascii_case("content-length") {
-                    content_length = value.trim().parse().unwrap_or(0);
-                }
-            }
-        }
-
-        // Read body
-        let mut buf = vec![0u8; content_length];
-        if content_length > 0 {
-            reader.read_exact(&mut buf)?;
-        }
-        Ok((status, String::from_utf8_lossy(&buf).to_string()))
+        resp_rx
+            .recv()
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "IPC task died"))?
     }
 
     pub fn try_recv(&self) -> Option<HelperEvent> {
         self.event_rx.try_recv().ok()
     }
+}
 
-    /// Connect to a Unix socket with a timeout.
-    /// Spawns a thread to do the blocking connect and waits with a deadline.
-    fn connect_with_timeout(path: &str, timeout: Duration) -> std::io::Result<UnixStream> {
-        let path = path.to_string();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let result = UnixStream::connect(&path);
-            let _ = tx.send(result);
-        });
-        match rx.recv_timeout(timeout) {
-            Ok(result) => result,
-            Err(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
+/// Open a hyper HTTP/1.1 connection over Unix socket.
+async fn open_connection() -> io::Result<http1::SendRequest<Full<Bytes>>> {
+    let stream = tokio::time::timeout(CONNECT_TIMEOUT, UnixStream::connect(SOCKET_PATH))
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
                 "socket connect timed out (stale socket?)",
-            )),
+            )
+        })??;
+
+    let io = TokioIo::new(stream);
+    let (sender, conn) = http1::handshake(io)
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+    // Drive the HTTP connection in the background
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    Ok(sender)
+}
+
+/// Send a single HTTP request and return (status, body).
+async fn send_request(
+    method: String,
+    path: String,
+    body: Option<Bytes>,
+) -> io::Result<(u16, String)> {
+    let mut sender = open_connection().await?;
+
+    let has_body = body.is_some();
+    let req_body = Full::new(body.unwrap_or_default());
+
+    let mut builder = Request::builder()
+        .method(method.as_str())
+        .uri(&path)
+        .header("host", "localhost");
+    if has_body {
+        builder = builder.header("content-type", "application/json");
+    }
+
+    let req = builder
+        .body(req_body)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+    let resp = tokio::time::timeout(COMMAND_TIMEOUT, sender.send_request(req))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "request timed out"))?
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+    let status = resp.status().as_u16();
+
+    // Only collect body for non-streaming responses (those with Content-Length).
+    // Streaming responses (e.g. POST /connect) have no Content-Length — drop the
+    // body so the connection closes cleanly.
+    if resp.headers().contains_key("content-length") {
+        let collected = resp
+            .collect()
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        Ok((status, String::from_utf8_lossy(&collected.to_bytes()).to_string()))
+    } else {
+        Ok((status, String::new()))
+    }
+}
+
+/// Long-lived event stream: GET /events, parse NDJSON body frames.
+async fn event_stream(tx: mpsc::Sender<HelperEvent>) -> io::Result<()> {
+    let mut sender = open_connection().await?;
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/events")
+        .header("host", "localhost")
+        .body(Full::new(Bytes::new()))
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+    eprintln!("[GUI-IPC] Sending GET /events...");
+    let resp = sender
+        .send_request(req)
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+    eprintln!("[GUI-IPC] /events response: {} {:?}", resp.status(), resp.headers());
+    let mut body = resp.into_body();
+    let mut buf = BytesMut::new();
+
+    while let Some(frame_result) = body.frame().await {
+        let frame = frame_result.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        if let Ok(data) = frame.into_data() {
+            eprintln!("[GUI-IPC] frame ({} bytes): {:?}", data.len(), String::from_utf8_lossy(&data[..data.len().min(200)]));
+            buf.extend_from_slice(&data);
+
+            // Process all complete lines in the buffer
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let line_bytes = buf.split_to(pos + 1);
+                let text = String::from_utf8_lossy(&line_bytes);
+                let trimmed = text.trim();
+                if trimmed.is_empty() || trimmed.contains("\"keepalive\"") {
+                    continue;
+                }
+                match ipc::decode_line::<HelperEvent>(trimmed) {
+                    Ok(event) => {
+                        eprintln!("[GUI-IPC] parsed event: {:?}", std::mem::discriminant(&event));
+                        if tx.send(event).is_err() {
+                            return Ok(()); // GUI closed
+                        }
+                    }
+                    Err(e) => eprintln!("[GUI-IPC] decode error: {} — line: {:?}", e, trimmed),
+                }
+            }
         }
     }
+
+    Ok(())
 }

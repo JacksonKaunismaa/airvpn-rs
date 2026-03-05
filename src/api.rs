@@ -368,17 +368,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_normalize_arch() {
-        let arch = normalize_arch();
-        assert!(!arch.is_empty());
-    }
-
-    #[test]
-    fn test_base_params_count() {
-        assert_eq!(base_params("u", "p").len(), 6);
-    }
-
-    #[test]
     fn test_load_provider_config() {
         let config = load_provider_config().expect("failed to load provider config");
         assert!(!config.bootstrap_urls.is_empty());

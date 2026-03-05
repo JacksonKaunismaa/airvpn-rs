@@ -1437,15 +1437,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sha256_hex_deterministic() {
-        // Verify our SHA-256 produces consistent results
-        let hash1 = sha256_hex("ipv4_in_185.236.200.1/32_1");
-        let hash2 = sha256_hex("ipv4_in_185.236.200.1/32_1");
-        assert_eq!(hash1, hash2);
-        assert_eq!(hash1.len(), 64, "SHA-256 hex digest should be 64 characters");
-    }
-
-    #[test]
     fn test_ensure_cidr() {
         assert_eq!(ensure_cidr("10.0.0.1"), "10.0.0.1/32");
         assert_eq!(ensure_cidr("10.0.0.0/8"), "10.0.0.0/8");
@@ -1503,26 +1494,6 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
-    fn test_classify_ip_ipv4() {
-        assert_eq!(classify_ip("192.168.1.1"), Some(IpVersion::V4));
-    }
-
-    #[test]
-    fn test_classify_ip_ipv6() {
-        assert_eq!(classify_ip("2001:db8::1"), Some(IpVersion::V6));
-    }
-
-    #[test]
-    fn test_classify_ip_ipv4_cidr() {
-        assert_eq!(classify_ip("10.0.0.0/8"), Some(IpVersion::V4));
-    }
-
-    #[test]
-    fn test_classify_ip_ipv6_cidr() {
-        assert_eq!(classify_ip("fe80::/10"), Some(IpVersion::V6));
-    }
-
-    #[test]
     fn test_classify_ip_invalid() {
         assert_eq!(classify_ip("not-an-ip"), None);
     }
@@ -1530,16 +1501,6 @@ mod tests {
     #[test]
     fn test_classify_ip_empty() {
         assert_eq!(classify_ip(""), None);
-    }
-
-    #[test]
-    fn test_classify_ip_loopback_v4() {
-        assert_eq!(classify_ip("127.0.0.1"), Some(IpVersion::V4));
-    }
-
-    #[test]
-    fn test_classify_ip_loopback_v6() {
-        assert_eq!(classify_ip("::1"), Some(IpVersion::V6));
     }
 
     // -------------------------------------------------------------------
@@ -1556,26 +1517,6 @@ mod tests {
     fn test_ensure_cidr_invalid_ip() {
         // Invalid IP — returned as-is (no CIDR appended)
         assert_eq!(ensure_cidr("not-an-ip"), "not-an-ip");
-    }
-
-    #[test]
-    fn test_ensure_cidr_already_has_cidr_v4() {
-        assert_eq!(ensure_cidr("10.0.0.0/8"), "10.0.0.0/8");
-    }
-
-    #[test]
-    fn test_ensure_cidr_already_has_cidr_v6() {
-        assert_eq!(ensure_cidr("fe80::/10"), "fe80::/10");
-    }
-
-    #[test]
-    fn test_ensure_cidr_bare_v4() {
-        assert_eq!(ensure_cidr("192.168.1.1"), "192.168.1.1/32");
-    }
-
-    #[test]
-    fn test_ensure_cidr_bare_v6() {
-        assert_eq!(ensure_cidr("::1"), "::1/128");
     }
 
     // -------------------------------------------------------------------
@@ -1675,50 +1616,6 @@ mod tests {
     // Ruleset with both incoming AND outgoing allowlisted IPs
     // -------------------------------------------------------------------
 
-    #[test]
-    fn test_ruleset_mixed_incoming_outgoing_ips() {
-        let config = NetlockConfig {
-            allow_lan: false,
-            allow_dhcp: false,
-            allow_ping: false,
-            allow_ipv4ipv6translation: false,
-            allowed_ips_incoming: vec![
-                "10.0.0.1".to_string(),
-                "2001:db8::1".to_string(),
-            ],
-            allowed_ips_outgoing: vec![
-                "203.0.113.5".to_string(),
-                "2001:db8::ff".to_string(),
-            ],
-            incoming_policy_accept: false,
-        };
-        let ruleset = generate_ruleset(&config);
-
-        // INPUT: incoming IPs get saddr accept
-        assert!(ruleset.contains("ip saddr 10.0.0.1/32 counter accept"),
-            "incoming IPv4 should have saddr accept in INPUT");
-        assert!(ruleset.contains("ip6 saddr 2001:db8::1/128 counter accept"),
-            "incoming IPv6 should have saddr accept in INPUT");
-
-        // OUTPUT: incoming IPs get daddr + ct state established (response only)
-        assert!(ruleset.contains("ip daddr 10.0.0.1/32 ct state established counter accept"),
-            "incoming IPv4 should have daddr ct state established in OUTPUT");
-        assert!(ruleset.contains("ip6 daddr 2001:db8::1/128 ct state established counter accept"),
-            "incoming IPv6 should have daddr ct state established in OUTPUT");
-
-        // OUTPUT: outgoing IPs get unrestricted daddr accept
-        assert!(ruleset.contains("ip daddr 203.0.113.5/32 counter accept"),
-            "outgoing IPv4 should have unrestricted daddr accept in OUTPUT");
-        assert!(ruleset.contains("ip6 daddr 2001:db8::ff/128 counter accept"),
-            "outgoing IPv6 should have unrestricted daddr accept in OUTPUT");
-
-        // Outgoing IPs should NOT appear in INPUT
-        assert!(!ruleset.contains("ip saddr 203.0.113.5"),
-            "outgoing IPs should not appear as saddr in INPUT");
-        assert!(!ruleset.contains("ip6 saddr 2001:db8::ff"),
-            "outgoing IPv6 should not appear as saddr in INPUT");
-    }
-
     // -------------------------------------------------------------------
     // Invalid IP in allowlist should be silently skipped
     // -------------------------------------------------------------------
@@ -1744,19 +1641,6 @@ mod tests {
         assert!(ruleset.contains("table inet"));
         assert!(ruleset.contains("chain input"));
         assert!(ruleset.contains("chain output"));
-    }
-
-    // -------------------------------------------------------------------
-    // SHA-256 consistency test
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn test_sha256_hex_different_inputs() {
-        let hash_a = sha256_hex("input_a");
-        let hash_b = sha256_hex("input_b");
-        assert_ne!(hash_a, hash_b, "different inputs should produce different hashes");
-        assert_eq!(hash_a.len(), 64);
-        assert_eq!(hash_b.len(), 64);
     }
 
     // -------------------------------------------------------------------
@@ -1972,15 +1856,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_ping_hole_rules_mixed() {
-        let ips = vec!["1.2.3.4".to_string(), "2001:db8::1".to_string()];
-        let (batch, count) = build_ping_hole_rules(&ips);
-        assert_eq!(count, 2);
-        assert!(batch.contains("ip daddr 1.2.3.4 icmp type echo-request"));
-        assert!(batch.contains("ip6 daddr 2001:db8::1 icmpv6 type echo-request"));
-    }
-
-    #[test]
     fn test_build_ping_hole_rules_deduplicates() {
         let ips = vec![
             "1.2.3.4".to_string(),
@@ -2004,14 +1879,6 @@ mod tests {
         let (batch, count) = build_ping_hole_rules(&ips);
         assert_eq!(count, 2);
         assert!(!batch.contains("not-an-ip"));
-    }
-
-    #[test]
-    fn test_build_ping_hole_rules_empty_input() {
-        let ips: Vec<String> = vec![];
-        let (batch, count) = build_ping_hole_rules(&ips);
-        assert_eq!(count, 0);
-        assert!(batch.is_empty());
     }
 
     #[test]

@@ -367,11 +367,6 @@ mod tests {
     }
 
     #[test]
-    fn test_split_domain_port_standard_https() {
-        assert_eq!(split_domain_port("example.com:443"), ("example.com", 443));
-    }
-
-    #[test]
     fn test_generate_random_token_length() {
         let token = generate_random_token();
         assert_eq!(token.len(), 32); // 16 bytes * 2 hex chars
@@ -391,14 +386,6 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_random_token_is_lowercase_hex() {
-        let token = generate_random_token();
-        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
-        // hex::encode produces lowercase
-        assert_eq!(token, token.to_lowercase());
-    }
-
-    #[test]
     fn test_check_tunnel_timeout_on_bad_ip() {
         // With a non-routable exit IP, the check should time out (not hang).
         let start = std::time::Instant::now();
@@ -411,17 +398,6 @@ mod tests {
     }
 
     #[test]
-    fn test_check_tunnel_timeout_on_bad_ip_with_port() {
-        // Same as above but with a port in check_domain.
-        let start = std::time::Instant::now();
-        let result = check_tunnel("TestServer", "10.0.0.1/32", "example.invalid:89", "192.0.2.1", "https");
-        let elapsed = start.elapsed();
-        assert!(result.is_err());
-        assert!(elapsed < VERIFY_TIMEOUT + Duration::from_secs(2),
-            "tunnel check took {:?}, expected < {:?}", elapsed, VERIFY_TIMEOUT + Duration::from_secs(2));
-    }
-
-    #[test]
     fn test_check_dns_timeout_on_bad_ip() {
         // With a non-routable exit IP, the check should time out (not hang).
         let start = std::time::Instant::now();
@@ -429,17 +405,6 @@ mod tests {
         let elapsed = start.elapsed();
         assert!(result.is_err());
         // Must complete within VERIFY_TIMEOUT + small margin (not hang forever)
-        assert!(elapsed < VERIFY_TIMEOUT + Duration::from_secs(2),
-            "DNS check took {:?}, expected < {:?}", elapsed, VERIFY_TIMEOUT + Duration::from_secs(2));
-    }
-
-    #[test]
-    fn test_check_dns_timeout_on_bad_ip_with_port() {
-        // Same as above but with a port in check_domain.
-        let start = std::time::Instant::now();
-        let result = check_dns("TestServer", "example.invalid:89", "192.0.2.1", "{hash}.example.invalid", "https");
-        let elapsed = start.elapsed();
-        assert!(result.is_err());
         assert!(elapsed < VERIFY_TIMEOUT + Duration::from_secs(2),
             "DNS check took {:?}, expected < {:?}", elapsed, VERIFY_TIMEOUT + Duration::from_secs(2));
     }

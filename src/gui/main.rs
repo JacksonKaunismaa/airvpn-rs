@@ -17,6 +17,7 @@ pub struct LogEntry {
 }
 
 fn main() -> iced::Result {
+    eprintln!("[GUI] Starting airvpn-gui (built {})", env!("CARGO_PKG_VERSION"));
     iced::application(App::boot, App::update, App::view)
         .title("AirVPN")
         .theme(theme::airvpn_theme())

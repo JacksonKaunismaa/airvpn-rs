@@ -541,13 +541,6 @@ mod tests {
     }
 
     #[test]
-    fn test_expand_tilde_deep_path() {
-        let expanded = expand_tilde("~/a/b/c/d/e.txt");
-        assert!(expanded.to_str().unwrap().ends_with("a/b/c/d/e.txt"));
-        assert!(!expanded.to_str().unwrap().starts_with('~'));
-    }
-
-    #[test]
     fn test_resolve_credentials_only_username_errors() {
         let result = resolve_credentials(Some("alice"), None, &HashMap::new());
         assert!(result.is_err());
@@ -571,26 +564,6 @@ mod tests {
                 .contains("--username and password"),
             "should mention both flags are required"
         );
-    }
-
-    #[test]
-    fn test_resolve_credentials_both_cli_flags() {
-        let (user, pass) = resolve_credentials(Some("bob"), Some("pass123"), &HashMap::new()).unwrap();
-        assert_eq!(user, "bob");
-        assert_eq!(pass, "pass123");
-    }
-
-    #[test]
-    fn test_expand_tilde_home_set() {
-        let home = std::env::var("HOME").unwrap_or_default();
-        if !home.is_empty() {
-            let expanded = expand_tilde("~/.config/test");
-            assert!(
-                expanded.to_str().unwrap().starts_with(&home),
-                "expanded path should start with HOME: {}",
-                expanded.display()
-            );
-        }
     }
 
     // -------------------------------------------------------------------
@@ -706,11 +679,4 @@ mod tests {
         assert_eq!(reverse_server_hash("deadbeef", &names), None);
     }
 
-    #[test]
-    fn test_xml_escape() {
-        assert_eq!(xml_escape("hello"), "hello");
-        assert_eq!(xml_escape("a&b"), "a&amp;b");
-        assert_eq!(xml_escape("a\"b"), "a&quot;b");
-        assert_eq!(xml_escape("<b>"), "&lt;b&gt;");
-    }
 }

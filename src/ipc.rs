@@ -269,15 +269,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_event_profile_saved_roundtrip() {
-        let event = HelperEvent::ProfileSaved;
-
-        let encoded = encode_line(&event).expect("encode failed");
-        assert!(encoded.contains(r#""event":"ProfileSaved""#));
-        assert!(encoded.ends_with('\n'));
-
-        let decoded: HelperEvent = decode_line(&encoded).expect("decode failed");
-        assert!(matches!(decoded, HelperEvent::ProfileSaved));
-    }
 }

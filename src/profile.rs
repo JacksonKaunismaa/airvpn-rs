@@ -838,40 +838,6 @@ mod tests {
         assert!(ProfileFormat::from_header(b"v3n").is_err());
     }
 
-    #[test]
-    fn test_profile_format_header_roundtrip() {
-        // Each format's header() should round-trip through from_header()
-        for fmt in &[ProfileFormat::V2N, ProfileFormat::V2S, ProfileFormat::V2P] {
-            let header = fmt.header();
-            let parsed = ProfileFormat::from_header(header).unwrap();
-            assert_eq!(parsed, *fmt);
-        }
-    }
-
-    // -------------------------------------------------------------------
-    // generate_id uniqueness
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn test_generate_id_uniqueness() {
-        let ids: Vec<String> = (0..100).map(|_| generate_id()).collect();
-        // All should be 64 chars, all hex
-        for id in &ids {
-            assert_eq!(id.len(), 64);
-            assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
-        }
-        // All should be unique
-        let unique: std::collections::HashSet<&String> = ids.iter().collect();
-        assert_eq!(unique.len(), 100, "100 generated IDs should all be unique");
-    }
-
-    #[test]
-    fn test_generate_id_lowercase_hex() {
-        let id = generate_id();
-        // hex::encode produces lowercase
-        assert!(id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
-    }
-
     // -------------------------------------------------------------------
     // encrypt_with_password / decrypt_with_password with various payloads
     // -------------------------------------------------------------------

@@ -614,7 +614,6 @@ async fn handle_connect_async(
     Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/x-ndjson")
-        .header("Transfer-Encoding", "chunked")
         .body(body)
         .unwrap()
 }
@@ -766,7 +765,6 @@ async fn handle_events_async(state: State) -> Response<HyperBody> {
     Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/x-ndjson")
-        .header("Transfer-Encoding", "chunked")
         .body(body)
         .unwrap()
 }

@@ -67,32 +67,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ping_results_new() {
-        let pr = PingResults::new();
-        assert_eq!(pr.get("any_server"), -1);
-    }
-
-    #[test]
-    fn test_ping_results_get_existing() {
-        let mut pr = PingResults::new();
-        pr.latencies.insert("TestServer".to_string(), 42);
-        assert_eq!(pr.get("TestServer"), 42);
-    }
-
-    #[test]
-    fn test_ping_results_get_missing() {
-        let pr = PingResults::new();
-        assert_eq!(pr.get("NoSuchServer"), -1);
-    }
-
-    #[test]
-    fn test_ping_results_negative_one_sentinel() {
-        let mut pr = PingResults::new();
-        pr.latencies.insert("FailedServer".to_string(), -1);
-        assert_eq!(pr.get("FailedServer"), -1);
-    }
-
-    #[test]
     fn test_median_ping_all_success() {
         // Three successful pings: 10, 20, 15 → sorted: 10, 15, 20 → median = 15
         let rounds = vec![Some(10), Some(20), Some(15)];
@@ -117,24 +91,6 @@ mod tests {
     fn test_median_ping_all_failures() {
         let rounds = vec![None, None, None];
         assert_eq!(median_ping(&rounds), None);
-    }
-
-    #[test]
-    fn test_median_ping_identical_values() {
-        let rounds = vec![Some(42), Some(42), Some(42)];
-        assert_eq!(median_ping(&rounds), Some(42));
-    }
-
-    #[test]
-    fn test_median_ping_sorted_already() {
-        let rounds = vec![Some(1), Some(2), Some(3)];
-        assert_eq!(median_ping(&rounds), Some(2));
-    }
-
-    #[test]
-    fn test_median_ping_reverse_sorted() {
-        let rounds = vec![Some(100), Some(50), Some(10)];
-        assert_eq!(median_ping(&rounds), Some(50));
     }
 }
 

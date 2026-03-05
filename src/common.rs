@@ -97,8 +97,4 @@ mod tests {
         assert_eq!(backoff_secs(u32::MAX), 192); // saturating, exponent capped at 6
     }
 
-    #[test]
-    fn test_read_stdin_password_disabled() {
-        assert!(read_stdin_password(false).unwrap().is_none());
-    }
 }

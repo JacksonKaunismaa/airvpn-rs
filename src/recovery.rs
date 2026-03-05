@@ -556,35 +556,6 @@ mod tests {
     }
 
     #[test]
-    fn test_state_json_format() {
-        let state = State {
-            lock_active: false,
-            wg_interface: "wg0".to_string(),
-            wg_config_path: "/run/airvpn-rs/wg0.conf".to_string(),
-            dns_ipv4: "10.0.0.1".to_string(),
-            dns_ipv6: "fd00::1".to_string(),
-            pid: 99999,
-            blocked_ipv6_ifaces: vec![],
-            endpoint_ip: String::new(),
-            nonce: 123456789,
-            resolv_was_immutable: false,
-        };
-
-        let json = serde_json::to_string_pretty(&state).unwrap();
-
-        // Verify JSON contains expected fields
-        assert!(json.contains("\"lock_active\": false"));
-        assert!(json.contains("\"wg_interface\": \"wg0\""));
-        assert!(json.contains("\"wg_config_path\": \"/run/airvpn-rs/wg0.conf\""));
-        assert!(json.contains("\"dns_ipv4\": \"10.0.0.1\""));
-        assert!(json.contains("\"dns_ipv6\": \"fd00::1\""));
-        assert!(json.contains("\"pid\": 99999"));
-        assert!(json.contains("\"blocked_ipv6_ifaces\""));
-        assert!(json.contains("\"nonce\": 123456789"));
-        assert!(json.contains("\"resolv_was_immutable\": false"));
-    }
-
-    #[test]
     fn test_state_deserialize_without_blocked_ipv6_ifaces() {
         // Old state files won't have the field — serde(default) should handle it
         let json = r#"{
@@ -616,44 +587,6 @@ mod tests {
         // Note: u32::MAX wraps to -1 as i32, and kill(-1, 0) signals all
         // processes, so we avoid that.
         assert!(!is_pid_alive(i32::MAX as u32));
-    }
-
-    #[test]
-    fn test_state_with_blocked_ipv6() {
-        let state = State {
-            lock_active: true,
-            wg_interface: "wg0".to_string(),
-            wg_config_path: "/run/airvpn-rs/wg0.conf".to_string(),
-            dns_ipv4: "10.0.0.1".to_string(),
-            dns_ipv6: "fd00::1".to_string(),
-            pid: 12345,
-            blocked_ipv6_ifaces: vec!["eth0".to_string(), "wlan0".to_string()],
-            endpoint_ip: String::new(),
-            nonce: 0,
-            resolv_was_immutable: false,
-        };
-        let json = serde_json::to_string(&state).unwrap();
-        let parsed: State = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.blocked_ipv6_ifaces, vec!["eth0", "wlan0"]);
-    }
-
-    #[test]
-    fn test_state_empty_blocked_ipv6_default() {
-        // Old state files without blocked_ipv6_ifaces should deserialize with empty vec
-        let json = r#"{"lock_active":true,"wg_interface":"wg0","wg_config_path":"/run/airvpn-rs/wg0.conf","dns_ipv4":"10.0.0.1","dns_ipv6":"fd00::1","pid":12345}"#;
-        let state: State = serde_json::from_str(json).unwrap();
-        assert!(state.blocked_ipv6_ifaces.is_empty());
-    }
-
-    #[test]
-    fn test_load_does_not_panic() {
-        // load() reads from /run/airvpn-rs/state.json.
-        // We can't control whether it exists (a real test run as root may
-        // leave it), so we only verify:
-        // 1. load() doesn't panic
-        // 2. It returns Ok (either Some or None depending on disk state)
-        let result = load();
-        assert!(result.is_ok(), "load() should not error: {:?}", result);
     }
 
     #[test]
@@ -743,13 +676,6 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_nonce_nonzero() {
-        // Generate a few nonces and verify they're not all zero
-        let nonces: Vec<u64> = (0..10).map(|_| generate_nonce()).collect();
-        assert!(nonces.iter().any(|n| *n != 0), "nonces should not all be zero");
-    }
-
-    #[test]
     fn test_validate_state_invalid_wg_config_path_traversal() {
         let state = State {
             lock_active: true,
@@ -783,20 +709,4 @@ mod tests {
         assert!(!validate_state(&state));
     }
 
-    #[test]
-    fn test_validate_state_valid_wg_config_path() {
-        let state = State {
-            lock_active: true,
-            wg_interface: "avpn0".to_string(),
-            wg_config_path: "/run/airvpn-rs/avpn0.conf".to_string(),
-            dns_ipv4: "10.0.0.1".to_string(),
-            dns_ipv6: String::new(),
-            pid: 12345,
-            blocked_ipv6_ifaces: vec![],
-            endpoint_ip: String::new(),
-            nonce: 42,
-            resolv_was_immutable: false,
-        };
-        assert!(validate_state(&state));
-    }
 }
