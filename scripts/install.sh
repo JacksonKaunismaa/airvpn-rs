@@ -26,6 +26,11 @@ install -Dm755 "$SCRIPT_DIR/target/release/airvpn-gui" /usr/bin/airvpn-gui
 echo "Installing provider config..."
 install -Dm644 "$SCRIPT_DIR/resources/provider.json" /etc/airvpn-rs/provider.json
 
+# Install desktop entry and icon
+echo "Installing desktop entry..."
+install -Dm644 "$SCRIPT_DIR/resources/airvpn-gui.desktop" /usr/share/applications/airvpn-gui.desktop
+install -Dm644 "$SCRIPT_DIR/resources/airvpn.svg" /usr/share/icons/hicolor/scalable/apps/airvpn.svg
+
 # Install systemd units
 echo "Installing systemd units..."
 install -Dm644 "$SCRIPT_DIR/resources/airvpn-helper.socket" /etc/systemd/system/airvpn-helper.socket
@@ -47,6 +52,8 @@ echo ""
 echo "Installed:"
 echo "  /usr/bin/airvpn"
 echo "  /usr/bin/airvpn-gui"
+echo "  /usr/share/applications/airvpn-gui.desktop"
+echo "  /usr/share/icons/hicolor/scalable/apps/airvpn.svg"
 echo "  /etc/systemd/system/airvpn-helper.socket (enabled)"
 echo "  /etc/systemd/system/airvpn-helper.service"
 echo ""

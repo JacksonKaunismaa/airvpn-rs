@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=AirVPN
+Comment=AirVPN WireGuard client
+Exec=airvpn-gui
+Icon=airvpn
+Terminal=false
+Categories=Network;VPN;
+Keywords=vpn;wireguard;airvpn;
