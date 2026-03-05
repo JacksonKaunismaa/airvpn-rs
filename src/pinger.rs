@@ -127,10 +127,22 @@ impl LatencyCache {
 /// Uses the system `ping` command with 1 packet, 3s timeout (Eddie default:
 /// `pinger.timeout = 3000` i.e. 3000ms).
 fn ping_ip(ip: &str) -> Option<u64> {
-    let output = Command::new("ping")
-        .args(["-c", "1", "-W", "3", "-q", ip])
-        .output()
-        .ok()?;
+    ping_ip_with_interface(ip, None)
+}
+
+/// Ping an IP, optionally binding to a specific interface (`-I <iface>`).
+///
+/// Used by the background pinger to force the connected server's ping
+/// through the VPN tunnel (via `avpn0`) while other servers are pinged
+/// through the physical NIC (no `-I` flag, using host routes).
+fn ping_ip_with_interface(ip: &str, interface: Option<&str>) -> Option<u64> {
+    let mut cmd = Command::new("ping");
+    cmd.args(["-c", "1", "-W", "3", "-q"]);
+    if let Some(iface) = interface {
+        cmd.args(["-I", iface]);
+    }
+    cmd.arg(ip);
+    let output = cmd.output().ok()?;
 
     if !output.status.success() {
         return None;
@@ -320,7 +332,15 @@ fn median_ping(results: &[Option<u64>]) -> Option<u64> {
 /// Used by the background pinger which already has extracted IPs from the
 /// LatencyCache. Returns `Vec<(name, latency_ms)>` where latency is -1 on
 /// failure. All servers are pinged in parallel.
-pub fn measure_all_from_ips(pairs: &[(String, String)]) -> Vec<(String, i64)> {
+///
+/// If `connected_server` is provided, that server's ping is forced through
+/// the given VPN interface (e.g. `avpn0`) for accurate in-tunnel latency.
+/// All other servers are pinged via their host routes (physical NIC).
+pub fn measure_all_from_ips(
+    pairs: &[(String, String)],
+    connected_server: Option<&str>,
+    vpn_interface: Option<&str>,
+) -> Vec<(String, i64)> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::thread;
@@ -338,10 +358,16 @@ pub fn measure_all_from_ips(pairs: &[(String, String)]) -> Vec<(String, i64)> {
             let name = name.clone();
             let ip = ip.clone();
             let completed = Arc::clone(&completed);
+            // Connected server gets pinged through the tunnel interface
+            let iface = if connected_server == Some(name.as_str()) {
+                vpn_interface.map(|s| s.to_string())
+            } else {
+                None
+            };
 
             thread::spawn(move || {
                 let rounds: Vec<Option<u64>> =
-                    (0..PING_ROUNDS).map(|_| ping_ip(&ip)).collect();
+                    (0..PING_ROUNDS).map(|_| ping_ip_with_interface(&ip, iface.as_deref())).collect();
                 let latency = match median_ping(&rounds) {
                     Some(ms) => ms as i64,
                     None => -1,
