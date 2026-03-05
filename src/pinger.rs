@@ -51,9 +51,8 @@ impl LatencyCache {
 
     /// Record a failed ping. Keeps stale EWMA if one exists (better than
     /// nothing); no-op if the server was never measured.
-    pub fn update_failed(&mut self, name: &str) {
+    pub fn update_failed(&mut self, _name: &str) {
         // Intentionally a no-op: stale data > no data.
-        let _ = name;
     }
 
     /// Get the smoothed latency for a server, rounded to the nearest
@@ -120,14 +119,6 @@ impl LatencyCache {
             Err(_) => Self::default(),
         }
     }
-}
-
-/// Ping a single IP address, return latency in ms or None on failure.
-///
-/// Uses the system `ping` command with 1 packet, 3s timeout (Eddie default:
-/// `pinger.timeout = 3000` i.e. 3000ms).
-fn ping_ip(ip: &str) -> Option<u64> {
-    ping_ip_with_interface(ip, None)
 }
 
 /// Ping an IP, optionally binding to a specific interface (`-I <iface>`).
@@ -399,58 +390,32 @@ pub fn measure_all_from_ips(
 ///
 /// Eddie pings `IpsEntry.FirstPreferIPv4` (Latency.cs line 75).
 pub fn measure_all(servers: &[crate::manifest::Server]) -> LatencyCache {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-    use std::thread;
-
-    let total = servers.len();
-    let completed = Arc::new(AtomicUsize::new(0));
-
-    // Spawn a thread per server. Each thread does PING_ROUNDS sequential pings
-    // and returns (server_name, latency_ms). All servers ping in parallel.
-    let handles: Vec<_> = servers
+    // Extract (name, ip) pairs — prefer first IPv4, fall back to first entry IP.
+    let pairs: Vec<(String, String)> = servers
         .iter()
-        .map(|server| {
-            let name = server.name.clone();
+        .filter_map(|server| {
             let ip = server
                 .ips_entry
                 .iter()
                 .find(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())
                 .or_else(|| server.ips_entry.first())
-                .cloned();
-            let completed = Arc::clone(&completed);
-
-            thread::spawn(move || {
-                let latency = match ip {
-                    Some(ref ip) if ip.parse::<std::net::IpAddr>().is_ok() => {
-                        let rounds: Vec<Option<u64>> =
-                            (0..PING_ROUNDS).map(|_| ping_ip(ip)).collect();
-                        match median_ping(&rounds) {
-                            Some(ms) => ms as i64,
-                            None => -1,
-                        }
-                    }
-                    _ => -1,
-                };
-
-                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                if done % 50 == 0 || done == total {
-                    info!("Ping progress: {}/{}", done, total);
-                }
-
-                (name, latency)
-            })
+                .cloned()?;
+            if ip.parse::<std::net::IpAddr>().is_ok() {
+                Some((server.name.clone(), ip))
+            } else {
+                None
+            }
         })
         .collect();
 
+    let results = measure_all_from_ips(&pairs, None, None);
+
     let mut cache = LatencyCache::new();
-    for handle in handles {
-        if let Ok((name, latency)) = handle.join() {
-            if latency >= 0 {
-                cache.update(&name, latency);
-            } else {
-                cache.update_failed(&name);
-            }
+    for (name, latency) in &results {
+        if *latency >= 0 {
+            cache.update(name, *latency);
+        } else {
+            cache.update_failed(name);
         }
     }
 

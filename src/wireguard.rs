@@ -637,7 +637,7 @@ fn teardown_routing(_iface: &str, endpoint_ip: &str) {
     }
 }
 
-/// Add /32 host routes for all server entry IPs through the physical gateway.
+/// Add host routes for all server entry IPs through the physical gateway.
 ///
 /// Uses `ip -batch` for performance (tested: 1024 routes in 18ms).
 /// Errors are non-fatal — some routes may already exist (e.g., the connected
@@ -653,7 +653,8 @@ pub fn add_server_host_routes(server_ips: &[String], gateway: &str) -> Result<()
     for ip in server_ips {
         // Only add routes whose IP version matches the gateway
         if ip.contains(':') == gw_is_v6 {
-            batch.push_str(&format!("route add {}/32 via {}\n", ip, gateway));
+            let prefix = if ip.contains(':') { "/128" } else { "/32" };
+            batch.push_str(&format!("route add {}{} via {}\n", ip, prefix, gateway));
         }
     }
     if batch.is_empty() {
@@ -685,7 +686,7 @@ pub fn add_server_host_routes(server_ips: &[String], gateway: &str) -> Result<()
     Ok(())
 }
 
-/// Remove /32 host routes for server entry IPs. Best-effort cleanup.
+/// Remove host routes for server entry IPs. Best-effort cleanup.
 pub fn remove_server_host_routes(server_ips: &[String], gateway: &str) -> Result<()> {
     if server_ips.is_empty() {
         return Ok(());
@@ -696,7 +697,8 @@ pub fn remove_server_host_routes(server_ips: &[String], gateway: &str) -> Result
     let mut batch = String::new();
     for ip in server_ips {
         if ip.contains(':') == gw_is_v6 {
-            batch.push_str(&format!("route del {}/32 via {}\n", ip, gateway));
+            let prefix = if ip.contains(':') { "/128" } else { "/32" };
+            batch.push_str(&format!("route del {}{} via {}\n", ip, prefix, gateway));
         }
     }
     if batch.is_empty() {
