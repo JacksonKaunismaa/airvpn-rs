@@ -1145,6 +1145,18 @@ pub fn run(
     let mut first_iteration = true;
     let mut consecutive_failures: u32 = 0;
 
+    // Collect ALL server entry IPs for the network lock allowlist (Eddie: allowlists
+    // all servers so reconnection to a different server doesn't require lock rebuild).
+    let mut all_entry_ips: Vec<String> = data.filtered_servers
+        .iter()
+        .flat_map(|s| s.ips_entry.iter().cloned())
+        .collect();
+
+    // Activate network lock once before the loop with all server IPs.
+    if !config.no_lock {
+        activate_netlock(&params, config, provider_config, &data.manifest.bootstrap_urls, &all_entry_ips)?;
+    }
+
     loop {
         // Check for shutdown before attempting connection
         if params.shutdown.load(Ordering::Relaxed) {
@@ -1155,6 +1167,19 @@ pub fn run(
         // Re-fetch manifest on reconnection (2nd+ iteration)
         if !first_iteration {
             refresh_manifest_if_needed(provider_config, &params, &mut data, config);
+            // New servers may have appeared — rebuild allowlist and reload lock atomically.
+            let new_entry_ips: Vec<String> = data.filtered_servers
+                .iter()
+                .flat_map(|s| s.ips_entry.iter().cloned())
+                .collect();
+            if new_entry_ips != all_entry_ips {
+                all_entry_ips = new_entry_ips;
+                if !config.no_lock {
+                    if let Err(e) = activate_netlock(&params, config, provider_config, &data.manifest.bootstrap_urls, &all_entry_ips) {
+                        warn!("Failed to reload netlock with updated server IPs: {}", e);
+                    }
+                }
+            }
         }
         first_iteration = false;
 
@@ -1229,11 +1254,6 @@ pub fn run(
 
         // 6b. Run vpn.pre hook (Eddie: Session.cs line 301, before connection starts)
         run_hook(&params.hook_pre, "vpn.pre");
-
-        // 7. Activate network lock BEFORE auth (Eddie: Session.cs:57-64).
-        if !config.no_lock {
-            activate_netlock(&params, config, provider_config, &data.manifest.bootstrap_urls, &server_ref.ips_entry)?;
-        }
 
         // 7b. Pre-connection authorization (Eddie: Session.cs:173-218)
         let reset_from_auth = match api::fetch_connect_with_urls(
