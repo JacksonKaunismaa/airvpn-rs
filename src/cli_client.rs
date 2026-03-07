@@ -405,8 +405,8 @@ pub fn send_simple(method: &str, path: &str, body: Option<&str>) -> Result<()> {
 }
 
 /// GET /servers — fetch and display server list.
-pub fn send_list_servers(skip_ping: bool, sort: &str) -> Result<()> {
-    let path = format!("/servers?skip_ping={}&sort={}", skip_ping, sort);
+pub fn send_list_servers(sort: &str) -> Result<()> {
+    let path = format!("/servers?sort={}", sort);
     let (status, body) = http_request("GET", &path, None)?;
 
     if status != 200 {

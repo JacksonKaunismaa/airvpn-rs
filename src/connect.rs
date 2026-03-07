@@ -28,7 +28,6 @@ pub struct ConnectConfig {
     pub deny_server: Vec<String>,
     pub allow_country: Vec<String>,
     pub deny_country: Vec<String>,
-    pub skip_ping: bool,
     pub no_verify: bool,
     pub no_lock_last: bool,
     pub no_start_last: bool,
@@ -38,9 +37,8 @@ pub struct ConnectConfig {
     pub cli_event_up: [Option<String>; 3],
     pub cli_event_down: [Option<String>; 3],
     pub event_tx: std::sync::mpsc::Sender<crate::ipc::EngineEvent>,
-    /// Pre-populated latency cache from the background pinger. If this has
-    /// data, `fetch_initial_data` uses it instead of running a full ping sweep.
-    pub cached_latency: Option<pinger::LatencyCache>,
+    /// Pre-populated latency cache from the background pinger.
+    pub cached_latency: pinger::LatencyCache,
     /// Callback to update the background pinger's server IP list after manifest
     /// fetch. Called with `(name, entry_ip)` pairs so the pinger knows which
     /// IPs to measure. `None` when running outside the helper (standalone CLI).
@@ -553,32 +551,7 @@ fn fetch_manifest_and_user(
     Ok((manifest, user_info))
 }
 
-/// One-shot latency measurement for all servers (fallback when no cached data).
-///
-/// The persistent lock's `ping_allow` subchain is populated by the helper when
-/// server IPs arrive (via `on_server_ips` callback), so ICMP is already allowed
-/// by the time this runs.
-fn measure_all_inline(
-    filtered_servers: &[manifest::Server],
-    config: &ConnectConfig,
-) -> pinger::LatencyCache {
-    emit(config, crate::ipc::EngineEvent::Log {
-        level: "info".into(),
-        message: format!("Measuring latency for {} servers...", filtered_servers.len()),
-    });
-    info!("Measuring server latencies...");
-
-    let results = pinger::measure_all(filtered_servers);
-
-    info!("Pinged {} servers.", results.len());
-    emit(config, crate::ipc::EngineEvent::Log {
-        level: "info".into(),
-        message: format!("Latency measurement complete ({} servers)", results.len()),
-    });
-    results
-}
-
-/// Fetch initial data, filter servers, measure latencies, resolve preferences.
+/// Fetch initial data, filter servers, resolve preferences.
 fn fetch_initial_data(
     provider_config: &mut api::ProviderConfig,
     params: &SessionParams,
@@ -664,40 +637,9 @@ fn fetch_initial_data(
         }
     }
 
-    // Latency measurement (Eddie: Jobs/Latency.cs).
-    // Skip when we already know which server to use (--server flag or startlast).
-    // Pinging is only needed for auto-selection by score.
-    let has_predetermined_server = config.server_name.is_some() || start_last_name.is_some();
-    let ping_results = if config.skip_ping || has_predetermined_server {
-        if has_predetermined_server && !config.skip_ping {
-            info!("Skipping latency measurement (server already determined).");
-            emit(config, crate::ipc::EngineEvent::Log {
-                level: "info".into(),
-                message: "Skipping ping (server already determined)".into(),
-            });
-        } else {
-            info!("Skipping latency measurement (--skip-ping).");
-            emit(config, crate::ipc::EngineEvent::Log {
-                level: "info".into(),
-                message: "Skipping latency measurement".into(),
-            });
-        }
-        pinger::LatencyCache::new()
-    } else if let Some(ref cached) = config.cached_latency {
-        if cached.has_data() {
-            info!("Using cached latency data ({} servers measured by background pinger).", cached.len());
-            emit(config, crate::ipc::EngineEvent::Log {
-                level: "info".into(),
-                message: format!("Using cached latency ({} servers)", cached.len()),
-            });
-            cached.clone()
-        } else {
-            info!("Background pinger cache empty, falling back to one-shot measurement.");
-            measure_all_inline(&filtered_servers, config)
-        }
-    } else {
-        measure_all_inline(&filtered_servers, config)
-    };
+    // Latency data comes from the background pinger. On first-ever connect the
+    // cache will be empty and ping simply contributes 0 to scoring — that's fine.
+    let ping_results = config.cached_latency.clone();
 
     Ok(SessionData {
         manifest,

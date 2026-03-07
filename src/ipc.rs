@@ -72,7 +72,6 @@ pub struct ConnectRequest {
     pub server: Option<String>,
     pub no_lock: bool,
     pub allow_lan: bool,
-    pub skip_ping: bool,
     pub allow_country: Vec<String>,
     pub deny_country: Vec<String>,
     pub allow_server: Vec<String>,

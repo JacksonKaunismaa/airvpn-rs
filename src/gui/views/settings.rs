@@ -83,7 +83,6 @@ pub fn view<'a>(
     no_lock: bool,
     allow_lan: bool,
     no_reconnect: bool,
-    skip_ping: bool,
     no_verify: bool,
     lock_installed: bool,
     lock_persistent: bool,
@@ -146,9 +145,6 @@ pub fn view<'a>(
             checkbox(!no_reconnect)
                 .label("Auto-reconnect")
                 .on_toggle(|checked| Message::ConnectNoReconnectToggle(!checked)),
-            checkbox(skip_ping)
-                .label("Skip ping measurement")
-                .on_toggle(Message::ConnectSkipPingToggle),
             checkbox(no_verify)
                 .label("Skip tunnel verification")
                 .on_toggle(Message::ConnectNoVerifyToggle),

@@ -121,17 +121,10 @@ impl LatencyCache {
     }
 }
 
-/// Ping an IP, optionally binding to a specific interface (`-I <iface>`).
-///
-/// Used by the background pinger to force the connected server's ping
-/// through the VPN tunnel (via `avpn0`) while other servers are pinged
-/// through the physical NIC (no `-I` flag, using host routes).
-fn ping_ip_with_interface(ip: &str, interface: Option<&str>) -> Option<u64> {
+/// Ping an IP via the default route (host routes send it through physical NIC).
+fn ping_ip(ip: &str) -> Option<u64> {
     let mut cmd = Command::new("ping");
     cmd.args(["-c", "1", "-W", "3", "-q"]);
-    if let Some(iface) = interface {
-        cmd.args(["-I", iface]);
-    }
     cmd.arg(ip);
     let output = cmd.output().ok()?;
 
@@ -272,16 +265,10 @@ mod tests {
 ///
 /// Used by the background pinger which already has extracted IPs from the
 /// LatencyCache. Returns `Vec<(name, latency_ms)>` where latency is -1 on
-/// failure. All servers are pinged in parallel (1 ping each — EWMA smoothing
-/// handles outliers across cycles, so multi-round median is unnecessary).
-///
-/// If `connected_server` is provided, that server's ping is forced through
-/// the given VPN interface (e.g. `avpn0`) for accurate in-tunnel latency.
-/// All other servers are pinged via their host routes (physical NIC).
+/// failure. All servers are pinged in parallel via host routes (physical NIC).
+/// EWMA smoothing handles outliers across cycles.
 pub fn measure_all_from_ips(
     pairs: &[(String, String)],
-    connected_server: Option<&str>,
-    vpn_interface: Option<&str>,
 ) -> Vec<(String, i64)> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -300,15 +287,9 @@ pub fn measure_all_from_ips(
             let name = name.clone();
             let ip = ip.clone();
             let completed = Arc::clone(&completed);
-            // Connected server gets pinged through the tunnel interface
-            let iface = if connected_server == Some(name.as_str()) {
-                vpn_interface.map(|s| s.to_string())
-            } else {
-                None
-            };
 
             thread::spawn(move || {
-                let latency = match ping_ip_with_interface(&ip, iface.as_deref()) {
+                let latency = match ping_ip(&ip) {
                     Some(ms) => ms as i64,
                     None => -1,
                 };
@@ -334,9 +315,7 @@ pub fn measure_all_from_ips(
 
 /// Measure latency for all servers (pings first IPv4 entry IP of each).
 ///
-/// Each server is pinged [PING_ROUNDS] times and the median is used to resist
-/// ICMP spoofing. If the majority of pings fail, the server is marked as -1.
-///
+/// One-shot fallback for `/servers` when background pinger has no data yet.
 /// Eddie pings `IpsEntry.FirstPreferIPv4` (Latency.cs line 75).
 pub fn measure_all(servers: &[crate::manifest::Server]) -> LatencyCache {
     // Extract (name, ip) pairs — prefer first IPv4, fall back to first entry IP.
@@ -357,7 +336,7 @@ pub fn measure_all(servers: &[crate::manifest::Server]) -> LatencyCache {
         })
         .collect();
 
-    let results = measure_all_from_ips(&pairs, None, None);
+    let results = measure_all_from_ips(&pairs);
 
     let mut cache = LatencyCache::new();
     for (name, latency) in &results {

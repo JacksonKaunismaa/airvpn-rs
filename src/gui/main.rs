@@ -84,7 +84,6 @@ struct App {
     connect_no_lock: bool,
     connect_allow_lan: bool,
     connect_no_reconnect: bool,
-    connect_skip_ping: bool,
     connect_no_verify: bool,
 }
 
@@ -113,7 +112,6 @@ pub enum Message {
     ConnectNoLockToggle(bool),
     ConnectAllowLanToggle(bool),
     ConnectNoReconnectToggle(bool),
-    ConnectSkipPingToggle(bool),
     ConnectNoVerifyToggle(bool),
     LockInstall,
     LockUninstall,
@@ -177,7 +175,6 @@ impl App {
             connect_no_lock: false,
             connect_allow_lan: true,
             connect_no_reconnect: false,
-            connect_skip_ping: false,
             connect_no_verify: false,
         };
 
@@ -439,10 +436,6 @@ impl App {
                 self.connect_no_reconnect = val;
                 Task::none()
             }
-            Message::ConnectSkipPingToggle(val) => {
-                self.connect_skip_ping = val;
-                Task::none()
-            }
             Message::ConnectNoVerifyToggle(val) => {
                 self.connect_no_verify = val;
                 Task::none()
@@ -597,12 +590,10 @@ impl App {
         let dns_servers = if self.settings_dns.is_empty() { Vec::new() } else {
             self.settings_dns.split(',').map(|s| s.trim().to_string()).collect()
         };
-        let skip_ping = server.is_some() || self.connect_skip_ping;
         ConnectRequest {
             server,
             no_lock: self.connect_no_lock,
             allow_lan: self.connect_allow_lan,
-            skip_ping,
             allow_country: Vec::new(),
             deny_country: Vec::new(),
             allow_server: Vec::new(),
@@ -730,7 +721,6 @@ impl App {
                 self.connect_no_lock,
                 self.connect_allow_lan,
                 self.connect_no_reconnect,
-                self.connect_skip_ping,
                 self.connect_no_verify,
                 self.lock_installed,
                 self.lock_persistent,

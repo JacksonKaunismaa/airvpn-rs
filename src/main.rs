@@ -39,9 +39,6 @@ enum Commands {
         /// Never connect to servers in these countries (repeatable, 2-letter code)
         #[arg(long)]
         deny_country: Vec<String>,
-        /// Skip server latency measurement (faster startup, uses score without ping)
-        #[arg(long)]
-        skip_ping: bool,
         /// Skip post-connection tunnel and DNS verification
         #[arg(long)]
         no_verify: bool,
@@ -99,9 +96,6 @@ enum Commands {
         /// Sort order: score (default), name, load, users
         #[arg(long, default_value = "score")]
         sort: String,
-        /// Skip latency measurement (faster, uses score without ping)
-        #[arg(long)]
-        skip_ping: bool,
     },
     /// Clean up stale state after crash
     Recover,
@@ -276,7 +270,6 @@ fn main() -> anyhow::Result<()> {
             deny_server,
             allow_country,
             deny_country,
-            skip_ping,
             no_verify,
             no_lock_last,
             no_start_last,
@@ -296,7 +289,6 @@ fn main() -> anyhow::Result<()> {
                 server,
                 no_lock,
                 allow_lan,
-                skip_ping,
                 allow_country,
                 deny_country,
                 allow_server,
@@ -315,8 +307,8 @@ fn main() -> anyhow::Result<()> {
         }
         Commands::Disconnect => cli_client::send_simple("POST", "/disconnect", None),
         Commands::Status => cli_client::send_status(),
-        Commands::Servers { sort, skip_ping } => {
-            cli_client::send_list_servers(skip_ping, &sort)
+        Commands::Servers { sort } => {
+            cli_client::send_list_servers(&sort)
         }
         Commands::Recover => cli_client::send_simple("POST", "/recover", None),
         Commands::Lock { action } => {

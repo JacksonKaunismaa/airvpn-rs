@@ -880,10 +880,8 @@ fn build_ping_hole_rules(server_ips: &[String]) -> (String, usize) {
 /// Build the nft batch commands for per-IP all-protocol allowlist rules.
 ///
 /// Unlike `build_ping_hole_rules` (ICMP-only), this generates `ip daddr <ip> accept`
-/// rules that allow all protocols — matching Eddie's outgoing server allowlist behavior.
-///
-/// Returns the batch string and the count of valid rules generated.
-/// Pure function — no side effects, testable without root.
+/// rules that allow all protocols. Only used in tests.
+#[cfg(test)]
 fn build_server_allowlist_rules(server_ips: &[String]) -> (String, usize) {
     let mut batch = String::new();
     let mut seen = std::collections::HashSet::new();
