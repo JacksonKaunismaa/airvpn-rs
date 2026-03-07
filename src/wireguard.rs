@@ -662,7 +662,7 @@ pub fn add_server_host_routes(server_ips: &[String], gateway: &str) -> Result<()
     }
 
     let mut child = Command::new("ip")
-        .args([ip_ver, "-batch", "-"])
+        .args([ip_ver, "-force", "-batch", "-"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -675,13 +675,14 @@ pub fn add_server_host_routes(server_ips: &[String], gateway: &str) -> Result<()
     let output = child.wait_with_output()
         .context("failed to wait on ip -batch for server routes")?;
 
-    // Non-fatal: some routes may already exist (e.g., the connected endpoint)
+    // Non-fatal: some routes may already exist (e.g., the connected endpoint).
+    // -force ensures ip continues past errors instead of terminating on first failure.
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         warn!("Some server host routes failed (non-fatal): {}", stderr.trim());
     }
 
-    let count = server_ips.len();
+    let count = batch.lines().count();
     info!("Added {} server host routes via physical gateway", count);
     Ok(())
 }
@@ -706,7 +707,7 @@ pub fn remove_server_host_routes(server_ips: &[String], gateway: &str) -> Result
     }
 
     let mut child = Command::new("ip")
-        .args([ip_ver, "-batch", "-"])
+        .args([ip_ver, "-force", "-batch", "-"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

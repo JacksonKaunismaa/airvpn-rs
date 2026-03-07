@@ -79,6 +79,7 @@ pub fn view<'a>(
     event_down: (&str, &str, bool),
     loaded: bool,
     dirty: bool,
+    show_errors: bool,
     no_lock: bool,
     allow_lan: bool,
     no_reconnect: bool,
@@ -153,6 +154,14 @@ pub fn view<'a>(
                 .on_toggle(Message::ConnectNoVerifyToggle),
         ]
         .spacing(6),
+    );
+
+    // ── GUI ───────────────────────────────────────────────
+    content = content.push(section_header("GUI"));
+    content = content.push(
+        checkbox(show_errors)
+            .label("Show error messages")
+            .on_toggle(Message::ShowErrorsToggle),
     );
 
     // ── Network ──────────────────────────────────────────

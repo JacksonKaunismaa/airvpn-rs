@@ -1174,6 +1174,8 @@ fn dispatch_list_servers(skip_ping: bool, sort: Option<&str>, username: &str, pa
                 users: s.users,
                 users_max: s.users_max,
                 load_percent: load,
+                bandwidth_cur: 2_i64.saturating_mul(s.bandwidth.saturating_mul(8)) / (1_000 * 1_000),
+                bandwidth_max: s.bandwidth_max,
                 score,
                 ping_ms,
                 warning,

@@ -137,13 +137,13 @@ fn build_header<'a>(sort_column: SortColumn, sort_ascending: bool) -> Element<'a
     let arrow = if sort_ascending { " \u{25B2}" } else { " \u{25BC}" };
 
     let cols: &[(SortColumn, &str, f32)] = &[
-        (SortColumn::Name, "Name", 160.0),
-        (SortColumn::Country, "Country", 70.0),
-        (SortColumn::Location, "Location", 110.0),
-        (SortColumn::Users, "Users", 80.0),
-        (SortColumn::Load, "Load%", 70.0),
-        (SortColumn::Score, "Score", 70.0),
-        (SortColumn::Ping, "Ping", 70.0),
+        (SortColumn::Name, "Name", 140.0),
+        (SortColumn::Country, "Country", 60.0),
+        (SortColumn::Location, "Location", 100.0),
+        (SortColumn::Users, "Users", 70.0),
+        (SortColumn::Load, "Load", 190.0),
+        (SortColumn::Score, "Score", 60.0),
+        (SortColumn::Ping, "Ping", 60.0),
     ];
 
     let mut header_row = row![].spacing(4);
@@ -188,14 +188,19 @@ fn build_row<'a>(server: &ServerInfo, is_warning: bool) -> Element<'a, Message> 
 
     let users_str = format!("{}/{}", server.users, server.users_max);
 
+    let load_str = format!(
+        "{:.0}%, {}/{} Mbit/s",
+        server.load_percent, server.bandwidth_cur, server.bandwidth_max
+    );
+
     row![
-        text(server.name.clone()).size(13).color(dim).width(160.0),
-        text(server.country_code.clone()).size(13).color(dim).width(70.0),
-        text(server.location.clone()).size(13).color(dim).width(110.0),
-        text(users_str).size(13).color(dim).width(80.0),
-        text(format!("{:.0}%", server.load_percent)).size(13).color(dim).width(70.0),
-        text(server.score.to_string()).size(13).color(dim).width(70.0),
-        text(ping_str).size(13).color(dim).width(70.0),
+        text(server.name.clone()).size(13).color(dim).width(140.0),
+        text(server.country_code.clone()).size(13).color(dim).width(60.0),
+        text(server.location.clone()).size(13).color(dim).width(100.0),
+        text(users_str).size(13).color(dim).width(70.0),
+        text(load_str).size(13).color(dim).width(190.0),
+        text(server.score.to_string()).size(13).color(dim).width(60.0),
+        text(ping_str).size(13).color(dim).width(60.0),
     ]
     .spacing(4)
     .into()

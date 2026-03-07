@@ -2,7 +2,7 @@ mod ipc;
 mod theme;
 mod views;
 
-use iced::widget::{button, column, container, row, text, Space};
+use iced::widget::{button, column, container, row, text};
 use iced::{Element, Fill, Size, Subscription, Task};
 use iced::time;
 use std::time::Duration;
@@ -49,7 +49,9 @@ struct App {
     server_sort_ascending: bool,
     server_search: String,
     helper: Option<ipc::HelperClient>,
-    helper_error: Option<String>,
+    error_overview: Option<String>,
+    error_servers: Option<String>,
+    error_settings: Option<String>,
     logs: Vec<LogEntry>,
     log_filter_debug: bool,
     log_filter_info: bool,
@@ -74,6 +76,9 @@ struct App {
     settings_event_down_wait: bool,
     settings_loaded: bool,
     settings_dirty: bool,
+
+    // GUI-only toggles (not persisted)
+    show_errors: bool,
 
     // Per-connect flags (not profile-backed)
     connect_no_lock: bool,
@@ -104,6 +109,7 @@ pub enum Message {
     SettingsIpv6ModeChanged(String),
     SettingsDnsChanged(String),
     SettingsEventChanged { hook: String, field: String, value: String },
+    ShowErrorsToggle(bool),
     ConnectNoLockToggle(bool),
     ConnectAllowLanToggle(bool),
     ConnectNoReconnectToggle(bool),
@@ -139,7 +145,9 @@ impl App {
             server_sort_ascending: true,
             server_search: String::new(),
             helper: None,
-            helper_error: None,
+            error_overview: None,
+            error_servers: None,
+            error_settings: None,
             logs: Vec::new(),
             log_filter_debug: false,
             log_filter_info: true,
@@ -163,6 +171,8 @@ impl App {
             settings_event_down_wait: true,
             settings_loaded: false,
             settings_dirty: false,
+
+            show_errors: false,
 
             connect_no_lock: false,
             connect_allow_lan: true,
@@ -201,9 +211,10 @@ impl App {
                 Task::none()
             }
             Message::Disconnect => {
+                self.error_overview = None;
                 if let Some(ref helper) = self.helper {
                     if let Err(e) = helper.send_command("POST", "/disconnect", None) {
-                        self.helper_error = Some(format!("Failed to send Disconnect: {}", e));
+                        self.error_overview = Some(format!("Failed to send Disconnect: {}", e));
                     }
                 }
                 Task::none()
@@ -223,15 +234,14 @@ impl App {
             Message::HelperConnected => {
                 match ipc::HelperClient::connect() {
                     Ok(client) => {
-                        // GET /events automatically delivers initial state + lock status
                         self.helper = Some(client);
-                        self.helper_error = None;
+                        self.error_overview = None;
                         self.activity.clear();
                         Task::none()
                     }
                     Err(e) => {
                         eprintln!("[GUI] HelperClient::connect() failed: {}", e);
-                        self.helper_error = Some(format!(
+                        self.error_overview = Some(format!(
                             "Cannot connect to helper: {}\n\
                              Is airvpn-helper.socket enabled?\n\
                              Run: sudo systemctl enable --now airvpn-helper.socket",
@@ -242,6 +252,7 @@ impl App {
                 }
             }
             Message::FetchServers => {
+                self.error_servers = None;
                 if let Some(ref helper) = self.helper {
                     self.servers_loading = true;
                     match helper.send_command("GET", "/servers?skip_ping=true", None) {
@@ -256,13 +267,13 @@ impl App {
                                     }
                                 }
                             } else {
-                                self.helper_error = Some(format!("Server list error: {}", body));
+                                self.error_servers = Some(format!("Server list error: {}", body));
                             }
                             self.servers_loading = false;
                         }
                         Err(e) => {
                             self.servers_loading = false;
-                            self.helper_error = Some(format!("Failed to fetch servers: {}", e));
+                            self.error_servers = Some(format!("Failed to fetch servers: {}", e));
                         }
                     }
                 }
@@ -313,6 +324,7 @@ impl App {
                 Task::none()
             }
             Message::FetchProfile => {
+                self.error_settings = None;
                 if let Some(ref helper) = self.helper {
                     match helper.send_command("GET", "/profile", None) {
                         Ok((status, body)) => {
@@ -328,11 +340,11 @@ impl App {
                                     }
                                 }
                             } else {
-                                self.helper_error = Some(format!("Profile error: {}", body));
+                                self.error_settings = Some(format!("Profile error: {}", body));
                             }
                         }
                         Err(e) => {
-                            self.helper_error = Some(format!("Failed to fetch profile: {}", e));
+                            self.error_settings = Some(format!("Failed to fetch profile: {}", e));
                         }
                     }
                 }
@@ -361,15 +373,15 @@ impl App {
                                 if status == 200 {
                                     self.settings_dirty = false;
                                 } else {
-                                    self.helper_error = Some(format!("Failed to save profile (HTTP {})", status));
+                                    self.error_settings = Some(format!("Failed to save profile (HTTP {})", status));
                                 }
                             }
                             Err(e) => {
-                                self.helper_error = Some(format!("Failed to save profile: {}", e));
+                                self.error_settings = Some(format!("Failed to save profile: {}", e));
                             }
                         },
                         Err(e) => {
-                            self.helper_error = Some(format!("Failed to serialize profile: {}", e));
+                            self.error_settings = Some(format!("Failed to serialize profile: {}", e));
                         }
                     }
                 }
@@ -411,6 +423,10 @@ impl App {
                 self.settings_dirty = true;
                 Task::none()
             }
+            Message::ShowErrorsToggle(val) => {
+                self.show_errors = val;
+                Task::none()
+            }
             Message::ConnectNoLockToggle(val) => {
                 self.connect_no_lock = val;
                 Task::none()
@@ -432,33 +448,37 @@ impl App {
                 Task::none()
             }
             Message::LockInstall => {
+                self.error_settings = None;
                 if let Some(ref helper) = self.helper {
                     if let Err(e) = helper.send_command("POST", "/lock/install", None) {
-                        self.helper_error = Some(format!("Failed to send LockInstall: {}", e));
+                        self.error_settings = Some(format!("Failed to send LockInstall: {}", e));
                     }
                 }
                 Task::none()
             }
             Message::LockUninstall => {
+                self.error_settings = None;
                 if let Some(ref helper) = self.helper {
                     if let Err(e) = helper.send_command("POST", "/lock/uninstall", None) {
-                        self.helper_error = Some(format!("Failed to send LockUninstall: {}", e));
+                        self.error_settings = Some(format!("Failed to send LockUninstall: {}", e));
                     }
                 }
                 Task::none()
             }
             Message::LockEnable => {
+                self.error_settings = None;
                 if let Some(ref helper) = self.helper {
                     if let Err(e) = helper.send_command("POST", "/lock/enable", None) {
-                        self.helper_error = Some(format!("Failed to send LockEnable: {}", e));
+                        self.error_settings = Some(format!("Failed to send LockEnable: {}", e));
                     }
                 }
                 Task::none()
             }
             Message::LockDisable => {
+                self.error_settings = None;
                 if let Some(ref helper) = self.helper {
                     if let Err(e) = helper.send_command("POST", "/lock/disable", None) {
-                        self.helper_error = Some(format!("Failed to send LockDisable: {}", e));
+                        self.error_settings = Some(format!("Failed to send LockDisable: {}", e));
                     }
                 }
                 Task::none()
@@ -524,7 +544,7 @@ impl App {
                 self.lock_installed = persistent_installed;
             }
             HelperEvent::Error { message } => {
-                self.helper_error = Some(message);
+                self.error_overview = Some(message);
             }
             HelperEvent::EddieProfileFound { path: _ } => {
                 // Eddie import is now handled via HTTP 409 response in send_connect().
@@ -601,11 +621,12 @@ impl App {
 
     /// Send POST /connect via HTTP. Handles 409 Eddie import by auto-accepting and retrying.
     fn send_connect(&mut self, server: Option<String>) {
+        self.error_overview = None;
         let req = self.build_connect_request(server);
         let body = match serde_json::to_vec(&req) {
             Ok(b) => b,
             Err(e) => {
-                self.helper_error = Some(format!("Failed to serialize ConnectRequest: {}", e));
+                self.error_overview = Some(format!("Failed to serialize ConnectRequest: {}", e));
                 return;
             }
         };
@@ -625,25 +646,25 @@ impl App {
                             // Auto-accept Eddie import
                             let import_body = b"{\"accept\":true}";
                             if let Err(e) = helper.send_command("POST", "/import-eddie", Some(import_body)) {
-                                self.helper_error = Some(format!("Failed to import Eddie profile: {}", e));
+                                self.error_overview = Some(format!("Failed to import Eddie profile: {}", e));
                                 return;
                             }
                             // Retry connect
                             if let Err(e) = helper.send_command("POST", "/connect", Some(&body)) {
-                                self.helper_error = Some(format!("Failed to connect after Eddie import: {}", e));
+                                self.error_overview = Some(format!("Failed to connect after Eddie import: {}", e));
                             }
                             return;
                         }
                     }
                     // 409 but not Eddie — already connected or other error
-                    self.helper_error = Some(format!("Connect failed: {}", resp_body));
+                    self.error_overview = Some(format!("Connect failed: {}", resp_body));
                 } else if status != 200 {
-                    self.helper_error = Some(format!("Connect failed (HTTP {}): {}", status, resp_body));
+                    self.error_overview = Some(format!("Connect failed (HTTP {}): {}", status, resp_body));
                 }
                 // 200 = connect started, events arrive via /events stream
             }
             Err(e) => {
-                self.helper_error = Some(format!("Failed to send Connect: {}", e));
+                self.error_overview = Some(format!("Failed to send Connect: {}", e));
             }
         }
     }
@@ -705,6 +726,7 @@ impl App {
                 (&self.settings_event_down_file, &self.settings_event_down_args, self.settings_event_down_wait),
                 self.settings_loaded,
                 self.settings_dirty,
+                self.show_errors,
                 self.connect_no_lock,
                 self.connect_allow_lan,
                 self.connect_no_reconnect,
@@ -714,23 +736,30 @@ impl App {
                 self.lock_persistent,
             ),
         };
-        let content = container(content).padding(16).width(Fill);
+        // Per-tab error display (inline at top of content area, only when show_errors is on)
+        let tab_error = if self.show_errors {
+            match self.active_tab {
+                views::Tab::Overview => self.error_overview.as_deref(),
+                views::Tab::Servers => self.error_servers.as_deref(),
+                views::Tab::Settings => self.error_settings.as_deref(),
+                views::Tab::Logs => None,
+            }
+        } else {
+            None
+        };
 
-        // Error banner
+        let content_with_error: Element<Message> = if let Some(err) = tab_error {
+            let err_text = text(err)
+                .size(13)
+                .color(iced::Color::from_rgb(0.91, 0.27, 0.38));
+            column![err_text, content].spacing(4).into()
+        } else {
+            content
+        };
+
+        let content = container(content_with_error).padding(16).width(Fill);
+
         let mut main_col = column![];
-        if let Some(ref err) = self.helper_error {
-            let banner = container(
-                row![
-                    text(format!("Error: {}", err)).color(iced::Color::from_rgb(0.91, 0.27, 0.38)),
-                    Space::new().width(Fill),
-                    button(text("Retry")).on_press(Message::HelperConnected),
-                ]
-                .spacing(8),
-            )
-            .padding(8);
-            main_col = main_col.push(banner);
-        }
-
         main_col = main_col.push(
             row![sidebar, content]
                 .height(Fill)
