@@ -15,13 +15,42 @@ use crate::pinger::LatencyCache;
 //   ScoreBase:           raw score from manifest (lower = better)
 //   Users / UsersMax:    current / max user counts
 //
-// We use "Speed" scoreType (Eddie default: servers.scoretype="Speed"):
-//   All factors are 1.0 (ScoreBase *= 1, LoadPerc *= 1, UsersPerc *= 1)
+// ScoreType (Eddie: servers.scoretype, default "Speed"):
+//   Speed:   all factors 1.0 — balanced scoring
+//   Latency: ScoreB /= 500, LoadB /= 10, UsersB /= 10 — ping dominates
+//
+// Factor values confirmed from AirVPN manifest (2026-03-07):
+//   speed_factor=1, latency_factor=500, load_factor=1, users_factor=1,
+//   ping_factor=1, penality_factor=1000, speed_load_factor=1 (default),
+//   latency_load_factor=10 (default), speed_users_factor=1 (default),
+//   latency_users_factor=10 (default)
+//
 // Penalty tracking via ServerPenalties (Eddie: Penality field on ConnectionInfo).
 // Unmeasured ping (Ping==-1) contributes 0 instead of Eddie's 99995 sentinel,
 // so that load/users/scorebase/penalties still differentiate servers.
 // Result is truncated to i64 to match Eddie's `(int)(sum)` cast.
 // ---------------------------------------------------------------------------
+
+/// Scoring mode (Eddie: `servers.scoretype`).
+///
+/// Speed (default): balanced — load, users, scorebase, and ping all contribute equally.
+/// Latency: ping dominates — load and users divided by 10, scorebase divided by 500.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum ScoreType {
+    #[default]
+    Speed,
+    Latency,
+}
+
+impl ScoreType {
+    /// Parse from profile option string (case-insensitive, defaults to Speed).
+    pub fn from_profile(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "latency" => ScoreType::Latency,
+            _ => ScoreType::Speed,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Penalty tracking (Eddie: ConnectionInfo.Penality + advanced.penality_on_error)
@@ -114,45 +143,19 @@ fn users_perc(server: &Server) -> i64 {
 /// - `warning_closed` non-empty -> 99998 (Error-level warning in Eddie)
 /// - `warning_open` non-empty -> 99997 (Warning-level warning in Eddie)
 ///
-/// Normal computation (Speed scoreType, no ping):
+/// Normal computation (no ping):
 /// ```text
 /// Score = PenalityB + PingB + LoadB + ScoreB + UsersB
 /// ```
-/// With Speed factors (all 1.0):
-/// - PenalityB = 0 (base score excludes penalty; see `score_with_penalty()`)
-/// - PingB = 0 (no ping data; see `score_with_ping()` for ping-aware scoring)
-/// - LoadB = LoadPerc * 1
-/// - ScoreB = ScoreBase * 1
-/// - UsersB = UsersPerc * 1
+/// Speed mode (all 1.0): LoadB = LoadPerc, ScoreB = ScoreBase, UsersB = UsersPerc
+/// Latency mode: ScoreB /= 500, LoadB /= 10, UsersB /= 10 (ping dominates)
 ///
 /// Result is truncated to i64 to match Eddie's `(int)(sum)` cast.
 ///
 /// NOTE: This treats ping as 0 (not measured). For ping-aware scoring, use
-/// `score_with_ping()` which applies the Eddie sentinel (Ping==-1 -> 99995).
-pub fn score(server: &Server) -> i64 {
-    // warning_closed -> Error in Eddie -> HasWarningsErrors() -> 99998
-    if !server.warning_closed.is_empty() {
-        return 99998;
-    }
-    // warning_open -> Warning in Eddie -> HasWarnings() -> 99997
-    if !server.warning_open.is_empty() {
-        return 99997;
-    }
-
-    let penality_b = 0; // Base score excludes penalty; use score_with_penalty() for penalty-aware scoring
-    let ping_b = 0; // No ping data; use score_with_ping() for ping-aware scoring
-
-    let load = load_perc(server);
-    let users = users_perc(server);
-    let score_base = server.scorebase;
-
-    // Speed scoreType (Eddie default: servers.scoretype="Speed")
-    // All factors are 1.0 in speed mode
-    let load_b = load;
-    let score_b = score_base;
-    let users_b = users;
-
-    penality_b + ping_b + load_b + score_b + users_b
+/// `score_with_ping()`.
+pub fn score(server: &Server, score_type: ScoreType) -> i64 {
+    score_with_ping(server, -1, score_type)
 }
 
 /// Calculate server score with ICMP ping latency, matching Eddie's
@@ -162,12 +165,16 @@ pub fn score(server: &Server) -> i64 {
 /// - `ping_ms == -1` (not measured) -> fall back to base score (load + scorebase + users)
 /// - Otherwise: `PingB = ping_ms * ping_factor(1)` added to score sum
 ///
+/// Score type determines factor divisors (Eddie: `servers.scoretype`):
+/// - Speed (default): all factors 1.0
+/// - Latency: ScoreB /= 500, LoadB /= 10, UsersB /= 10
+///
 /// NOTE: Eddie returns 99995 sentinel for unmeasured ping, which makes all
 /// unmeasured servers score identically and breaks penalty-based rotation
 /// (score_with_penalty skips penalties for sentinels >= 99995). We diverge
 /// from Eddie here: unmeasured ping contributes 0 instead of a sentinel,
 /// so that load/users/scorebase/penalties still differentiate servers.
-pub fn score_with_ping(server: &Server, ping_ms: i64) -> i64 {
+pub fn score_with_ping(server: &Server, ping_ms: i64, score_type: ScoreType) -> i64 {
     // warning_closed -> Error in Eddie -> HasWarningsErrors() -> 99998
     if !server.warning_closed.is_empty() {
         return 99998;
@@ -185,15 +192,19 @@ pub fn score_with_ping(server: &Server, ping_ms: i64) -> i64 {
 
     let penality_b = 0; // Base score excludes penalty; use score_with_penalty() for penalty-aware scoring
 
-    let load = load_perc(server);
-    let users = users_perc(server);
-    let score_base = server.scorebase;
+    let mut load_b = load_perc(server);
+    let mut score_b = server.scorebase;
+    let mut users_b = users_perc(server);
 
-    // Speed scoreType (Eddie default: servers.scoretype="Speed")
-    // All factors are 1.0 in speed mode
-    let load_b = load;
-    let score_b = score_base;
-    let users_b = users;
+    // Apply score type divisors (Eddie: ConnectionInfo.cs lines 233-244)
+    match score_type {
+        ScoreType::Speed => {} // All factors 1.0, no adjustment needed
+        ScoreType::Latency => {
+            score_b /= 500;
+            load_b /= 10;
+            users_b /= 10;
+        }
+    }
 
     penality_b + ping_b + load_b + score_b + users_b
 }
@@ -203,8 +214,13 @@ pub fn score_with_ping(server: &Server, ping_ms: i64) -> i64 {
 ///
 /// Sentinel values (99995+) from warnings/unmeasured ping are not modified --
 /// a closed server stays closed regardless of penalties.
-pub fn score_with_penalty(server: &Server, penalties: &ServerPenalties, ping_ms: i64) -> i64 {
-    let base = score_with_ping(server, ping_ms);
+pub fn score_with_penalty(
+    server: &Server,
+    penalties: &ServerPenalties,
+    ping_ms: i64,
+    score_type: ScoreType,
+) -> i64 {
+    let base = score_with_ping(server, ping_ms, score_type);
     // Don't inflate sentinel values (warnings/errors/unmeasured ping)
     if base >= 99995 {
         return base;
@@ -266,6 +282,7 @@ pub fn filter_servers<'a>(
 pub fn select_server<'a>(
     servers: &'a [Server],
     server_name: Option<&str>,
+    score_type: ScoreType,
 ) -> anyhow::Result<&'a Server> {
     if servers.is_empty() {
         bail!("no servers available");
@@ -281,7 +298,7 @@ pub fn select_server<'a>(
     // Score all servers and pick the one with the lowest score.
     servers
         .iter()
-        .min_by(|a, b| score(a).cmp(&score(b)))
+        .min_by(|a, b| score(a, score_type).cmp(&score(b, score_type)))
         .context("no servers available")
 }
 
@@ -296,6 +313,7 @@ pub fn select_server_with_penalties<'a>(
     server_name: Option<&str>,
     penalties: &ServerPenalties,
     pings: &LatencyCache,
+    score_type: ScoreType,
 ) -> anyhow::Result<&'a Server> {
     if servers.is_empty() {
         bail!("no servers available");
@@ -313,8 +331,8 @@ pub fn select_server_with_penalties<'a>(
     servers
         .iter()
         .min_by(|a, b| {
-            let sa = score_with_penalty(a, penalties, pings.get(&a.name));
-            let sb = score_with_penalty(b, penalties, pings.get(&b.name));
+            let sa = score_with_penalty(a, penalties, pings.get(&a.name), score_type);
+            let sb = score_with_penalty(b, penalties, pings.get(&b.name), score_type);
             sa.cmp(&sb)
         })
         .context("no servers available")
@@ -376,7 +394,7 @@ mod tests {
         //
         // Score = 0 + 0 + 0 + 10 + 20 = 30
         let s = make_server("Alpha", 500_000, 1000, 50, 250, 10, "", "");
-        let sc = score(&s);
+        let sc = score(&s, ScoreType::Speed);
         assert_eq!(sc, 30);
     }
 
@@ -397,27 +415,27 @@ mod tests {
         //
         // Score = 0 + 0 + 80 + 0 + 80 = 160
         let s = make_server("Bravo", 50_000_000, 1000, 200, 250, 0, "", "");
-        let sc = score(&s);
+        let sc = score(&s, ScoreType::Speed);
         assert_eq!(sc, 160);
     }
 
     #[test]
     fn test_score_warning_closed() {
         let s = make_server("Closed", 500_000, 1000, 50, 250, 10, "", "Server maintenance");
-        assert_eq!(score(&s), 99998);
+        assert_eq!(score(&s, ScoreType::Speed), 99998);
     }
 
     #[test]
     fn test_score_warning_open() {
         let s = make_server("Open", 500_000, 1000, 50, 250, 10, "Degraded performance", "");
-        assert_eq!(score(&s), 99997);
+        assert_eq!(score(&s, ScoreType::Speed), 99997);
     }
 
     #[test]
     fn test_score_both_warnings_closed_takes_priority() {
         // When both are set, warning_closed (Error) is checked first → 99998
         let s = make_server("Both", 500_000, 1000, 50, 250, 10, "warning", "closed");
-        assert_eq!(score(&s), 99998);
+        assert_eq!(score(&s, ScoreType::Speed), 99998);
     }
 
     #[test]
@@ -427,7 +445,7 @@ mod tests {
         // Speed mode: LoadB = 100, ScoreB = 0, UsersB = 20
         // Score = 0 + 0 + 100 + 0 + 20 = 120
         let s = make_server("Zero", 500_000, 0, 50, 250, 0, "", "");
-        assert_eq!(score(&s), 120);
+        assert_eq!(score(&s, ScoreType::Speed), 120);
     }
 
     #[test]
@@ -437,7 +455,7 @@ mod tests {
         // Speed mode: LoadB = 0, ScoreB = 0, UsersB = 100
         // Score = 0 + 0 + 0 + 0 + 100 = 100
         let s = make_server("NoMax", 500_000, 1000, 50, 0, 0, "", "");
-        assert_eq!(score(&s), 100);
+        assert_eq!(score(&s, ScoreType::Speed), 100);
     }
 
     #[test]
@@ -458,7 +476,7 @@ mod tests {
             // Score: LoadB=0 + ScoreB=10 + UsersB=20 = 30
             make_server("Better", 500_000, 1000, 50, 250, 10, "", ""),
         ];
-        let selected = select_server(&servers, None).unwrap();
+        let selected = select_server(&servers, None, ScoreType::Speed).unwrap();
         assert_eq!(selected.name, "Better");
     }
 
@@ -469,7 +487,7 @@ mod tests {
             make_server("Pollux", 500_000, 1000, 50, 250, 10, "", ""),
         ];
         // Castor has a worse score, but explicit name selection overrides scoring.
-        let selected = select_server(&servers, Some("Castor")).unwrap();
+        let selected = select_server(&servers, Some("Castor"), ScoreType::Speed).unwrap();
         assert_eq!(selected.name, "Castor");
     }
 
@@ -478,7 +496,7 @@ mod tests {
         let servers = vec![
             make_server("Alpha", 500_000, 1000, 50, 250, 10, "", ""),
         ];
-        let err = select_server(&servers, Some("Nonexistent")).unwrap_err();
+        let err = select_server(&servers, Some("Nonexistent"), ScoreType::Speed).unwrap_err();
         assert!(
             err.to_string().contains("not found"),
             "expected 'not found' error, got: {err}"
@@ -488,7 +506,7 @@ mod tests {
     #[test]
     fn test_select_server_empty_list() {
         let servers: Vec<Server> = vec![];
-        let err = select_server(&servers, None).unwrap_err();
+        let err = select_server(&servers, None, ScoreType::Speed).unwrap_err();
         assert!(
             err.to_string().contains("no servers available"),
             "expected 'no servers available' error, got: {err}"
@@ -502,7 +520,7 @@ mod tests {
             make_server("Open", 500_000, 1000, 50, 250, 0, "degraded", ""),
             make_server("Good", 500_000, 1000, 50, 250, 10, "", ""),
         ];
-        let selected = select_server(&servers, None).unwrap();
+        let selected = select_server(&servers, None, ScoreType::Speed).unwrap();
         assert_eq!(selected.name, "Good");
     }
 
@@ -525,7 +543,7 @@ mod tests {
         penalties.penalize("Alpha", 30);
         // Base score with ping=10ms: 10 + 0 + 10 + 20 = 40
         // Penalty contribution = 30 * 1000 = 30000
-        assert_eq!(score_with_penalty(&s, &penalties, 10), 30040);
+        assert_eq!(score_with_penalty(&s, &penalties, 10, ScoreType::Speed), 30040);
     }
 
     #[test]
@@ -536,7 +554,7 @@ mod tests {
         let s = make_server("Alpha", 500_000, 1000, 50, 250, 10, "", "");
         let mut penalties = ServerPenalties::new();
         penalties.penalize("Alpha", 30);
-        assert_eq!(score_with_penalty(&s, &penalties, -1), 30030);
+        assert_eq!(score_with_penalty(&s, &penalties, -1, ScoreType::Speed), 30030);
     }
 
     #[test]
@@ -545,7 +563,7 @@ mod tests {
         let s = make_server("Closed", 500_000, 1000, 50, 250, 10, "", "maintenance");
         let mut penalties = ServerPenalties::new();
         penalties.penalize("Closed", 30);
-        assert_eq!(score_with_penalty(&s, &penalties, 10), 99998);
+        assert_eq!(score_with_penalty(&s, &penalties, 10, ScoreType::Speed), 99998);
     }
 
     // -------------------------------------------------------------------
@@ -557,7 +575,7 @@ mod tests {
         // Unmeasured ping (-1) falls back to base score (ping contributes 0).
         // Base: LoadB=0 + ScoreB=10 + UsersB=20 = 30
         let s = make_server("Alpha", 500_000, 1000, 50, 250, 10, "", "");
-        assert_eq!(score_with_ping(&s, -1), score(&s));
+        assert_eq!(score_with_ping(&s, -1, ScoreType::Speed), score(&s, ScoreType::Speed));
     }
 
     #[test]
@@ -565,7 +583,7 @@ mod tests {
         // Base score without ping = 30 (LoadB=0 + ScoreB=10 + UsersB=20)
         // With ping=15ms: PingB=15, total = 15 + 0 + 10 + 20 = 45
         let s = make_server("Alpha", 500_000, 1000, 50, 250, 10, "", "");
-        assert_eq!(score_with_ping(&s, 15), 45);
+        assert_eq!(score_with_ping(&s, 15, ScoreType::Speed), 45);
     }
 
     #[test]
@@ -583,12 +601,12 @@ mod tests {
         pings.update("Second", 5);
 
         // Without penalty, "Best" wins (score 35 vs 165)
-        let selected = select_server_with_penalties(&servers, None, &penalties, &pings).unwrap();
+        let selected = select_server_with_penalties(&servers, None, &penalties, &pings, ScoreType::Speed).unwrap();
         assert_eq!(selected.name, "Best");
 
         // Penalize "Best" -- now "Second" should win (35 + 30*1000 = 30035 > 165)
         penalties.penalize("Best", 30);
-        let selected = select_server_with_penalties(&servers, None, &penalties, &pings).unwrap();
+        let selected = select_server_with_penalties(&servers, None, &penalties, &pings, ScoreType::Speed).unwrap();
         assert_eq!(selected.name, "Second");
     }
 
@@ -603,7 +621,7 @@ mod tests {
         let pings = LatencyCache::new();
         // Explicit name should still find Alpha despite penalty
         let selected =
-            select_server_with_penalties(&servers, Some("Alpha"), &penalties, &pings).unwrap();
+            select_server_with_penalties(&servers, Some("Alpha"), &penalties, &pings, ScoreType::Speed).unwrap();
         assert_eq!(selected.name, "Alpha");
     }
 
@@ -618,7 +636,7 @@ mod tests {
         pings.update("Far", 200);
         pings.update("Near", 5);
 
-        let selected = select_server_with_penalties(&servers, None, &penalties, &pings).unwrap();
+        let selected = select_server_with_penalties(&servers, None, &penalties, &pings, ScoreType::Speed).unwrap();
         assert_eq!(selected.name, "Near");
     }
 
@@ -636,7 +654,7 @@ mod tests {
         // Only "Measured" has a ping result; "Unmeasured" defaults to -1 (→ 0 contribution)
         pings.update("Measured", 50);
 
-        let selected = select_server_with_penalties(&servers, None, &penalties, &pings).unwrap();
+        let selected = select_server_with_penalties(&servers, None, &penalties, &pings, ScoreType::Speed).unwrap();
         // Unmeasured: base 30 + ping 0 = 30
         // Measured: base 30 + ping 50 = 80
         assert_eq!(selected.name, "Unmeasured");
@@ -655,12 +673,12 @@ mod tests {
         let pings = LatencyCache::new(); // No pings (--skip-ping)
 
         // Without penalty, both score 30; min_by picks first (Achernar)
-        let selected = select_server_with_penalties(&servers, None, &penalties, &pings).unwrap();
+        let selected = select_server_with_penalties(&servers, None, &penalties, &pings, ScoreType::Speed).unwrap();
         assert_eq!(selected.name, "Achernar");
 
         // Penalize Achernar — Geminorum should now win
         penalties.penalize("Achernar", 30);
-        let selected = select_server_with_penalties(&servers, None, &penalties, &pings).unwrap();
+        let selected = select_server_with_penalties(&servers, None, &penalties, &pings, ScoreType::Speed).unwrap();
         assert_eq!(selected.name, "Geminorum");
     }
 
@@ -875,6 +893,78 @@ mod tests {
             "penalty should be capped at MAX_PENALTY ({})",
             ServerPenalties::MAX_PENALTY,
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Latency score type tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_score_latency_mode() {
+        // Same server as test_score_normal_server:
+        // LoadPerc = 0, ScoreBase = 10, UsersPerc = 20
+        //
+        // Latency mode: ScoreB /= 500, LoadB /= 10, UsersB /= 10
+        //   ScoreB = 10 / 500 = 0 (integer division)
+        //   LoadB = 0 / 10 = 0
+        //   UsersB = 20 / 10 = 2
+        //   PingB = 0 (no ping)
+        //
+        // Score = 0 + 0 + 0 + 2 = 2
+        let s = make_server("Alpha", 500_000, 1000, 50, 250, 10, "", "");
+        assert_eq!(score(&s, ScoreType::Latency), 2);
+    }
+
+    #[test]
+    fn test_score_latency_ping_dominates() {
+        // Two servers with identical load/users but different pings.
+        // In Speed mode, 50ms difference is meaningful but load matters equally.
+        // In Latency mode, load is divided by 10 so ping dominates.
+        let low_load = make_server("LowLoad", 500_000, 1000, 50, 250, 0, "", "");
+        let high_load = make_server("HighLoad", 50_000_000, 1000, 200, 250, 0, "", "");
+
+        // Speed mode: LowLoad=0+20=20, HighLoad=80+80=160
+        // With ping 100ms: LowLoad=120, HighLoad=260
+        assert_eq!(score_with_ping(&low_load, 100, ScoreType::Speed), 120);
+        assert_eq!(score_with_ping(&high_load, 100, ScoreType::Speed), 260);
+
+        // Latency mode: LowLoad load=0/10=0, users=20/10=2 → 2+100=102
+        //               HighLoad load=80/10=8, users=80/10=8 → 16+100=116
+        // Difference shrinks from 140 (speed) to 14 (latency) — ping dominates
+        assert_eq!(score_with_ping(&low_load, 100, ScoreType::Latency), 102);
+        assert_eq!(score_with_ping(&high_load, 100, ScoreType::Latency), 116);
+    }
+
+    #[test]
+    fn test_latency_mode_prefers_low_ping_over_low_load() {
+        // Server A: low load, high ping (200ms)
+        // Server B: high load, low ping (10ms)
+        // In Latency mode, B should win despite high load.
+        let servers = vec![
+            make_server("LowLoad", 500_000, 1000, 50, 250, 0, "", ""),
+            make_server("LowPing", 50_000_000, 1000, 200, 250, 0, "", ""),
+        ];
+        let penalties = ServerPenalties::new();
+        let mut pings = LatencyCache::new();
+        pings.update("LowLoad", 200);
+        pings.update("LowPing", 10);
+
+        // Speed mode: LowLoad wins (20+200=220 vs 160+10=170) — actually LowPing wins
+        // Latency mode: LowPing definitely wins (8+8+10=26 vs 0+2+200=202)
+        let selected = select_server_with_penalties(
+            &servers, None, &penalties, &pings, ScoreType::Latency,
+        ).unwrap();
+        assert_eq!(selected.name, "LowPing");
+    }
+
+    #[test]
+    fn test_score_type_from_profile() {
+        assert_eq!(ScoreType::from_profile("Speed"), ScoreType::Speed);
+        assert_eq!(ScoreType::from_profile("speed"), ScoreType::Speed);
+        assert_eq!(ScoreType::from_profile("Latency"), ScoreType::Latency);
+        assert_eq!(ScoreType::from_profile("latency"), ScoreType::Latency);
+        assert_eq!(ScoreType::from_profile(""), ScoreType::Speed);
+        assert_eq!(ScoreType::from_profile("unknown"), ScoreType::Speed);
     }
 
 }

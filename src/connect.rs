@@ -340,6 +340,7 @@ struct SessionParams {
     ipv6_mode: Ipv6Mode,
     custom_dns_ips: Vec<String>,
     blocked_ipv6_ifaces: Vec<String>,
+    score_type: server::ScoreType,
     profile_options: std::collections::HashMap<String, String>,
 }
 
@@ -457,6 +458,10 @@ fn resolve_session(config: &ConnectConfig) -> anyhow::Result<SessionParams> {
         info!("IPv6 disabled on {} interfaces", blocked_ipv6_ifaces.len());
     }
 
+    let score_type = server::ScoreType::from_profile(
+        profile_options.get("servers.scoretype").map(|s| s.as_str()).unwrap_or("Speed"),
+    );
+
     Ok(SessionParams {
         shutdown,
         nonce,
@@ -468,6 +473,7 @@ fn resolve_session(config: &ConnectConfig) -> anyhow::Result<SessionParams> {
         ipv6_mode,
         custom_dns_ips,
         blocked_ipv6_ifaces,
+        score_type,
         profile_options,
     })
 }
@@ -1260,6 +1266,7 @@ pub fn run(
             forced_server.as_deref(),
             &penalties,
             &data.ping_results,
+            params.score_type,
         )?;
         info!(
             "Selected server: {} ({}, {})",
@@ -1276,7 +1283,7 @@ pub fn run(
             server_ref.group,
             server_ref.ips_entry,
             server_ref.ips_exit,
-            server::score(server_ref),
+            server::score(server_ref, params.score_type),
             server_ref.bandwidth,
             server_ref.bandwidth_max,
             server_ref.users,
