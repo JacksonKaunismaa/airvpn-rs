@@ -236,7 +236,7 @@ allowlist pattern.
 ## 10. Background pinger with EWMA smoothing
 
 **Eddie:** Background `Jobs/Latency.cs` pings one server at a time, every 180s
-(success) or 5s (retry). Uses running average `(old + new) / 2`. Stops pinging
+(success) or 5s (retry). Uses running average `(old + new) / 2` (α=0.5). Stops pinging
 while connected. Ping results are in-memory only (lost on restart). Allowlists
 ALL server IPs in the session lock outgoing allowlist (for reconnection
 readiness, not pinging).
