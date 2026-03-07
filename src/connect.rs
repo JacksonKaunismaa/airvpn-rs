@@ -554,6 +554,10 @@ fn fetch_manifest_and_user(
 }
 
 /// One-shot latency measurement for all servers (fallback when no cached data).
+///
+/// The persistent lock's `ping_allow` subchain is populated by the helper when
+/// server IPs arrive (via `on_server_ips` callback), so ICMP is already allowed
+/// by the time this runs.
 fn measure_all_inline(
     filtered_servers: &[manifest::Server],
     config: &ConnectConfig,
@@ -564,36 +568,7 @@ fn measure_all_inline(
     });
     info!("Measuring server latencies...");
 
-    // Punch per-IP ICMP holes in the persistent lock so the pinger can
-    // reach server IPs. Collect all entry IPs (IPv4 preferred, like the pinger).
-    let server_ips: Vec<String> = filtered_servers
-        .iter()
-        .flat_map(|s| {
-            s.ips_entry
-                .iter()
-                .find(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())
-                .or_else(|| s.ips_entry.first())
-                .cloned()
-        })
-        .collect();
-    if let Err(e) = crate::netlock::open_ping_holes(&server_ips) {
-        warn!("Failed to open ICMP ping holes: {e} (pings may fail if persistent lock is active)");
-    }
-
-    // Drop guard ensures ping holes are closed even if measure_all panics.
-    struct PingHoleGuard;
-    impl Drop for PingHoleGuard {
-        fn drop(&mut self) {
-            if let Err(e) = crate::netlock::close_ping_holes() {
-                log::error!("Failed to close ICMP ping holes on cleanup: {e}");
-            }
-        }
-    }
-    let _guard = PingHoleGuard;
-
     let results = pinger::measure_all(filtered_servers);
-
-    drop(_guard);
 
     info!("Pinged {} servers.", results.len());
     emit(config, crate::ipc::EngineEvent::Log {

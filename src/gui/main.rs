@@ -255,7 +255,7 @@ impl App {
                 self.error_servers = None;
                 if let Some(ref helper) = self.helper {
                     self.servers_loading = true;
-                    match helper.send_command("GET", "/servers?skip_ping=true", None) {
+                    match helper.send_command("GET", "/servers", None) {
                         Ok((status, body)) => {
                             if status == 200 {
                                 // Parse {"servers": [...]}
