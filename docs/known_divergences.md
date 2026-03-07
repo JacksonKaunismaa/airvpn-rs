@@ -142,8 +142,10 @@ a leak window during DNS resolution.
 **airvpn-rs:** Uses two fully independent nftables tables:
 - `airvpn_persist` (priority -400): persistent always-on lock, loaded at boot by a
   systemd service (`Before=network-pre.target`). Allows LAN, DHCP, ICMP, bootstrap
-  IPs, and VPN tunnel traffic (`oifname "avpn-*"` for inner packets, `meta mark 51820`
+  IPs, and VPN tunnel traffic (`oifname "avpn0"` for inner packets, `meta mark 51820`
   for WireGuard outer packets). Uses `flags owner, persist` (kernel 5.12+/6.9+).
+  Blocks DNS (port 53/853) to RFC1918 destinations on non-tunnel interfaces to
+  prevent plaintext DNS leaks through the LAN rules during reconnection.
 - `airvpn_lock` (priority -300): session lock, identical to Eddie's. Created at
   connect, deleted at disconnect. Completely unaware of the persistent table.
 
@@ -240,10 +242,12 @@ ALL server IPs in the session lock outgoing allowlist (for reconnection
 readiness, not pinging).
 
 **airvpn-rs:** Background pinger in the helper daemon pings ALL servers in
-parallel every 3 minutes. Uses EWMA (α=0.3) instead of simple running average.
-**Continues pinging while connected** — connected server is pinged through the
-tunnel (accurate path latency), all others via host routes outside the tunnel.
-Results are persisted to `/var/lib/airvpn-rs/latency.json` (survive restarts).
+parallel every 3 minutes, one ping per server per cycle. Uses EWMA (α=0.3)
+instead of simple running average — EWMA smoothing across cycles makes
+multi-round median unnecessary. **Continues pinging while connected** —
+connected server is pinged through the tunnel (accurate path latency), all
+others via host routes outside the tunnel. Results are persisted to
+`/var/lib/airvpn-rs/latency.json` (survive restarts).
 
 Matches Eddie's all-server allowlist: session lock allowlists all server entry
 IPs (not just the selected server), activated once before the reconnection loop
