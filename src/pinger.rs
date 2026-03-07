@@ -162,33 +162,6 @@ fn ping_ip_with_interface(ip: &str, interface: Option<&str>) -> Option<u64> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_median_ping_all_success() {
-        // Three successful pings: 10, 20, 15 → sorted: 10, 15, 20 → median = 15
-        let rounds = vec![Some(10), Some(20), Some(15)];
-        assert_eq!(median_ping(&rounds), Some(15));
-    }
-
-    #[test]
-    fn test_median_ping_one_failure() {
-        // Two successes + one failure → use median of successes
-        let rounds = vec![Some(10), None, Some(30)];
-        assert_eq!(median_ping(&rounds), Some(30));
-    }
-
-    #[test]
-    fn test_median_ping_two_failures() {
-        // Two failures → too unreliable, return None
-        let rounds = vec![None, Some(10), None];
-        assert_eq!(median_ping(&rounds), None);
-    }
-
-    #[test]
-    fn test_median_ping_all_failures() {
-        let rounds = vec![None, None, None];
-        assert_eq!(median_ping(&rounds), None);
-    }
-
     // ---------------------------------------------------------------
     // LatencyCache EWMA tests
     // ---------------------------------------------------------------
@@ -295,34 +268,12 @@ mod tests {
     }
 }
 
-/// Number of ping rounds per server for median calculation.
-/// Multiple rounds resist ICMP spoofing — a single spoofed reply can't
-/// dominate the median.
-const PING_ROUNDS: usize = 3;
-
-/// Compute the median of successful pings. If the majority failed, returns None.
-///
-/// Rules:
-/// - If 2 or more pings failed (out of 3), return None (too unreliable).
-/// - Otherwise sort the successful values and return the middle one.
-fn median_ping(results: &[Option<u64>]) -> Option<u64> {
-    let mut successes: Vec<u64> = results.iter().filter_map(|r| *r).collect();
-    let fail_count = results.len() - successes.len();
-    if fail_count >= 2 {
-        return None;
-    }
-    successes.sort_unstable();
-    if successes.is_empty() {
-        return None;
-    }
-    Some(successes[successes.len() / 2])
-}
-
 /// Measure latency for a list of (name, ip) pairs.
 ///
 /// Used by the background pinger which already has extracted IPs from the
 /// LatencyCache. Returns `Vec<(name, latency_ms)>` where latency is -1 on
-/// failure. All servers are pinged in parallel.
+/// failure. All servers are pinged in parallel (1 ping each — EWMA smoothing
+/// handles outliers across cycles, so multi-round median is unnecessary).
 ///
 /// If `connected_server` is provided, that server's ping is forced through
 /// the given VPN interface (e.g. `avpn0`) for accurate in-tunnel latency.
@@ -357,9 +308,7 @@ pub fn measure_all_from_ips(
             };
 
             thread::spawn(move || {
-                let rounds: Vec<Option<u64>> =
-                    (0..PING_ROUNDS).map(|_| ping_ip_with_interface(&ip, iface.as_deref())).collect();
-                let latency = match median_ping(&rounds) {
+                let latency = match ping_ip_with_interface(&ip, iface.as_deref()) {
                     Some(ms) => ms as i64,
                     None => -1,
                 };
