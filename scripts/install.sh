@@ -51,6 +51,10 @@ echo "Installing shell completions..."
 /usr/bin/airvpn completions fish > /usr/share/fish/vendor_completions.d/airvpn.fish 2>/dev/null || true
 /usr/bin/airvpn completions bash > /usr/share/bash-completion/completions/airvpn 2>/dev/null || true
 
+# Create state directory for latency cache
+echo "Creating state directory..."
+install -dm755 /var/lib/airvpn-rs
+
 # Enable socket activation
 systemctl enable --now airvpn-helper.socket
 
@@ -65,6 +69,7 @@ echo "  /usr/share/fish/vendor_completions.d/airvpn.fish"
 echo "  /usr/share/bash-completion/completions/airvpn"
 echo "  /etc/systemd/system/airvpn-helper.socket (enabled)"
 echo "  /etc/systemd/system/airvpn-helper.service"
+echo "  /var/lib/airvpn-rs/ (latency cache)"
 echo ""
 echo "Socket status:"
 systemctl status --no-pager airvpn-helper.socket || true
