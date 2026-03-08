@@ -62,3 +62,7 @@ Profile at `/etc/airvpn-rs/default.profile` (0600 root:root).
 - Scoring verified 1:1 against Eddie's `ConnectionInfo.cs` + actual AirVPN manifest. Factor defaults: speed_factor=1, latency_factor=500, penality_factor=1000, ping_factor=1, load_factor=1, users_factor=1 (2026-03-07)
 - ScoreType enum (Speed/Latency) matching Eddie's `servers.scoretype` profile option. Latency mode: ScoreB/=500, LoadB/=10, UsersB/=10 — ping dominates (2026-03-07)
 - Dev testing: `systemd-socket-activate -l /run/airvpn-rs/helper.sock -- ./target/debug/airvpn helper`. `curl --unix-socket /run/airvpn-rs/helper.sock http://localhost/status` for debugging (2026-03-05)
+- Proactive manifest fetch: background_manifest_loop fetches every 30 min (Eddie: next_update=30 × 60s). Condvar chain: creds→manifest_cv→manifest loop→pinger_cv→pinger→ready_cv→connect. State type is `Arc<(Mutex<SharedState>, Notify)>` (2026-03-07)
+- Connect no longer fetches manifest — reads from SharedState cache. Only fetches UserInfo (WG keys) per-connect. Returns 503 if helper still warming up. Reconnection still does its own manifest+user fetch (2026-03-07)
+- `skip_ping` CLI flag fully removed — background pinger makes latency transparent. `measure_all_inline` removed. No client-facing ping messages (2026-03-07)
+- Eddie does NOT ship the manifest — caches it in Storage.xml from prior API fetch. Refresh interval: server-recommended `next_update` from manifest (× 60s), fallback 24h. Pinger has IPs from cached manifest at startup (2026-03-07)
