@@ -304,8 +304,8 @@ async fn router(req: Request<hyper::body::Incoming>, state: State, peer_uid: Opt
                     ("POST", "/disconnect") => handle_disconnect(&state),
                     ("GET", "/servers") => handle_list_servers(&query),
                     ("GET", "/profile") => handle_get_profile(),
-                    ("POST", "/profile") => handle_save_profile(&body_bytes),
-                    ("POST", "/import-eddie") => handle_import_eddie(&body_bytes, peer_uid),
+                    ("POST", "/profile") => handle_save_profile(&body_bytes, &state),
+                    ("POST", "/import-eddie") => handle_import_eddie(&body_bytes, peer_uid, &state),
                     ("POST", "/lock/enable") => handle_lock_enable(),
                     ("POST", "/lock/disable") => handle_lock_disable(),
                     ("POST", "/lock/install") => handle_lock_install(),
@@ -813,7 +813,7 @@ async fn handle_events_async(state: State) -> Response<HyperBody> {
 }
 
 /// POST /import-eddie — import credentials from Eddie profile.
-fn handle_import_eddie(body_bytes: &Bytes, peer_uid: Option<u32>) -> Response<HyperBody> {
+fn handle_import_eddie(body_bytes: &Bytes, peer_uid: Option<u32>, state: &State) -> Response<HyperBody> {
     let import_req: ipc::ImportEddieRequest = match serde_json::from_slice(body_bytes) {
         Ok(r) => r,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("invalid ImportEddieRequest JSON: {}", e)),
@@ -837,6 +837,9 @@ fn handle_import_eddie(body_bytes: &Bytes, peer_uid: Option<u32>) -> Response<Hy
             }
             if let Err(e) = config::save_credentials(&eddie_user, &eddie_pass) {
                 warn!("Could not save credentials to profile: {:#}", e);
+            } else {
+                // Wake manifest loop now that creds are available
+                state.1.manifest_cv.notify_all();
             }
             json_response(StatusCode::OK, &json!({"imported": true}))
         }
@@ -884,14 +887,21 @@ fn handle_get_profile() -> Response<HyperBody> {
 }
 
 /// POST /profile — save profile options.
-fn handle_save_profile(body_bytes: &Bytes) -> Response<HyperBody> {
+fn handle_save_profile(body_bytes: &Bytes, state: &State) -> Response<HyperBody> {
     let save_req: ipc::SaveProfileRequest = match serde_json::from_slice(body_bytes) {
         Ok(r) => r,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("invalid SaveProfileRequest JSON: {}", e)),
     };
 
+    let has_cred_keys = save_req.options.contains_key("login") || save_req.options.contains_key("password");
+
     match dispatch_save_profile(&save_req.options) {
-        Ok(()) => json_response(StatusCode::OK, &json!({"saved": true})),
+        Ok(()) => {
+            if has_cred_keys {
+                state.1.manifest_cv.notify_all();
+            }
+            json_response(StatusCode::OK, &json!({"saved": true}))
+        }
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to save profile: {:#}", e)),
     }
 }
