@@ -7,14 +7,14 @@ use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use zeroize::Zeroizing;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Message {
     pub kind: String,
     pub text: String,
     pub url: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Manifest {
     pub servers: Vec<Server>,
     pub modes: Vec<Mode>,
@@ -54,7 +54,7 @@ pub struct Server {
     pub warning_closed: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Mode {
     pub title: String,
     pub protocol: String,
