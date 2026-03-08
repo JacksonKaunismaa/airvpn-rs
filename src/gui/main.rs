@@ -204,6 +204,15 @@ impl App {
             }
             Message::ConnectToServer(server_name) => {
                 self.selected_server = Some(server_name.clone());
+                // If already connected, disconnect first so the new connect succeeds
+                if matches!(self.connection_state, ConnectionState::Connected { .. }) {
+                    if let Some(ref helper) = self.helper {
+                        if let Err(e) = helper.send_command("POST", "/disconnect", None) {
+                            self.error_overview = Some(format!("Failed to disconnect: {}", e));
+                            return Task::none();
+                        }
+                    }
+                }
                 self.send_connect(Some(server_name));
                 Task::none()
             }

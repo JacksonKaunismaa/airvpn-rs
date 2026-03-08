@@ -1,9 +1,9 @@
 //! Network lock (nftables kill switch) — prevents IP leaks when VPN is down.
 //!
 //! Uses a dedicated `table inet airvpn_lock` at priority -300 instead of
-//! Eddie's `flush ruleset` approach. Eddie uses flush-ruleset for iptables
-//! cross-compatibility; we are nftables-only. The rule contents and ordering
-//! are 1:1 with Eddie's NetworkLockNftables.cs.
+//! Eddie's `flush ruleset` approach. Eddie has separate lock implementations
+//! for iptables and nftables; we are nftables-only. The filter chain rules
+//! match Eddie's NetworkLockNftables.cs.
 //!
 //! Security model: nftables `drop` is terminal across all tables. A packet
 //! must be `accept`ed by ALL chains at the same hook to proceed. Our chains
