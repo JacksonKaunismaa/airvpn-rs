@@ -39,10 +39,8 @@ pub struct ConnectConfig {
     pub event_tx: std::sync::mpsc::Sender<crate::ipc::EngineEvent>,
     /// Pre-populated latency cache from the background pinger.
     pub cached_latency: pinger::LatencyCache,
-    /// Callback to update the background pinger's server IP list after manifest
-    /// fetch. Called with `(name, entry_ip)` pairs so the pinger knows which
-    /// IPs to measure. `None` when running outside the helper (standalone CLI).
-    pub on_server_ips: Option<Box<dyn Fn(Vec<(String, String)>) + Send>>,
+    /// Cached manifest from the background manifest refresh loop.
+    pub manifest: manifest::Manifest,
 }
 
 /// Emit an engine event to the event channel.
@@ -487,71 +485,26 @@ struct SessionData {
     start_last_name: Option<String>,
 }
 
-/// Fetch manifest and user data from AirVPN API.
-///
-/// Updates provider_config RSA key if manifest provides one, and displays
-/// any service messages.
-fn fetch_manifest_and_user(
+/// Fetch user data (WireGuard keys) from AirVPN API.
+fn fetch_user(
     provider_config: &mut api::ProviderConfig,
     params: &SessionParams,
-) -> anyhow::Result<(manifest::Manifest, manifest::UserInfo)> {
-    info!("Fetching server list...");
-    debug!("API request: act=manifest (credentials redacted)");
-    let manifest_xml = Zeroizing::new(api::fetch_manifest(provider_config, &params.username, &params.password)?);
-    debug!("Manifest XML response: {} bytes", manifest_xml.len());
-    let manifest = manifest::parse_manifest(&manifest_xml)?;
-    info!(
-        "Found {} servers, {} WireGuard modes",
-        manifest.servers.len(),
-        manifest.modes.len()
-    );
-    debug!(
-        "Manifest: {} servers, {} modes, {} bootstrap URLs, check_domain={:?}, check_dns_query={:?}, check_protocol={:?}",
-        manifest.servers.len(),
-        manifest.modes.len(),
-        manifest.bootstrap_urls.len(),
-        manifest.check_domain,
-        manifest.check_dns_query,
-        manifest.check_protocol,
-    );
-
-    // Eddie (Service.cs:924-932): if the manifest provides RSA key fields,
-    // use them for all subsequent API calls.
-    if let (Some(modulus), Some(exponent)) = (&manifest.rsa_modulus, &manifest.rsa_exponent) {
-        info!("Using RSA key from manifest for subsequent API calls");
-        debug!("Manifest RSA modulus: {} chars, exponent: {} chars", modulus.len(), exponent.len());
-        provider_config.rsa_modulus = modulus.clone();
-        provider_config.rsa_exponent = exponent.clone();
-    }
-
-    for msg in &manifest.messages {
-        match msg.kind.as_str() {
-            "error" => error!("[AirVPN] {}", msg.text),
-            "warning" => warn!("[AirVPN] {}", msg.text),
-            _ => info!("[AirVPN] {}", msg.text),
-        }
-    }
-
-    info!("Fetching user data...");
-    debug!("API request: act=user (credentials redacted)");
-    let user_xml = Zeroizing::new(api::fetch_user_with_urls(
-        provider_config, &params.username, &params.password, &manifest.bootstrap_urls,
-    )?);
-    debug!("User XML response: {} bytes", user_xml.len());
+) -> anyhow::Result<manifest::UserInfo> {
+    info!("Fetching user data (WireGuard keys)...");
+    let user_xml = Zeroizing::new(api::fetch_user(provider_config, &params.username, &params.password)?);
     let user_info = manifest::parse_user(&user_xml)?;
     debug!("User info: login={}, {} WireGuard keys", user_info.login, user_info.keys.len());
-
-    if manifest.modes.is_empty() {
-        anyhow::bail!("No WireGuard modes available");
-    }
     if user_info.keys.is_empty() {
-        anyhow::bail!("No WireGuard keys in user data");
+        anyhow::bail!("No WireGuard keys found — check your AirVPN account.");
     }
-
-    Ok((manifest, user_info))
+    Ok(user_info)
 }
 
 /// Fetch initial data, filter servers, resolve preferences.
+///
+/// Uses the cached manifest from SharedState (populated by the background
+/// manifest loop) instead of fetching its own. Only user data (WireGuard
+/// keys) is fetched fresh per-connect.
 fn fetch_initial_data(
     provider_config: &mut api::ProviderConfig,
     params: &SessionParams,
@@ -559,17 +512,15 @@ fn fetch_initial_data(
 ) -> anyhow::Result<SessionData> {
     emit(config, crate::ipc::EngineEvent::Log {
         level: "info".into(),
-        message: "Fetching server list...".into(),
+        message: format!("Using cached server list ({} servers)", config.manifest.servers.len()),
     });
-    let (manifest, user_info) = fetch_manifest_and_user(provider_config, params)?;
-    emit(config, crate::ipc::EngineEvent::Log {
-        level: "info".into(),
-        message: format!("Found {} servers", manifest.servers.len()),
-    });
+
+    // Fetch user info (WG keys — needed fresh per-connect)
+    let user_info = fetch_user(provider_config, params)?;
 
     // Server filtering (Eddie: GetConnections allow/deny filtering)
     let filtered_servers: Vec<manifest::Server> = server::filter_servers(
-        &manifest.servers,
+        &config.manifest.servers,
         &config.allow_server,
         &config.deny_server,
         &config.allow_country,
@@ -589,7 +540,7 @@ fn fetch_initial_data(
         info!(
             "Filters applied: {} of {} servers eligible",
             filtered_servers.len(),
-            manifest.servers.len()
+            config.manifest.servers.len()
         );
     }
 
@@ -619,30 +570,12 @@ fn fetch_initial_data(
         None
     };
 
-    // Notify the background pinger of server IPs from this manifest.
-    // This must happen before latency checks so the pinger can start
-    // measuring even if we skip the inline ping below.
-    {
-        let server_ip_pairs: Vec<(String, String)> = filtered_servers
-            .iter()
-            .filter_map(|s| {
-                let ip = s.ips_entry.iter()
-                    .find(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())
-                    .or_else(|| s.ips_entry.first());
-                ip.map(|ip| (s.name.clone(), ip.clone()))
-            })
-            .collect();
-        if let Some(ref cb) = config.on_server_ips {
-            cb(server_ip_pairs);
-        }
-    }
-
     // Latency data comes from the background pinger. On first-ever connect the
     // cache will be empty and ping simply contributes 0 to scoring — that's fine.
     let ping_results = config.cached_latency.clone();
 
     Ok(SessionData {
-        manifest,
+        manifest: config.manifest.clone(),
         user_info,
         filtered_servers,
         ping_results,
