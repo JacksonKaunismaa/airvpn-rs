@@ -297,7 +297,8 @@ fn recover_from_state(state: &State) -> Result<()> {
         // The policy rules and routes in table 51820 are still cleaned up; only the
         // endpoint host route removal is skipped (it'll be removed when the interface
         // goes down anyway since the route's nexthop becomes unreachable).
-        if let Err(e) = wireguard::disconnect(&state.wg_config_path, &state.endpoint_ip) {
+        let iface = if state.wg_interface.is_empty() { wireguard::VPN_INTERFACE } else { &state.wg_interface };
+        if let Err(e) = wireguard::disconnect(&state.wg_config_path, &state.endpoint_ip, iface) {
             warn!("failed to disconnect WireGuard: {}", e);
             cleanup_failed = true;
         }

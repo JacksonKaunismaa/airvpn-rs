@@ -137,7 +137,7 @@ pub fn cmd_disconnect_internal(config_path: &str, iface: &str, lock_active: bool
         let _ = wireguard::remove_server_host_routes(server_route_ips, original_gw);
     }
     // 2. Tear down WireGuard (also tears down routing + endpoint host route)
-    let _ = wireguard::disconnect(config_path, endpoint_ip);
+    let _ = wireguard::disconnect(config_path, endpoint_ip, iface);
     // 3. Restore DNS
     let _ = dns::deactivate();
     dns::flush();
@@ -168,7 +168,7 @@ pub fn partial_disconnect(config_path: &str, iface: &str, lock_active: bool, end
         let _ = netlock::deallow_interface(iface);
     }
     // 2. Tear down WireGuard
-    let _ = wireguard::disconnect(config_path, endpoint_ip);
+    let _ = wireguard::disconnect(config_path, endpoint_ip, iface);
     // NOTE: DNS is intentionally kept active — deactivating would restore the
     // original resolv.conf, leaking queries through --allow-lan LAN rules.
     // netlock base table and IPv6 blocking also remain active — no leak window.
@@ -724,6 +724,10 @@ fn activate_netlock(
         }
     }
     let allowed_ips = resolved_ips;
+    let iface_name = {
+        let v = options::get_str(&config.resolved, options::NETWORK_IFACE_NAME);
+        if v.is_empty() { wireguard::VPN_INTERFACE } else { v }
+    };
     let lock_config = netlock::NetlockConfig {
         allow_lan: config.allow_lan,
         allow_dhcp: true,
@@ -732,6 +736,7 @@ fn activate_netlock(
         allowed_ips_incoming: vec![],
         allowed_ips_outgoing: allowed_ips,
         incoming_policy_accept: options::get_str(&config.resolved, options::NETLOCK_INCOMING) == "allow",
+        iface_name: iface_name.to_string(),
     };
     netlock::activate(&lock_config)?;
     info!("Network lock active (dedicated nftables table)");
@@ -1246,7 +1251,11 @@ pub fn run(
             message: format!("Connecting to {} via {}...", server_ref.name, mode.title),
         });
         let wg_mtu = options::get_u64(&config.resolved, options::WG_MTU) as u16;
-        let (config_path, iface, original_gw) = match wireguard::connect(&wg_params, ipv6_enabled, wg_mtu) {
+        let iface_name = {
+            let v = options::get_str(&config.resolved, options::NETWORK_IFACE_NAME);
+            if v.is_empty() { wireguard::VPN_INTERFACE } else { v }
+        };
+        let (config_path, iface, original_gw) = match wireguard::connect(&wg_params, ipv6_enabled, wg_mtu, iface_name) {
             Ok(result) => {
                 consecutive_failures = 0;
                 result
@@ -1291,7 +1300,7 @@ pub fn run(
         let handshake_timeout_first = options::get_u64(&config.resolved, options::WG_HANDSHAKE_FIRST);
         if let Err(e) = wireguard::wait_for_handshake(&iface, handshake_timeout_first) {
             error!("Handshake failed: {:#}", e);
-            let _ = wireguard::disconnect(&config_path, &endpoint_ip);
+            let _ = wireguard::disconnect(&config_path, &endpoint_ip, &iface);
             if config.no_reconnect {
                 let _ = wireguard::remove_server_host_routes(&all_entry_ips, &original_gw);
                 cleanup_and_bail(config.no_lock, &params.blocked_ipv6_ifaces);

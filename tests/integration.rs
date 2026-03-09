@@ -39,6 +39,7 @@ fn test_netlock_config() -> NetlockConfig {
         allowed_ips_incoming: vec![],
         allowed_ips_outgoing: vec![],
         incoming_policy_accept: false,
+        iface_name: airvpn::wireguard::VPN_INTERFACE.to_string(),
     }
 }
 
@@ -52,6 +53,7 @@ fn full_netlock_config() -> NetlockConfig {
         allowed_ips_incoming: vec!["198.51.100.1".to_string()],
         allowed_ips_outgoing: vec!["203.0.113.5".to_string()],
         incoming_policy_accept: false,
+        iface_name: airvpn::wireguard::VPN_INTERFACE.to_string(),
     }
 }
 
@@ -623,7 +625,7 @@ AllowedIPs = 0.0.0.0/0
     // connect() will fail because the endpoint is unreachable / keys are fake,
     // but we can check the file was created with correct permissions.
     // The function cleans up the config file on failure.
-    let result = wireguard::connect(&params, false, 1320);
+    let result = wireguard::connect(&params, false, 1320, wireguard::VPN_INTERFACE);
 
     // connect() should fail (no real server), but we need to verify the file
     // handling behavior. The config file should be cleaned up after failure.

@@ -229,7 +229,7 @@ PrivateKey = {}
 /// 7. `setup_routing()` — policy routing through the tunnel
 ///
 /// Returns (config_path, interface_name) on success.
-pub fn connect(params: &WgConnectParams, ipv6_enabled: bool, mtu: u16) -> Result<(String, String, String)> {
+pub fn connect(params: &WgConnectParams, ipv6_enabled: bool, mtu: u16, iface_name: &str) -> Result<(String, String, String)> {
     debug!("WireGuard connect: endpoint_ip={}, config_len={} bytes",
            params.endpoint_ip, params.wg_config.len());
 
@@ -294,8 +294,13 @@ pub fn connect(params: &WgConnectParams, ipv6_enabled: bool, mtu: u16) -> Result
         }
     }
 
-    // Fixed interface name (decoupled from config file naming)
-    let iface = VPN_INTERFACE.to_string();
+    // Validate interface name to prevent command injection
+    if !crate::common::validate_interface_name(iface_name) {
+        cleanup_config(&config_path);
+        anyhow::bail!("invalid interface name: {:?}", iface_name);
+    }
+
+    let iface = iface_name.to_string();
 
     // Pre-cleanup: if interface already exists from a crash, remove it
     if is_connected(&iface) {
@@ -739,8 +744,8 @@ pub fn remove_server_host_routes(server_ips: &[String], gateway: &str) -> Result
 /// `endpoint_ip` is the VPN server's entry IP, needed to clean up the host
 /// route added during `setup_routing`. Pass an empty string if unknown
 /// (best-effort cleanup will skip the host route removal).
-pub fn disconnect(config_path: &str, endpoint_ip: &str) -> Result<()> {
-    debug!("WireGuard disconnect: config_path={}, endpoint_ip={}", config_path, endpoint_ip);
+pub fn disconnect(config_path: &str, endpoint_ip: &str, iface_name: &str) -> Result<()> {
+    debug!("WireGuard disconnect: config_path={}, endpoint_ip={}, iface={}", config_path, endpoint_ip, iface_name);
 
     // Validate config_path to prevent path traversal and command injection.
     // Must be under /run/airvpn-rs/ with no parent-dir components.
@@ -753,8 +758,12 @@ pub fn disconnect(config_path: &str, endpoint_ip: &str) -> Result<()> {
         }
     }
 
-    // Fixed interface name (decoupled from config file naming)
-    let iface = VPN_INTERFACE;
+    // Validate interface name
+    if !crate::common::validate_interface_name(iface_name) {
+        anyhow::bail!("invalid interface name: {:?}", iface_name);
+    }
+
+    let iface = iface_name;
 
     // 1. Tear down routing rules before removing the interface
     teardown_routing(iface, endpoint_ip);

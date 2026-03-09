@@ -987,7 +987,13 @@ fn dispatch_lock_install() -> Result<String> {
         anyhow::bail!("no bootstrap IPs found in provider config");
     }
 
-    let ruleset = netlock::generate_persistent_ruleset(&bootstrap_ips);
+    let profile_options = config::load_profile_options();
+    let resolved = options::resolve(&profile_options, &std::collections::HashMap::new());
+    let iface_name = {
+        let v = options::get_str(&resolved, options::NETWORK_IFACE_NAME);
+        if v.is_empty() { wireguard::VPN_INTERFACE } else { v }
+    };
+    let ruleset = netlock::generate_persistent_ruleset(&bootstrap_ips, iface_name);
 
     // Write rules file
     std::fs::create_dir_all("/etc/airvpn-rs")
