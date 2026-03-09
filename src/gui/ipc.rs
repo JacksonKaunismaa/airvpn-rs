@@ -19,6 +19,7 @@ use tokio::net::UnixStream;
 const SOCKET_PATH: &str = "/run/airvpn-rs/helper.sock";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECT_TIMEOUT_LONG: Duration = Duration::from_secs(30);
 
 pub struct HelperClient {
     event_rx: mpsc::Receiver<HelperEvent>,
@@ -37,11 +38,16 @@ impl HelperClient {
         let (tx, rx) = mpsc::channel();
 
         rt.spawn(async move {
-            eprintln!("[GUI-IPC] Event stream starting (hyper client)");
-            if let Err(e) = event_stream(tx).await {
-                eprintln!("[GUI-IPC] Event stream error: {}", e);
+            loop {
+                eprintln!("[GUI-IPC] Event stream starting (hyper client)");
+                match event_stream(&tx).await {
+                    Ok(()) => eprintln!("[GUI-IPC] Event stream ended cleanly"),
+                    Err(e) => eprintln!("[GUI-IPC] Event stream error: {}", e),
+                }
+                // Reconnect after a brief pause
+                eprintln!("[GUI-IPC] Reconnecting event stream in 500ms...");
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
-            eprintln!("[GUI-IPC] Event stream ended");
         });
 
         Ok(Self { event_rx: rx, rt })
@@ -57,16 +63,42 @@ impl HelperClient {
         let method = method.to_string();
         let path = path.to_string();
         let body_owned = body.map(|b| Bytes::copy_from_slice(b));
+        // POST /connect may include an auto-disconnect, give it more time
+        let timeout = if method == "POST" && path == "/connect" {
+            CONNECT_TIMEOUT_LONG
+        } else {
+            COMMAND_TIMEOUT
+        };
 
         let (resp_tx, resp_rx) = mpsc::channel();
         self.rt.spawn(async move {
-            let result = send_request(method, path, body_owned).await;
+            let result = send_request(method, path, body_owned, timeout).await;
             let _ = resp_tx.send(result);
         });
 
         resp_rx
             .recv()
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "IPC task died"))?
+    }
+
+    /// Fire a command without waiting for the response.
+    /// Used for POST /connect which may block for a long time (auto-disconnect).
+    /// Errors are logged to stderr; state updates arrive via /events stream.
+    pub fn fire_command(&self, method: &str, path: &str, body: Option<&[u8]>) {
+        let method = method.to_string();
+        let path = path.to_string();
+        let body_owned = body.map(|b| Bytes::copy_from_slice(b));
+
+        self.rt.spawn(async move {
+            match send_request(method, path, body_owned, CONNECT_TIMEOUT_LONG).await {
+                Ok((status, resp_body)) => {
+                    if status != 200 {
+                        eprintln!("[GUI-IPC] fire_command: HTTP {}: {}", status, resp_body);
+                    }
+                }
+                Err(e) => eprintln!("[GUI-IPC] fire_command failed: {}", e),
+            }
+        });
     }
 
     pub fn try_recv(&self) -> Option<HelperEvent> {
@@ -103,6 +135,7 @@ async fn send_request(
     method: String,
     path: String,
     body: Option<Bytes>,
+    timeout: Duration,
 ) -> io::Result<(u16, String)> {
     let mut sender = open_connection().await?;
 
@@ -121,7 +154,7 @@ async fn send_request(
         .body(req_body)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-    let resp = tokio::time::timeout(COMMAND_TIMEOUT, sender.send_request(req))
+    let resp = tokio::time::timeout(timeout, sender.send_request(req))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "request timed out"))?
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -143,7 +176,7 @@ async fn send_request(
 }
 
 /// Long-lived event stream: GET /events, parse NDJSON body frames.
-async fn event_stream(tx: mpsc::Sender<HelperEvent>) -> io::Result<()> {
+async fn event_stream(tx: &mpsc::Sender<HelperEvent>) -> io::Result<()> {
     let mut sender = open_connection().await?;
 
     let req = Request::builder()
