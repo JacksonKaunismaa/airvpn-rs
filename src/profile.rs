@@ -24,7 +24,7 @@ use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha1::Sha1;
 use sha2::Sha256;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
 type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
@@ -327,26 +327,50 @@ pub fn save_profile(
         }
     }
 
-    // Write with correct permissions atomically (no world-readable window)
+    // Atomic write: write to temp file then rename (crash-safe)
+    // Temp file MUST be in same directory as target (same filesystem for atomic rename)
+    let temp = PathBuf::from(format!("{}.tmp", path.display()));
+
     #[cfg(unix)]
     {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .with_context(|| format!("failed to create profile: {}", path.display()))?;
-        f.write_all(&file_data)
-            .with_context(|| format!("failed to write profile: {}", path.display()))?;
+        let write_result = (|| -> Result<()> {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&temp)
+                .with_context(|| format!("failed to create temp profile: {}", temp.display()))?;
+            f.write_all(&file_data)
+                .with_context(|| format!("failed to write temp profile: {}", temp.display()))?;
+            drop(f); // ensure file handle is closed before rename
+            Ok(())
+        })();
+        if let Err(e) = write_result {
+            let _ = std::fs::remove_file(&temp);
+            return Err(e);
+        }
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(path, &file_data)
-            .with_context(|| format!("failed to write profile: {}", path.display()))?;
+        let write_result = std::fs::write(&temp, &file_data)
+            .with_context(|| format!("failed to write temp profile: {}", temp.display()));
+        if let Err(e) = write_result {
+            let _ = std::fs::remove_file(&temp);
+            return Err(e);
+        }
     }
+
+    std::fs::rename(&temp, path).with_context(|| {
+        let _ = std::fs::remove_file(&temp);
+        format!(
+            "failed to rename temp profile {} -> {}",
+            temp.display(),
+            path.display()
+        )
+    })?;
 
     Ok(())
 }
