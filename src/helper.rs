@@ -279,7 +279,7 @@ async fn async_run(std_listener: std::os::unix::net::UnixListener) -> Result<()>
 async fn router(req: Request<hyper::body::Incoming>, state: State, peer_uid: Option<u32>) -> Response<HyperBody> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    let query: HashMap<String, String> = req.uri().query()
+    let _query: HashMap<String, String> = req.uri().query()
         .map(|q| parse_query_string(q))
         .unwrap_or_default();
 
@@ -304,8 +304,8 @@ async fn router(req: Request<hyper::body::Incoming>, state: State, peer_uid: Opt
                     ("POST", "/disconnect") => handle_disconnect(&state),
                     ("GET", "/servers") => handle_list_servers(&query),
                     ("GET", "/profile") => handle_get_profile(),
-                    ("POST", "/profile") => handle_save_profile(&body_bytes, &state),
-                    ("POST", "/import-eddie") => handle_import_eddie(&body_bytes, peer_uid, &state),
+                    ("POST", "/profile") => handle_save_profile(&body_bytes),
+                    ("POST", "/import-eddie") => handle_import_eddie(&body_bytes, peer_uid),
                     ("POST", "/lock/enable") => handle_lock_enable(),
                     ("POST", "/lock/disable") => handle_lock_disable(),
                     ("POST", "/lock/install") => handle_lock_install(),
@@ -470,22 +470,6 @@ async fn handle_connect_async(
 
     // Spawn connect thread
     let connect_broadcast_state = Arc::clone(&state);
-    // Clone cached latency data from the background pinger
-    let cached_latency = {
-        let st = state.lock().unwrap();
-        let cache = st.latency.clone();
-        if cache.has_data() { Some(cache) } else { None }
-    };
-
-    // Callback to update the background pinger's server IP list
-    let state_for_ips = Arc::clone(&state);
-    let on_server_ips: Box<dyn Fn(Vec<(String, String)>) + Send> = Box::new(move |pairs| {
-        if !pairs.is_empty() {
-            let mut st = state_for_ips.lock().unwrap();
-            st.latency.set_server_ips(pairs);
-        }
-    });
-
     let connect_config = connect::ConnectConfig {
         server_name: connect_req.server,
         no_lock: connect_req.no_lock,
@@ -507,8 +491,6 @@ async fn handle_connect_async(
         cli_event_up: connect_req.event_up,
         cli_event_down: connect_req.event_down,
         event_tx: event_tx.clone(),
-        cached_latency,
-        on_server_ips: Some(on_server_ips),
     };
 
     let conn_handle = thread::spawn(move || {
@@ -813,7 +795,7 @@ async fn handle_events_async(state: State) -> Response<HyperBody> {
 }
 
 /// POST /import-eddie — import credentials from Eddie profile.
-fn handle_import_eddie(body_bytes: &Bytes, peer_uid: Option<u32>, state: &State) -> Response<HyperBody> {
+fn handle_import_eddie(body_bytes: &Bytes, peer_uid: Option<u32>) -> Response<HyperBody> {
     let import_req: ipc::ImportEddieRequest = match serde_json::from_slice(body_bytes) {
         Ok(r) => r,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("invalid ImportEddieRequest JSON: {}", e)),
@@ -837,9 +819,6 @@ fn handle_import_eddie(body_bytes: &Bytes, peer_uid: Option<u32>, state: &State)
             }
             if let Err(e) = config::save_credentials(&eddie_user, &eddie_pass) {
                 warn!("Could not save credentials to profile: {:#}", e);
-            } else {
-                // Wake manifest loop now that creds are available
-                state.1.manifest_cv.notify_all();
             }
             json_response(StatusCode::OK, &json!({"imported": true}))
         }
@@ -887,21 +866,14 @@ fn handle_get_profile() -> Response<HyperBody> {
 }
 
 /// POST /profile — save profile options.
-fn handle_save_profile(body_bytes: &Bytes, state: &State) -> Response<HyperBody> {
+fn handle_save_profile(body_bytes: &Bytes) -> Response<HyperBody> {
     let save_req: ipc::SaveProfileRequest = match serde_json::from_slice(body_bytes) {
         Ok(r) => r,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("invalid SaveProfileRequest JSON: {}", e)),
     };
 
-    let has_cred_keys = save_req.options.contains_key("login") || save_req.options.contains_key("password");
-
     match dispatch_save_profile(&save_req.options) {
-        Ok(()) => {
-            if has_cred_keys {
-                state.1.manifest_cv.notify_all();
-            }
-            json_response(StatusCode::OK, &json!({"saved": true}))
-        }
+        Ok(()) => json_response(StatusCode::OK, &json!({"saved": true})),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to save profile: {:#}", e)),
     }
 }
@@ -1153,7 +1125,7 @@ fn dispatch_list_servers(skip_ping: bool, sort: Option<&str>, username: &str, pa
     let manifest = manifest::parse_manifest(&manifest_xml)?;
 
     let pings = if skip_ping {
-        pinger::LatencyCache::default()
+        pinger::PingResults::default()
     } else {
         pinger::measure_all(&manifest.servers)
     };
@@ -1184,8 +1156,6 @@ fn dispatch_list_servers(skip_ping: bool, sort: Option<&str>, username: &str, pa
                 users: s.users,
                 users_max: s.users_max,
                 load_percent: load,
-                bandwidth_cur: 2_i64.saturating_mul(s.bandwidth.saturating_mul(8)) / (1_000 * 1_000),
-                bandwidth_max: s.bandwidth_max,
                 score,
                 ping_ms,
                 warning,
@@ -1195,19 +1165,7 @@ fn dispatch_list_servers(skip_ping: bool, sort: Option<&str>, username: &str, pa
         })
         .collect();
 
-    // Sort the results (None = no sorting, GUI sorts client-side)
-    if let Some(sort_field) = sort {
-        match sort_field {
-            "name" => servers.sort_by(|a, b| a.name.cmp(&b.name)),
-            "load" => servers.sort_by(|a, b| {
-                a.load_percent
-                    .partial_cmp(&b.load_percent)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            }),
-            "users" => servers.sort_by_key(|s| s.users),
-            _ => servers.sort_by_key(|s| s.score), // "score" or default
-        }
-    }
+    servers.sort_by_key(|s| s.score);
 
     Ok(servers)
 }

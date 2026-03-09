@@ -63,11 +63,7 @@ enum Commands {
     /// Show connection status
     Status,
     /// List available servers
-    Servers {
-        /// Sort order: score (default), name, load, users
-        #[arg(long, default_value = "score")]
-        sort: String,
-    },
+    Servers,
     /// Clean up stale state after crash
     Recover,
     /// Manage persistent network lock (kill switch)
@@ -266,9 +262,7 @@ fn main() -> anyhow::Result<()> {
         }
         Commands::Disconnect => cli_client::send_simple("POST", "/disconnect", None),
         Commands::Status => cli_client::send_status(),
-        Commands::Servers { sort } => {
-            cli_client::send_list_servers(&sort)
-        }
+        Commands::Servers => cli_client::send_list_servers(),
         Commands::Recover => cli_client::send_simple("POST", "/recover", None),
         Commands::Lock { action } => {
             let (method, path) = match action {
