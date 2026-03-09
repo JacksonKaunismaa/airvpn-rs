@@ -18,6 +18,7 @@ pub const NETLOCK: &str = "netlock";
 pub const NETLOCK_ALLOW_PRIVATE: &str = "netlock.allow_private";
 pub const RECONNECT: &str = "reconnect";
 pub const VERIFY: &str = "verify";
+pub const CONNECTIONS_ALLOW_ANYWAY: &str = "connections.allow_anyway";
 
 // Server selection
 pub const SERVER: &str = "server";
@@ -75,6 +76,7 @@ pub static REGISTRY: &[OptionDef] = &[
     OptionDef { name: NETLOCK_ALLOW_PRIVATE, default: "true", description: "Allow LAN traffic through lock" },
     OptionDef { name: RECONNECT, default: "true", description: "Auto-reconnect on disconnect" },
     OptionDef { name: VERIFY, default: "true", description: "Verify tunnel and DNS after connect" },
+    OptionDef { name: CONNECTIONS_ALLOW_ANYWAY, default: "false", description: "Allow connection even when account has warnings (e.g. expired)" },
     // Server selection
     OptionDef { name: SERVER, default: "", description: "Server name (auto-select if empty)" },
     OptionDef { name: SERVERS_ALLOWLIST, default: "", description: "Only connect to these servers (comma-separated)" },

@@ -396,10 +396,52 @@ fn fetch_user(
     let user_xml = api::fetch_user_with_urls_timeout(provider_config, &params.username, &params.password, &[], http_timeout_secs)?;
     let user_info = manifest::parse_user(&user_xml)?;
     debug!("User info: login={}, {} WireGuard keys", user_info.login, user_info.keys.len());
-    if user_info.keys.is_empty() {
-        anyhow::bail!("No WireGuard keys found — check your AirVPN account.");
-    }
     Ok(user_info)
+}
+
+/// Check account status from the UserInfo response.
+///
+/// The AirVPN API sets a `message` attribute on the `<user>` element when there
+/// is an account-level issue (expired subscription, renewal needed, etc.).
+/// If a message is present and `connections.allow_anyway` is false, this function
+/// returns an error with a clear explanation. If `allow_anyway` is true, it logs
+/// a warning and proceeds.
+///
+/// Also checks that WireGuard keys are available — expired accounts typically
+/// have no keys, which would cause a cryptic WireGuard error downstream.
+fn check_account_status(
+    user_info: &manifest::UserInfo,
+    resolved: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<()> {
+    let allow_anyway = options::get_bool(resolved, options::CONNECTIONS_ALLOW_ANYWAY);
+
+    if !user_info.message.is_empty() {
+        if allow_anyway {
+            warn!(
+                "Account warning from server: {} (proceeding because connections.allow_anyway=true)",
+                user_info.message,
+            );
+        } else {
+            anyhow::bail!(
+                "Account issue: {}. \
+                 Set connections.allow_anyway=true in your profile to connect anyway.",
+                user_info.message,
+            );
+        }
+    }
+
+    if user_info.keys.is_empty() {
+        if allow_anyway {
+            warn!("No WireGuard keys found — account may be expired or inactive (proceeding because connections.allow_anyway=true)");
+        } else {
+            anyhow::bail!(
+                "No WireGuard keys found — your AirVPN subscription may be expired or inactive. \
+                 Check your account at https://airvpn.org or set connections.allow_anyway=true to attempt connection anyway."
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Fetch initial data, filter servers, resolve preferences.
@@ -420,6 +462,10 @@ fn fetch_initial_data(
     // Fetch user info (WG keys — needed fresh per-connect)
     let http_timeout_secs = options::get_u64(&config.resolved, options::HTTP_TIMEOUT);
     let user_info = fetch_user(provider_config, params, http_timeout_secs)?;
+
+    // Check account status before proceeding — expired accounts get a clear
+    // error instead of a cryptic WireGuard failure downstream.
+    check_account_status(&user_info, &config.resolved)?;
 
     // Server filtering (Eddie: GetConnections allow/deny filtering)
     let filtered_servers: Vec<manifest::Server> = server::filter_servers(

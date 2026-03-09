@@ -950,6 +950,7 @@ mod tests {
             login: "testuser".to_string(),
             wg_public_key: TEST_PUBLIC_KEY.to_string(),
             keys: vec![test_key()],
+            message: String::new(),
         }
     }
 

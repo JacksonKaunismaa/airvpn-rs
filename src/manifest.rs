@@ -67,6 +67,9 @@ pub struct UserInfo {
     pub login: String,
     pub wg_public_key: String,
     pub keys: Vec<WireGuardKey>,
+    /// Server-provided status message (e.g. "expired", "renewal needed").
+    /// Non-empty means the server flagged an account-level issue.
+    pub message: String,
 }
 
 pub struct WireGuardKey {
@@ -475,6 +478,7 @@ pub fn parse_user(xml: &str) -> anyhow::Result<UserInfo> {
     let mut login = String::new();
     let mut wg_public_key = String::new();
     let mut keys: Vec<WireGuardKey> = Vec::new();
+    let mut user_message = String::new();
     loop {
         match reader.read_event() {
             Err(e) => bail!("XML parse error at position {}: {e}", reader.error_position()),
@@ -502,9 +506,11 @@ pub fn parse_user(xml: &str) -> anyhow::Result<UserInfo> {
                 match e.name().as_ref() {
                     b"user" => {
                         in_user = true;
+                        // Preserve the server message so the caller can decide
+                        // whether to abort or proceed (connections.allow_anyway).
                         if let Some(msg) = attr_opt(e, b"message") {
                             if !msg.is_empty() {
-                                bail!("server message: {}", sanitize_server_message(&msg));
+                                user_message = sanitize_server_message(&msg);
                             }
                         }
                         login = attr_opt(e, b"login").unwrap_or_default();
@@ -538,6 +544,7 @@ pub fn parse_user(xml: &str) -> anyhow::Result<UserInfo> {
                         login: std::mem::take(&mut login),
                         wg_public_key: std::mem::take(&mut wg_public_key),
                         keys: std::mem::take(&mut keys),
+                        message: std::mem::take(&mut user_message),
                     });
                 }
             }
@@ -676,10 +683,24 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_user_with_message_bails() {
+    fn test_parse_user_with_message_preserves_it() {
         let xml = r#"<?xml version="1.0" encoding="utf-8"?>
 <user login="t" wg_public_key="P" message="expired"><keys /></user>"#;
-        assert!(parse_user(xml).is_err());
+        let user = parse_user(xml).unwrap();
+        assert_eq!(user.message, "expired");
+        assert!(user.keys.is_empty());
+    }
+
+    #[test]
+    fn test_parse_user_no_message() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<user login="testuser" wg_public_key="PubKey==">
+  <keys>
+    <key name="default" wg_private_key="Priv==" wg_ipv4="10.0.0.1" wg_ipv6="fd00::1" wg_dns_ipv4="10.0.0.1" wg_dns_ipv6="fd00::53" wg_preshared="" />
+  </keys>
+</user>"#;
+        let user = parse_user(xml).unwrap();
+        assert!(user.message.is_empty());
     }
 
     #[test]
