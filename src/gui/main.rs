@@ -6,7 +6,7 @@ use iced::widget::{button, column, container, row, text};
 use iced::{Element, Fill, Size, Subscription, Task};
 use iced::time;
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_LOG_ENTRIES: usize = 10_000;
 
@@ -80,6 +80,8 @@ struct App {
     connect_no_reconnect: bool,
     connect_no_verify: bool,
 
+    // Auto-refresh timer for server list
+    last_server_fetch: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +163,8 @@ impl App {
             connect_allow_lan: true,
             connect_no_reconnect: false,
             connect_no_verify: false,
+
+            last_server_fetch: Instant::now(),
         };
 
         // With systemd socket activation, the socket always exists.
@@ -219,6 +223,14 @@ impl App {
                 for event in events {
                     self.handle_helper_event(event);
                 }
+                // Auto-refresh server list every 3 minutes
+                if self.helper.is_some()
+                    && !self.servers_loading
+                    && self.last_server_fetch.elapsed() > Duration::from_secs(180)
+                {
+                    self.last_server_fetch = Instant::now();
+                    return Task::done(Message::FetchServers);
+                }
                 Task::none()
             }
             Message::HelperConnected => {
@@ -243,6 +255,7 @@ impl App {
             }
             Message::FetchServers => {
                 self.error_servers = None;
+                self.last_server_fetch = Instant::now();
                 if let Some(ref helper) = self.helper {
                     self.servers_loading = true;
                     match helper.send_command("GET", "/servers", None) {
