@@ -1,5 +1,7 @@
 //! Logs tab: filterable, color-coded log viewer.
 
+use std::collections::VecDeque;
+
 use iced::widget::{button, checkbox, column, container, row, scrollable, text, Space};
 use iced::{Element, Fill};
 
@@ -7,7 +9,7 @@ use crate::{LogEntry, Message};
 
 /// Render the logs tab.
 pub fn view<'a>(
-    logs: &[LogEntry],
+    logs: &VecDeque<LogEntry>,
     filter_debug: bool,
     filter_info: bool,
     filter_warn: bool,

@@ -5,7 +5,10 @@ mod views;
 use iced::widget::{button, column, container, row, text};
 use iced::{Element, Fill, Size, Subscription, Task};
 use iced::time;
+use std::collections::VecDeque;
 use std::time::Duration;
+
+const MAX_LOG_ENTRIES: usize = 10_000;
 
 use airvpn::ipc::{ConnectionState, ConnectRequest, HelperEvent, SaveProfileRequest, ServerInfo};
 
@@ -52,7 +55,7 @@ struct App {
     error_overview: Option<String>,
     error_servers: Option<String>,
     error_settings: Option<String>,
-    logs: Vec<LogEntry>,
+    logs: VecDeque<LogEntry>,
     log_filter_debug: bool,
     log_filter_info: bool,
     log_filter_warn: bool,
@@ -137,7 +140,7 @@ impl App {
             error_overview: None,
             error_servers: None,
             error_settings: None,
-            logs: Vec::new(),
+            logs: VecDeque::with_capacity(MAX_LOG_ENTRIES),
             log_filter_debug: false,
             log_filter_info: true,
             log_filter_warn: true,
@@ -476,11 +479,14 @@ impl App {
                 let h = secs / 3600;
                 let m = (secs % 3600) / 60;
                 let s = secs % 60;
-                self.logs.push(LogEntry {
+                self.logs.push_back(LogEntry {
                     timestamp: format!("{:02}:{:02}:{:02}", h, m, s),
                     level,
                     message,
                 });
+                if self.logs.len() > MAX_LOG_ENTRIES {
+                    self.logs.pop_front();
+                }
             }
             HelperEvent::Stats { rx_bytes, tx_bytes } => {
                 if self.prev_rx_bytes > 0 {
