@@ -110,6 +110,10 @@ struct App {
 
     // Tick counter for loading animation (wraps on overflow)
     loading_tick: u32,
+
+    // Helper reconnection state
+    helper_reconnecting: bool,
+    helper_reconnect_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -231,6 +235,9 @@ impl App {
             last_server_fetch: Instant::now(),
 
             loading_tick: 0,
+
+            helper_reconnecting: false,
+            helper_reconnect_at: Instant::now(),
         };
 
         // With systemd socket activation, the socket always exists.
@@ -273,13 +280,37 @@ impl App {
             Message::Disconnect => {
                 self.error_overview = None;
                 if let Some(ref helper) = self.helper {
-                    if let Err(e) = helper.send_command("POST", "/disconnect", None) {
-                        self.error_overview = Some(format!("Failed to send Disconnect: {}", e));
+                    if helper.send_command("POST", "/disconnect", None).is_err() {
+                        self.enter_reconnection();
                     }
                 }
                 Task::none()
             }
             Message::Tick => {
+                // Attempt reconnection if helper died
+                if self.helper_reconnecting && Instant::now() >= self.helper_reconnect_at {
+                    eprintln!("[GUI] Attempting helper reconnection...");
+                    match ipc::HelperClient::connect() {
+                        Ok(client) => {
+                            eprintln!("[GUI] Helper reconnected successfully");
+                            self.helper = Some(client);
+                            self.helper_reconnecting = false;
+                            self.activity.clear();
+                            self.error_overview = None;
+                            // Re-fetch state from the new helper instance
+                            // (event stream delivers initial StatusResponse + LockStatus,
+                            // but we also need servers/profile if they were loaded)
+                            return Task::none();
+                        }
+                        Err(e) => {
+                            eprintln!("[GUI] Helper reconnection failed: {}", e);
+                            self.helper_reconnect_at =
+                                Instant::now() + Duration::from_secs(2);
+                        }
+                    }
+                    return Task::none();
+                }
+
                 // Drain events into a vec to avoid borrow conflict
                 let events: Vec<_> = self
                     .helper
@@ -307,18 +338,18 @@ impl App {
                 match ipc::HelperClient::connect() {
                     Ok(client) => {
                         self.helper = Some(client);
+                        self.helper_reconnecting = false;
                         self.error_overview = None;
                         self.activity.clear();
                         Task::none()
                     }
                     Err(e) => {
                         eprintln!("[GUI] HelperClient::connect() failed: {}", e);
-                        self.error_overview = Some(format!(
-                            "Cannot connect to helper: {}\n\
-                             Is airvpn-helper.socket enabled?\n\
-                             Run: sudo systemctl enable --now airvpn-helper.socket",
-                            e
-                        ));
+                        // Enter reconnection mode — systemd may need a moment to spawn
+                        self.helper_reconnecting = true;
+                        self.helper_reconnect_at =
+                            Instant::now() + Duration::from_secs(2);
+                        self.activity = "Reconnecting to helper...".into();
                         Task::none()
                     }
                 }
@@ -344,9 +375,9 @@ impl App {
                             }
                             self.servers_loading = false;
                         }
-                        Err(e) => {
+                        Err(_) => {
                             self.servers_loading = false;
-                            self.error_servers = Some(format!("Failed to fetch servers: {}", e));
+                            self.enter_reconnection();
                         }
                     }
                 }
@@ -416,8 +447,8 @@ impl App {
                                 self.error_settings = Some(format!("Profile error: {}", body));
                             }
                         }
-                        Err(e) => {
-                            self.error_settings = Some(format!("Failed to fetch profile: {}", e));
+                        Err(_) => {
+                            self.enter_reconnection();
                         }
                     }
                 }
@@ -460,8 +491,8 @@ impl App {
                                     self.error_settings = Some(format!("Failed to save profile (HTTP {})", status));
                                 }
                             }
-                            Err(e) => {
-                                self.error_settings = Some(format!("Failed to save profile: {}", e));
+                            Err(_) => {
+                                self.enter_reconnection();
                             }
                         },
                         Err(e) => {
@@ -582,8 +613,8 @@ impl App {
             Message::LockInstall => {
                 self.error_settings = None;
                 if let Some(ref helper) = self.helper {
-                    if let Err(e) = helper.send_command("POST", "/lock/install", None) {
-                        self.error_settings = Some(format!("Failed to send LockInstall: {}", e));
+                    if helper.send_command("POST", "/lock/install", None).is_err() {
+                        self.enter_reconnection();
                     }
                 }
                 Task::none()
@@ -591,8 +622,8 @@ impl App {
             Message::LockUninstall => {
                 self.error_settings = None;
                 if let Some(ref helper) = self.helper {
-                    if let Err(e) = helper.send_command("POST", "/lock/uninstall", None) {
-                        self.error_settings = Some(format!("Failed to send LockUninstall: {}", e));
+                    if helper.send_command("POST", "/lock/uninstall", None).is_err() {
+                        self.enter_reconnection();
                     }
                 }
                 Task::none()
@@ -600,8 +631,8 @@ impl App {
             Message::LockEnable => {
                 self.error_settings = None;
                 if let Some(ref helper) = self.helper {
-                    if let Err(e) = helper.send_command("POST", "/lock/enable", None) {
-                        self.error_settings = Some(format!("Failed to send LockEnable: {}", e));
+                    if helper.send_command("POST", "/lock/enable", None).is_err() {
+                        self.enter_reconnection();
                     }
                 }
                 Task::none()
@@ -609,8 +640,8 @@ impl App {
             Message::LockDisable => {
                 self.error_settings = None;
                 if let Some(ref helper) = self.helper {
-                    if let Err(e) = helper.send_command("POST", "/lock/disable", None) {
-                        self.error_settings = Some(format!("Failed to send LockDisable: {}", e));
+                    if helper.send_command("POST", "/lock/disable", None).is_err() {
+                        self.enter_reconnection();
                     }
                 }
                 Task::none()
@@ -620,8 +651,8 @@ impl App {
                 self.activity = "Importing Eddie profile...".into();
                 if let Some(ref helper) = self.helper {
                     let import_body = b"{\"accept\":true}";
-                    if let Err(e) = helper.send_command("POST", "/import-eddie", Some(import_body)) {
-                        self.error_overview = Some(format!("Failed to import Eddie profile: {}", e));
+                    if helper.send_command("POST", "/import-eddie", Some(import_body)).is_err() {
+                        self.enter_reconnection();
                         return Task::none();
                     }
                     // Retry connect after successful import
@@ -710,6 +741,9 @@ impl App {
             HelperEvent::Shutdown => {
                 self.helper = None;
                 self.connection_state = ConnectionState::Disconnected;
+                self.helper_reconnecting = true;
+                self.helper_reconnect_at = Instant::now() + Duration::from_secs(1);
+                self.activity = "Reconnecting to helper...".into();
             }
             HelperEvent::ServerList { servers } => {
                 self.servers = servers;
@@ -779,6 +813,17 @@ impl App {
         }
     }
 
+    /// Enter reconnection mode after a send_command I/O error.
+    /// Drops the dead HelperClient so the next attempt creates a fresh connection
+    /// (which triggers systemd socket activation to respawn the helper).
+    fn enter_reconnection(&mut self) {
+        eprintln!("[GUI] Helper connection lost, entering reconnection mode");
+        self.helper = None;
+        self.helper_reconnecting = true;
+        self.helper_reconnect_at = Instant::now() + Duration::from_secs(1);
+        self.activity = "Reconnecting to helper...".into();
+    }
+
     /// Build a ConnectRequest from current settings.
     fn build_connect_request(&self, server: Option<String>) -> ConnectRequest {
         let mut overrides = HashMap::new();
@@ -831,8 +876,8 @@ impl App {
                 }
                 // 200 = connect started, events arrive via /events stream
             }
-            Err(e) => {
-                self.error_overview = Some(format!("Failed to send Connect: {}", e));
+            Err(_) => {
+                self.enter_reconnection();
             }
         }
     }
@@ -956,7 +1001,7 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        if self.helper.is_some() {
+        if self.helper.is_some() || self.helper_reconnecting {
             time::every(Duration::from_millis(100)).map(|_| Message::Tick)
         } else {
             Subscription::none()
