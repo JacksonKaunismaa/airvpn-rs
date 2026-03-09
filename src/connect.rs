@@ -459,7 +459,7 @@ fn fetch_initial_data(
     let start_last = !config.no_start_last
         && params.profile_options
             .get("servers.startlast")
-            .is_none_or(|v| v != "False"); // default true (Eddie defaults false)
+            .is_some_and(|v| v == "True"); // default false (matches Eddie)
 
     let start_last_name: Option<String> = if config.server_name.is_some() {
         None
