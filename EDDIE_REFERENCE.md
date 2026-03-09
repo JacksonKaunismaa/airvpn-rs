@@ -3,6 +3,8 @@
 Comprehensive analysis of the Eddie source code at [github.com/AirVPN/Eddie](https://github.com/AirVPN/Eddie) (v2.24.6, commit 621fdcd).
 This document serves as a reference for auditing a Rust reimplementation.
 
+Refer to `/home/agent/Work-Stuff/Eddie` for the full source code on disk. Prefer verifying claims against the source code rather than relying on this document, which could be slightly inaccurate.
+
 ---
 
 ## 1. API Communication

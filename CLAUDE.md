@@ -66,3 +66,7 @@ Profile at `/etc/airvpn-rs/default.profile` (0600 root:root).
 - Connect no longer fetches manifest — reads from SharedState cache. Only fetches UserInfo (WG keys) per-connect. Returns 503 if helper still warming up. Reconnection still does its own manifest+user fetch (2026-03-07)
 - `skip_ping` CLI flag fully removed — background pinger makes latency transparent. `measure_all_inline` removed. No client-facing ping messages (2026-03-07)
 - Eddie does NOT ship the manifest — caches it in Storage.xml from prior API fetch. Refresh interval: server-recommended `next_update` from manifest (× 60s), fallback 24h. Pinger has IPs from cached manifest at startup (2026-03-07)
+- Event hooks (event.vpn.pre/up/down) removed — split-process architecture means socket clients could execute arbitrary commands as root. Documented in known_divergences.md (2026-03-09)
+- Credentials use `Zeroizing<String>` end-to-end: profile decryption, config resolution, API calls, connect flow. Eddie uses plain String everywhere — we're strictly better (2026-03-09)
+- `WireGuardKey` and `WgConnectParams` have manual Debug impls that redact private keys — `Zeroizing<String>` delegates Debug to inner String (2026-03-09)
+- `dns.rs` now validates interface names like all other modules. Previously was the only module that didn't call `validate_interface_name()` (2026-03-09)
