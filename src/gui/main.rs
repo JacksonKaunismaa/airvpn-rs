@@ -103,6 +103,7 @@ struct App {
     settings_penality: String,
     settings_http_timeout: String,
     settings_checking_ntry: String,
+    settings_capacity_factor: String,
 
     // Auto-refresh timer for server list
     last_server_fetch: Instant,
@@ -151,6 +152,7 @@ pub enum Message {
     SettingsPenalityChanged(String),
     SettingsHttpTimeoutChanged(String),
     SettingsCheckingNtryChanged(String),
+    SettingsCapacityFactorChanged(String),
     LockInstall,
     LockUninstall,
     LockEnable,
@@ -224,6 +226,7 @@ impl App {
             settings_penality: String::new(),
             settings_http_timeout: String::new(),
             settings_checking_ntry: String::new(),
+            settings_capacity_factor: String::new(),
 
             last_server_fetch: Instant::now(),
 
@@ -446,6 +449,7 @@ impl App {
                     options.insert(options::PENALITY_ON_ERROR.into(), self.settings_penality.clone());
                     options.insert(options::HTTP_TIMEOUT.into(), self.settings_http_timeout.clone());
                     options.insert(options::CHECKING_NTRY.into(), self.settings_checking_ntry.clone());
+                    options.insert(options::SERVERS_CAPACITY_FACTOR.into(), self.settings_capacity_factor.clone());
                     let req = SaveProfileRequest { options };
                     match serde_json::to_vec(&req) {
                         Ok(body) => match helper.send_command("POST", "/profile", Some(&body)) {
@@ -547,6 +551,11 @@ impl App {
             }
             Message::SettingsCheckingNtryChanged(val) => {
                 self.settings_checking_ntry = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsCapacityFactorChanged(val) => {
+                self.settings_capacity_factor = val;
                 self.settings_dirty = true;
                 Task::none()
             }
@@ -758,6 +767,8 @@ impl App {
                     .cloned().unwrap_or_else(|| "10".into());
                 self.settings_checking_ntry = options.get(options::CHECKING_NTRY)
                     .cloned().unwrap_or_else(|| "3".into());
+                self.settings_capacity_factor = options.get(options::SERVERS_CAPACITY_FACTOR)
+                    .cloned().unwrap_or_else(|| "0".into());
 
                 self.settings_loaded = true;
                 self.settings_dirty = false;
@@ -905,6 +916,7 @@ impl App {
                 &self.settings_penality,
                 &self.settings_http_timeout,
                 &self.settings_checking_ntry,
+                &self.settings_capacity_factor,
             ),
         };
         // Per-tab error display (inline at top of content area, only when show_errors is on)

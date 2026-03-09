@@ -1020,6 +1020,7 @@ pub fn run(
 
         // 6. Select server (penalty-aware + ping-aware, from filtered list)
         let penality_factor = options::get_i64(&config.resolved, options::SCORING_PENALITY_FACTOR);
+        let capacity_factor = options::get_i64(&config.resolved, options::SERVERS_CAPACITY_FACTOR);
         let server_ref = server::select_server_with_penalties(
             &data.filtered_servers,
             forced_server.as_deref(),
@@ -1027,6 +1028,7 @@ pub fn run(
             &data.ping_results,
             params.score_type,
             penality_factor,
+            capacity_factor,
         )?;
         info!(
             "Selected server: {} ({}, {})",
@@ -1043,7 +1045,7 @@ pub fn run(
             server_ref.group,
             server_ref.ips_entry,
             server_ref.ips_exit,
-            server::score(server_ref, params.score_type),
+            server::score(server_ref, params.score_type, capacity_factor),
             server_ref.bandwidth,
             server_ref.bandwidth_max,
             server_ref.users,

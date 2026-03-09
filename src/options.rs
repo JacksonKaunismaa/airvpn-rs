@@ -48,6 +48,7 @@ pub const DNS_SERVERS: &str = "dns.servers";
 
 // Scoring
 pub const SCORING_PENALITY_FACTOR: &str = "scoring.penality_factor";
+pub const SERVERS_CAPACITY_FACTOR: &str = "servers.capacity_factor";
 
 // Advanced / Pinger
 pub const PINGER_TIMEOUT: &str = "pinger.timeout";
@@ -99,6 +100,7 @@ pub static REGISTRY: &[OptionDef] = &[
     OptionDef { name: DNS_SERVERS, default: "", description: "Custom DNS servers (comma-separated IPs)" },
     // Scoring
     OptionDef { name: SCORING_PENALITY_FACTOR, default: "1000", description: "Multiplier for server penalties in scoring" },
+    OptionDef { name: SERVERS_CAPACITY_FACTOR, default: "0", description: "Capacity weighting factor (0 = disabled). Higher values prefer high-bandwidth servers" },
     // Advanced / Pinger
     OptionDef { name: PINGER_TIMEOUT, default: "3", description: "ICMP ping timeout per server (seconds)" },
     OptionDef { name: PINGER_ENABLED, default: "true", description: "Enable background latency pinger" },

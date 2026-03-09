@@ -122,6 +122,7 @@ pub fn view<'a>(
     penality: &'a str,
     http_timeout: &'a str,
     checking_ntry: &'a str,
+    capacity_factor: &'a str,
 ) -> Element<'a, Message> {
     if !loaded {
         return container(text("Loading settings...").size(16))
@@ -166,6 +167,7 @@ pub fn view<'a>(
             penality,
             http_timeout,
             checking_ntry,
+            capacity_factor,
         ),
     };
 
@@ -432,6 +434,7 @@ fn view_advanced<'a>(
     penality: &'a str,
     http_timeout: &'a str,
     checking_ntry: &'a str,
+    capacity_factor: &'a str,
 ) -> Element<'a, Message> {
     let mut content = column![].spacing(16);
 
@@ -468,6 +471,12 @@ fn view_advanced<'a>(
                 "3",
                 checking_ntry,
                 Message::SettingsCheckingNtryChanged,
+            ),
+            text_field(
+                "Capacity Factor (0 = off)",
+                "0",
+                capacity_factor,
+                Message::SettingsCapacityFactorChanged,
             ),
         ]
         .spacing(8),
