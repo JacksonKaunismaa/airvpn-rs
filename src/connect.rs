@@ -255,7 +255,7 @@ struct SessionParams {
     ipv6_mode: Ipv6Mode,
     custom_dns_ips: Vec<String>,
     blocked_ipv6_ifaces: Vec<String>,
-    score_type: server::ScoreType,
+    scoring: server::ScoringConfig,
     profile_options: std::collections::HashMap<String, String>,
 }
 
@@ -357,10 +357,8 @@ fn resolve_session(config: &ConnectConfig) -> anyhow::Result<SessionParams> {
         info!("IPv6 disabled on {} interfaces", blocked_ipv6_ifaces.len());
     }
 
-    // Score type from pre-resolved options
-    let score_type = server::ScoreType::from_profile(
-        options::get_str(&config.resolved, options::SERVERS_SCORETYPE),
-    );
+    // Scoring config from pre-resolved options (score type + all factors)
+    let scoring = server::ScoringConfig::from_options(&config.resolved);
 
     Ok(SessionParams {
         shutdown,
@@ -370,7 +368,7 @@ fn resolve_session(config: &ConnectConfig) -> anyhow::Result<SessionParams> {
         ipv6_mode,
         custom_dns_ips,
         blocked_ipv6_ifaces,
-        score_type,
+        scoring,
         profile_options: config.resolved.clone(),
     })
 }
@@ -1101,16 +1099,12 @@ pub fn run(
         };
 
         // 6. Select server (penalty-aware + ping-aware, from filtered list)
-        let penality_factor = options::get_i64(&config.resolved, options::SCORING_PENALITY_FACTOR);
-        let capacity_factor = options::get_i64(&config.resolved, options::SERVERS_CAPACITY_FACTOR);
         let server_ref = server::select_server_with_penalties(
             &data.filtered_servers,
             forced_server.as_deref(),
             &penalties,
             &data.ping_results,
-            params.score_type,
-            penality_factor,
-            capacity_factor,
+            &params.scoring,
         )?;
         info!(
             "Selected server: {} ({}, {})",
@@ -1127,7 +1121,7 @@ pub fn run(
             server_ref.group,
             server_ref.ips_entry,
             server_ref.ips_exit,
-            server::score(server_ref, params.score_type, capacity_factor),
+            server::score(server_ref, &params.scoring),
             server_ref.bandwidth,
             server_ref.bandwidth_max,
             server_ref.users,
