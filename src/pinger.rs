@@ -274,11 +274,13 @@ mod tests {
 ///
 /// Used by the background pinger which already has extracted IPs from the
 /// LatencyCache. Returns `Vec<(name, latency_ms)>` where latency is -1 on
-/// failure. All servers are pinged in parallel via host routes (physical NIC).
-/// EWMA smoothing handles outliers across cycles.
+/// failure. Servers are pinged in parallel (up to `max_jobs` concurrent
+/// threads) via host routes (physical NIC). EWMA smoothing handles outliers
+/// across cycles.
 pub fn measure_all_from_ips(
     pairs: &[(String, String)],
     ping_timeout_secs: u64,
+    max_jobs: usize,
 ) -> Vec<(String, i64)> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -290,35 +292,39 @@ pub fn measure_all_from_ips(
     }
 
     let completed = Arc::new(AtomicUsize::new(0));
+    let max_jobs = max_jobs.max(1); // at least 1
 
-    let handles: Vec<_> = pairs
-        .iter()
-        .map(|(name, ip)| {
-            let name = name.clone();
-            let ip = ip.clone();
-            let completed = Arc::clone(&completed);
-
-            let timeout = ping_timeout_secs;
-            thread::spawn(move || {
-                let latency = match ping_ip(&ip, timeout) {
-                    Some(ms) => ms as i64,
-                    None => -1,
-                };
-
-                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                if done % 50 == 0 || done == total {
-                    info!("Ping cycle progress: {}/{}", done, total);
-                }
-
-                (name, latency)
-            })
-        })
-        .collect();
-
+    // Process in batches of max_jobs to limit concurrent threads
     let mut results = Vec::with_capacity(total);
-    for handle in handles {
-        if let Ok(pair) = handle.join() {
-            results.push(pair);
+    for batch in pairs.chunks(max_jobs) {
+        let handles: Vec<_> = batch
+            .iter()
+            .map(|(name, ip)| {
+                let name = name.clone();
+                let ip = ip.clone();
+                let completed = Arc::clone(&completed);
+
+                let timeout = ping_timeout_secs;
+                thread::spawn(move || {
+                    let latency = match ping_ip(&ip, timeout) {
+                        Some(ms) => ms as i64,
+                        None => -1,
+                    };
+
+                    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done % 50 == 0 || done == total {
+                        info!("Ping cycle progress: {}/{}", done, total);
+                    }
+
+                    (name, latency)
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            if let Ok(pair) = handle.join() {
+                results.push(pair);
+            }
         }
     }
     results
@@ -347,7 +353,7 @@ pub fn measure_all(servers: &[crate::manifest::Server]) -> LatencyCache {
         })
         .collect();
 
-    let results = measure_all_from_ips(&pairs, 3);
+    let results = measure_all_from_ips(&pairs, 3, pairs.len());
 
     let mut cache = LatencyCache::new();
     for (name, latency) in &results {

@@ -127,12 +127,12 @@ fn ensure_cidr(ip: &str, default_suffix: &str) -> String {
 /// wg-quick-only directives (Address, MTU, Table, DNS, PostUp/PostDown) are
 /// NOT included — we handle those via direct `ip` commands in `connect()`.
 ///
-/// IPv4 entry IPs are preferred over IPv6 (matching Eddie's default
-/// `network.entry.iplayer = "ipv4-ipv6"`), since we block IPv6 on all
-/// interfaces during connection.
+/// Entry IP preference is controlled by `ip_layer`:
+/// - `"ipv4"` (default): prefer IPv4, fall back to IPv6
+/// - `"ipv6"`: prefer IPv6, fall back to IPv4
 ///
 /// Returns `WgConnectParams` containing the config and separated address/MTU info.
-pub fn generate_config(key: &WireGuardKey, server: &Server, mode: &Mode, user: &UserInfo, keepalive: u16) -> Result<WgConnectParams> {
+pub fn generate_config(key: &WireGuardKey, server: &Server, mode: &Mode, user: &UserInfo, keepalive: u16, ip_layer: &str) -> Result<WgConnectParams> {
     if key.wg_private_key.is_empty() {
         anyhow::bail!("missing WireGuard private key from API response");
     }
@@ -153,8 +153,7 @@ pub fn generate_config(key: &WireGuardKey, server: &Server, mode: &Mode, user: &
     validate_wg_ip(&key.wg_ipv4, "wg_ipv4")?;
     validate_wg_ip(&key.wg_ipv6, "wg_ipv6")?;
 
-    // Prefer IPv4 entry IPs (matching Eddie's default network.entry.iplayer="ipv4-ipv6")
-    // Since we block IPv6 on all interfaces, IPv6 entry IPs would fail
+    // Split entry IPs into IPv4 and IPv6 pools
     let ipv4_entries: Vec<&String> = server.ips_entry.iter()
         .filter(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())
         .collect();
@@ -162,12 +161,21 @@ pub fn generate_config(key: &WireGuardKey, server: &Server, mode: &Mode, user: &
         .filter(|ip| ip.parse::<std::net::Ipv6Addr>().is_ok())
         .collect();
 
-    // Try IPv4 first (at entry_index), then fall back to IPv6
-    let endpoint_ip = ipv4_entries.get(mode.entry_index)
-        .or_else(|| ipv4_entries.first())
-        .or_else(|| ipv6_entries.get(mode.entry_index))
-        .or_else(|| ipv6_entries.first())
-        .ok_or_else(|| anyhow::anyhow!("server {} has no entry IPs", server.name))?;
+    // Select endpoint IP based on ip_layer preference, with fallback to the other protocol
+    let endpoint_ip = if ip_layer == "ipv6" {
+        // Prefer IPv6, fall back to IPv4
+        ipv6_entries.get(mode.entry_index)
+            .or_else(|| ipv6_entries.first())
+            .or_else(|| ipv4_entries.get(mode.entry_index))
+            .or_else(|| ipv4_entries.first())
+    } else {
+        // Prefer IPv4 (default), fall back to IPv6
+        ipv4_entries.get(mode.entry_index)
+            .or_else(|| ipv4_entries.first())
+            .or_else(|| ipv6_entries.get(mode.entry_index))
+            .or_else(|| ipv6_entries.first())
+    }
+    .ok_or_else(|| anyhow::anyhow!("server {} has no entry IPs", server.name))?;
 
     // IPv6 addresses (containing ':') must be wrapped in brackets for the endpoint
     let endpoint = if endpoint_ip.contains(':') {
@@ -970,7 +978,7 @@ mod tests {
         let mode = test_mode();
         let user = test_user();
 
-        let params = generate_config(&key, &server, &mode, &user, 15).unwrap();
+        let params = generate_config(&key, &server, &mode, &user, 15, "ipv4").unwrap();
         let config = &*params.wg_config;
 
         // Verify returned fields
@@ -1004,7 +1012,7 @@ mod tests {
         let mode = test_mode();
         let user = test_user();
 
-        let params = generate_config(&key, &server, &mode, &user, 15).unwrap();
+        let params = generate_config(&key, &server, &mode, &user, 15, "ipv4").unwrap();
         let config = &*params.wg_config;
         assert!(
             !config.contains("PresharedKey"),
@@ -1026,7 +1034,7 @@ mod tests {
             entry_index: 1,
         };
 
-        let params = generate_config(&key, &server, &mode, &user, 15).unwrap();
+        let params = generate_config(&key, &server, &mode, &user, 15, "ipv4").unwrap();
         let config = &*params.wg_config;
         assert!(
             config.contains("Endpoint = 185.32.12.2:1637"),
@@ -1048,7 +1056,7 @@ mod tests {
             entry_index: 99,
         };
 
-        let params = generate_config(&key, &server, &mode, &user, 15).unwrap();
+        let params = generate_config(&key, &server, &mode, &user, 15, "ipv4").unwrap();
         let config = &*params.wg_config;
         assert!(
             config.contains("Endpoint = 185.32.12.1:1637"),
@@ -1080,7 +1088,7 @@ mod tests {
             warning_closed: String::new(),
         };
 
-        let result = generate_config(&key, &server, &mode, &user, 15);
+        let result = generate_config(&key, &server, &mode, &user, 15, "ipv4");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("no entry IPs"));
     }
@@ -1109,7 +1117,7 @@ mod tests {
             warning_closed: String::new(),
         };
 
-        let params = generate_config(&key, &server, &mode, &user, 15).unwrap();
+        let params = generate_config(&key, &server, &mode, &user, 15, "ipv4").unwrap();
         let config = &*params.wg_config;
         assert!(
             config.contains("Endpoint = [fd00::1]:1637"),
@@ -1150,11 +1158,51 @@ mod tests {
             warning_closed: String::new(),
         };
 
-        let params = generate_config(&key, &server, &mode, &user, 15).unwrap();
+        let params = generate_config(&key, &server, &mode, &user, 15, "ipv4").unwrap();
         let config = &*params.wg_config;
         assert!(
             config.contains("Endpoint = 203.0.113.1:1637"),
             "should prefer IPv4 even when IPv6 is listed first, got: {}",
+            &*config
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // generate_config with ip_layer="ipv6" — prefers IPv6 over IPv4
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_generate_config_ipv6_layer_prefers_ipv6() {
+        let key = test_key();
+        let user = test_user();
+        let mode = test_mode();
+
+        let server = Server {
+            name: "MixedServer".to_string(),
+            group: "eu-de".to_string(),
+            ips_entry: vec![
+                "203.0.113.1".to_string(),    // IPv4 first in list
+                "fd00::1".to_string(),         // IPv6 second
+            ],
+            ips_exit: vec!["10.0.0.1".to_string()],
+            country_code: "DE".to_string(),
+            location: "Berlin".to_string(),
+            scorebase: 0,
+            bandwidth: 500_000,
+            bandwidth_max: 1_000_000,
+            users: 10,
+            users_max: 250,
+            support_ipv4: true,
+            support_ipv6: true,
+            warning_open: String::new(),
+            warning_closed: String::new(),
+        };
+
+        let params = generate_config(&key, &server, &mode, &user, 15, "ipv6").unwrap();
+        let config = &*params.wg_config;
+        assert!(
+            config.contains("Endpoint = [fd00::1]:1637"),
+            "ip_layer=ipv6 should prefer IPv6 even when IPv4 is listed first, got: {}",
             &*config
         );
     }
@@ -1190,7 +1238,7 @@ mod tests {
             warning_closed: String::new(),
         };
 
-        let params = generate_config(&key, &server, &mode, &user, 15).unwrap();
+        let params = generate_config(&key, &server, &mode, &user, 15, "ipv4").unwrap();
         let config = &*params.wg_config;
         assert!(
             config.contains("Endpoint = [2001:db8::1]:1637"),
@@ -1211,7 +1259,7 @@ mod tests {
         let mode = test_mode();
         let user = test_user();
 
-        let result = generate_config(&key, &server, &mode, &user, 15);
+        let result = generate_config(&key, &server, &mode, &user, 15, "ipv4");
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("private key"),
@@ -1231,7 +1279,7 @@ mod tests {
         let mut user = test_user();
         user.wg_public_key = String::new();
 
-        let result = generate_config(&key, &server, &mode, &user, 15);
+        let result = generate_config(&key, &server, &mode, &user, 15, "ipv4");
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("public key"),
@@ -1256,7 +1304,7 @@ mod tests {
             entry_index: 0,
         };
 
-        let result = generate_config(&key, &server, &mode, &user, 15);
+        let result = generate_config(&key, &server, &mode, &user, 15, "ipv4");
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("no port"),
@@ -1355,7 +1403,7 @@ mod tests {
         let mode = test_mode();
         let user = test_user();
 
-        let result = generate_config(&key, &server, &mode, &user, 15);
+        let result = generate_config(&key, &server, &mode, &user, 15, "ipv4");
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -1373,7 +1421,7 @@ mod tests {
         let mode = test_mode();
         let user = test_user();
 
-        let result = generate_config(&key, &server, &mode, &user, 15);
+        let result = generate_config(&key, &server, &mode, &user, 15, "ipv4");
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("invalid characters"),

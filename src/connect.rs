@@ -1231,7 +1231,8 @@ pub fn run(
 
         // 8. Generate WireGuard config and connect
         let wg_keepalive = options::get_u64(&config.resolved, options::WG_KEEPALIVE) as u16;
-        let wg_params = wireguard::generate_config(wg_key, server_ref, mode, &data.user_info, wg_keepalive)?;
+        let ip_layer = options::get_str(&config.resolved, options::NETWORK_ENTRY_IPLAYER);
+        let wg_params = wireguard::generate_config(wg_key, server_ref, mode, &data.user_info, wg_keepalive, ip_layer)?;
         let endpoint_ip = wg_params.endpoint_ip.clone();
         debug!(
             "WireGuard config: endpoint={}, ipv4={}, ipv6={}, dns={}/{}, mode={} (keys redacted)",
