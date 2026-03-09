@@ -65,15 +65,6 @@ struct App {
     settings_locklast: bool,
     settings_ipv6_mode: String,
     settings_dns: String,
-    settings_event_pre_file: String,
-    settings_event_pre_args: String,
-    settings_event_pre_wait: bool,
-    settings_event_up_file: String,
-    settings_event_up_args: String,
-    settings_event_up_wait: bool,
-    settings_event_down_file: String,
-    settings_event_down_args: String,
-    settings_event_down_wait: bool,
     settings_loaded: bool,
     settings_dirty: bool,
 
@@ -108,7 +99,6 @@ pub enum Message {
     SettingsLocklastToggle(bool),
     SettingsIpv6ModeChanged(String),
     SettingsDnsChanged(String),
-    SettingsEventChanged { hook: String, field: String, value: String },
     ShowErrorsToggle(bool),
     ConnectNoLockToggle(bool),
     ConnectAllowLanToggle(bool),
@@ -159,15 +149,6 @@ impl App {
             settings_locklast: false,
             settings_ipv6_mode: String::new(),
             settings_dns: String::new(),
-            settings_event_pre_file: String::new(),
-            settings_event_pre_args: String::new(),
-            settings_event_pre_wait: true,
-            settings_event_up_file: String::new(),
-            settings_event_up_args: String::new(),
-            settings_event_up_wait: true,
-            settings_event_down_file: String::new(),
-            settings_event_down_args: String::new(),
-            settings_event_down_wait: true,
             settings_loaded: false,
             settings_dirty: false,
 
@@ -363,15 +344,6 @@ impl App {
                     options.insert("servers.locklast".into(), if self.settings_locklast { "True" } else { "False" }.into());
                     options.insert("network.ipv6.mode".into(), self.settings_ipv6_mode.clone());
                     options.insert("dns.servers".into(), self.settings_dns.clone());
-                    options.insert("event.vpn.pre.filename".into(), self.settings_event_pre_file.clone());
-                    options.insert("event.vpn.pre.arguments".into(), self.settings_event_pre_args.clone());
-                    options.insert("event.vpn.pre.waitend".into(), if self.settings_event_pre_wait { "True" } else { "False" }.into());
-                    options.insert("event.vpn.up.filename".into(), self.settings_event_up_file.clone());
-                    options.insert("event.vpn.up.arguments".into(), self.settings_event_up_args.clone());
-                    options.insert("event.vpn.up.waitend".into(), if self.settings_event_up_wait { "True" } else { "False" }.into());
-                    options.insert("event.vpn.down.filename".into(), self.settings_event_down_file.clone());
-                    options.insert("event.vpn.down.arguments".into(), self.settings_event_down_args.clone());
-                    options.insert("event.vpn.down.waitend".into(), if self.settings_event_down_wait { "True" } else { "False" }.into());
                     let req = SaveProfileRequest { options };
                     match serde_json::to_vec(&req) {
                         Ok(body) => match helper.send_command("POST", "/profile", Some(&body)) {
@@ -410,22 +382,6 @@ impl App {
             }
             Message::SettingsDnsChanged(val) => {
                 self.settings_dns = val;
-                self.settings_dirty = true;
-                Task::none()
-            }
-            Message::SettingsEventChanged { hook, field, value } => {
-                match (hook.as_str(), field.as_str()) {
-                    ("pre", "file") => self.settings_event_pre_file = value,
-                    ("pre", "args") => self.settings_event_pre_args = value,
-                    ("pre", "wait") => self.settings_event_pre_wait = value == "true",
-                    ("up", "file") => self.settings_event_up_file = value,
-                    ("up", "args") => self.settings_event_up_args = value,
-                    ("up", "wait") => self.settings_event_up_wait = value == "true",
-                    ("down", "file") => self.settings_event_down_file = value,
-                    ("down", "args") => self.settings_event_down_args = value,
-                    ("down", "wait") => self.settings_event_down_wait = value == "true",
-                    _ => {}
-                }
                 self.settings_dirty = true;
                 Task::none()
             }
@@ -566,15 +522,6 @@ impl App {
                 self.settings_locklast = options.get("servers.locklast").map(|v| v == "True").unwrap_or(false);
                 self.settings_ipv6_mode = options.get("network.ipv6.mode").cloned().unwrap_or_else(|| "in-block".into());
                 self.settings_dns = options.get("dns.servers").cloned().unwrap_or_default();
-                self.settings_event_pre_file = options.get("event.vpn.pre.filename").cloned().unwrap_or_default();
-                self.settings_event_pre_args = options.get("event.vpn.pre.arguments").cloned().unwrap_or_default();
-                self.settings_event_pre_wait = options.get("event.vpn.pre.waitend").map(|v| v == "True").unwrap_or(true);
-                self.settings_event_up_file = options.get("event.vpn.up.filename").cloned().unwrap_or_default();
-                self.settings_event_up_args = options.get("event.vpn.up.arguments").cloned().unwrap_or_default();
-                self.settings_event_up_wait = options.get("event.vpn.up.waitend").map(|v| v == "True").unwrap_or(true);
-                self.settings_event_down_file = options.get("event.vpn.down.filename").cloned().unwrap_or_default();
-                self.settings_event_down_args = options.get("event.vpn.down.arguments").cloned().unwrap_or_default();
-                self.settings_event_down_wait = options.get("event.vpn.down.waitend").map(|v| v == "True").unwrap_or(true);
                 self.settings_loaded = true;
                 self.settings_dirty = false;
             }
@@ -582,15 +529,6 @@ impl App {
                 self.settings_dirty = false;
             }
         }
-    }
-
-    /// Build an event hook array [filename, arguments, waitend] from settings.
-    fn build_event_hook(&self, file: &str, args: &str, wait: bool) -> [Option<String>; 3] {
-        [
-            if file.is_empty() { None } else { Some(file.to_string()) },
-            if args.is_empty() { None } else { Some(args.to_string()) },
-            if wait { Some("True".into()) } else { None },
-        ]
     }
 
     /// Build a ConnectRequest from current settings.
@@ -613,9 +551,6 @@ impl App {
             no_start_last: false,
             ipv6_mode,
             dns_servers,
-            event_pre: self.build_event_hook(&self.settings_event_pre_file, &self.settings_event_pre_args, self.settings_event_pre_wait),
-            event_up: self.build_event_hook(&self.settings_event_up_file, &self.settings_event_up_args, self.settings_event_up_wait),
-            event_down: self.build_event_hook(&self.settings_event_down_file, &self.settings_event_down_args, self.settings_event_down_wait),
         }
     }
 
@@ -721,9 +656,6 @@ impl App {
                 self.settings_locklast,
                 &self.settings_ipv6_mode,
                 &self.settings_dns,
-                (&self.settings_event_pre_file, &self.settings_event_pre_args, self.settings_event_pre_wait),
-                (&self.settings_event_up_file, &self.settings_event_up_args, self.settings_event_up_wait),
-                (&self.settings_event_down_file, &self.settings_event_down_args, self.settings_event_down_wait),
                 self.settings_loaded,
                 self.settings_dirty,
                 self.show_errors,

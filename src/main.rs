@@ -57,35 +57,6 @@ enum Commands {
         /// (Eddie: dns.servers — comma-separated in profile)
         #[arg(long = "dns")]
         dns_servers: Vec<String>,
-        // Event hooks (Eddie: ProfileOptions.EnsureDefaultsEvent, Engine.RunEventCommand).
-        // CLI overrides profile, not saved.
-        /// Script to run before VPN connection (Eddie: event.vpn.pre.filename)
-        #[arg(long = "event.vpn.pre.filename")]
-        event_vpn_pre_filename: Option<String>,
-        /// Arguments for vpn.pre script (Eddie: event.vpn.pre.arguments)
-        #[arg(long = "event.vpn.pre.arguments")]
-        event_vpn_pre_arguments: Option<String>,
-        /// Wait for vpn.pre script to finish (Eddie: event.vpn.pre.waitend, default: true)
-        #[arg(long = "event.vpn.pre.waitend")]
-        event_vpn_pre_waitend: Option<String>,
-        /// Script to run after VPN connects (Eddie: event.vpn.up.filename)
-        #[arg(long = "event.vpn.up.filename")]
-        event_vpn_up_filename: Option<String>,
-        /// Arguments for vpn.up script (Eddie: event.vpn.up.arguments)
-        #[arg(long = "event.vpn.up.arguments")]
-        event_vpn_up_arguments: Option<String>,
-        /// Wait for vpn.up script to finish (Eddie: event.vpn.up.waitend, default: true)
-        #[arg(long = "event.vpn.up.waitend")]
-        event_vpn_up_waitend: Option<String>,
-        /// Script to run after VPN disconnects (Eddie: event.vpn.down.filename)
-        #[arg(long = "event.vpn.down.filename")]
-        event_vpn_down_filename: Option<String>,
-        /// Arguments for vpn.down script (Eddie: event.vpn.down.arguments)
-        #[arg(long = "event.vpn.down.arguments")]
-        event_vpn_down_arguments: Option<String>,
-        /// Wait for vpn.down script to finish (Eddie: event.vpn.down.waitend, default: true)
-        #[arg(long = "event.vpn.down.waitend")]
-        event_vpn_down_waitend: Option<String>,
     },
     /// Disconnect from AirVPN
     Disconnect,
@@ -275,15 +246,6 @@ fn main() -> anyhow::Result<()> {
             no_start_last,
             ipv6_mode,
             dns_servers,
-            event_vpn_pre_filename,
-            event_vpn_pre_arguments,
-            event_vpn_pre_waitend,
-            event_vpn_up_filename,
-            event_vpn_up_arguments,
-            event_vpn_up_waitend,
-            event_vpn_down_filename,
-            event_vpn_down_arguments,
-            event_vpn_down_waitend,
         } => {
             let req = ipc::ConnectRequest {
                 server,
@@ -299,9 +261,6 @@ fn main() -> anyhow::Result<()> {
                 no_start_last,
                 ipv6_mode,
                 dns_servers,
-                event_pre: [event_vpn_pre_filename, event_vpn_pre_arguments, event_vpn_pre_waitend],
-                event_up: [event_vpn_up_filename, event_vpn_up_arguments, event_vpn_up_waitend],
-                event_down: [event_vpn_down_filename, event_vpn_down_arguments, event_vpn_down_waitend],
             };
             cli_client::send_connect(&req)
         }

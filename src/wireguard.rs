@@ -29,7 +29,6 @@ pub const VPN_INTERFACE: &str = "avpn0";
 ///
 /// Returned by `generate_config()` with the wg-native config and the
 /// address/MTU info that `connect()` needs to set up the interface.
-#[derive(Debug)]
 pub struct WgConnectParams {
     /// wg-native config (PrivateKey + Peer section only, for `wg setconf`).
     /// Wrapped in Zeroizing because it contains the private key.
@@ -41,6 +40,17 @@ pub struct WgConnectParams {
     pub ipv6_address: String,
     /// VPN server endpoint IP (without port)
     pub endpoint_ip: String,
+}
+
+impl std::fmt::Debug for WgConnectParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WgConnectParams")
+            .field("wg_config", &"[REDACTED]")
+            .field("ipv4_address", &self.ipv4_address)
+            .field("ipv6_address", &self.ipv6_address)
+            .field("endpoint_ip", &self.endpoint_ip)
+            .finish()
+    }
 }
 
 /// Validate an interface name: alphanumeric + dash + underscore, max 15 chars.

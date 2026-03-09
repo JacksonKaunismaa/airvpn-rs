@@ -1,8 +1,8 @@
 //! VPN connection lifecycle: connect, disconnect, reconnection loop.
 //!
 //! This module contains the main `run()` function (formerly `cmd_connect`),
-//! along with disconnect helpers, event hooks, and supporting types that
-//! were previously in main.rs.
+//! along with disconnect helpers and supporting types that were previously
+//! in main.rs.
 
 use crate::{api, common, config, dns, ipv6, manifest, netlock, pinger, recovery, server, verify, wireguard};
 
@@ -22,8 +22,8 @@ pub struct ConnectConfig {
     pub no_lock: bool,
     pub allow_lan: bool,
     pub no_reconnect: bool,
-    pub username: String,
-    pub password: String,
+    pub username: Zeroizing<String>,
+    pub password: Zeroizing<String>,
     pub allow_server: Vec<String>,
     pub deny_server: Vec<String>,
     pub allow_country: Vec<String>,
@@ -33,9 +33,6 @@ pub struct ConnectConfig {
     pub no_start_last: bool,
     pub cli_ipv6_mode: Option<String>,
     pub cli_dns_servers: Vec<String>,
-    pub cli_event_pre: [Option<String>; 3],
-    pub cli_event_up: [Option<String>; 3],
-    pub cli_event_down: [Option<String>; 3],
     pub event_tx: std::sync::mpsc::Sender<crate::ipc::EngineEvent>,
     /// Pre-populated latency cache from the background pinger.
     pub cached_latency: pinger::LatencyCache,
@@ -99,80 +96,6 @@ enum ResetLevel {
 }
 
 // ---------------------------------------------------------------------------
-// Event hooks (Eddie: ProfileOptions.EnsureDefaultsEvent, Engine.RunEventCommand)
-// ---------------------------------------------------------------------------
-
-/// VPN lifecycle event hook (Eddie: event.vpn.{pre,up,down}).
-///
-/// Each event has filename, arguments, and waitend (synchronous vs async).
-/// Eddie ref: Engine.cs RunEventCommand() lines 1546-1563.
-pub struct EventHook {
-    filename: String,
-    arguments: String,
-    wait_end: bool,
-}
-
-impl EventHook {
-    pub fn is_empty(&self) -> bool {
-        self.filename.trim().is_empty()
-    }
-
-    /// Resolve hook from CLI flags (highest priority) then profile options.
-    /// Matches Eddie: CLI overrides profile, not saved.
-    pub fn resolve(
-        event: &str,
-        cli_filename: &Option<String>,
-        cli_arguments: &Option<String>,
-        cli_waitend: &Option<String>,
-        profile: &std::collections::HashMap<String, String>,
-    ) -> Self {
-        let key_fn = format!("event.{}.filename", event);
-        let key_args = format!("event.{}.arguments", event);
-        let key_wait = format!("event.{}.waitend", event);
-        EventHook {
-            filename: cli_filename.clone()
-                .or_else(|| profile.get(&key_fn).cloned())
-                .unwrap_or_default(),
-            arguments: cli_arguments.clone()
-                .or_else(|| profile.get(&key_args).cloned())
-                .unwrap_or_default(),
-            wait_end: cli_waitend.as_deref()
-                .or_else(|| profile.get(&key_wait).map(|s| s.as_str()))
-                .map(|v| !v.eq_ignore_ascii_case("false"))
-                .unwrap_or(true), // Eddie default: true
-        }
-    }
-}
-
-/// Run a VPN lifecycle event hook (fire-and-forget, matching Eddie).
-///
-/// Eddie: SystemExec.ExecForUserEvent ignores return values. We log
-/// exit codes and failures but never abort the connection.
-pub fn run_hook(hook: &EventHook, event: &str) {
-    if hook.is_empty() {
-        return;
-    }
-    info!("Running {} hook: {} {}", event, hook.filename, hook.arguments);
-    let mut cmd = std::process::Command::new(&hook.filename);
-    if !hook.arguments.is_empty() {
-        // Eddie: Process.Start(filename, arguments) — OS splits the argument string
-        cmd.args(hook.arguments.split_whitespace());
-    }
-    if hook.wait_end {
-        match cmd.status() {
-            Ok(s) if s.success() => debug!("{} hook completed", event),
-            Ok(s) => warn!("{} hook exited with {}", event, s),
-            Err(e) => warn!("{} hook failed: {}", event, e),
-        }
-    } else {
-        match cmd.spawn() {
-            Ok(_) => debug!("{} hook spawned (async)", event),
-            Err(e) => warn!("{} hook failed to spawn: {}", event, e),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Pre-flight checks
 // ---------------------------------------------------------------------------
 
@@ -202,7 +125,7 @@ pub fn preflight_checks() -> anyhow::Result<()> {
 /// Used by both `cmd_connect` (on clean shutdown) and `cmd_disconnect` (external command).
 /// `server_route_ips` and `original_gw` are used to clean up the /32 host routes
 /// added for the background pinger. Pass empty slices/strings if not available.
-pub fn cmd_disconnect_internal(config_path: &str, iface: &str, lock_active: bool, blocked_ipv6: &[String], endpoint_ip: &str, hook_down: &EventHook, server_route_ips: &[String], original_gw: &str) -> anyhow::Result<()> {
+pub fn cmd_disconnect_internal(config_path: &str, iface: &str, lock_active: bool, blocked_ipv6: &[String], endpoint_ip: &str, server_route_ips: &[String], original_gw: &str) -> anyhow::Result<()> {
     // 1. Remove interface-specific nft rules before deactivating table
     if lock_active && !iface.is_empty() {
         let _ = netlock::deallow_interface(iface);
@@ -213,9 +136,6 @@ pub fn cmd_disconnect_internal(config_path: &str, iface: &str, lock_active: bool
     }
     // 2. Tear down WireGuard (also tears down routing + endpoint host route)
     let _ = wireguard::disconnect(config_path, endpoint_ip);
-    // 2b. Run vpn.down hook (Eddie: Session.cs line 441, after disconnect/cleanup
-    // but BEFORE DNS restore and IPv6 restore)
-    run_hook(hook_down, "vpn.down");
     // 3. Restore DNS
     let _ = dns::deactivate();
     dns::flush();
@@ -330,9 +250,6 @@ struct SessionParams {
     nonce: u64,
     username: Zeroizing<String>,
     password: Zeroizing<String>,
-    hook_pre: EventHook,
-    hook_up: EventHook,
-    hook_down: EventHook,
     ipv6_mode: Ipv6Mode,
     custom_dns_ips: Vec<String>,
     blocked_ipv6_ifaces: Vec<String>,
@@ -389,7 +306,7 @@ fn preflight_and_cleanup() -> anyhow::Result<()> {
 
 /// Resolve all session-constant parameters from CLI flags, profile, and system state.
 ///
-/// Installs the signal handler, resolves credentials, event hooks, IPv6 mode,
+/// Installs the signal handler, resolves credentials, IPv6 mode,
 /// custom DNS, and blocks IPv6 on all interfaces.
 fn resolve_session(config: &ConnectConfig) -> anyhow::Result<SessionParams> {
     // Install signal handler EARLY — before any infrastructure changes
@@ -400,19 +317,11 @@ fn resolve_session(config: &ConnectConfig) -> anyhow::Result<SessionParams> {
 
     // Credentials arrive pre-resolved from the caller (CLI or helper daemon).
     // Wrapped in Zeroizing to clear from memory on drop.
-    let username = Zeroizing::new(config.username.clone());
-    let password = Zeroizing::new(config.password.clone());
+    let username = config.username.clone();
+    let password = config.password.clone();
 
-    // Load profile options once (used for event hooks, locklast/startlast, ipv6 mode, etc.)
+    // Load profile options once (used for locklast/startlast, ipv6 mode, etc.)
     let profile_options = config::load_profile_options();
-
-    // Resolve event hooks (Eddie: Engine.RunEventCommand, CLI overrides profile).
-    let hook_pre = EventHook::resolve(
-        "vpn.pre", &config.cli_event_pre[0], &config.cli_event_pre[1], &config.cli_event_pre[2], &profile_options);
-    let hook_up = EventHook::resolve(
-        "vpn.up", &config.cli_event_up[0], &config.cli_event_up[1], &config.cli_event_up[2], &profile_options);
-    let hook_down = EventHook::resolve(
-        "vpn.down", &config.cli_event_down[0], &config.cli_event_down[1], &config.cli_event_down[2], &profile_options);
 
     // Resolve IPv6 mode: CLI --ipv6-mode overrides profile (Eddie: network.ipv6.mode)
     let ipv6_mode = {
@@ -463,9 +372,6 @@ fn resolve_session(config: &ConnectConfig) -> anyhow::Result<SessionParams> {
         nonce,
         username,
         password,
-        hook_pre,
-        hook_up,
-        hook_down,
         ipv6_mode,
         custom_dns_ips,
         blocked_ipv6_ifaces,
@@ -491,7 +397,7 @@ fn fetch_user(
     params: &SessionParams,
 ) -> anyhow::Result<manifest::UserInfo> {
     info!("Fetching user data (WireGuard keys)...");
-    let user_xml = Zeroizing::new(api::fetch_user(provider_config, &params.username, &params.password)?);
+    let user_xml = api::fetch_user(provider_config, &params.username, &params.password)?;
     let user_info = manifest::parse_user(&user_xml)?;
     debug!("User info: login={}, {} WireGuard keys", user_info.login, user_info.keys.len());
     if user_info.keys.is_empty() {
@@ -595,7 +501,7 @@ fn refresh_manifest_if_needed(
     config: &ConnectConfig,
 ) {
     info!("Re-fetching manifest for updated server data...");
-    match api::fetch_manifest(provider_config, &params.username, &params.password).map(Zeroizing::new) {
+    match api::fetch_manifest(provider_config, &params.username, &params.password) {
         Ok(new_xml) => match manifest::parse_manifest(&new_xml) {
             Ok(new_manifest) => {
                 let new_filtered: Vec<manifest::Server> = server::filter_servers(
@@ -630,7 +536,7 @@ fn refresh_manifest_if_needed(
         Err(e) => warn!("Failed to re-fetch manifest, using stale data: {:#}", e),
     }
     // Also refresh user data (WireGuard keys may have changed)
-    match api::fetch_user_with_urls(provider_config, &params.username, &params.password, &data.manifest.bootstrap_urls).map(Zeroizing::new) {
+    match api::fetch_user_with_urls(provider_config, &params.username, &params.password, &data.manifest.bootstrap_urls) {
         Ok(new_user_xml) => match manifest::parse_user(&new_user_xml) {
             Ok(new_user) => {
                 data.user_info = new_user;
@@ -958,12 +864,12 @@ fn handle_reset_level(
 ) -> anyhow::Result<bool> {
     match reset_level {
         ResetLevel::None | ResetLevel::Fatal => {
-            cmd_disconnect_internal(config_path, iface, !config.no_lock, &params.blocked_ipv6_ifaces, endpoint_ip, &params.hook_down, server_route_ips, original_gw)?;
+            cmd_disconnect_internal(config_path, iface, !config.no_lock, &params.blocked_ipv6_ifaces, endpoint_ip, server_route_ips, original_gw)?;
             Ok(true)
         }
         ResetLevel::Error => {
             if config.no_reconnect {
-                cmd_disconnect_internal(config_path, iface, !config.no_lock, &params.blocked_ipv6_ifaces, endpoint_ip, &params.hook_down, server_route_ips, original_gw)?;
+                cmd_disconnect_internal(config_path, iface, !config.no_lock, &params.blocked_ipv6_ifaces, endpoint_ip, server_route_ips, original_gw)?;
                 warn!("Connection lost (--no-reconnect, exiting).");
                 return Ok(true);
             }
@@ -977,7 +883,7 @@ fn handle_reset_level(
         }
         ResetLevel::Retry => {
             if config.no_reconnect {
-                cmd_disconnect_internal(config_path, iface, !config.no_lock, &params.blocked_ipv6_ifaces, endpoint_ip, &params.hook_down, server_route_ips, original_gw)?;
+                cmd_disconnect_internal(config_path, iface, !config.no_lock, &params.blocked_ipv6_ifaces, endpoint_ip, server_route_ips, original_gw)?;
                 warn!("Connection lost (--no-reconnect, exiting).");
                 return Ok(true);
             }
@@ -988,7 +894,7 @@ fn handle_reset_level(
         }
         ResetLevel::Switch => {
             if config.no_reconnect {
-                cmd_disconnect_internal(config_path, iface, !config.no_lock, &params.blocked_ipv6_ifaces, endpoint_ip, &params.hook_down, server_route_ips, original_gw)?;
+                cmd_disconnect_internal(config_path, iface, !config.no_lock, &params.blocked_ipv6_ifaces, endpoint_ip, server_route_ips, original_gw)?;
                 warn!("Server switch requested (--no-reconnect, exiting).");
                 return Ok(true);
             }
@@ -1162,9 +1068,6 @@ pub fn run(
             resolve_effective_dns(&params.custom_dns_ips, wg_key, ipv6_enabled);
         let dns_ipv6: &str = &effective_dns_ipv6_owned;
 
-        // 6b. Run vpn.pre hook (Eddie: Session.cs line 301, before connection starts)
-        run_hook(&params.hook_pre, "vpn.pre");
-
         // 7b. Pre-connection authorization (Eddie: Session.cs:173-218)
         let reset_from_auth = match api::fetch_connect_with_urls(
             provider_config,
@@ -1329,12 +1232,12 @@ pub fn run(
         ) {
             if params.shutdown.load(Ordering::Relaxed) {
                 warn!("Setup interrupted by shutdown signal, disconnecting...");
-                let _ = cmd_disconnect_internal(&config_path, &iface, !config.no_lock, &params.blocked_ipv6_ifaces, &endpoint_ip, &params.hook_down, &all_entry_ips, &original_gw);
+                let _ = cmd_disconnect_internal(&config_path, &iface, !config.no_lock, &params.blocked_ipv6_ifaces, &endpoint_ip, &all_entry_ips, &original_gw);
                 break;
             }
             error!("Setup failed after WireGuard connected: {:#}", e);
             warn!("Cleaning up...");
-            let _ = cmd_disconnect_internal(&config_path, &iface, !config.no_lock, &params.blocked_ipv6_ifaces, &endpoint_ip, &params.hook_down, &all_entry_ips, &original_gw);
+            let _ = cmd_disconnect_internal(&config_path, &iface, !config.no_lock, &params.blocked_ipv6_ifaces, &endpoint_ip, &all_entry_ips, &original_gw);
             return Err(e);
         }
 
@@ -1385,9 +1288,6 @@ pub fn run(
                 server_location: server_ref.location.clone(),
             },
         ));
-
-        // Run vpn.up hook (Eddie: Session.cs line 799, after VPN established)
-        run_hook(&params.hook_up, "vpn.up");
 
         // 13. Monitor loop — determines ResetLevel when connection ends
         let reset_level = run_monitor_loop(

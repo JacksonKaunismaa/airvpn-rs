@@ -69,7 +69,6 @@ pub struct UserInfo {
     pub keys: Vec<WireGuardKey>,
 }
 
-#[derive(Debug)]
 pub struct WireGuardKey {
     pub name: String,
     pub wg_private_key: Zeroizing<String>,
@@ -78,6 +77,20 @@ pub struct WireGuardKey {
     pub wg_dns_ipv4: String,
     pub wg_dns_ipv6: String,
     pub wg_preshared: Zeroizing<String>,
+}
+
+impl std::fmt::Debug for WireGuardKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WireGuardKey")
+            .field("name", &self.name)
+            .field("wg_private_key", &"[REDACTED]")
+            .field("wg_ipv4", &self.wg_ipv4)
+            .field("wg_ipv6", &self.wg_ipv6)
+            .field("wg_dns_ipv4", &self.wg_dns_ipv4)
+            .field("wg_dns_ipv6", &self.wg_dns_ipv6)
+            .field("wg_preshared", &"[REDACTED]")
+            .finish()
+    }
 }
 
 struct ServerGroupAttrs {

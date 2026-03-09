@@ -142,6 +142,10 @@ pub fn flush() {
 /// Returns the raw `resolvectl dns <iface>` output line, e.g.
 /// "Link 2 (eth0): 8.8.8.8 8.8.4.4" — the caller parses IPs from this.
 fn get_interface_dns(iface: &str) -> Option<String> {
+    if !crate::common::validate_interface_name(iface) {
+        warn!("get_interface_dns: invalid interface name {:?}", iface);
+        return None;
+    }
     let output = Command::new("resolvectl")
         .args(["dns", iface])
         .output()
@@ -162,9 +166,14 @@ fn list_interfaces() -> Vec<String> {
     if let Ok(entries) = fs::read_dir("/sys/class/net") {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name != "lo" && name != "lo0" {
-                ifaces.push(name);
+            if name == "lo" || name == "lo0" {
+                continue;
             }
+            if !crate::common::validate_interface_name(&name) {
+                warn!("skipping invalid interface name in list_interfaces: {:?}", name);
+                continue;
+            }
+            ifaces.push(name);
         }
     }
     ifaces
@@ -179,6 +188,9 @@ fn list_interfaces() -> Vec<String> {
 ///
 /// Reference: Eddie impl.cpp dns-switch-do (lines ~228-321)
 fn configure_systemd_resolved_all(dns_ipv4: &str, dns_ipv6: &str, vpn_iface: &str) -> Result<()> {
+    if !crate::common::validate_interface_name(vpn_iface) {
+        anyhow::bail!("invalid VPN interface name: {:?}", vpn_iface);
+    }
     let ifaces = list_interfaces();
 
     for iface in &ifaces {
@@ -290,6 +302,9 @@ fn configure_systemd_resolved_all(dns_ipv4: &str, dns_ipv6: &str, vpn_iface: &st
 /// Eddie always writes resolv.conf AND configures systemd-resolved if active.
 /// The resolv.conf swap is the universal fallback; systemd-resolved is layered on top.
 pub fn activate(dns_ipv4: &str, dns_ipv6: &str, iface: &str) -> Result<()> {
+    if !crate::common::validate_interface_name(iface) {
+        anyhow::bail!("invalid interface name: {:?}", iface);
+    }
     if dns_ipv4.is_empty() && dns_ipv6.is_empty() {
         anyhow::bail!("no DNS servers provided (both IPv4 and IPv6 are empty)");
     }
@@ -395,68 +410,74 @@ pub fn deactivate() -> Result<()> {
                     .strip_prefix("systemd_resolve_")
                     .and_then(|s| s.strip_suffix(".airvpn-rs"))
                     .unwrap_or("");
-                if !iface.is_empty() {
-                    if let Ok(content) = fs::read_to_string(entry.path()) {
-                        let mut dns_line = String::new();
-                        let mut dr_line = String::new();
-                        for line in content.lines() {
-                            if let Some(v) = line.strip_prefix("dns=") {
-                                dns_line = v.to_string();
-                            }
-                            if let Some(v) = line.strip_prefix("default_route=") {
-                                dr_line = v.to_string();
-                            }
+                if iface.is_empty() || !crate::common::validate_interface_name(iface) {
+                    if !iface.is_empty() {
+                        warn!("skipping invalid interface name from backup file: {:?}", iface);
+                    }
+                    // Still clean up the invalid backup file
+                    let _ = fs::remove_file(entry.path());
+                    continue;
+                }
+                if let Ok(content) = fs::read_to_string(entry.path()) {
+                    let mut dns_line = String::new();
+                    let mut dr_line = String::new();
+                    for line in content.lines() {
+                        if let Some(v) = line.strip_prefix("dns=") {
+                            dns_line = v.to_string();
                         }
-
-                        // Restore DNS servers.
-                        // resolvectl dns output format: "Link 2 (eth0): 8.8.8.8 8.8.4.4"
-                        // Extract just the IP addresses from the saved line.
-                        let mut dns_restored = false;
-                        if !dns_line.is_empty() {
-                            let servers: Vec<&str> = dns_line
-                                .split_whitespace()
-                                .filter(|s| s.parse::<std::net::IpAddr>().is_ok())
-                                .collect();
-                            if !servers.is_empty() {
-                                let mut args = vec!["dns", iface];
-                                args.extend(servers);
-                                let result = Command::new("resolvectl").args(&args).output();
-                                if result.map(|o| o.status.success()).unwrap_or(false) {
-                                    dns_restored = true;
-                                }
-                            }
-                        }
-
-                        // If the interface had no original DNS servers, revert it
-                        // instead of leaving VPN DNS in place.
-                        if !dns_restored {
-                            let _ = Command::new("resolvectl")
-                                .args(["revert", iface])
-                                .output();
-                        }
-
-                        // Restore default-route.
-                        // An unset default-route is different from explicitly false.
-                        // Only restore if the backup contains an explicit "yes" or "no";
-                        // otherwise let `resolvectl revert` (above) handle it.
-                        if dr_line.contains("yes") {
-                            let _ = Command::new("resolvectl")
-                                .args(["default-route", iface, "true"])
-                                .output();
-                        } else if dr_line.contains("no") {
-                            let _ = Command::new("resolvectl")
-                                .args(["default-route", iface, "false"])
-                                .output();
-                        }
-                        // else: was unset — resolvectl revert will handle it
-
-                        // Only mark as restored if DNS was actually put back.
-                        if dns_restored {
-                            restored_ifaces.push(iface.to_string());
+                        if let Some(v) = line.strip_prefix("default_route=") {
+                            dr_line = v.to_string();
                         }
                     }
-                    let _ = fs::remove_file(entry.path());
+
+                    // Restore DNS servers.
+                    // resolvectl dns output format: "Link 2 (eth0): 8.8.8.8 8.8.4.4"
+                    // Extract just the IP addresses from the saved line.
+                    let mut dns_restored = false;
+                    if !dns_line.is_empty() {
+                        let servers: Vec<&str> = dns_line
+                            .split_whitespace()
+                            .filter(|s| s.parse::<std::net::IpAddr>().is_ok())
+                            .collect();
+                        if !servers.is_empty() {
+                            let mut args = vec!["dns", iface];
+                            args.extend(servers);
+                            let result = Command::new("resolvectl").args(&args).output();
+                            if result.map(|o| o.status.success()).unwrap_or(false) {
+                                dns_restored = true;
+                            }
+                        }
+                    }
+
+                    // If the interface had no original DNS servers, revert it
+                    // instead of leaving VPN DNS in place.
+                    if !dns_restored {
+                        let _ = Command::new("resolvectl")
+                            .args(["revert", iface])
+                            .output();
+                    }
+
+                    // Restore default-route.
+                    // An unset default-route is different from explicitly false.
+                    // Only restore if the backup contains an explicit "yes" or "no";
+                    // otherwise let `resolvectl revert` (above) handle it.
+                    if dr_line.contains("yes") {
+                        let _ = Command::new("resolvectl")
+                            .args(["default-route", iface, "true"])
+                            .output();
+                    } else if dr_line.contains("no") {
+                        let _ = Command::new("resolvectl")
+                            .args(["default-route", iface, "false"])
+                            .output();
+                    }
+                    // else: was unset — resolvectl revert will handle it
+
+                    // Only mark as restored if DNS was actually put back.
+                    if dns_restored {
+                        restored_ifaces.push(iface.to_string());
+                    }
                 }
+                let _ = fs::remove_file(entry.path());
             }
         }
     }
@@ -496,6 +517,9 @@ pub fn deactivate() -> Result<()> {
 ///
 /// Returns Ok(true) if any DNS settings were re-applied, Ok(false) if no drift detected.
 pub fn check_and_reapply(dns_ipv4: &str, dns_ipv6: &str, vpn_iface: &str) -> Result<bool> {
+    if !crate::common::validate_interface_name(vpn_iface) {
+        anyhow::bail!("invalid VPN interface name: {:?}", vpn_iface);
+    }
     let mut reapplied = false;
 
     // Check resolv.conf drift

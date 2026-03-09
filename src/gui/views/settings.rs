@@ -1,4 +1,4 @@
-//! Settings tab: profile options, per-connect flags, persistent lock controls, event hooks.
+//! Settings tab: profile options, per-connect flags, persistent lock controls.
 
 use iced::widget::{button, checkbox, column, container, pick_list, row, scrollable, text, text_input, Space};
 use iced::{Element, Fill};
@@ -15,57 +15,6 @@ fn label(s: &str) -> iced::widget::Text<'_> {
     text(s).size(14)
 }
 
-/// Render a single event-hook group (pre/up/down).
-fn event_hook_group<'a>(
-    title: &'a str,
-    hook: &str,
-    file: &str,
-    args: &str,
-    wait: bool,
-) -> iced::widget::Column<'a, Message> {
-    let hook_str = hook.to_string();
-    let hook_str2 = hook.to_string();
-    let hook_str3 = hook.to_string();
-    column![
-        label(title),
-        row![
-            text("Script path").size(12).width(90),
-            text_input("Path to script...", file)
-                .on_input(move |s| Message::SettingsEventChanged {
-                    hook: hook_str.clone(),
-                    field: "file".into(),
-                    value: s,
-                })
-                .width(Fill),
-        ]
-        .spacing(8)
-        .align_y(iced::Alignment::Center),
-        row![
-            text("Arguments").size(12).width(90),
-            text_input("Script arguments...", args)
-                .on_input(move |s| Message::SettingsEventChanged {
-                    hook: hook_str2.clone(),
-                    field: "args".into(),
-                    value: s,
-                })
-                .width(Fill),
-        ]
-        .spacing(8)
-        .align_y(iced::Alignment::Center),
-        checkbox(wait)
-            .label("Wait for completion")
-            .on_toggle({
-                let hook_str = hook_str3;
-                move |v| Message::SettingsEventChanged {
-                    hook: hook_str.clone(),
-                    field: "wait".into(),
-                    value: v.to_string(),
-                }
-            }),
-    ]
-    .spacing(4)
-}
-
 /// Render the settings tab.
 #[allow(clippy::too_many_arguments)]
 pub fn view<'a>(
@@ -74,9 +23,6 @@ pub fn view<'a>(
     locklast: bool,
     ipv6_mode: &str,
     dns: &str,
-    event_pre: (&str, &str, bool),
-    event_up: (&str, &str, bool),
-    event_down: (&str, &str, bool),
     loaded: bool,
     dirty: bool,
     show_errors: bool,
@@ -232,30 +178,6 @@ pub fn view<'a>(
     lock_row = lock_row.push(disable_btn);
 
     content = content.push(lock_row);
-
-    // ── Event Hooks ──────────────────────────────────────
-    content = content.push(section_header("Event Hooks"));
-    content = content.push(event_hook_group(
-        "Pre-connect",
-        "pre",
-        event_pre.0,
-        event_pre.1,
-        event_pre.2,
-    ));
-    content = content.push(event_hook_group(
-        "Post-connect",
-        "up",
-        event_up.0,
-        event_up.1,
-        event_up.2,
-    ));
-    content = content.push(event_hook_group(
-        "Post-disconnect",
-        "down",
-        event_down.0,
-        event_down.1,
-        event_down.2,
-    ));
 
     // ── Save button ──────────────────────────────────────
     content = content.push(Space::new().height(8));

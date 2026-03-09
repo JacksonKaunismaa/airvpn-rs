@@ -21,6 +21,7 @@ use log::{debug, info, warn};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::profile::{generate_id, load_profile, save_profile, ProfileFormat};
 
@@ -434,12 +435,12 @@ fn save_options(path: &Path, options: &HashMap<String, String>) -> Result<()> {
 /// Resolve credentials from: CLI flags -> profile options -> stdin prompt.
 ///
 /// Takes pre-loaded profile options to avoid redundant loading/prompting.
-/// Returns `(username, password)`.
+/// Returns `(username, password)` wrapped in `Zeroizing` for secure cleanup.
 pub fn resolve_credentials(
     cli_username: Option<&str>,
     cli_password: Option<&str>,
     profile_options: &HashMap<String, String>,
-) -> Result<(String, String)> {
+) -> Result<(Zeroizing<String>, Zeroizing<String>)> {
     // Error if only one of username/password provided via CLI/stdin
     if cli_username.is_some() != cli_password.is_some() {
         bail!("--username and password (via --password-stdin or profile) must be provided together");
@@ -447,13 +448,13 @@ pub fn resolve_credentials(
 
     // 1. CLI flags take priority
     if let (Some(user), Some(pass)) = (cli_username, cli_password) {
-        return Ok((user.to_string(), pass.to_string()));
+        return Ok((Zeroizing::new(user.to_string()), Zeroizing::new(pass.to_string())));
     }
 
     // 2. Try credentials from profile options
     if let (Some(login), Some(password)) = (profile_options.get("login"), profile_options.get("password")) {
         if !login.is_empty() && !password.is_empty() {
-            return Ok((login.clone(), password.clone()));
+            return Ok((Zeroizing::new(login.clone()), Zeroizing::new(password.clone())));
         }
     }
 
@@ -476,7 +477,7 @@ pub fn resolve_credentials(
         bail!("password cannot be empty");
     }
 
-    Ok((username, password))
+    Ok((Zeroizing::new(username), Zeroizing::new(password)))
 }
 
 // ---------------------------------------------------------------------------
@@ -490,8 +491,8 @@ mod tests {
     #[test]
     fn test_resolve_from_cli_flags() {
         let (user, pass) = resolve_credentials(Some("alice"), Some("s3cret"), &HashMap::new()).unwrap();
-        assert_eq!(user, "alice");
-        assert_eq!(pass, "s3cret");
+        assert_eq!(&*user, "alice");
+        assert_eq!(&*pass, "s3cret");
     }
 
     #[test]

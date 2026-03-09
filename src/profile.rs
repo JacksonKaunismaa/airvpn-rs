@@ -151,7 +151,7 @@ fn simple_decrypt(
     crypt_key: &[u8; KEY_BYTE_SIZE],
     auth_key: &[u8; KEY_BYTE_SIZE],
     non_secret_payload_length: usize,
-) -> Option<Vec<u8>> {
+) -> Option<Zeroizing<Vec<u8>>> {
     let iv_length = BLOCK_BYTE_SIZE;
 
     // Check minimum length
@@ -192,6 +192,7 @@ fn simple_decrypt(
     Aes256CbcDec::new(crypt_key.into(), &iv.into())
         .decrypt_padded_vec_mut::<Pkcs7>(ciphertext)
         .ok()
+        .map(Zeroizing::new)
 }
 
 /// Eddie's `SimpleEncryptWithPassword` — PBKDF2 key derivation then encrypt.
@@ -229,7 +230,7 @@ fn decrypt_with_password(
     encrypted: &[u8],
     password: &str,
     external_payload_length: usize,
-) -> Option<Vec<u8>> {
+) -> Option<Zeroizing<Vec<u8>>> {
     if encrypted.len() < external_payload_length + SALT_BYTE_SIZE + SALT_BYTE_SIZE {
         return None;
     }
@@ -269,7 +270,7 @@ fn profile_encrypt(data: &[u8], password: &str) -> Vec<u8> {
 /// Decrypt profile data matching Eddie's `Crypto.Manager.ReadBytesEncrypted`.
 ///
 /// Returns `None` if decryption fails (wrong password or corrupt data).
-fn profile_decrypt(encrypted: &[u8], password: &str) -> Option<Vec<u8>> {
+fn profile_decrypt(encrypted: &[u8], password: &str) -> Option<Zeroizing<Vec<u8>>> {
     decrypt_with_password(encrypted, password, NOT_SECRET_PAYLOAD.len())
 }
 
@@ -358,7 +359,7 @@ pub fn save_profile(
 pub fn load_profile(
     path: &Path,
     password_provider: impl Fn() -> Result<String>,
-) -> Result<(ProfileFormat, String, Vec<u8>)> {
+) -> Result<(ProfileFormat, String, Zeroizing<Vec<u8>>)> {
     let file_data = std::fs::read(path)
         .with_context(|| format!("failed to read profile: {}", path.display()))?;
 
@@ -403,7 +404,7 @@ pub fn load_profile_with_keyring(
     path: &Path,
     password_provider: impl Fn() -> Result<String>,
     keyring_reader: impl Fn(&str) -> Result<Option<String>>,
-) -> Result<(ProfileFormat, String, Vec<u8>)> {
+) -> Result<(ProfileFormat, String, Zeroizing<Vec<u8>>)> {
     let file_data = std::fs::read(path)
         .with_context(|| format!("failed to read profile: {}", path.display()))?;
 
@@ -673,7 +674,7 @@ mod tests {
 
         assert_eq!(fmt, ProfileFormat::V2N);
         assert_eq!(loaded_id, id);
-        assert_eq!(decrypted, data);
+        assert_eq!(&*decrypted, data);
     }
 
     #[test]
@@ -694,7 +695,7 @@ mod tests {
 
         assert_eq!(fmt, ProfileFormat::V2P);
         assert_eq!(loaded_id, id);
-        assert_eq!(decrypted, data);
+        assert_eq!(&*decrypted, data);
     }
 
     #[test]
@@ -749,7 +750,7 @@ mod tests {
         let encrypted = encrypt_with_password(plaintext, password, NOT_SECRET_PAYLOAD);
         let decrypted = decrypt_with_password(&encrypted, password, NOT_SECRET_PAYLOAD.len());
 
-        assert_eq!(decrypted.as_deref(), Some(plaintext.as_slice()));
+        assert_eq!(decrypted.as_deref().map(|d| d.as_slice()), Some(plaintext.as_slice()));
     }
 
     #[test]
@@ -848,7 +849,7 @@ mod tests {
         let password = "test-password";
         let encrypted = encrypt_with_password(plaintext, password, NOT_SECRET_PAYLOAD);
         let decrypted = decrypt_with_password(&encrypted, password, NOT_SECRET_PAYLOAD.len());
-        assert_eq!(decrypted.as_deref(), Some(plaintext.as_slice()));
+        assert_eq!(decrypted.as_deref().map(|d| d.as_slice()), Some(plaintext.as_slice()));
     }
 
     #[test]
@@ -857,7 +858,7 @@ mod tests {
         let password = "test-password";
         let encrypted = encrypt_with_password(plaintext, password, NOT_SECRET_PAYLOAD);
         let decrypted = decrypt_with_password(&encrypted, password, NOT_SECRET_PAYLOAD.len());
-        assert_eq!(decrypted.as_deref(), Some(plaintext.as_slice()));
+        assert_eq!(decrypted.as_deref().map(|d| d.as_slice()), Some(plaintext.as_slice()));
     }
 
     #[test]
@@ -868,7 +869,7 @@ mod tests {
         let password = "test-password";
         let encrypted = encrypt_with_password(plaintext, password, NOT_SECRET_PAYLOAD);
         let decrypted = decrypt_with_password(&encrypted, password, NOT_SECRET_PAYLOAD.len());
-        assert_eq!(decrypted.as_deref(), Some(plaintext.as_slice()));
+        assert_eq!(decrypted.as_deref().map(|d| d.as_slice()), Some(plaintext.as_slice()));
     }
 
     #[test]
@@ -878,7 +879,7 @@ mod tests {
         let password = "test-password-for-large-data";
         let encrypted = encrypt_with_password(&plaintext, password, NOT_SECRET_PAYLOAD);
         let decrypted = decrypt_with_password(&encrypted, password, NOT_SECRET_PAYLOAD.len());
-        assert_eq!(decrypted.as_deref(), Some(plaintext.as_slice()));
+        assert_eq!(decrypted.as_deref().map(|d| d.as_slice()), Some(plaintext.as_slice()));
     }
 
     #[test]
@@ -887,7 +888,7 @@ mod tests {
         let password = "\u{1F512}\u{1F511}"; // lock + key emojis
         let encrypted = encrypt_with_password(plaintext, password, NOT_SECRET_PAYLOAD);
         let decrypted = decrypt_with_password(&encrypted, password, NOT_SECRET_PAYLOAD.len());
-        assert_eq!(decrypted.as_deref(), Some(plaintext.as_slice()));
+        assert_eq!(decrypted.as_deref().map(|d| d.as_slice()), Some(plaintext.as_slice()));
     }
 
     #[test]

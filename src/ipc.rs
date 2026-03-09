@@ -82,9 +82,6 @@ pub struct ConnectRequest {
     pub no_start_last: bool,
     pub ipv6_mode: Option<String>,
     pub dns_servers: Vec<String>,
-    pub event_pre: [Option<String>; 3],
-    pub event_up: [Option<String>; 3],
-    pub event_down: [Option<String>; 3],
 }
 
 /// Response for GET /status.

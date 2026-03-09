@@ -366,3 +366,31 @@ EWMA smoothing (divergence #10) ensures data stays fresh across cycles.
 `LatencyCache::load()`
 
 **Eddie ref:** `Session.cs` lines 121-142 (`PingerInvalid` loop)
+
+---
+
+## 15. No event hooks (event.vpn.pre/up/down)
+
+**Eddie:** Supports lifecycle event hooks (`event.vpn.pre`, `event.vpn.up`,
+`event.vpn.down`) that execute arbitrary shell commands at connection
+milestones. Each hook has `filename`, `arguments`, and `waitend` fields
+configured in the profile or via CLI. Eddie runs these via
+`Engine.RunEventCommand()` / `SystemExec.ExecForUserEvent`.
+
+**airvpn-rs:** Event hooks are not supported. The CLI flags
+(`--event.vpn.pre.filename`, etc.), profile options (`event.vpn.pre.*`), and
+the `EventHook` struct have been removed entirely.
+
+**Why:** In airvpn-rs's split-process architecture, the helper daemon runs as
+root and accepts commands over a Unix socket (`/run/airvpn-rs/helper.sock`,
+group `wheel`). Event hooks configured via IPC would allow any wheel-group
+process to execute arbitrary commands as root by specifying a hook script in a
+connect request. The security value of the feature is low (users can achieve
+the same effect with systemd units or wrapper scripts), while the risk of
+privilege escalation through the IPC socket is real.
+
+**Files:** Removed from `src/connect.rs`, `src/ipc.rs`, `src/main.rs`,
+`src/helper.rs`, `src/gui/main.rs`, `src/gui/views/settings.rs`
+
+**Eddie ref:** `Engine.cs` `RunEventCommand()`, `ProfileOptions.cs`
+`EnsureDefaultsEvent()`

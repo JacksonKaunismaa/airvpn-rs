@@ -178,9 +178,9 @@ pub fn build_envelope(
 /// Decrypted content is UTF-8 XML.
 ///
 /// Reference: Eddie Service.FetchUrl() — response decryption block
-pub fn decrypt_response(body: &[u8], key: &[u8; 32], iv: &[u8; 16]) -> Result<String> {
+pub fn decrypt_response(body: &[u8], key: &[u8; 32], iv: &[u8; 16]) -> Result<Zeroizing<String>> {
     let plaintext = aes_cbc_decrypt(body, key, iv).context("failed to decrypt API response")?;
-    String::from_utf8(plaintext).context("decrypted response is not valid UTF-8")
+    Ok(Zeroizing::new(String::from_utf8(plaintext).context("decrypted response is not valid UTF-8")?))
 }
 
 // ---------------------------------------------------------------------------

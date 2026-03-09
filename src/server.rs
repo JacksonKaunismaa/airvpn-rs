@@ -134,7 +134,7 @@ fn users_perc(server: &Server) -> i64 {
     if server.users_max == 0 {
         return 100;
     }
-    (server.users * 100) / server.users_max
+    server.users.saturating_mul(100) / server.users_max
 }
 
 /// Calculate server score (lower = better), matching Eddie's `ConnectionInfo.Score()`.

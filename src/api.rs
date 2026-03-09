@@ -19,6 +19,7 @@ use reqwest::blocking::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::time::Duration;
+use zeroize::Zeroizing;
 
 use crate::crypto;
 use crate::manifest::{attr_opt, sanitize_server_message};
@@ -214,14 +215,14 @@ fn parse_connect_response(xml: &str) -> Result<ConnectDirective> {
 // API calls
 // ---------------------------------------------------------------------------
 
-pub fn fetch_manifest(config: &ProviderConfig, username: &str, password: &str) -> Result<String> {
+pub fn fetch_manifest(config: &ProviderConfig, username: &str, password: &str) -> Result<Zeroizing<String>> {
     let mut params = base_params(username, password);
     params.insert(0, ("act".into(), "manifest".into()));
     params.insert(1, ("ts".into(), "0".into()));
     fetch_encrypted(config, &params, &[])
 }
 
-pub fn fetch_user(config: &ProviderConfig, username: &str, password: &str) -> Result<String> {
+pub fn fetch_user(config: &ProviderConfig, username: &str, password: &str) -> Result<Zeroizing<String>> {
     fetch_user_with_urls(config, username, password, &[])
 }
 
@@ -230,7 +231,7 @@ pub fn fetch_user_with_urls(
     username: &str,
     password: &str,
     extra_urls: &[String],
-) -> Result<String> {
+) -> Result<Zeroizing<String>> {
     let mut params = base_params(username, password);
     params.insert(0, ("act".into(), "user".into()));
     fetch_encrypted(config, &params, extra_urls)
@@ -293,7 +294,7 @@ fn fetch_encrypted(
     config: &ProviderConfig,
     params: &[(String, String)],
     extra_urls: &[String],
-) -> Result<String> {
+) -> Result<Zeroizing<String>> {
     let safe_params: Vec<(&str, &str)> = params.iter()
         .map(|(k, v)| {
             let v_safe: &str = match k.as_str() {
