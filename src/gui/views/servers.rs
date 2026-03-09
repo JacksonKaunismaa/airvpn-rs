@@ -22,6 +22,7 @@ pub enum SortColumn {
 pub fn view<'a>(
     servers: &[ServerInfo],
     loading: bool,
+    loading_tick: u32,
     selected_idx: Option<usize>,
     sort_column: SortColumn,
     sort_ascending: bool,
@@ -54,9 +55,10 @@ pub fn view<'a>(
 
     content = content.push(top_bar);
 
-    // Loading indicator
+    // Loading indicator with animated dots (cycles every ~2s at 100ms ticks)
     if loading {
-        content = content.push(text("Loading servers...").size(14));
+        let dots = ".".repeat((loading_tick / 5 % 4) as usize);
+        content = content.push(text(format!("Loading servers{dots}")).size(14));
         return content.into();
     }
 

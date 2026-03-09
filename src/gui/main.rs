@@ -82,6 +82,9 @@ struct App {
 
     // Auto-refresh timer for server list
     last_server_fetch: Instant,
+
+    // Tick counter for loading animation (wraps on overflow)
+    loading_tick: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +168,8 @@ impl App {
             connect_no_verify: false,
 
             last_server_fetch: Instant::now(),
+
+            loading_tick: 0,
         };
 
         // With systemd socket activation, the socket always exists.
@@ -222,6 +227,10 @@ impl App {
                     .unwrap_or_default();
                 for event in events {
                     self.handle_helper_event(event);
+                }
+                // Advance loading animation tick
+                if self.servers_loading {
+                    self.loading_tick = self.loading_tick.wrapping_add(1);
                 }
                 // Auto-refresh server list every 3 minutes
                 if self.helper.is_some()
@@ -656,6 +665,7 @@ impl App {
             views::Tab::Servers => views::servers::view(
                 &self.servers,
                 self.servers_loading,
+                self.loading_tick,
                 self.selected_server_idx,
                 self.server_sort,
                 self.server_sort_ascending,
