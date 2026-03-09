@@ -74,6 +74,9 @@ struct App {
     // GUI-only toggles (not persisted)
     show_errors: bool,
 
+    // Eddie import confirmation (Some = dialog visible with profile path)
+    eddie_import_pending: Option<String>,
+
     // Per-connect flags (not profile-backed)
     connect_no_lock: bool,
     connect_allow_lan: bool,
@@ -116,6 +119,8 @@ pub enum Message {
     LockUninstall,
     LockEnable,
     LockDisable,
+    EddieImportAccept,
+    EddieImportCancel,
 }
 
 impl App {
@@ -161,6 +166,7 @@ impl App {
             settings_dirty: false,
 
             show_errors: false,
+            eddie_import_pending: None,
 
             connect_no_lock: false,
             connect_allow_lan: true,
@@ -466,6 +472,28 @@ impl App {
                 }
                 Task::none()
             }
+            Message::EddieImportAccept => {
+                let _path = self.eddie_import_pending.take();
+                self.activity = "Importing Eddie profile...".into();
+                if let Some(ref helper) = self.helper {
+                    let import_body = b"{\"accept\":true}";
+                    if let Err(e) = helper.send_command("POST", "/import-eddie", Some(import_body)) {
+                        self.error_overview = Some(format!("Failed to import Eddie profile: {}", e));
+                        return Task::none();
+                    }
+                    // Retry connect after successful import
+                    let server = self.selected_server.clone();
+                    self.send_connect(server);
+                }
+                Task::none()
+            }
+            Message::EddieImportCancel => {
+                self.eddie_import_pending = None;
+                self.error_overview = Some(
+                    "Credentials required. Run 'sudo airvpn connect' to set up.".into(),
+                );
+                Task::none()
+            }
         }
     }
 
@@ -604,18 +632,9 @@ impl App {
                 if status == 409 {
                     // Check if Eddie import needed
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&resp_body) {
-                        if parsed.get("eddie_profile").is_some() {
-                            self.activity = "Importing Eddie profile...".into();
-                            // Auto-accept Eddie import
-                            let import_body = b"{\"accept\":true}";
-                            if let Err(e) = helper.send_command("POST", "/import-eddie", Some(import_body)) {
-                                self.error_overview = Some(format!("Failed to import Eddie profile: {}", e));
-                                return;
-                            }
-                            // Retry connect
-                            if let Err(e) = helper.send_command("POST", "/connect", Some(&body)) {
-                                self.error_overview = Some(format!("Failed to connect after Eddie import: {}", e));
-                            }
+                        if let Some(path) = parsed.get("eddie_profile").and_then(|v| v.as_str()) {
+                            // Show confirmation dialog instead of auto-accepting
+                            self.eddie_import_pending = Some(path.to_string());
                             return;
                         }
                     }
@@ -661,6 +680,7 @@ impl App {
                 self.connection_count,
                 &self.selected_server,
                 &self.activity,
+                &self.eddie_import_pending,
             ),
             views::Tab::Servers => views::servers::view(
                 &self.servers,

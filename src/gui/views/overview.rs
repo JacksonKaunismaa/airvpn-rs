@@ -1,7 +1,7 @@
 //! Overview tab: connection status, connect/disconnect, stats, lock status.
 
-use iced::widget::{button, column, row, text};
-use iced::Element;
+use iced::widget::{button, column, container, row, text};
+use iced::{Element, Fill};
 
 use airvpn::ipc::ConnectionState;
 
@@ -21,7 +21,13 @@ pub fn view<'a>(
     connection_count: u32,
     selected_server: &Option<String>,
     activity: &'a str,
+    eddie_import_pending: &'a Option<String>,
 ) -> Element<'a, Message> {
+    // If Eddie import confirmation is pending, show that dialog instead
+    if let Some(path) = eddie_import_pending {
+        return eddie_import_dialog(path);
+    }
+
     let mut content = column![].spacing(12);
 
     // Status line with color indication
@@ -137,6 +143,27 @@ pub fn view<'a>(
     content = content.push(text(lock_text));
 
     content.into()
+}
+
+/// Confirmation dialog for Eddie profile import.
+fn eddie_import_dialog(path: &str) -> Element<'_, Message> {
+    let content = column![
+        text("Import credentials from Eddie profile?").size(20),
+        text(path)
+            .size(14)
+            .color(iced::Color::from_rgb(0.53, 0.57, 0.63)),
+        row![
+            button(text("Import")).on_press(Message::EddieImportAccept),
+            button(text("Cancel")).on_press(Message::EddieImportCancel),
+        ]
+        .spacing(12),
+    ]
+    .spacing(16);
+
+    container(content)
+        .width(Fill)
+        .padding(24)
+        .into()
 }
 
 fn format_bytes(bytes: u64) -> String {
