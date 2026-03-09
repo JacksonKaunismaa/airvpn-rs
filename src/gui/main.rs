@@ -5,12 +5,13 @@ mod views;
 use iced::widget::{button, column, container, row, text};
 use iced::{Element, Fill, Size, Subscription, Task};
 use iced::time;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 const MAX_LOG_ENTRIES: usize = 10_000;
 
 use airvpn::ipc::{ConnectionState, ConnectRequest, HelperEvent, SaveProfileRequest, ServerInfo};
+use airvpn::options;
 
 #[derive(Debug, Clone)]
 pub struct LogEntry {
@@ -589,25 +590,19 @@ impl App {
 
     /// Build a ConnectRequest from current settings.
     fn build_connect_request(&self, server: Option<String>) -> ConnectRequest {
-        let ipv6_mode = if self.settings_ipv6_mode.is_empty() { None } else { Some(self.settings_ipv6_mode.clone()) };
-        let dns_servers = if self.settings_dns.is_empty() { Vec::new() } else {
-            self.settings_dns.split(',').map(|s| s.trim().to_string()).collect()
-        };
-        ConnectRequest {
-            server,
-            no_lock: self.connect_no_lock,
-            allow_lan: self.connect_allow_lan,
-            allow_country: Vec::new(),
-            deny_country: Vec::new(),
-            allow_server: Vec::new(),
-            deny_server: Vec::new(),
-            no_reconnect: self.connect_no_reconnect,
-            no_verify: self.connect_no_verify,
-            no_lock_last: false,
-            no_start_last: false,
-            ipv6_mode,
-            dns_servers,
+        let mut overrides = HashMap::new();
+        // Always send current GUI state as overrides — resolve() handles layering
+        overrides.insert(options::NETLOCK.into(), (!self.connect_no_lock).to_string());
+        overrides.insert(options::NETLOCK_ALLOW_PRIVATE.into(), self.connect_allow_lan.to_string());
+        overrides.insert(options::RECONNECT.into(), (!self.connect_no_reconnect).to_string());
+        overrides.insert(options::VERIFY.into(), (!self.connect_no_verify).to_string());
+        if !self.settings_ipv6_mode.is_empty() {
+            overrides.insert(options::NETWORK_IPV6_MODE.into(), self.settings_ipv6_mode.clone());
         }
+        if !self.settings_dns.is_empty() {
+            overrides.insert(options::DNS_SERVERS.into(), self.settings_dns.clone());
+        }
+        ConnectRequest { server, overrides }
     }
 
     /// Send POST /connect via HTTP. Handles 409 Eddie import by auto-accepting and retrying.

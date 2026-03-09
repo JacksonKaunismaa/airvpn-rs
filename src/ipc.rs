@@ -3,6 +3,7 @@
 //! JSON-lines protocol over Unix socket: one JSON object per line,
 //! newline-delimited.
 
+use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 /// GUI-friendly server info with pre-calculated scoring.
@@ -56,7 +57,7 @@ pub enum HelperEvent {
     /// Server list in response to ListServers command.
     ServerList { servers: Vec<ServerInfo> },
     Profile {
-        options: std::collections::HashMap<String, String>,
+        options: HashMap<String, String>,
         credentials_configured: bool,
     },
     ProfileSaved,
@@ -69,19 +70,10 @@ pub enum HelperEvent {
 /// Request body for POST /connect.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectRequest {
+    /// Target server name (None = auto-select best server).
     pub server: Option<String>,
-    pub no_lock: bool,
-    pub allow_lan: bool,
-    pub allow_country: Vec<String>,
-    pub deny_country: Vec<String>,
-    pub allow_server: Vec<String>,
-    pub deny_server: Vec<String>,
-    pub no_reconnect: bool,
-    pub no_verify: bool,
-    pub no_lock_last: bool,
-    pub no_start_last: bool,
-    pub ipv6_mode: Option<String>,
-    pub dns_servers: Vec<String>,
+    /// Per-session option overrides. Merged: defaults -> profile -> overrides.
+    pub overrides: HashMap<String, String>,
 }
 
 /// Response for GET /status.
@@ -114,7 +106,7 @@ pub struct EddieImportNeeded {
 /// Request body for POST /profile.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaveProfileRequest {
-    pub options: std::collections::HashMap<String, String>,
+    pub options: HashMap<String, String>,
 }
 
 /// Internal engine events (mpsc channel, not serialized over socket).
@@ -252,7 +244,7 @@ mod tests {
 
     #[test]
     fn test_event_profile_roundtrip() {
-        let mut options = std::collections::HashMap::new();
+        let mut options = HashMap::new();
         options.insert("servers.locklast".to_string(), "false".to_string());
         options.insert("mode.protocol".to_string(), "wireguard".to_string());
         let event = HelperEvent::Profile { options: options.clone(), credentials_configured: true };

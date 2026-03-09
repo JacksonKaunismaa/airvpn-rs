@@ -1,4 +1,6 @@
-use airvpn::{cli_client, ipc};
+use std::collections::HashMap;
+
+use airvpn::{cli_client, ipc, options};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
@@ -243,21 +245,23 @@ fn main() -> anyhow::Result<()> {
             ipv6_mode,
             dns_servers,
         } => {
-            let req = ipc::ConnectRequest {
-                server,
-                no_lock,
-                allow_lan,
-                allow_country,
-                deny_country,
-                allow_server,
-                deny_server,
-                no_reconnect,
-                no_verify,
-                no_lock_last,
-                no_start_last,
-                ipv6_mode,
-                dns_servers,
-            };
+            let mut overrides = HashMap::new();
+            // CLI flags are negative (--no-lock = disable), options are positive
+            // Only set override if flag is non-default
+            if no_lock { overrides.insert(options::NETLOCK.into(), "false".into()); }
+            if allow_lan { overrides.insert(options::NETLOCK_ALLOW_PRIVATE.into(), "true".into()); }
+            if no_reconnect { overrides.insert(options::RECONNECT.into(), "false".into()); }
+            if no_verify { overrides.insert(options::VERIFY.into(), "false".into()); }
+            if no_lock_last { overrides.insert(options::SERVERS_LOCKLAST.into(), "false".into()); }
+            if no_start_last { overrides.insert(options::SERVERS_STARTLAST.into(), "false".into()); }
+            if !allow_server.is_empty() { overrides.insert(options::SERVERS_ALLOWLIST.into(), allow_server.join(",")); }
+            if !deny_server.is_empty() { overrides.insert(options::SERVERS_DENYLIST.into(), deny_server.join(",")); }
+            if !allow_country.is_empty() { overrides.insert(options::AREAS_ALLOWLIST.into(), allow_country.join(",")); }
+            if !deny_country.is_empty() { overrides.insert(options::AREAS_DENYLIST.into(), deny_country.join(",")); }
+            if let Some(ref mode) = ipv6_mode { overrides.insert(options::NETWORK_IPV6_MODE.into(), mode.clone()); }
+            if !dns_servers.is_empty() { overrides.insert(options::DNS_SERVERS.into(), dns_servers.join(",")); }
+
+            let req = ipc::ConnectRequest { server, overrides };
             cli_client::send_connect(&req)
         }
         Commands::Disconnect => cli_client::send_simple("POST", "/disconnect", None),
