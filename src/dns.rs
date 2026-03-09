@@ -114,18 +114,51 @@ fn is_systemd_resolved_active() -> bool {
         .unwrap_or(false)
 }
 
+/// DNS resolution mode: which method to use for DNS configuration.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DnsMode {
+    /// Auto-detect: use systemd-resolved if active, resolv.conf otherwise.
+    Auto,
+    /// Force resolv.conf swap only (skip systemd-resolved even if active).
+    ResolvConf,
+    /// Force systemd-resolved configuration (fail if not active).
+    SystemdResolved,
+}
+
+impl DnsMode {
+    /// Parse from the `dns.mode` option string.
+    pub fn parse(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "resolvconf" => DnsMode::ResolvConf,
+            "systemd-resolved" => DnsMode::SystemdResolved,
+            _ => DnsMode::Auto,
+        }
+    }
+
+    /// Whether systemd-resolved should be used for this mode.
+    fn use_systemd_resolved(self) -> bool {
+        match self {
+            DnsMode::Auto => is_systemd_resolved_active(),
+            DnsMode::ResolvConf => false,
+            DnsMode::SystemdResolved => true,
+        }
+    }
+}
+
 /// Flush DNS caches (matching Eddie's dns-flush handler).
 ///
-/// Restarts common DNS cache services and flushes systemd-resolved.
+/// Restarts the given DNS cache services and flushes systemd-resolved.
 /// Eddie default: "nscd;dnsmasq;named;bind9"
-pub fn flush() {
+///
+/// `services` is the list from the `linux.dns.services` option.
+pub fn flush_with_services(services: &[String]) {
     // Restart common DNS cache services (best-effort, most won't be running).
     // Must happen BEFORE the resolvectl flush — Eddie does services first,
     // then flush.  A restart re-populates the service's cache, so flushing
     // before the restart is wasted work.
-    for service in &["nscd", "dnsmasq", "named", "bind9"] {
+    for service in services {
         let _ = Command::new("systemctl")
-            .args(["try-restart", service])
+            .args(["try-restart", service.as_str()])
             .output();
     }
 
@@ -135,6 +168,18 @@ pub fn flush() {
             .arg("flush-caches")
             .output();
     }
+}
+
+/// Flush DNS caches using the hardcoded default service list.
+///
+/// Convenience wrapper for callers that don't have access to resolved options
+/// (e.g. deactivate, which runs during cleanup without options context).
+pub fn flush() {
+    let defaults: Vec<String> = ["nscd", "dnsmasq", "named", "bind9"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    flush_with_services(&defaults);
 }
 
 /// Read current DNS servers for an interface via resolvectl.
@@ -301,7 +346,10 @@ fn configure_systemd_resolved_all(dns_ipv4: &str, dns_ipv6: &str, vpn_iface: &st
 ///
 /// Eddie always writes resolv.conf AND configures systemd-resolved if active.
 /// The resolv.conf swap is the universal fallback; systemd-resolved is layered on top.
-pub fn activate(dns_ipv4: &str, dns_ipv6: &str, iface: &str) -> Result<()> {
+///
+/// `mode` controls whether to auto-detect, force resolvconf, or force systemd-resolved.
+/// `dns_services` is the list of DNS cache services to restart during flush.
+pub fn activate(dns_ipv4: &str, dns_ipv6: &str, iface: &str, mode: DnsMode, dns_services: &[String]) -> Result<()> {
     if !crate::common::validate_interface_name(iface) {
         anyhow::bail!("invalid interface name: {:?}", iface);
     }
@@ -309,9 +357,9 @@ pub fn activate(dns_ipv4: &str, dns_ipv6: &str, iface: &str) -> Result<()> {
         anyhow::bail!("no DNS servers provided (both IPv4 and IPv6 are empty)");
     }
 
-    // If systemd-resolved is active, configure all interfaces:
+    // Configure systemd-resolved if the mode says so:
     // VPN interface gets DNS + default-route=true, all others get default-route=false.
-    if is_systemd_resolved_active() {
+    if mode.use_systemd_resolved() {
         configure_systemd_resolved_all(dns_ipv4, dns_ipv6, iface)?;
     }
 
@@ -349,7 +397,7 @@ pub fn activate(dns_ipv4: &str, dns_ipv6: &str, iface: &str) -> Result<()> {
             .context("failed to set /etc/resolv.conf permissions")?;
     }
 
-    flush();
+    flush_with_services(dns_services);
 
     Ok(())
 }
@@ -515,8 +563,10 @@ pub fn deactivate() -> Result<()> {
 /// resolv.conf behind our back, and can also revert per-interface systemd-resolved
 /// settings. This function is called periodically to detect and fix both kinds of drift.
 ///
+/// `mode` and `dns_services` control DNS mode and which services to restart (from options).
+///
 /// Returns Ok(true) if any DNS settings were re-applied, Ok(false) if no drift detected.
-pub fn check_and_reapply(dns_ipv4: &str, dns_ipv6: &str, vpn_iface: &str) -> Result<bool> {
+pub fn check_and_reapply(dns_ipv4: &str, dns_ipv6: &str, vpn_iface: &str, mode: DnsMode, dns_services: &[String]) -> Result<bool> {
     if !crate::common::validate_interface_name(vpn_iface) {
         anyhow::bail!("invalid VPN interface name: {:?}", vpn_iface);
     }
@@ -560,7 +610,7 @@ pub fn check_and_reapply(dns_ipv4: &str, dns_ipv6: &str, vpn_iface: &str) -> Res
                 }
             }
 
-            flush();
+            flush_with_services(dns_services);
             reapplied = true;
         }
     }
@@ -568,7 +618,7 @@ pub fn check_and_reapply(dns_ipv4: &str, dns_ipv6: &str, vpn_iface: &str) -> Res
     // Also re-check systemd-resolved settings (NetworkManager can revert per-interface DNS).
     // Eddie checks ALL interfaces on every DnsSwitchCheck cycle (impl.cpp uses the same
     // code path for both initial setup and periodic checking via the `check` parameter).
-    if is_systemd_resolved_active() {
+    if mode.use_systemd_resolved() {
         let ifaces = list_interfaces();
         for iface in &ifaces {
             // Skip the VPN interface — it must keep default-route=true so DNS

@@ -123,6 +123,17 @@ pub fn view<'a>(
     // Area filters
     areas_allowlist: &'a str,
     areas_denylist: &'a str,
+    // DNS settings
+    dns_mode: &'a str,
+    dns_services: &'a str,
+    // UI display settings
+    ui_unit: &'a str,
+    ui_iec: bool,
+    // Logging settings
+    log_file_enabled: bool,
+    log_file_path: &'a str,
+    // Mode settings
+    mode_port: &'a str,
     // Advanced settings
     pinger_timeout: &'a str,
     manifest_refresh: &'a str,
@@ -150,8 +161,10 @@ pub fn view<'a>(
             startlast,
             locklast,
             show_errors,
+            ui_unit,
+            ui_iec,
         ),
-        SettingsSubTab::Network => view_network(ipv6_mode, dns, routes_custom, areas_allowlist, areas_denylist),
+        SettingsSubTab::Network => view_network(ipv6_mode, dns, dns_mode, dns_services, routes_custom, areas_allowlist, areas_denylist),
         SettingsSubTab::WireGuard => view_wireguard(
             wg_key,
             wg_mtu,
@@ -177,6 +190,9 @@ pub fn view<'a>(
             http_timeout,
             checking_ntry,
             capacity_factor,
+            log_file_enabled,
+            log_file_path,
+            mode_port,
         ),
     };
 
@@ -200,6 +216,8 @@ fn view_general<'a>(
     startlast: bool,
     locklast: bool,
     show_errors: bool,
+    ui_unit: &'a str,
+    ui_iec: bool,
 ) -> Element<'a, Message> {
     let mut content = column![].spacing(16);
 
@@ -246,6 +264,30 @@ fn view_general<'a>(
             .on_toggle(Message::ShowErrorsToggle),
     );
 
+    // Display Units
+    content = content.push(section_header("Display Units"));
+
+    let unit_options: Vec<&str> = vec!["bytes", "bits"];
+    let unit_selected: Option<&str> = unit_options.iter().find(|&&o| o == ui_unit).copied();
+
+    content = content.push(
+        column![
+            row![
+                label("Speed / Transfer Unit").width(220),
+                pick_list(unit_options, unit_selected, |selected: &str| {
+                    Message::SettingsUiUnitChanged(selected.to_string())
+                })
+                .width(160),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+            checkbox(ui_iec)
+                .label("Use binary IEC units (KiB/MiB instead of KB/MB)")
+                .on_toggle(Message::SettingsUiIecToggle),
+        ]
+        .spacing(6),
+    );
+
     content.into()
 }
 
@@ -254,6 +296,8 @@ fn view_general<'a>(
 fn view_network<'a>(
     ipv6_mode: &'a str,
     dns: &'a str,
+    dns_mode: &'a str,
+    dns_services: &'a str,
     routes_custom: &'a str,
     areas_allowlist: &'a str,
     areas_denylist: &'a str,
@@ -286,6 +330,35 @@ fn view_network<'a>(
             .align_y(iced::Alignment::Center),
         ]
         .spacing(8),
+    );
+
+    // DNS Configuration
+    content = content.push(section_header("DNS Configuration"));
+
+    let dns_mode_options: Vec<&str> = vec!["auto", "resolvconf", "systemd-resolved"];
+    let dns_mode_selected: Option<&str> = dns_mode_options.iter().find(|&&o| o == dns_mode).copied();
+
+    content = content.push(
+        column![
+            row![
+                label("DNS Mode").width(220),
+                pick_list(dns_mode_options, dns_mode_selected, |selected: &str| {
+                    Message::SettingsDnsModeChanged(selected.to_string())
+                })
+                .width(200),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+            text("auto = detect systemd-resolved; resolvconf = force /etc/resolv.conf swap; systemd-resolved = force resolvectl").size(12),
+            text_field(
+                "DNS Cache Services",
+                "nscd,dnsmasq,named,bind9",
+                dns_services,
+                Message::SettingsDnsServicesChanged,
+            ),
+            text("Services restarted on DNS flush (comma-separated)").size(12),
+        ]
+        .spacing(6),
     );
 
     // Custom routes (out = bypass VPN + open firewall, in = force through tunnel)
@@ -504,6 +577,9 @@ fn view_advanced<'a>(
     http_timeout: &'a str,
     checking_ntry: &'a str,
     capacity_factor: &'a str,
+    log_file_enabled: bool,
+    log_file_path: &'a str,
+    mode_port: &'a str,
 ) -> Element<'a, Message> {
     let mut content = column![].spacing(16);
 
@@ -549,6 +625,42 @@ fn view_advanced<'a>(
             ),
         ]
         .spacing(8),
+    );
+
+    // WireGuard Mode
+    content = content.push(section_header("WireGuard Mode"));
+    content = content.push(
+        column![
+            text_field(
+                "Force Port",
+                "empty = auto",
+                mode_port,
+                Message::SettingsModePortChanged,
+            ),
+            text("Force a specific WireGuard port (e.g. 1637). Empty = auto-select from manifest.").size(12),
+        ]
+        .spacing(6),
+    );
+
+    // File Logging
+    // TODO: Wire log.file.enabled / log.file.path into the helper daemon's
+    // logging setup (main.rs env_logger or tracing init). Currently only
+    // registered as profile options; the helper does not read them yet.
+    content = content.push(section_header("File Logging"));
+    content = content.push(
+        column![
+            checkbox(log_file_enabled)
+                .label("Enable file logging")
+                .on_toggle(Message::SettingsLogFileEnabledToggle),
+            text_field(
+                "Log File Path",
+                "/var/log/airvpn-rs/helper.log",
+                log_file_path,
+                Message::SettingsLogFilePathChanged,
+            ),
+            text("Requires helper restart to take effect.").size(12),
+        ]
+        .spacing(6),
     );
 
     content.into()

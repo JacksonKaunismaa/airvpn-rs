@@ -381,7 +381,7 @@ fn test_dns_activate_deactivate() {
     // configuration for this interface will fail silently if it doesn't exist.
     let test_iface = "lo";
 
-    dns::activate(test_ipv4, test_ipv6, test_iface).expect("dns activate");
+    dns::activate(test_ipv4, test_ipv6, test_iface, dns::DnsMode::Auto, &[]).expect("dns activate");
 
     // Verify /etc/resolv.conf contains our nameservers
     let content =
@@ -435,7 +435,7 @@ fn test_dns_check_and_reapply() {
     let test_ipv6 = "fd99::2";
     let test_iface = "lo";
 
-    dns::activate(test_ipv4, test_ipv6, test_iface).expect("dns activate");
+    dns::activate(test_ipv4, test_ipv6, test_iface, dns::DnsMode::Auto, &[]).expect("dns activate");
 
     // Verify our DNS is in place
     let content = fs::read_to_string("/etc/resolv.conf").expect("read resolv.conf");
@@ -446,7 +446,7 @@ fn test_dns_check_and_reapply() {
         .expect("overwrite resolv.conf with garbage");
 
     // check_and_reapply should detect drift and restore our DNS
-    let reapplied = dns::check_and_reapply(test_ipv4, test_ipv6, test_iface).expect("check_and_reapply");
+    let reapplied = dns::check_and_reapply(test_ipv4, test_ipv6, test_iface, dns::DnsMode::Auto, &[]).expect("check_and_reapply");
     assert!(reapplied, "should detect drift and reapply DNS");
 
     // Verify DNS was restored
@@ -458,7 +458,7 @@ fn test_dns_check_and_reapply() {
     );
 
     // check_and_reapply again should find no drift
-    let reapplied2 = dns::check_and_reapply(test_ipv4, test_ipv6, test_iface).expect("second check_and_reapply");
+    let reapplied2 = dns::check_and_reapply(test_ipv4, test_ipv6, test_iface, dns::DnsMode::Auto, &[]).expect("second check_and_reapply");
     assert!(!reapplied2, "should not reapply when DNS is correct");
 
     dns::deactivate().expect("dns deactivate");
@@ -497,7 +497,7 @@ fn test_dns_immutability_handling() {
     // Activate should succeed — it clears the immutable flag internally
     let test_ipv4 = "10.99.99.3";
     let test_ipv6 = "fd99::3";
-    let result = dns::activate(test_ipv4, test_ipv6, "lo");
+    let result = dns::activate(test_ipv4, test_ipv6, "lo", dns::DnsMode::Auto, &[]);
     // Clear immutable flag in case activate failed (cleanup safety)
     let _ = Command::new("chattr")
         .args(["-i", "/etc/resolv.conf"])

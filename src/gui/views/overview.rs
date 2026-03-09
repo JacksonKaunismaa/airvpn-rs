@@ -7,7 +7,32 @@ use airvpn::ipc::ConnectionState;
 
 use crate::Message;
 
+/// Display unit configuration for speeds and transfer totals.
+#[derive(Debug, Clone, Copy)]
+pub struct UnitConfig {
+    /// "bytes" or "bits"
+    pub unit: UnitType,
+    /// false = decimal SI (KB/MB), true = binary IEC (KiB/MiB)
+    pub iec: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UnitType {
+    Bytes,
+    Bits,
+}
+
+impl UnitConfig {
+    pub fn from_options(unit_str: &str, iec_str: &str) -> Self {
+        Self {
+            unit: if unit_str.eq_ignore_ascii_case("bits") { UnitType::Bits } else { UnitType::Bytes },
+            iec: iec_str.eq_ignore_ascii_case("true"),
+        }
+    }
+}
+
 /// Render the overview tab.
+#[allow(clippy::too_many_arguments)]
 pub fn view<'a>(
     connection_state: &ConnectionState,
     lock_session: bool,
@@ -23,6 +48,7 @@ pub fn view<'a>(
     startlast: bool,
     activity: &'a str,
     eddie_import_pending: &'a Option<String>,
+    unit_config: UnitConfig,
 ) -> Element<'a, Message> {
     // If Eddie import confirmation is pending, show that dialog instead
     if let Some(path) = eddie_import_pending {
@@ -109,14 +135,14 @@ pub fn view<'a>(
     // Transfer stats and speed when connected
     if matches!(connection_state, ConnectionState::Connected { .. }) {
         content = content.push(row![
-            text(format!("RX: {}", format_bytes(rx_bytes))),
+            text(format!("RX: {}", format_transfer(rx_bytes, unit_config))),
             text("  "),
-            text(format!("TX: {}", format_bytes(tx_bytes))),
+            text(format!("TX: {}", format_transfer(tx_bytes, unit_config))),
         ]);
         content = content.push(row![
-            text(format!("\u{2193} {}", format_speed(rx_speed))),
+            text(format!("\u{2193} {}", format_speed_with_unit(rx_speed, unit_config))),
             text("  "),
-            text(format!("\u{2191} {}", format_speed(tx_speed))),
+            text(format!("\u{2191} {}", format_speed_with_unit(tx_speed, unit_config))),
         ]);
     }
 
@@ -168,34 +194,41 @@ fn eddie_import_dialog(path: &str) -> Element<'_, Message> {
         .into()
 }
 
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    const GB: u64 = 1024 * MB;
-
-    if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.2} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.2} KB", bytes as f64 / KB as f64)
+/// Format a byte count for transfer totals, respecting unit and IEC settings.
+fn format_transfer(bytes: u64, cfg: UnitConfig) -> String {
+    let (value, base_unit) = if cfg.unit == UnitType::Bits {
+        (bytes as f64 * 8.0, "b")
     } else {
-        format!("{} B", bytes)
-    }
+        (bytes as f64, "B")
+    };
+    format_value(value, base_unit, cfg.iec)
 }
 
-fn format_speed(bytes_per_sec: f64) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = 1024.0 * KB;
-    const GB: f64 = 1024.0 * MB;
-
-    if bytes_per_sec >= GB {
-        format!("{:.2} GB/s", bytes_per_sec / GB)
-    } else if bytes_per_sec >= MB {
-        format!("{:.2} MB/s", bytes_per_sec / MB)
-    } else if bytes_per_sec >= KB {
-        format!("{:.2} KB/s", bytes_per_sec / KB)
+/// Format a bytes-per-second speed, respecting unit and IEC settings.
+fn format_speed_with_unit(bytes_per_sec: f64, cfg: UnitConfig) -> String {
+    let (value, base_unit) = if cfg.unit == UnitType::Bits {
+        (bytes_per_sec * 8.0, "bps")
     } else {
-        format!("{:.0} B/s", bytes_per_sec)
+        (bytes_per_sec, "B/s")
+    };
+    format_value(value, base_unit, cfg.iec)
+}
+
+/// Generic value formatter with SI or IEC prefixes.
+fn format_value(value: f64, base_unit: &str, iec: bool) -> String {
+    let (k, m, g, k_prefix, m_prefix, g_prefix) = if iec {
+        (1024.0, 1024.0 * 1024.0, 1024.0 * 1024.0 * 1024.0, "Ki", "Mi", "Gi")
+    } else {
+        (1000.0, 1000.0 * 1000.0, 1000.0 * 1000.0 * 1000.0, "K", "M", "G")
+    };
+
+    if value >= g {
+        format!("{:.2} {}{}", value / g, g_prefix, base_unit)
+    } else if value >= m {
+        format!("{:.2} {}{}", value / m, m_prefix, base_unit)
+    } else if value >= k {
+        format!("{:.2} {}{}", value / k, k_prefix, base_unit)
+    } else {
+        format!("{:.0} {}", value, base_unit)
     }
 }

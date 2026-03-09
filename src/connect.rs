@@ -257,6 +257,8 @@ struct SessionParams {
     blocked_ipv6_ifaces: Vec<String>,
     scoring: server::ScoringConfig,
     profile_options: std::collections::HashMap<String, String>,
+    dns_mode: dns::DnsMode,
+    dns_services: Vec<String>,
 }
 
 /// Pre-flight checks and orphaned state cleanup.
@@ -360,6 +362,11 @@ fn resolve_session(config: &ConnectConfig) -> anyhow::Result<SessionParams> {
     // Scoring config from pre-resolved options (score type + all factors)
     let scoring = server::ScoringConfig::from_options(&config.resolved);
 
+    // DNS mode and services from pre-resolved options
+    let dns_mode = dns::DnsMode::parse(options::get_str(&config.resolved, options::DNS_MODE));
+    info!("DNS mode: {:?}", dns_mode);
+    let dns_services = options::get_list(&config.resolved, options::LINUX_DNS_SERVICES);
+
     Ok(SessionParams {
         shutdown,
         nonce,
@@ -370,6 +377,8 @@ fn resolve_session(config: &ConnectConfig) -> anyhow::Result<SessionParams> {
         blocked_ipv6_ifaces,
         scoring,
         profile_options: config.resolved.clone(),
+        dns_mode,
+        dns_services,
     })
 }
 
@@ -635,6 +644,8 @@ fn run_monitor_loop(
     dns_ipv4: &str,
     dns_ipv6: &str,
     handshake_timeout_connected: u64,
+    dns_mode: dns::DnsMode,
+    dns_services: &[String],
 ) -> ResetLevel {
     let mut dns_fail_count: u32 = 0;
     loop {
@@ -658,7 +669,7 @@ fn run_monitor_loop(
             break ResetLevel::Error;
         }
 
-        match dns::check_and_reapply(dns_ipv4, dns_ipv6, iface) {
+        match dns::check_and_reapply(dns_ipv4, dns_ipv6, iface, dns_mode, dns_services) {
             Ok(_) => { dns_fail_count = 0; }
             Err(e) => {
                 dns_fail_count += 1;
@@ -788,7 +799,7 @@ fn post_connect_setup(
         message: "Configuring DNS...".into(),
     });
     debug!("Activating DNS: ipv4={}, ipv6={}, iface={}", effective_dns_ipv4, effective_dns_ipv6, iface);
-    dns::activate(effective_dns_ipv4, effective_dns_ipv6, iface)?;
+    dns::activate(effective_dns_ipv4, effective_dns_ipv6, iface, params.dns_mode, &params.dns_services)?;
     info!("DNS configured: {}{}", effective_dns_ipv4,
           if effective_dns_ipv6.is_empty() { String::new() } else { format!(", {}", effective_dns_ipv6) });
     if !dns::verify_resolv_conf(effective_dns_ipv4, effective_dns_ipv6, std::path::Path::new("/etc/resolv.conf")) {
@@ -1086,7 +1097,21 @@ pub fn run(
         first_iteration = false;
 
         // Select WireGuard mode and key from (possibly refreshed) manifest/user data.
-        let mode = match data.manifest.modes.first() {
+        // If mode.port is set, prefer the mode with that port; fall back to first available.
+        let forced_port: u16 = options::get_str(&config.resolved, options::MODE_PORT)
+            .parse()
+            .unwrap_or(0);
+        let mode = if forced_port > 0 {
+            data.manifest.modes.iter()
+                .find(|m| m.port == forced_port)
+                .or_else(|| {
+                    warn!("Requested port {} not found in manifest modes, using first available", forced_port);
+                    data.manifest.modes.first()
+                })
+        } else {
+            data.manifest.modes.first()
+        };
+        let mode = match mode {
             Some(m) => m,
             None => {
                 warn!("Refreshed manifest has no WireGuard modes, cannot connect");
@@ -1401,6 +1426,8 @@ pub fn run(
             &effective_dns_ipv4,
             dns_ipv6,
             handshake_timeout_connected,
+            params.dns_mode,
+            &params.dns_services,
         );
 
         // Handle reset level (Eddie: Session.cs phase 6 cleanup + wait)

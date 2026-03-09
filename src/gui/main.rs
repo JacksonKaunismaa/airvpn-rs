@@ -107,6 +107,21 @@ struct App {
     settings_areas_allowlist: String,
     settings_areas_denylist: String,
 
+    // DNS settings (profile-backed)
+    settings_dns_mode: String,
+    settings_dns_services: String,
+
+    // UI display settings (profile-backed)
+    settings_ui_unit: String,
+    settings_ui_iec: bool,
+
+    // Logging settings (profile-backed)
+    settings_log_file_enabled: bool,
+    settings_log_file_path: String,
+
+    // Mode settings (profile-backed)
+    settings_mode_port: String,
+
     // Advanced settings (profile-backed, text for text_input widget)
     settings_pinger_timeout: String,
     settings_manifest_refresh: String,
@@ -168,6 +183,17 @@ pub enum Message {
     SettingsNetlockAllowlistIpsChanged(String),
     // Routes
     SettingsRoutesCustomChanged(String),
+    // DNS settings
+    SettingsDnsModeChanged(String),
+    SettingsDnsServicesChanged(String),
+    // UI display settings
+    SettingsUiUnitChanged(String),
+    SettingsUiIecToggle(bool),
+    // Logging settings
+    SettingsLogFileEnabledToggle(bool),
+    SettingsLogFilePathChanged(String),
+    // Mode settings
+    SettingsModePortChanged(String),
     // Advanced settings
     SettingsPingerTimeoutChanged(String),
     SettingsManifestRefreshChanged(String),
@@ -250,6 +276,17 @@ impl App {
 
             settings_areas_allowlist: String::new(),
             settings_areas_denylist: String::new(),
+
+            settings_dns_mode: String::new(),
+            settings_dns_services: String::new(),
+
+            settings_ui_unit: String::new(),
+            settings_ui_iec: false,
+
+            settings_log_file_enabled: false,
+            settings_log_file_path: String::new(),
+
+            settings_mode_port: String::new(),
 
             settings_pinger_timeout: String::new(),
             settings_manifest_refresh: String::new(),
@@ -513,6 +550,17 @@ impl App {
                     options.insert(options::NETLOCK_ALLOWLIST_IPS.into(), self.settings_netlock_allowlist_ips.clone());
                     // Routes
                     options.insert(options::ROUTES_CUSTOM.into(), self.settings_routes_custom.clone());
+                    // DNS settings
+                    options.insert(options::DNS_MODE.into(), self.settings_dns_mode.clone());
+                    options.insert(options::LINUX_DNS_SERVICES.into(), self.settings_dns_services.clone());
+                    // UI display settings
+                    options.insert(options::UI_UNIT.into(), self.settings_ui_unit.clone());
+                    options.insert(options::UI_IEC.into(), self.settings_ui_iec.to_string());
+                    // Logging settings
+                    options.insert(options::LOG_FILE_ENABLED.into(), self.settings_log_file_enabled.to_string());
+                    options.insert(options::LOG_FILE_PATH.into(), self.settings_log_file_path.clone());
+                    // Mode settings
+                    options.insert(options::MODE_PORT.into(), self.settings_mode_port.clone());
                     // Advanced settings
                     options.insert(options::PINGER_TIMEOUT.into(), self.settings_pinger_timeout.clone());
                     options.insert(options::MANIFEST_REFRESH.into(), self.settings_manifest_refresh.clone());
@@ -651,6 +699,41 @@ impl App {
             }
             Message::SettingsCapacityFactorChanged(val) => {
                 self.settings_capacity_factor = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsDnsModeChanged(val) => {
+                self.settings_dns_mode = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsDnsServicesChanged(val) => {
+                self.settings_dns_services = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsUiUnitChanged(val) => {
+                self.settings_ui_unit = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsUiIecToggle(val) => {
+                self.settings_ui_iec = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsLogFileEnabledToggle(val) => {
+                self.settings_log_file_enabled = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsLogFilePathChanged(val) => {
+                self.settings_log_file_path = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsModePortChanged(val) => {
+                self.settings_mode_port = val;
                 self.settings_dirty = true;
                 Task::none()
             }
@@ -868,6 +951,30 @@ impl App {
                 self.settings_routes_custom = options.get(options::ROUTES_CUSTOM)
                     .cloned().unwrap_or_default();
 
+                // DNS settings
+                self.settings_dns_mode = options.get(options::DNS_MODE)
+                    .cloned().unwrap_or_else(|| "auto".into());
+                self.settings_dns_services = options.get(options::LINUX_DNS_SERVICES)
+                    .cloned().unwrap_or_else(|| "nscd,dnsmasq,named,bind9".into());
+
+                // UI display settings
+                self.settings_ui_unit = options.get(options::UI_UNIT)
+                    .cloned().unwrap_or_else(|| "bytes".into());
+                self.settings_ui_iec = options.get(options::UI_IEC)
+                    .map(|v| v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+
+                // Logging settings
+                self.settings_log_file_enabled = options.get(options::LOG_FILE_ENABLED)
+                    .map(|v| v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                self.settings_log_file_path = options.get(options::LOG_FILE_PATH)
+                    .cloned().unwrap_or_else(|| "/var/log/airvpn-rs/helper.log".into());
+
+                // Mode settings
+                self.settings_mode_port = options.get(options::MODE_PORT)
+                    .cloned().unwrap_or_default();
+
                 // Advanced settings
                 self.settings_pinger_timeout = options.get(options::PINGER_TIMEOUT)
                     .cloned().unwrap_or_else(|| "3".into());
@@ -991,6 +1098,7 @@ impl App {
                 self.settings_startlast,
                 &self.activity,
                 &self.eddie_import_pending,
+                views::overview::UnitConfig::from_options(&self.settings_ui_unit, &self.settings_ui_iec.to_string()),
             ),
             views::Tab::Servers => views::servers::view(
                 &self.servers,
@@ -1041,6 +1149,17 @@ impl App {
                 // Area filters
                 &self.settings_areas_allowlist,
                 &self.settings_areas_denylist,
+                // DNS settings
+                &self.settings_dns_mode,
+                &self.settings_dns_services,
+                // UI display settings
+                &self.settings_ui_unit,
+                self.settings_ui_iec,
+                // Logging settings
+                self.settings_log_file_enabled,
+                &self.settings_log_file_path,
+                // Mode settings
+                &self.settings_mode_port,
                 // Advanced
                 &self.settings_pinger_timeout,
                 &self.settings_manifest_refresh,

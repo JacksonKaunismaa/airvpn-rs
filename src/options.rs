@@ -60,6 +60,21 @@ pub const SCORING_USERS_FACTOR: &str = "scoring.users_factor";
 pub const SCORING_PING_FACTOR: &str = "scoring.ping_factor";
 pub const SERVERS_CAPACITY_FACTOR: &str = "servers.capacity_factor";
 
+// DNS
+pub const DNS_MODE: &str = "dns.mode";
+pub const LINUX_DNS_SERVICES: &str = "linux.dns.services";
+
+// UI
+pub const UI_UNIT: &str = "ui.unit";
+pub const UI_IEC: &str = "ui.iec";
+
+// Logging
+pub const LOG_FILE_ENABLED: &str = "log.file.enabled";
+pub const LOG_FILE_PATH: &str = "log.file.path";
+
+// Mode
+pub const MODE_PORT: &str = "mode.port";
+
 // Advanced / Pinger
 pub const PINGER_TIMEOUT: &str = "pinger.timeout";
 pub const PINGER_ENABLED: &str = "pinger.enabled";
@@ -120,6 +135,17 @@ pub static REGISTRY: &[OptionDef] = &[
     OptionDef { name: SCORING_USERS_FACTOR, default: "10", description: "Divisor for users in Latency mode (Speed mode: 1)" },
     OptionDef { name: SCORING_PING_FACTOR, default: "1", description: "Multiplier for ping latency in scoring" },
     OptionDef { name: SERVERS_CAPACITY_FACTOR, default: "0", description: "Capacity weighting factor (0 = disabled). Higher values prefer high-bandwidth servers" },
+    // DNS
+    OptionDef { name: DNS_MODE, default: "auto", description: "DNS resolution mode: auto, resolvconf, or systemd-resolved" },
+    OptionDef { name: LINUX_DNS_SERVICES, default: "nscd,dnsmasq,named,bind9", description: "DNS cache services to restart on flush (comma-separated)" },
+    // UI
+    OptionDef { name: UI_UNIT, default: "bytes", description: "Display unit for speeds: bytes or bits" },
+    OptionDef { name: UI_IEC, default: "false", description: "Use binary IEC units (KiB/MiB) instead of decimal SI (KB/MB)" },
+    // Logging
+    OptionDef { name: LOG_FILE_ENABLED, default: "false", description: "Enable file logging for the helper daemon" },
+    OptionDef { name: LOG_FILE_PATH, default: "/var/log/airvpn-rs/helper.log", description: "Path for the helper daemon log file" },
+    // Mode
+    OptionDef { name: MODE_PORT, default: "", description: "Force WireGuard port (empty = auto-select from manifest)" },
     // Advanced / Pinger
     OptionDef { name: PINGER_TIMEOUT, default: "3", description: "ICMP ping timeout per server (seconds)" },
     OptionDef { name: PINGER_ENABLED, default: "true", description: "Enable background latency pinger" },
