@@ -32,6 +32,7 @@ pub const SERVERS_LAST: &str = "servers.last";
 pub const SERVERS_SCORETYPE: &str = "servers.scoretype";
 
 // WireGuard
+pub const KEY: &str = "key";
 pub const WG_MTU: &str = "wireguard.interface.mtu";
 pub const WG_KEEPALIVE: &str = "wireguard.peer.persistentkeepalive";
 pub const WG_HANDSHAKE_FIRST: &str = "wireguard.handshake.timeout.first";
@@ -88,6 +89,7 @@ pub static REGISTRY: &[OptionDef] = &[
     OptionDef { name: SERVERS_LAST, default: "", description: "SHA256 hash of last-used server name" },
     OptionDef { name: SERVERS_SCORETYPE, default: "Speed", description: "Server scoring mode: Speed or Latency" },
     // WireGuard
+    OptionDef { name: KEY, default: "Default", description: "WireGuard device/key name (Eddie: key)" },
     OptionDef { name: WG_MTU, default: "1320", description: "MTU for the WireGuard interface" },
     OptionDef { name: WG_KEEPALIVE, default: "15", description: "WireGuard PersistentKeepalive interval (seconds)" },
     OptionDef { name: WG_HANDSHAKE_FIRST, default: "50", description: "Timeout for initial WireGuard handshake (seconds)" },

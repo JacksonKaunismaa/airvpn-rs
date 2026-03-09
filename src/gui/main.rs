@@ -88,6 +88,7 @@ struct App {
     settings_sub_tab: views::settings::SettingsSubTab,
 
     // WireGuard settings (profile-backed, text for text_input widget)
+    settings_wg_key: String,
     settings_wg_mtu: String,
     settings_wg_keepalive: String,
     settings_wg_handshake_first: String,
@@ -143,6 +144,7 @@ pub enum Message {
     ConnectNoVerifyToggle(bool),
     SettingsSubTabChanged(views::settings::SettingsSubTab),
     // WireGuard settings
+    SettingsWgKeyChanged(String),
     SettingsWgMtuChanged(String),
     SettingsWgKeepaliveChanged(String),
     SettingsWgHandshakeFirstChanged(String),
@@ -217,6 +219,7 @@ impl App {
 
             settings_sub_tab: views::settings::SettingsSubTab::General,
 
+            settings_wg_key: String::new(),
             settings_wg_mtu: String::new(),
             settings_wg_keepalive: String::new(),
             settings_wg_handshake_first: String::new(),
@@ -467,6 +470,7 @@ impl App {
                     options.insert(options::RECONNECT.into(), (!self.connect_no_reconnect).to_string());
                     options.insert(options::VERIFY.into(), (!self.connect_no_verify).to_string());
                     // WireGuard settings
+                    options.insert(options::KEY.into(), self.settings_wg_key.clone());
                     options.insert(options::WG_MTU.into(), self.settings_wg_mtu.clone());
                     options.insert(options::WG_KEEPALIVE.into(), self.settings_wg_keepalive.clone());
                     options.insert(options::WG_HANDSHAKE_FIRST.into(), self.settings_wg_handshake_first.clone());
@@ -528,6 +532,11 @@ impl App {
             }
             Message::SettingsSubTabChanged(tab) => {
                 self.settings_sub_tab = tab;
+                Task::none()
+            }
+            Message::SettingsWgKeyChanged(val) => {
+                self.settings_wg_key = val;
+                self.settings_dirty = true;
                 Task::none()
             }
             Message::SettingsWgMtuChanged(val) => {
@@ -774,6 +783,8 @@ impl App {
                     .unwrap_or(true); // default: verify ON
 
                 // WireGuard settings
+                self.settings_wg_key = options.get(options::KEY)
+                    .cloned().unwrap_or_else(|| "Default".into());
                 self.settings_wg_mtu = options.get(options::WG_MTU)
                     .cloned().unwrap_or_else(|| "1320".into());
                 self.settings_wg_keepalive = options.get(options::WG_KEEPALIVE)
@@ -948,6 +959,7 @@ impl App {
                 self.lock_persistent,
                 self.settings_sub_tab,
                 // WireGuard
+                &self.settings_wg_key,
                 &self.settings_wg_mtu,
                 &self.settings_wg_keepalive,
                 &self.settings_wg_handshake_first,

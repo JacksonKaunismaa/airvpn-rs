@@ -444,6 +444,42 @@ fn check_account_status(
     Ok(())
 }
 
+/// Select a WireGuard key by name from the user's device list.
+///
+/// Matches the `key` profile option (Eddie: `key`, default "Default").
+/// Falls back to the first key with a warning if the named key is not found.
+fn select_key<'a>(
+    keys: &'a [manifest::WireGuardKey],
+    resolved: &std::collections::HashMap<String, String>,
+) -> Option<&'a manifest::WireGuardKey> {
+    if keys.is_empty() {
+        return None;
+    }
+    let key_name = options::get_str(resolved, options::KEY);
+    if key_name.is_empty() || key_name.eq_ignore_ascii_case("default") {
+        // "Default" matches the first key (standard AirVPN behavior)
+        return keys.first();
+    }
+    // Match by exact name
+    if let Some(k) = keys.iter().find(|k| k.name == key_name) {
+        info!("Using WireGuard key/device: {}", k.name);
+        return Some(k);
+    }
+    // Case-insensitive fallback
+    if let Some(k) = keys.iter().find(|k| k.name.eq_ignore_ascii_case(key_name)) {
+        info!("Using WireGuard key/device: {} (case-insensitive match for '{}')", k.name, key_name);
+        return Some(k);
+    }
+    let available: Vec<&str> = keys.iter().map(|k| k.name.as_str()).collect();
+    warn!(
+        "Key '{}' not found, falling back to first key '{}'. Available keys: {:?}",
+        key_name,
+        keys[0].name,
+        available,
+    );
+    keys.first()
+}
+
 /// Fetch initial data, filter servers, resolve preferences.
 ///
 /// Uses the cached manifest from SharedState (populated by the background
@@ -1055,7 +1091,7 @@ pub fn run(
                 continue;
             }
         };
-        let wg_key = match data.user_info.keys.first() {
+        let wg_key = match select_key(&data.user_info.keys, &config.resolved) {
             Some(k) => k,
             None => {
                 warn!("Refreshed user data has no WireGuard keys, cannot connect");

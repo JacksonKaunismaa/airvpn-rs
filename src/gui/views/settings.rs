@@ -109,6 +109,7 @@ pub fn view<'a>(
     lock_persistent: bool,
     sub_tab: SettingsSubTab,
     // WireGuard settings
+    wg_key: &'a str,
     wg_mtu: &'a str,
     wg_keepalive: &'a str,
     wg_handshake_first: &'a str,
@@ -146,6 +147,7 @@ pub fn view<'a>(
         ),
         SettingsSubTab::Network => view_network(ipv6_mode, dns),
         SettingsSubTab::WireGuard => view_wireguard(
+            wg_key,
             wg_mtu,
             wg_keepalive,
             wg_handshake_first,
@@ -279,6 +281,7 @@ fn view_network<'a>(ipv6_mode: &'a str, dns: &'a str) -> Element<'a, Message> {
 // ── WireGuard sub-tab ──────────────────────────────────────────────────
 
 fn view_wireguard<'a>(
+    wg_key: &'a str,
     wg_mtu: &'a str,
     wg_keepalive: &'a str,
     wg_handshake_first: &'a str,
@@ -290,6 +293,7 @@ fn view_wireguard<'a>(
 
     content = content.push(
         column![
+            text_field("Device / Key Name", "Default", wg_key, Message::SettingsWgKeyChanged),
             text_field("Interface MTU", "1320", wg_mtu, Message::SettingsWgMtuChanged),
             text_field(
                 "Persistent Keepalive (s)",

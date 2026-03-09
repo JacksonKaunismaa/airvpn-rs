@@ -59,6 +59,10 @@ enum Commands {
         /// (Eddie: dns.servers — comma-separated in profile)
         #[arg(long = "dns")]
         dns_servers: Vec<String>,
+        /// WireGuard device/key name (default: "Default")
+        /// (Eddie: key — selects which AirVPN device to use)
+        #[arg(long)]
+        key: Option<String>,
     },
     /// Disconnect from AirVPN
     Disconnect,
@@ -244,6 +248,7 @@ fn main() -> anyhow::Result<()> {
             no_start_last,
             ipv6_mode,
             dns_servers,
+            key,
         } => {
             let mut overrides = HashMap::new();
             // CLI flags are negative (--no-lock = disable), options are positive
@@ -260,6 +265,7 @@ fn main() -> anyhow::Result<()> {
             if !deny_country.is_empty() { overrides.insert(options::AREAS_DENYLIST.into(), deny_country.join(",")); }
             if let Some(ref mode) = ipv6_mode { overrides.insert(options::NETWORK_IPV6_MODE.into(), mode.clone()); }
             if !dns_servers.is_empty() { overrides.insert(options::DNS_SERVERS.into(), dns_servers.join(",")); }
+            if let Some(ref k) = key { overrides.insert(options::KEY.into(), k.clone()); }
 
             let req = ipc::ConnectRequest { server, overrides };
             cli_client::send_connect(&req)
