@@ -40,6 +40,8 @@ fn test_netlock_config() -> NetlockConfig {
         allowed_ips_outgoing: vec![],
         incoming_policy_accept: false,
         iface_name: airvpn::wireguard::VPN_INTERFACE.to_string(),
+        custom_route_out_cidrs: vec![],
+        allowlist_out_cidrs: vec![],
     }
 }
 
@@ -54,6 +56,8 @@ fn full_netlock_config() -> NetlockConfig {
         allowed_ips_outgoing: vec!["203.0.113.5".to_string()],
         incoming_policy_accept: false,
         iface_name: airvpn::wireguard::VPN_INTERFACE.to_string(),
+        custom_route_out_cidrs: vec![],
+        allowlist_out_cidrs: vec![],
     }
 }
 

@@ -50,6 +50,18 @@ pub struct NetlockConfig {
     /// to avoid interfering with WireGuard keepalive packets.
     /// Reference: NetworkLockNftables.cs line 274
     pub incoming_policy_accept: bool,
+    /// WireGuard interface name for tunnel traffic matching in DNS leak rules.
+    /// Resolved from `network.iface.name` option (default: "avpn0").
+    pub iface_name: String,
+    /// CIDRs from custom routes with action="out" — bypass VPN tunnel.
+    /// These get `daddr accept` in the OUTPUT chain so traffic isn't blocked.
+    pub custom_route_out_cidrs: Vec<String>,
+    /// CIDRs from `netlock.allowlist.outgoing.ips` — allowed through firewall only.
+    /// No routing change, just firewall passthrough.
+    pub allowlist_out_cidrs: Vec<String>,
+    /// Local interfaces (e.g. phone-relay) to allow forwarding through the VPN tunnel.
+    /// Adds FORWARD rules (iface↔vpn) to both lock chains and NAT masquerade to persist.
+    pub local_forward_ifaces: Vec<String>,
 }
 
 /// Compute SHA-256 hex digest of a string (matching Eddie's Crypto.Manager.HashSHA256).
@@ -219,6 +231,18 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
     // 1. IPv6 RH0 drop
     r.push_str("    rt type 0 counter drop\n");
 
+    // Local interfaces forwarded through VPN (e.g. phone-relay)
+    for local_iface in &config.local_forward_ifaces {
+        r.push_str(&format!(
+            "    iifname \"{}\" oifname \"{}\" ct state new,established counter accept\n",
+            local_iface, config.iface_name
+        ));
+        r.push_str(&format!(
+            "    iifname \"{}\" oifname \"{}\" ct state related,established counter accept\n",
+            config.iface_name, local_iface
+        ));
+    }
+
     // Final drop (handle for interface insertion)
     r.push_str("    counter drop comment \"airvpn_filter_forward_latest_rule\"\n");
 
@@ -254,7 +278,18 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
         r.push_str("    ip6 saddr 64:ff9b:1::/48 ip6 daddr 64:ff9b:1::/48 counter accept\n");
     }
 
-    // 4. LAN rules (Eddie: netlock.allow_private)
+    // 4. Block DNS (port 53/853) to LAN destinations on non-tunnel interfaces.
+    // Must come before LAN rules to prevent DNS from leaking through the RFC1918
+    // accept rules when the tunnel is down (e.g., WiFi 10.73.x.x -> VPN DNS 10.128.0.1).
+    if config.allow_lan {
+        let iface = &config.iface_name;
+        r.push_str(&format!("    oifname != \"{}\" ip daddr {{ 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12 }} udp dport {{ 53, 853 }} counter drop comment \"block_lan_dns_leak\"\n", iface));
+        r.push_str(&format!("    oifname != \"{}\" ip daddr {{ 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12 }} tcp dport {{ 53, 853 }} counter drop comment \"block_lan_dns_leak\"\n", iface));
+        r.push_str(&format!("    oifname != \"{}\" ip6 daddr {{ fe80::/10, ff00::/8, fc00::/7 }} udp dport {{ 53, 853 }} counter drop comment \"block_lan_dns_leak\"\n", iface));
+        r.push_str(&format!("    oifname != \"{}\" ip6 daddr {{ fe80::/10, ff00::/8, fc00::/7 }} tcp dport {{ 53, 853 }} counter drop comment \"block_lan_dns_leak\"\n", iface));
+    }
+
+    // 4b. LAN rules (Eddie: netlock.allow_private)
     if config.allow_lan {
         // IPv4 RFC1918 bidirectional (same as input)
         r.push_str("    ip saddr 192.168.0.0/16 ip daddr 192.168.0.0/16 counter accept\n");
@@ -349,7 +384,47 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
         }
     }
 
-    // 8. Final drop (handle for rule insertion)
+    // 8. Custom route "out" CIDRs — bypass tunnel (unrestricted daddr accept)
+    for cidr_str in &config.custom_route_out_cidrs {
+        let cidr = ensure_cidr(cidr_str);
+        match classify_ip(&cidr) {
+            Some(IpVersion::V4) => {
+                r.push_str(&format!(
+                    "    ip daddr {} counter accept comment \"airvpn_custom_route_out\"\n",
+                    cidr
+                ));
+            }
+            Some(IpVersion::V6) => {
+                r.push_str(&format!(
+                    "    ip6 daddr {} counter accept comment \"airvpn_custom_route_out\"\n",
+                    cidr
+                ));
+            }
+            None => {}
+        }
+    }
+
+    // 9. Netlock allowlist CIDRs — firewall passthrough only (no routing change)
+    for cidr_str in &config.allowlist_out_cidrs {
+        let cidr = ensure_cidr(cidr_str);
+        match classify_ip(&cidr) {
+            Some(IpVersion::V4) => {
+                r.push_str(&format!(
+                    "    ip daddr {} counter accept comment \"airvpn_allowlist_out\"\n",
+                    cidr
+                ));
+            }
+            Some(IpVersion::V6) => {
+                r.push_str(&format!(
+                    "    ip6 daddr {} counter accept comment \"airvpn_allowlist_out\"\n",
+                    cidr
+                ));
+            }
+            None => {}
+        }
+    }
+
+    // 10. Final drop (handle for rule insertion)
     r.push_str("    counter drop comment \"airvpn_filter_output_latest_rule\"\n");
 
     r.push_str("  }\n");
@@ -368,7 +443,7 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
 /// state (owner process exited).
 ///
 /// This is a standalone `airvpn_persist` table, fully independent from the
-/// session lock (`airvpn_lock`). VPN traffic passes via `oifname "avpn-*"`
+/// session lock (`airvpn_lock`). VPN traffic passes via `oifname "<iface>"`
 /// (inner packets) and `meta mark 51820` (outer WireGuard packets).
 ///
 /// This table is independent of the session lock (`airvpn_lock`). It runs at
@@ -376,12 +451,12 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
 /// tables to get through.
 ///
 /// The persistent table allows VPN traffic generically:
-/// - `oifname "avpn-*"` / `iifname "avpn-*"`: inner tunnel packets
+/// - `oifname "<iface>"` / `iifname "<iface>"`: inner tunnel packets
 /// - `meta mark 51820`: outer WireGuard packets (marked by routing policy)
 ///
-/// This means the persistent lock doesn't need to know the specific server IP
-/// or interface name — it just allows any AirVPN tunnel traffic.
-pub fn generate_persistent_ruleset(bootstrap_ips: &[String]) -> String {
+/// The `iface_name` parameter specifies the WireGuard interface name
+/// (resolved from `network.iface.name` option, default "avpn0").
+pub fn generate_persistent_ruleset(bootstrap_ips: &[String], iface_name: &str, allowlist_out_cidrs: &[String], local_forward_ifaces: &[String]) -> String {
     let mut r = String::new();
 
     // Table definition with owner+persist flags
@@ -446,7 +521,7 @@ pub fn generate_persistent_ruleset(bootstrap_ips: &[String]) -> String {
     r.push_str("    ct state related,established counter accept\n");
 
     // 10. VPN tunnel interface (inner packets arriving from tunnel)
-    r.push_str("    iifname \"avpn-*\" counter accept\n");
+    r.push_str(&format!("    iifname \"{}\" counter accept\n", iface_name));
 
     // Final drop sentinel
     r.push_str("    counter drop comment \"airvpn_persist_input_latest_rule\"\n");
@@ -465,16 +540,41 @@ pub fn generate_persistent_ruleset(bootstrap_ips: &[String]) -> String {
     r.push_str("    rt type 0 counter drop\n");
 
     // VPN tunnel interface (forwarded traffic through tunnel)
-    r.push_str("    iifname \"avpn-*\" counter accept\n");
-    r.push_str("    oifname \"avpn-*\" counter accept\n");
+    r.push_str(&format!("    iifname \"{}\" counter accept\n", iface_name));
+    r.push_str(&format!("    oifname \"{}\" counter accept\n", iface_name));
+
+    // Local interfaces forwarded through VPN (e.g. phone-relay)
+    for local_iface in local_forward_ifaces {
+        r.push_str(&format!(
+            "    iifname \"{}\" oifname \"{}\" ct state new,established counter accept\n",
+            local_iface, iface_name
+        ));
+        r.push_str(&format!(
+            "    iifname \"{}\" oifname \"{}\" ct state related,established counter accept\n",
+            iface_name, local_iface
+        ));
+    }
 
     // Final drop sentinel
     r.push_str("    counter drop comment \"airvpn_persist_forward_latest_rule\"\n");
 
     r.push_str("  }\n\n");
 
+    // NAT chain for local interfaces forwarded through VPN
+    if !local_forward_ifaces.is_empty() {
+        r.push_str("  chain postrouting {\n");
+        r.push_str("    type nat hook postrouting priority srcnat; policy accept;\n");
+        for local_iface in local_forward_ifaces {
+            r.push_str(&format!(
+                "    iifname \"{}\" oifname \"{}\" counter masquerade comment \"local_forward_masq_{}\"\n",
+                local_iface, iface_name, local_iface
+            ));
+        }
+        r.push_str("  }\n\n");
+    }
+
     // =========================================================================
-    // ping_allow subchain (empty by default — populated by open_ping_holes())
+    // ping_allow subchain (empty by default — populated by populate_ping_allow())
     // =========================================================================
     r.push_str("  chain ping_allow {\n");
     r.push_str("  }\n\n");
@@ -502,7 +602,17 @@ pub fn generate_persistent_ruleset(bootstrap_ips: &[String]) -> String {
     r.push_str("    ip6 saddr 64:ff9b::/96 ip6 daddr 64:ff9b::/96 counter accept\n");
     r.push_str("    ip6 saddr 64:ff9b:1::/48 ip6 daddr 64:ff9b:1::/48 counter accept\n");
 
-    // 5. LAN (always enabled)
+    // 5. Block DNS (port 53/853) to LAN destinations on non-tunnel interfaces.
+    // Without this, DNS queries leak through the LAN rules below when the tunnel
+    // is down (e.g., during reconnection). The VPN DNS (10.128.0.1) is in the
+    // same RFC1918 /8 as many WiFi networks, so the LAN rule accepts it.
+    // Queries through the tunnel are unaffected.
+    r.push_str(&format!("    oifname != \"{}\" ip daddr {{ 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12 }} udp dport {{ 53, 853 }} counter drop comment \"block_lan_dns_leak\"\n", iface_name));
+    r.push_str(&format!("    oifname != \"{}\" ip daddr {{ 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12 }} tcp dport {{ 53, 853 }} counter drop comment \"block_lan_dns_leak\"\n", iface_name));
+    r.push_str(&format!("    oifname != \"{}\" ip6 daddr {{ fe80::/10, ff00::/8, fc00::/7 }} udp dport {{ 53, 853 }} counter drop comment \"block_lan_dns_leak\"\n", iface_name));
+    r.push_str(&format!("    oifname != \"{}\" ip6 daddr {{ fe80::/10, ff00::/8, fc00::/7 }} tcp dport {{ 53, 853 }} counter drop comment \"block_lan_dns_leak\"\n", iface_name));
+
+    // 6. LAN (always enabled)
     // RFC1918 bidirectional
     r.push_str("    ip saddr 192.168.0.0/16 ip daddr 192.168.0.0/16 counter accept\n");
     r.push_str("    ip saddr 10.0.0.0/8 ip daddr 10.0.0.0/8 counter accept\n");
@@ -556,10 +666,30 @@ pub fn generate_persistent_ruleset(bootstrap_ips: &[String]) -> String {
         }
     }
 
-    // 9. VPN tunnel interface (inner packets going into tunnel)
-    r.push_str("    oifname \"avpn-*\" counter accept\n");
+    // 9. Netlock allowlist CIDRs — firewall passthrough (persists across reconnections)
+    for cidr_str in allowlist_out_cidrs {
+        let cidr = ensure_cidr(cidr_str);
+        match classify_ip(&cidr) {
+            Some(IpVersion::V4) => {
+                r.push_str(&format!(
+                    "    ip daddr {} counter accept comment \"airvpn_persist_allowlist_out\"\n",
+                    cidr
+                ));
+            }
+            Some(IpVersion::V6) => {
+                r.push_str(&format!(
+                    "    ip6 daddr {} counter accept comment \"airvpn_persist_allowlist_out\"\n",
+                    cidr
+                ));
+            }
+            None => {}
+        }
+    }
 
-    // 10. WireGuard outer packets (marked by routing policy table 51820)
+    // 10. VPN tunnel interface (inner packets going into tunnel)
+    r.push_str(&format!("    oifname \"{}\" counter accept\n", iface_name));
+
+    // 11. WireGuard outer packets (marked by routing policy table 51820)
     r.push_str("    meta mark 51820 counter accept\n");
 
     // Final drop sentinel
@@ -571,145 +701,6 @@ pub fn generate_persistent_ruleset(bootstrap_ips: &[String]) -> String {
     r.push_str("}\n");
 
     r
-}
-
-/// Install the persistent kill switch: write rules + systemd service, enable,
-/// and load the nftables table. Called from both CLI (`cmd_lock_install`) and
-/// the helper daemon (`LockInstall` command).
-///
-/// The caller is responsible for extracting bootstrap IPs from the provider
-/// config — this function takes them as input.
-pub fn install_persistent(bootstrap_ips: &[String]) -> Result<()> {
-    use log::{info, warn};
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let ruleset = generate_persistent_ruleset(bootstrap_ips);
-
-    // Write rules file
-    std::fs::create_dir_all("/etc/airvpn-rs")
-        .context("failed to create /etc/airvpn-rs")?;
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o644)
-            .open(PERSISTENT_RULES_PATH)
-            .context("failed to write lock.nft")?;
-        std::io::Write::write_all(&mut f, ruleset.as_bytes())
-            .context("failed to write lock.nft")?;
-    }
-    info!("Wrote {}", PERSISTENT_RULES_PATH);
-
-    // Write systemd service
-    let service = "\
-[Unit]
-Description=AirVPN persistent kill switch
-DefaultDependencies=no
-Before=network-pre.target
-Wants=network-pre.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/bin/nft -f /etc/airvpn-rs/lock.nft
-ExecStop=/bin/sh -c 'printf \"add table inet airvpn_persist { flags owner, persist; }\\ndelete table inet airvpn_persist\\n\" | /usr/bin/nft -f -'
-
-[Install]
-WantedBy=sysinit.target
-";
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o644)
-            .open(PERSISTENT_SERVICE_PATH)
-            .context("failed to write systemd service")?;
-        std::io::Write::write_all(&mut f, service.as_bytes())
-            .context("failed to write systemd service")?;
-    }
-    info!("Wrote {}", PERSISTENT_SERVICE_PATH);
-
-    // Enable service
-    let output = Command::new("systemctl")
-        .args(["daemon-reload"])
-        .output()
-        .context("failed to run systemctl daemon-reload")?;
-    if !output.status.success() {
-        warn!(
-            "systemctl daemon-reload failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let output = Command::new("systemctl")
-        .args(["enable", "airvpn-lock.service"])
-        .output()
-        .context("failed to enable service")?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "systemctl enable failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    info!("Enabled airvpn-lock.service");
-
-    // Load the table now. If airvpn_persist already active, delete it first
-    // (owner+persist flags can only be set at table creation time).
-    if is_persist_active() {
-        let _ = reclaim_and_delete();
-    }
-    let output = Command::new("nft")
-        .args(["-f", PERSISTENT_RULES_PATH])
-        .output()
-        .context("failed to load lock.nft")?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "nft -f failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    info!("Persistent lock installed and active.");
-    info!("{} bootstrap IPs allowlisted.", bootstrap_ips.len());
-    info!("To temporarily disable: airvpn-rs lock disable");
-    Ok(())
-}
-
-/// Uninstall the persistent kill switch: stop + disable systemd service,
-/// remove files, and delete the nftables table. Called from both CLI
-/// (`cmd_lock_uninstall`) and the helper daemon (`LockUninstall` command).
-pub fn uninstall_persistent() -> Result<()> {
-    use log::{info, warn};
-
-    // Stop and disable service
-    let _ = Command::new("systemctl")
-        .args(["stop", "airvpn-lock.service"])
-        .output();
-    let _ = Command::new("systemctl")
-        .args(["disable", "airvpn-lock.service"])
-        .output();
-    let _ = Command::new("systemctl")
-        .args(["daemon-reload"])
-        .output();
-
-    // Remove files
-    let _ = std::fs::remove_file(PERSISTENT_SERVICE_PATH);
-    let _ = std::fs::remove_file(PERSISTENT_RULES_PATH);
-
-    // Delete persistent table if active. Safe even while VPN is running —
-    // airvpn_persist and airvpn_lock are independent tables.
-    if is_persist_active() {
-        match reclaim_and_delete() {
-            Ok(()) => {}
-            Err(e) => {
-                warn!("Could not delete table: {}", e);
-            }
-        }
-    }
-
-    info!("Persistent lock uninstalled.");
-    Ok(())
 }
 
 /// Activate the network lock: write ruleset to tmpfile and load via `nft -f`.
@@ -919,15 +910,15 @@ fn build_server_allowlist_rules(server_ips: &[String]) -> (String, usize) {
     (batch, count)
 }
 
-/// Open per-IP ICMP holes in the persistent lock's `ping_allow` subchain.
+/// Populate the persistent lock's `ping_allow` subchain with ICMP-only rules
+/// for all known server IPs. These rules stay permanently so the background
+/// pinger can always reach servers without per-cycle open/close overhead.
 ///
-/// Inserts one `ip daddr <ip> icmp type echo-request accept` rule per server IP
-/// so the pinger can measure latency. Only allows ICMP to the specific IPs, not
-/// blanket outbound ping. Call `close_ping_holes()` after pinging completes.
+/// Flushes existing rules first, then adds fresh ones. Idempotent — safe to
+/// call whenever the server IP list changes (manifest refresh, cache load).
 ///
-/// No-op if the persistent table is not active (users without persistent lock
-/// get blanket ICMP through the session lock's `allow_ping` setting).
-pub fn open_ping_holes(server_ips: &[String]) -> Result<()> {
+/// No-op if the persistent table is not active.
+pub fn populate_ping_allow(server_ips: &[String]) -> Result<()> {
     if !is_persist_active() {
         return Ok(());
     }
@@ -935,97 +926,16 @@ pub fn open_ping_holes(server_ips: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    let (batch, count) = build_ping_hole_rules(server_ips);
-    if batch.is_empty() {
+    let (rules, count) = build_ping_hole_rules(server_ips);
+    if rules.is_empty() {
         return Ok(());
     }
 
-    let mut child = Command::new("nft")
-        .args(["-f", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("failed to spawn nft for ping holes")?;
-
-    if let Some(ref mut stdin) = child.stdin {
-        stdin
-            .write_all(batch.as_bytes())
-            .context("failed to write ping hole rules")?;
-    }
-    let output = child
-        .wait_with_output()
-        .context("failed to wait on nft for ping holes")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("nft failed to add ping holes: {}", stderr.trim());
-    }
-
-    log::info!(
-        "Opened {} ICMP ping holes in persistent lock",
-        count
+    // Flush + repopulate in a single nft -f transaction
+    let batch = format!(
+        "flush chain inet {} ping_allow\n{}",
+        PERSIST_TABLE_NAME, rules
     );
-    Ok(())
-}
-
-/// Close all ICMP ping holes by flushing the `ping_allow` subchain.
-///
-/// Restores the persistent lock to its default state where outbound
-/// echo-request is not allowed. Safe to call even if no holes are open.
-///
-/// No-op if the persistent table is not active.
-pub fn close_ping_holes() -> Result<()> {
-    if !is_persist_active() {
-        return Ok(());
-    }
-
-    let output = Command::new("nft")
-        .args([
-            "flush",
-            "chain",
-            "inet",
-            PERSIST_TABLE_NAME,
-            "ping_allow",
-        ])
-        .output()
-        .context("failed to flush ping_allow chain")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("nft failed to flush ping_allow: {}", stderr.trim());
-    }
-
-    log::info!("Closed ICMP ping holes in persistent lock");
-    Ok(())
-}
-
-/// Allow all outbound traffic to server IPs through the persistent lock.
-///
-/// Uses the existing `ping_allow` subchain. Flushes any previous rules first.
-/// No-op if the persistent table is not active.
-///
-/// Unlike `open_ping_holes` (ICMP-only), this allows all protocols to
-/// server IPs — matching Eddie's outgoing allowlist behavior. The background
-/// pinger uses this so it can reach servers outside the tunnel when only
-/// the persistent lock is active.
-///
-/// Call `close_ping_holes()` to remove these rules when done.
-pub fn open_server_allowlist(server_ips: &[String]) -> Result<()> {
-    if !is_persist_active() {
-        return Ok(());
-    }
-    if server_ips.is_empty() {
-        return Ok(());
-    }
-
-    // Flush existing rules first (ping holes or previous allowlist)
-    close_ping_holes()?;
-
-    let (batch, count) = build_server_allowlist_rules(server_ips);
-    if batch.is_empty() {
-        return Ok(());
-    }
 
     let mut child = Command::new("nft")
         .args(["-f", "-"])
@@ -1033,24 +943,24 @@ pub fn open_server_allowlist(server_ips: &[String]) -> Result<()> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .context("failed to spawn nft for server allowlist")?;
+        .context("failed to spawn nft for ping_allow")?;
 
     if let Some(ref mut stdin) = child.stdin {
         stdin
             .write_all(batch.as_bytes())
-            .context("failed to write server allowlist rules")?;
+            .context("failed to write ping_allow rules")?;
     }
     let output = child
         .wait_with_output()
-        .context("failed to wait on nft for server allowlist")?;
+        .context("failed to wait on nft for ping_allow")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("nft failed to add server allowlist: {}", stderr.trim());
+        anyhow::bail!("nft failed to populate ping_allow: {}", stderr.trim());
     }
 
     log::info!(
-        "Opened server allowlist in persistent lock ({} IPs)",
+        "Populated ping_allow in persistent lock ({} server IPs)",
         count
     );
     Ok(())
@@ -1247,6 +1157,10 @@ mod tests {
             allowed_ips_incoming: vec![],
             allowed_ips_outgoing: vec![],
             incoming_policy_accept: false,
+            iface_name: crate::wireguard::VPN_INTERFACE.to_string(),
+            custom_route_out_cidrs: vec![],
+            allowlist_out_cidrs: vec![],
+            local_forward_ifaces: vec![],
         }
     }
 
@@ -1313,6 +1227,10 @@ mod tests {
                 "203.0.113.5".to_string(),
             ],
             incoming_policy_accept: false,
+            iface_name: crate::wireguard::VPN_INTERFACE.to_string(),
+            custom_route_out_cidrs: vec![],
+            allowlist_out_cidrs: vec![],
+            local_forward_ifaces: vec![],
         };
         let ruleset = generate_ruleset(&config);
 
@@ -1429,6 +1347,10 @@ mod tests {
             allowed_ips_incoming: vec![],
             allowed_ips_outgoing: vec![],
             incoming_policy_accept: false,
+            iface_name: crate::wireguard::VPN_INTERFACE.to_string(),
+            custom_route_out_cidrs: vec![],
+            allowlist_out_cidrs: vec![],
+            local_forward_ifaces: vec![],
         };
         let ruleset = generate_ruleset(&config);
 
@@ -1459,6 +1381,56 @@ mod tests {
     }
 
     #[test]
+    fn test_ruleset_dns_leak_block_with_lan() {
+        let config = NetlockConfig {
+            allow_lan: true,
+            allow_dhcp: false,
+            allow_ping: false,
+            allow_ipv4ipv6translation: false,
+            allowed_ips_incoming: vec![],
+            allowed_ips_outgoing: vec![],
+            incoming_policy_accept: false,
+            iface_name: crate::wireguard::VPN_INTERFACE.to_string(),
+            custom_route_out_cidrs: vec![],
+            allowlist_out_cidrs: vec![],
+            local_forward_ifaces: vec![],
+        };
+        let ruleset = generate_ruleset(&config);
+
+        // DNS leak block rules should be present
+        assert!(ruleset.contains("block_lan_dns_leak"),
+            "session ruleset should have DNS leak block rules when allow_lan is true");
+
+        // DNS block must come BEFORE LAN accept in output chain
+        let output_start = ruleset.find("chain output").expect("output chain");
+        let output_section = &ruleset[output_start..];
+        let dns_block_pos = output_section.find("block_lan_dns_leak").unwrap();
+        let lan_accept_pos = output_section.find("ip saddr 10.0.0.0/8 ip daddr 10.0.0.0/8 counter accept").unwrap();
+        assert!(dns_block_pos < lan_accept_pos,
+            "DNS leak block rules must come before LAN accept rules in output chain");
+    }
+
+    #[test]
+    fn test_ruleset_no_dns_leak_block_without_lan() {
+        let config = NetlockConfig {
+            allow_lan: false,
+            allow_dhcp: false,
+            allow_ping: false,
+            allow_ipv4ipv6translation: false,
+            allowed_ips_incoming: vec![],
+            allowed_ips_outgoing: vec![],
+            incoming_policy_accept: false,
+            iface_name: crate::wireguard::VPN_INTERFACE.to_string(),
+            custom_route_out_cidrs: vec![],
+            allowlist_out_cidrs: vec![],
+            local_forward_ifaces: vec![],
+        };
+        let ruleset = generate_ruleset(&config);
+        assert!(!ruleset.contains("block_lan_dns_leak"),
+            "session ruleset should NOT have DNS leak block rules when allow_lan is false");
+    }
+
+    #[test]
     fn test_ruleset_no_lan() {
         let config = NetlockConfig {
             allow_lan: false,
@@ -1468,6 +1440,10 @@ mod tests {
             allowed_ips_incoming: vec![],
             allowed_ips_outgoing: vec![],
             incoming_policy_accept: false,
+            iface_name: crate::wireguard::VPN_INTERFACE.to_string(),
+            custom_route_out_cidrs: vec![],
+            allowlist_out_cidrs: vec![],
+            local_forward_ifaces: vec![],
         };
         let ruleset = generate_ruleset(&config);
 
@@ -1553,6 +1529,10 @@ mod tests {
             allowed_ips_incoming: vec!["1.2.3.4".to_string()],
             allowed_ips_outgoing: vec![],
             incoming_policy_accept: false,
+            iface_name: crate::wireguard::VPN_INTERFACE.to_string(),
+            custom_route_out_cidrs: vec![],
+            allowlist_out_cidrs: vec![],
+            local_forward_ifaces: vec![],
         };
         let ruleset = generate_ruleset(&config);
 
@@ -1631,6 +1611,10 @@ mod tests {
             allowed_ips_incoming: vec![],
             allowed_ips_outgoing: vec![],
             incoming_policy_accept: false,
+            iface_name: crate::wireguard::VPN_INTERFACE.to_string(),
+            custom_route_out_cidrs: vec![],
+            allowlist_out_cidrs: vec![],
+            local_forward_ifaces: vec![],
         };
         let ruleset = generate_ruleset(&config);
 
@@ -1655,6 +1639,10 @@ mod tests {
             allowed_ips_incoming: vec![],
             allowed_ips_outgoing: vec![],
             incoming_policy_accept: false,
+            iface_name: crate::wireguard::VPN_INTERFACE.to_string(),
+            custom_route_out_cidrs: vec![],
+            allowlist_out_cidrs: vec![],
+            local_forward_ifaces: vec![],
         };
         let ruleset = generate_ruleset(&config);
 
@@ -1675,6 +1663,10 @@ mod tests {
             allowed_ips_incoming: vec![],
             allowed_ips_outgoing: vec![],
             incoming_policy_accept: true,
+            iface_name: crate::wireguard::VPN_INTERFACE.to_string(),
+            custom_route_out_cidrs: vec![],
+            allowlist_out_cidrs: vec![],
+            local_forward_ifaces: vec![],
         };
         let ruleset = generate_ruleset(&config);
 
@@ -1728,6 +1720,10 @@ mod tests {
             allowed_ips_incoming: vec!["not-an-ip".to_string()],
             allowed_ips_outgoing: vec!["also-invalid".to_string()],
             incoming_policy_accept: false,
+            iface_name: crate::wireguard::VPN_INTERFACE.to_string(),
+            custom_route_out_cidrs: vec![],
+            allowlist_out_cidrs: vec![],
+            local_forward_ifaces: vec![],
         };
         let ruleset = generate_ruleset(&config);
 
@@ -1747,7 +1743,7 @@ mod tests {
 
     #[test]
     fn test_persistent_ruleset_uses_persist_table_name() {
-        let ruleset = generate_persistent_ruleset(&vec![]);
+        let ruleset = generate_persistent_ruleset(&vec![], crate::wireguard::VPN_INTERFACE, &vec![], &vec![]);
         assert!(ruleset.contains("table inet airvpn_persist"),
             "persistent ruleset should use airvpn_persist table name");
         assert!(!ruleset.contains("table inet airvpn_lock"),
@@ -1756,46 +1752,59 @@ mod tests {
 
     #[test]
     fn test_persistent_ruleset_has_owner_persist_flags() {
-        let ruleset = generate_persistent_ruleset(&vec![]);
+        let ruleset = generate_persistent_ruleset(&vec![], crate::wireguard::VPN_INTERFACE, &vec![], &vec![]);
         assert!(ruleset.contains("flags owner, persist;"),
             "persistent ruleset should have owner+persist flags");
     }
 
     #[test]
     fn test_persistent_ruleset_has_meta_mark_in_output() {
-        let ruleset = generate_persistent_ruleset(&vec![]);
+        let ruleset = generate_persistent_ruleset(&vec![], crate::wireguard::VPN_INTERFACE, &vec![], &vec![]);
         assert!(ruleset.contains("meta mark 51820 counter accept"),
             "persistent ruleset should allow WireGuard outer packets via meta mark");
     }
 
     #[test]
     fn test_persistent_ruleset_has_avpn_oifname_in_output() {
-        let ruleset = generate_persistent_ruleset(&vec![]);
-        assert!(ruleset.contains("oifname \"avpn-*\" counter accept"),
+        let ruleset = generate_persistent_ruleset(&vec![], crate::wireguard::VPN_INTERFACE, &vec![], &vec![]);
+        assert!(ruleset.contains("oifname \"avpn0\" counter accept"),
             "persistent ruleset should allow VPN tunnel output via oifname");
     }
 
     #[test]
     fn test_persistent_ruleset_has_avpn_iifname_in_input() {
-        let ruleset = generate_persistent_ruleset(&vec![]);
-        assert!(ruleset.contains("iifname \"avpn-*\" counter accept"),
+        let ruleset = generate_persistent_ruleset(&vec![], crate::wireguard::VPN_INTERFACE, &vec![], &vec![]);
+        assert!(ruleset.contains("iifname \"avpn0\" counter accept"),
             "persistent ruleset should allow VPN tunnel input via iifname");
     }
 
     #[test]
     fn test_persistent_ruleset_has_avpn_in_forward() {
-        let ruleset = generate_persistent_ruleset(&vec![]);
-        // Forward chain should have both iifname and oifname for avpn-*
+        let ruleset = generate_persistent_ruleset(&vec![], crate::wireguard::VPN_INTERFACE, &vec![], &vec![]);
         let forward_start = ruleset.find("chain forward").expect("forward chain");
         let forward_end = ruleset[forward_start..]
             .find("\n  }\n")
             .map(|p| forward_start + p)
             .expect("forward chain end");
         let forward_section = &ruleset[forward_start..forward_end];
-        assert!(forward_section.contains("iifname \"avpn-*\" counter accept"),
+        assert!(forward_section.contains("iifname \"avpn0\" counter accept"),
             "forward chain should allow incoming VPN tunnel traffic");
-        assert!(forward_section.contains("oifname \"avpn-*\" counter accept"),
+        assert!(forward_section.contains("oifname \"avpn0\" counter accept"),
             "forward chain should allow outgoing VPN tunnel traffic");
+    }
+
+    #[test]
+    fn test_persistent_ruleset_has_dns_leak_block() {
+        let ruleset = generate_persistent_ruleset(&vec![], crate::wireguard::VPN_INTERFACE, &vec![], &vec![]);
+        assert!(ruleset.contains("block_lan_dns_leak"),
+            "persistent ruleset should have DNS leak block rules");
+        // DNS block must come BEFORE LAN accept rules in the OUTPUT chain
+        let output_start = ruleset.find("chain output").expect("output chain");
+        let output_section = &ruleset[output_start..];
+        let dns_block_pos = output_section.find("block_lan_dns_leak").unwrap();
+        let lan_accept_pos = output_section.find("ip saddr 10.0.0.0/8 ip daddr 10.0.0.0/8 counter accept").unwrap();
+        assert!(dns_block_pos < lan_accept_pos,
+            "DNS leak block rules must come before LAN accept rules in output chain");
     }
 
     #[test]
@@ -1805,7 +1814,7 @@ mod tests {
             "54.93.175.114".to_string(),
             "82.196.3.205".to_string(),
         ];
-        let ruleset = generate_persistent_ruleset(&bootstrap_ips);
+        let ruleset = generate_persistent_ruleset(&bootstrap_ips, crate::wireguard::VPN_INTERFACE, &vec![], &vec![]);
         assert!(ruleset.contains("ip daddr 63.33.78.166/32"));
         assert!(ruleset.contains("ip daddr 54.93.175.114/32"));
         assert!(ruleset.contains("ip daddr 82.196.3.205/32"));
@@ -1817,13 +1826,13 @@ mod tests {
             "1.2.3.4".to_string(),
             "2a03:b0c0:0:1010::9b:c001".to_string(),
         ];
-        let ruleset = generate_persistent_ruleset(&bootstrap_ips);
+        let ruleset = generate_persistent_ruleset(&bootstrap_ips, crate::wireguard::VPN_INTERFACE, &vec![], &vec![]);
         assert!(ruleset.contains("ip6 daddr 2a03:b0c0:0:1010::9b:c001/128"));
     }
 
     #[test]
     fn test_persistent_ruleset_always_allows_lan() {
-        let ruleset = generate_persistent_ruleset(&vec![]);
+        let ruleset = generate_persistent_ruleset(&vec![], crate::wireguard::VPN_INTERFACE, &vec![], &vec![]);
         assert!(ruleset.contains("192.168.0.0/16"));
         assert!(ruleset.contains("10.0.0.0/8"));
         assert!(ruleset.contains("172.16.0.0/12"));
@@ -1832,7 +1841,7 @@ mod tests {
 
     #[test]
     fn test_persistent_ruleset_priority_minus_400() {
-        let ruleset = generate_persistent_ruleset(&vec![]);
+        let ruleset = generate_persistent_ruleset(&vec![], crate::wireguard::VPN_INTERFACE, &vec![], &vec![]);
         assert!(ruleset.contains("priority -400;"),
             "persistent ruleset should use priority -400");
         assert!(!ruleset.contains("priority -300;"),
@@ -1841,7 +1850,7 @@ mod tests {
 
     #[test]
     fn test_persistent_ruleset_input_allows_inbound_ping_only() {
-        let ruleset = generate_persistent_ruleset(&vec![]);
+        let ruleset = generate_persistent_ruleset(&vec![], crate::wireguard::VPN_INTERFACE, &vec![], &vec![]);
         let input_start = ruleset.find("chain input").expect("input chain");
         let input_end = ruleset[input_start..]
             .find("\n  }\n")
@@ -1864,7 +1873,7 @@ mod tests {
 
     #[test]
     fn test_persistent_ruleset_output_allows_echo_reply_only() {
-        let ruleset = generate_persistent_ruleset(&vec![]);
+        let ruleset = generate_persistent_ruleset(&vec![], crate::wireguard::VPN_INTERFACE, &vec![], &vec![]);
         let output_start = ruleset.find("chain output").expect("output chain");
         let output_end = ruleset[output_start..]
             .find("\n  }\n")
@@ -1891,7 +1900,7 @@ mod tests {
 
     #[test]
     fn test_persistent_ruleset_has_ping_allow_subchain() {
-        let ruleset = generate_persistent_ruleset(&vec![]);
+        let ruleset = generate_persistent_ruleset(&vec![], crate::wireguard::VPN_INTERFACE, &vec![], &vec![]);
         assert!(
             ruleset.contains("chain ping_allow {"),
             "persistent ruleset should have a ping_allow subchain"
@@ -1900,7 +1909,7 @@ mod tests {
 
     #[test]
     fn test_persistent_ruleset_output_jumps_to_ping_allow() {
-        let ruleset = generate_persistent_ruleset(&vec![]);
+        let ruleset = generate_persistent_ruleset(&vec![], crate::wireguard::VPN_INTERFACE, &vec![], &vec![]);
         let output_start = ruleset.find("chain output").expect("output chain");
         let output_end = ruleset[output_start..]
             .find("\n  }\n")
@@ -1916,7 +1925,7 @@ mod tests {
 
     #[test]
     fn test_persistent_ruleset_ping_allow_is_empty_by_default() {
-        let ruleset = generate_persistent_ruleset(&vec![]);
+        let ruleset = generate_persistent_ruleset(&vec![], crate::wireguard::VPN_INTERFACE, &vec![], &vec![]);
         let chain_start = ruleset.find("chain ping_allow {").expect("ping_allow chain");
         let chain_end = ruleset[chain_start..]
             .find("\n  }\n")
@@ -2069,7 +2078,7 @@ mod tests {
 
     #[test]
     fn test_persistent_ruleset_output_icmpv6_no_echo_request() {
-        let ruleset = generate_persistent_ruleset(&vec![]);
+        let ruleset = generate_persistent_ruleset(&vec![], crate::wireguard::VPN_INTERFACE, &vec![], &vec![]);
         let output_start = ruleset.find("chain output").expect("output chain");
         let output_end = ruleset[output_start..]
             .find("\n  }\n")
@@ -2087,5 +2096,153 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Custom routes and allowlist tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_session_lock_custom_route_out_ipv4() {
+        let config = NetlockConfig {
+            custom_route_out_cidrs: vec!["192.168.1.0/24".to_string()],
+            ..default_config()
+        };
+        let ruleset = generate_ruleset(&config);
+        assert!(
+            ruleset.contains("ip daddr 192.168.1.0/24 counter accept comment \"airvpn_custom_route_out\""),
+            "session lock must contain custom route out CIDR accept rule"
+        );
+    }
+
+    #[test]
+    fn test_session_lock_custom_route_out_ipv6() {
+        let config = NetlockConfig {
+            custom_route_out_cidrs: vec!["2001:db8::/32".to_string()],
+            ..default_config()
+        };
+        let ruleset = generate_ruleset(&config);
+        assert!(
+            ruleset.contains("ip6 daddr 2001:db8::/32 counter accept comment \"airvpn_custom_route_out\""),
+            "session lock must contain IPv6 custom route out accept rule"
+        );
+    }
+
+    #[test]
+    fn test_session_lock_allowlist_ipv4() {
+        let config = NetlockConfig {
+            allowlist_out_cidrs: vec!["1.2.3.4".to_string()],
+            local_forward_ifaces: vec![],
+            ..default_config()
+        };
+        let ruleset = generate_ruleset(&config);
+        // Bare IP should get /32 suffix from ensure_cidr
+        assert!(
+            ruleset.contains("ip daddr 1.2.3.4/32 counter accept comment \"airvpn_allowlist_out\""),
+            "session lock must contain allowlist CIDR with /32 suffix"
+        );
+    }
+
+    #[test]
+    fn test_session_lock_allowlist_ipv6() {
+        let config = NetlockConfig {
+            allowlist_out_cidrs: vec!["2001:db8::1".to_string()],
+            local_forward_ifaces: vec![],
+            ..default_config()
+        };
+        let ruleset = generate_ruleset(&config);
+        assert!(
+            ruleset.contains("ip6 daddr 2001:db8::1/128 counter accept comment \"airvpn_allowlist_out\""),
+            "session lock must contain IPv6 allowlist with /128 suffix"
+        );
+    }
+
+    #[test]
+    fn test_session_lock_custom_and_allowlist_before_final_drop() {
+        let config = NetlockConfig {
+            custom_route_out_cidrs: vec!["10.0.0.0/8".to_string()],
+            allowlist_out_cidrs: vec!["5.6.7.0/24".to_string()],
+            local_forward_ifaces: vec![],
+            ..default_config()
+        };
+        let ruleset = generate_ruleset(&config);
+
+        let custom_pos = ruleset.find("airvpn_custom_route_out").expect("custom route rule");
+        let allowlist_pos = ruleset.find("airvpn_allowlist_out").expect("allowlist rule");
+        let drop_pos = ruleset.find("airvpn_filter_output_latest_rule").expect("final drop");
+
+        assert!(custom_pos < drop_pos, "custom route must come before final drop");
+        assert!(allowlist_pos < drop_pos, "allowlist must come before final drop");
+        assert!(custom_pos < allowlist_pos, "custom routes before allowlist (order)");
+    }
+
+    #[test]
+    fn test_session_lock_empty_custom_and_allowlist() {
+        let config = default_config();
+        let ruleset = generate_ruleset(&config);
+        assert!(
+            !ruleset.contains("airvpn_custom_route_out"),
+            "no custom route rules when list is empty"
+        );
+        assert!(
+            !ruleset.contains("airvpn_allowlist_out"),
+            "no allowlist rules when list is empty"
+        );
+    }
+
+    #[test]
+    fn test_persistent_lock_allowlist_ipv4() {
+        let allowlist = vec!["203.0.113.0/24".to_string()];
+        let ruleset = generate_persistent_ruleset(&vec![], crate::wireguard::VPN_INTERFACE, &allowlist, &vec![]);
+        assert!(
+            ruleset.contains("ip daddr 203.0.113.0/24 counter accept comment \"airvpn_persist_allowlist_out\""),
+            "persistent lock must contain allowlist CIDR accept rule"
+        );
+    }
+
+    #[test]
+    fn test_persistent_lock_allowlist_ipv6() {
+        let allowlist = vec!["2001:db8:abcd::/48".to_string()];
+        let ruleset = generate_persistent_ruleset(&vec![], crate::wireguard::VPN_INTERFACE, &allowlist, &vec![]);
+        assert!(
+            ruleset.contains("ip6 daddr 2001:db8:abcd::/48 counter accept comment \"airvpn_persist_allowlist_out\""),
+            "persistent lock must contain IPv6 allowlist accept rule"
+        );
+    }
+
+    #[test]
+    fn test_persistent_lock_allowlist_before_final_drop() {
+        let allowlist = vec!["198.51.100.0/24".to_string()];
+        let ruleset = generate_persistent_ruleset(&vec![], crate::wireguard::VPN_INTERFACE, &allowlist, &vec![]);
+
+        let allowlist_pos = ruleset.find("airvpn_persist_allowlist_out").expect("allowlist rule");
+        let drop_pos = ruleset.find("airvpn_persist_output_latest_rule").expect("final drop");
+        assert!(allowlist_pos < drop_pos, "allowlist must come before final drop in persistent lock");
+    }
+
+    #[test]
+    fn test_persistent_lock_empty_allowlist() {
+        let ruleset = generate_persistent_ruleset(&vec![], crate::wireguard::VPN_INTERFACE, &vec![], &vec![]);
+        assert!(
+            !ruleset.contains("airvpn_persist_allowlist_out"),
+            "no allowlist rules in persistent lock when list is empty"
+        );
+    }
+
+    #[test]
+    fn test_session_lock_invalid_cidr_skipped() {
+        let config = NetlockConfig {
+            custom_route_out_cidrs: vec!["not-a-cidr".to_string(), "192.168.1.0/24".to_string()],
+            allowlist_out_cidrs: vec!["also-invalid".to_string(), "10.0.0.1".to_string()],
+            local_forward_ifaces: vec![],
+            ..default_config()
+        };
+        let ruleset = generate_ruleset(&config);
+        // Invalid entries should be silently skipped (classify_ip returns None)
+        assert!(!ruleset.contains("not-a-cidr"));
+        assert!(!ruleset.contains("also-invalid"));
+        // Valid entries should still be present
+        assert!(ruleset.contains("192.168.1.0/24"));
+        assert!(ruleset.contains("10.0.0.1/32"));
     }
 }

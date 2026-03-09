@@ -993,7 +993,10 @@ fn dispatch_lock_install() -> Result<String> {
         let v = options::get_str(&resolved, options::NETWORK_IFACE_NAME);
         if v.is_empty() { wireguard::VPN_INTERFACE } else { v }
     };
-    let ruleset = netlock::generate_persistent_ruleset(&bootstrap_ips, iface_name);
+    let allowlist_ips = options::parse_allowlist_ips(
+        options::get_str(&resolved, options::NETLOCK_ALLOWLIST_IPS),
+    );
+    let ruleset = netlock::generate_persistent_ruleset(&bootstrap_ips, iface_name, &allowlist_ips);
 
     // Write rules file
     std::fs::create_dir_all("/etc/airvpn-rs")

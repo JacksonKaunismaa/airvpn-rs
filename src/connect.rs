@@ -127,7 +127,7 @@ pub fn preflight_checks() -> anyhow::Result<()> {
 /// Used by both `cmd_connect` (on clean shutdown) and `cmd_disconnect` (external command).
 /// `server_route_ips` and `original_gw` are used to clean up the /32 host routes
 /// added for the background pinger. Pass empty slices/strings if not available.
-pub fn cmd_disconnect_internal(config_path: &str, iface: &str, lock_active: bool, blocked_ipv6: &[String], endpoint_ip: &str, server_route_ips: &[String], original_gw: &str) -> anyhow::Result<()> {
+pub fn cmd_disconnect_internal(config_path: &str, iface: &str, lock_active: bool, blocked_ipv6: &[String], endpoint_ip: &str, server_route_ips: &[String], original_gw: &str, custom_route_out_cidrs: &[String]) -> anyhow::Result<()> {
     // 1. Remove interface-specific nft rules before deactivating table
     if lock_active && !iface.is_empty() {
         let _ = netlock::deallow_interface(iface);
@@ -135,6 +135,10 @@ pub fn cmd_disconnect_internal(config_path: &str, iface: &str, lock_active: bool
     // 1b. Remove /32 server host routes (background pinger routes)
     if !server_route_ips.is_empty() && !original_gw.is_empty() {
         let _ = wireguard::remove_server_host_routes(server_route_ips, original_gw);
+    }
+    // 1c. Remove custom "out" routes (tunnel bypass routes)
+    if !custom_route_out_cidrs.is_empty() && !original_gw.is_empty() {
+        remove_custom_out_routes(custom_route_out_cidrs, original_gw);
     }
     // 2. Tear down WireGuard (also tears down routing + endpoint host route)
     let _ = wireguard::disconnect(config_path, endpoint_ip, iface);
@@ -235,6 +239,66 @@ fn resolve_bootstrap_host(host: &str) -> Vec<String> {
         Err(e) => {
             warn!("failed to resolve bootstrap host {}: {}", host, e);
             vec![]
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Custom route helpers
+// ---------------------------------------------------------------------------
+
+/// Add IP routes for custom "out" CIDRs via the original default gateway.
+///
+/// These routes bypass the VPN tunnel by sending traffic for specified CIDRs
+/// through the physical interface's gateway instead of the tunnel.
+fn add_custom_out_routes(cidrs: &[String], gateway: &str) {
+    for cidr in cidrs {
+        // Determine ip version from CIDR
+        let ip_version = if cidr.contains(':') { "-6" } else { "-4" };
+        let output = std::process::Command::new("ip")
+            .args([ip_version, "route", "add", cidr, "via", gateway])
+            .output();
+        match output {
+            Ok(o) if o.status.success() => {
+                info!("Custom route: {} via {} (bypass tunnel)", cidr, gateway);
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                // "File exists" is OK — route was already added (e.g. reconnection)
+                if stderr.contains("File exists") {
+                    debug!("Custom route {} already exists", cidr);
+                } else {
+                    warn!("Failed to add custom route {} via {}: {}", cidr, gateway, stderr.trim());
+                }
+            }
+            Err(e) => {
+                warn!("Failed to run ip route for custom route {}: {}", cidr, e);
+            }
+        }
+    }
+}
+
+/// Remove IP routes for custom "out" CIDRs. Called during disconnect.
+fn remove_custom_out_routes(cidrs: &[String], gateway: &str) {
+    for cidr in cidrs {
+        let ip_version = if cidr.contains(':') { "-6" } else { "-4" };
+        let output = std::process::Command::new("ip")
+            .args([ip_version, "route", "del", cidr, "via", gateway])
+            .output();
+        match output {
+            Ok(o) if o.status.success() => {
+                debug!("Removed custom route: {} via {}", cidr, gateway);
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                // "No such process" = route already gone — not an error
+                if !stderr.contains("No such process") {
+                    debug!("Failed to remove custom route {} via {}: {}", cidr, gateway, stderr.trim());
+                }
+            }
+            Err(e) => {
+                debug!("Failed to run ip route del for custom route {}: {}", cidr, e);
+            }
         }
     }
 }
@@ -739,6 +803,24 @@ fn activate_netlock(
         let v = options::get_str(&config.resolved, options::NETWORK_IFACE_NAME);
         if v.is_empty() { wireguard::VPN_INTERFACE } else { v }
     };
+    // Parse custom routes and allowlist IPs from resolved profile options
+    let custom_routes = options::parse_custom_routes(
+        options::get_str(&config.resolved, options::ROUTES_CUSTOM),
+    );
+    let custom_route_out_cidrs: Vec<String> = custom_routes
+        .iter()
+        .filter(|r| r.action == "out")
+        .map(|r| r.cidr.clone())
+        .collect();
+    let allowlist_out_cidrs = options::parse_allowlist_ips(
+        options::get_str(&config.resolved, options::NETLOCK_ALLOWLIST_IPS),
+    );
+    if !custom_route_out_cidrs.is_empty() {
+        info!("Custom routes (out): {} CIDRs will bypass tunnel", custom_route_out_cidrs.len());
+    }
+    if !allowlist_out_cidrs.is_empty() {
+        info!("Netlock allowlist: {} CIDRs allowed through firewall", allowlist_out_cidrs.len());
+    }
     let lock_config = netlock::NetlockConfig {
         allow_lan: config.allow_lan,
         allow_dhcp: true,
@@ -748,6 +830,8 @@ fn activate_netlock(
         allowed_ips_outgoing: allowed_ips,
         incoming_policy_accept: options::get_str(&config.resolved, options::NETLOCK_INCOMING) == "allow",
         iface_name: iface_name.to_string(),
+        custom_route_out_cidrs,
+        allowlist_out_cidrs,
     };
     netlock::activate(&lock_config)?;
     info!("Network lock active (dedicated nftables table)");
@@ -958,15 +1042,16 @@ fn handle_reset_level(
     consecutive_failures: &mut u32,
     server_route_ips: &[String],
     original_gw: &str,
+    custom_route_out_cidrs: &[String],
 ) -> anyhow::Result<bool> {
     match reset_level {
         ResetLevel::None | ResetLevel::Fatal => {
-            cmd_disconnect_internal(config_path, iface, !config.no_lock, &params.blocked_ipv6_ifaces, endpoint_ip, server_route_ips, original_gw)?;
+            cmd_disconnect_internal(config_path, iface, !config.no_lock, &params.blocked_ipv6_ifaces, endpoint_ip, server_route_ips, original_gw, custom_route_out_cidrs)?;
             Ok(true)
         }
         ResetLevel::Error => {
             if config.no_reconnect {
-                cmd_disconnect_internal(config_path, iface, !config.no_lock, &params.blocked_ipv6_ifaces, endpoint_ip, server_route_ips, original_gw)?;
+                cmd_disconnect_internal(config_path, iface, !config.no_lock, &params.blocked_ipv6_ifaces, endpoint_ip, server_route_ips, original_gw, custom_route_out_cidrs)?;
                 warn!("Connection lost (--no-reconnect, exiting).");
                 return Ok(true);
             }
@@ -981,7 +1066,7 @@ fn handle_reset_level(
         }
         ResetLevel::Retry => {
             if config.no_reconnect {
-                cmd_disconnect_internal(config_path, iface, !config.no_lock, &params.blocked_ipv6_ifaces, endpoint_ip, server_route_ips, original_gw)?;
+                cmd_disconnect_internal(config_path, iface, !config.no_lock, &params.blocked_ipv6_ifaces, endpoint_ip, server_route_ips, original_gw, custom_route_out_cidrs)?;
                 warn!("Connection lost (--no-reconnect, exiting).");
                 return Ok(true);
             }
@@ -992,7 +1077,7 @@ fn handle_reset_level(
         }
         ResetLevel::Switch => {
             if config.no_reconnect {
-                cmd_disconnect_internal(config_path, iface, !config.no_lock, &params.blocked_ipv6_ifaces, endpoint_ip, server_route_ips, original_gw)?;
+                cmd_disconnect_internal(config_path, iface, !config.no_lock, &params.blocked_ipv6_ifaces, endpoint_ip, server_route_ips, original_gw, custom_route_out_cidrs)?;
                 warn!("Server switch requested (--no-reconnect, exiting).");
                 return Ok(true);
             }
@@ -1063,6 +1148,17 @@ pub fn run(
     let mut all_entry_ips: Vec<String> = data.filtered_servers
         .iter()
         .flat_map(|s| s.ips_entry.iter().cloned())
+        .collect();
+
+    // Parse custom routes once (session-constant, from resolved profile options).
+    // "out" routes bypass the VPN tunnel via the original default gateway.
+    let custom_routes = options::parse_custom_routes(
+        options::get_str(&config.resolved, options::ROUTES_CUSTOM),
+    );
+    let custom_route_out_cidrs: Vec<String> = custom_routes
+        .iter()
+        .filter(|r| r.action == "out")
+        .map(|r| r.cidr.clone())
         .collect();
 
     // Activate network lock once before the loop with all server IPs.
@@ -1317,6 +1413,12 @@ pub fn run(
             warn!("Failed to add server host routes (pinger may not work): {e}");
         }
 
+        // Add IP routes for custom "out" routes — these bypass the VPN tunnel
+        // by routing through the original default gateway.
+        if !custom_route_out_cidrs.is_empty() {
+            add_custom_out_routes(&custom_route_out_cidrs, &original_gw);
+        }
+
         // Wait for first WireGuard handshake (Eddie: handshake_timeout_first=50s)
         info!("Waiting for handshake...");
         emit(config, crate::ipc::EngineEvent::Log {
@@ -1357,12 +1459,12 @@ pub fn run(
         ) {
             if params.shutdown.load(Ordering::Relaxed) {
                 warn!("Setup interrupted by shutdown signal, disconnecting...");
-                let _ = cmd_disconnect_internal(&config_path, &iface, !config.no_lock, &params.blocked_ipv6_ifaces, &endpoint_ip, &all_entry_ips, &original_gw);
+                let _ = cmd_disconnect_internal(&config_path, &iface, !config.no_lock, &params.blocked_ipv6_ifaces, &endpoint_ip, &all_entry_ips, &original_gw, &custom_route_out_cidrs);
                 break;
             }
             error!("Setup failed after WireGuard connected: {:#}", e);
             warn!("Cleaning up...");
-            let _ = cmd_disconnect_internal(&config_path, &iface, !config.no_lock, &params.blocked_ipv6_ifaces, &endpoint_ip, &all_entry_ips, &original_gw);
+            let _ = cmd_disconnect_internal(&config_path, &iface, !config.no_lock, &params.blocked_ipv6_ifaces, &endpoint_ip, &all_entry_ips, &original_gw, &custom_route_out_cidrs);
             return Err(e);
         }
 
@@ -1436,7 +1538,7 @@ pub fn run(
             &config_path, &iface, &endpoint_ip,
             &server_ref.name, data.lock_last,
             &mut penalties, &mut forced_server, &mut consecutive_failures,
-            &all_entry_ips, &original_gw,
+            &all_entry_ips, &original_gw, &custom_route_out_cidrs,
         )?;
         if should_break {
             break;
