@@ -52,6 +52,7 @@ struct App {
     server_sort: views::servers::SortColumn,
     server_sort_ascending: bool,
     server_search: String,
+    server_country_filter: String,
     helper: Option<ipc::HelperClient>,
     error_overview: Option<String>,
     error_servers: Option<String>,
@@ -98,6 +99,10 @@ struct App {
     settings_netlock_incoming: String,
     settings_netlock_allow_ping: bool,
 
+    // Area filter settings (profile-backed)
+    settings_areas_allowlist: String,
+    settings_areas_denylist: String,
+
     // Advanced settings (profile-backed, text for text_input widget)
     settings_pinger_timeout: String,
     settings_manifest_refresh: String,
@@ -129,6 +134,7 @@ pub enum Message {
     ServerClicked(usize),
     ServerSort(views::servers::SortColumn),
     ServerSearchChanged(String),
+    ServerCountryFilterChanged(String),
     LogFilterToggle(String),
     LogClear,
     FetchProfile,
@@ -149,6 +155,9 @@ pub enum Message {
     SettingsWgKeepaliveChanged(String),
     SettingsWgHandshakeFirstChanged(String),
     SettingsWgHandshakeConnectedChanged(String),
+    // Area filter settings
+    SettingsAreasAllowlistChanged(String),
+    SettingsAreasDenylistChanged(String),
     // Network Lock settings
     SettingsNetlockIncomingChanged(String),
     SettingsNetlockAllowPingToggle(bool),
@@ -190,6 +199,7 @@ impl App {
             server_sort: views::servers::SortColumn::Score,
             server_sort_ascending: true,
             server_search: String::new(),
+            server_country_filter: String::new(),
             helper: None,
             error_overview: None,
             error_servers: None,
@@ -227,6 +237,9 @@ impl App {
 
             settings_netlock_incoming: String::new(),
             settings_netlock_allow_ping: true,
+
+            settings_areas_allowlist: String::new(),
+            settings_areas_denylist: String::new(),
 
             settings_pinger_timeout: String::new(),
             settings_manifest_refresh: String::new(),
@@ -392,6 +405,7 @@ impl App {
                 let filtered = views::servers::filter_and_sort(
                     &self.servers,
                     &self.server_search,
+                    &self.server_country_filter,
                     self.server_sort,
                     self.server_sort_ascending,
                 );
@@ -413,6 +427,11 @@ impl App {
             }
             Message::ServerSearchChanged(query) => {
                 self.server_search = query;
+                self.selected_server_idx = None;
+                Task::none()
+            }
+            Message::ServerCountryFilterChanged(country) => {
+                self.server_country_filter = country;
                 self.selected_server_idx = None;
                 Task::none()
             }
@@ -475,6 +494,9 @@ impl App {
                     options.insert(options::WG_KEEPALIVE.into(), self.settings_wg_keepalive.clone());
                     options.insert(options::WG_HANDSHAKE_FIRST.into(), self.settings_wg_handshake_first.clone());
                     options.insert(options::WG_HANDSHAKE_CONNECTED.into(), self.settings_wg_handshake_connected.clone());
+                    // Area filter settings
+                    options.insert(options::AREAS_ALLOWLIST.into(), self.settings_areas_allowlist.clone());
+                    options.insert(options::AREAS_DENYLIST.into(), self.settings_areas_denylist.clone());
                     // Network Lock settings
                     options.insert(options::NETLOCK_INCOMING.into(), self.settings_netlock_incoming.clone());
                     options.insert(options::NETLOCK_ALLOW_PING.into(), self.settings_netlock_allow_ping.to_string());
@@ -556,6 +578,16 @@ impl App {
             }
             Message::SettingsWgHandshakeConnectedChanged(val) => {
                 self.settings_wg_handshake_connected = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsAreasAllowlistChanged(val) => {
+                self.settings_areas_allowlist = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsAreasDenylistChanged(val) => {
+                self.settings_areas_denylist = val;
                 self.settings_dirty = true;
                 Task::none()
             }
@@ -794,6 +826,12 @@ impl App {
                 self.settings_wg_handshake_connected = options.get(options::WG_HANDSHAKE_CONNECTED)
                     .cloned().unwrap_or_else(|| "200".into());
 
+                // Area filter settings
+                self.settings_areas_allowlist = options.get(options::AREAS_ALLOWLIST)
+                    .cloned().unwrap_or_default();
+                self.settings_areas_denylist = options.get(options::AREAS_DENYLIST)
+                    .cloned().unwrap_or_default();
+
                 // Network Lock settings
                 self.settings_netlock_incoming = options.get(options::NETLOCK_INCOMING)
                     .cloned().unwrap_or_else(|| "block".into());
@@ -933,6 +971,7 @@ impl App {
                 self.server_sort,
                 self.server_sort_ascending,
                 &self.server_search,
+                &self.server_country_filter,
                 &self.connection_state,
             ),
             views::Tab::Logs => views::logs::view(
@@ -967,6 +1006,9 @@ impl App {
                 // Network Lock
                 &self.settings_netlock_incoming,
                 self.settings_netlock_allow_ping,
+                // Area filters
+                &self.settings_areas_allowlist,
+                &self.settings_areas_denylist,
                 // Advanced
                 &self.settings_pinger_timeout,
                 &self.settings_manifest_refresh,

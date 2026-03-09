@@ -117,6 +117,9 @@ pub fn view<'a>(
     // Network Lock settings
     netlock_incoming: &'a str,
     netlock_allow_ping: bool,
+    // Area filters
+    areas_allowlist: &'a str,
+    areas_denylist: &'a str,
     // Advanced settings
     pinger_timeout: &'a str,
     manifest_refresh: &'a str,
@@ -145,7 +148,7 @@ pub fn view<'a>(
             locklast,
             show_errors,
         ),
-        SettingsSubTab::Network => view_network(ipv6_mode, dns),
+        SettingsSubTab::Network => view_network(ipv6_mode, dns, areas_allowlist, areas_denylist),
         SettingsSubTab::WireGuard => view_wireguard(
             wg_key,
             wg_mtu,
@@ -244,7 +247,12 @@ fn view_general<'a>(
 
 // ── Network sub-tab ────────────────────────────────────────────────────
 
-fn view_network<'a>(ipv6_mode: &'a str, dns: &'a str) -> Element<'a, Message> {
+fn view_network<'a>(
+    ipv6_mode: &'a str,
+    dns: &'a str,
+    areas_allowlist: &'a str,
+    areas_denylist: &'a str,
+) -> Element<'a, Message> {
     let mut content = column![].spacing(16);
 
     content = content.push(section_header("Network"));
@@ -271,6 +279,27 @@ fn view_network<'a>(ipv6_mode: &'a str, dns: &'a str) -> Element<'a, Message> {
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center),
+        ]
+        .spacing(8),
+    );
+
+    // Area filter settings (persistent, affect server selection during connect)
+    content = content.push(section_header("Country Filters"));
+    content = content.push(
+        column![
+            text("Restrict which countries are used for server selection during connect.").size(12),
+            text_field(
+                "Allowed Countries",
+                "US, NL, DE (empty = all)",
+                areas_allowlist,
+                Message::SettingsAreasAllowlistChanged,
+            ),
+            text_field(
+                "Denied Countries",
+                "CN, RU (empty = none)",
+                areas_denylist,
+                Message::SettingsAreasDenylistChanged,
+            ),
         ]
         .spacing(8),
     );
