@@ -4,7 +4,7 @@
 //! along with disconnect helpers and supporting types that were previously
 //! in main.rs.
 
-use crate::{api, common, config, dns, ipv6, manifest, netlock, pinger, recovery, server, verify, wireguard};
+use crate::{api, common, config, dns, ipv6, manifest, netlock, options, pinger, recovery, server, verify, wireguard};
 
 use std::sync::atomic::Ordering;
 
@@ -38,6 +38,8 @@ pub struct ConnectConfig {
     pub cached_latency: pinger::LatencyCache,
     /// Cached manifest from the background manifest refresh loop.
     pub manifest: manifest::Manifest,
+    /// Pre-resolved options (defaults -> profile -> session overrides).
+    pub resolved: std::collections::HashMap<String, String>,
 }
 
 /// Emit an engine event to the event channel.
@@ -320,27 +322,19 @@ fn resolve_session(config: &ConnectConfig) -> anyhow::Result<SessionParams> {
     let username = config.username.clone();
     let password = config.password.clone();
 
-    // Load profile options once (used for locklast/startlast, ipv6 mode, etc.)
-    let profile_options = config::load_profile_options();
+    // All options are pre-resolved by the helper (defaults -> profile -> overrides).
+    // No need to load the profile again here.
 
-    // Resolve IPv6 mode: CLI --ipv6-mode overrides profile (Eddie: network.ipv6.mode)
+    // IPv6 mode from pre-resolved options
     let ipv6_mode = {
-        let mode_str = config.cli_ipv6_mode.clone()
-            .or_else(|| profile_options.get("network.ipv6.mode").cloned())
-            .unwrap_or_else(|| "in-block".to_string());
-        Ipv6Mode::parse(&mode_str)?
+        let mode_str = options::get_str(&config.resolved, options::NETWORK_IPV6_MODE);
+        let mode_str = if mode_str.is_empty() { "in-block" } else { mode_str };
+        Ipv6Mode::parse(mode_str)?
     };
     info!("IPv6 mode: {:?}", ipv6_mode);
 
-    // Resolve custom DNS (Eddie: dns.servers — comma-separated IPs).
-    // CLI --dns overrides profile dns.servers. If neither set, use AirVPN's DNS.
-    let custom_dns_ips: Vec<String> = if !config.cli_dns_servers.is_empty() {
-        config.cli_dns_servers.clone()
-    } else if let Some(profile_dns) = profile_options.get("dns.servers") {
-        profile_dns.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
-    } else {
-        vec![]
-    };
+    // Custom DNS from pre-resolved options
+    let custom_dns_ips = options::get_list(&config.resolved, options::DNS_SERVERS);
     if !custom_dns_ips.is_empty() {
         // Validate all custom DNS IPs upfront
         for ip in &custom_dns_ips {
@@ -363,8 +357,9 @@ fn resolve_session(config: &ConnectConfig) -> anyhow::Result<SessionParams> {
         info!("IPv6 disabled on {} interfaces", blocked_ipv6_ifaces.len());
     }
 
+    // Score type from pre-resolved options
     let score_type = server::ScoreType::from_profile(
-        profile_options.get("servers.scoretype").map(|s| s.as_str()).unwrap_or("Speed"),
+        options::get_str(&config.resolved, options::SERVERS_SCORETYPE),
     );
 
     Ok(SessionParams {
@@ -376,7 +371,7 @@ fn resolve_session(config: &ConnectConfig) -> anyhow::Result<SessionParams> {
         custom_dns_ips,
         blocked_ipv6_ifaces,
         score_type,
-        profile_options,
+        profile_options: config.resolved.clone(),
     })
 }
 
