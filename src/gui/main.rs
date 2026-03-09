@@ -78,7 +78,7 @@ struct App {
     // Eddie import confirmation (Some = dialog visible with profile path)
     eddie_import_pending: Option<String>,
 
-    // Per-connect flags (not profile-backed)
+    // Connection settings (profile-backed)
     connect_no_lock: bool,
     connect_allow_lan: bool,
     connect_no_reconnect: bool,
@@ -372,10 +372,15 @@ impl App {
             Message::SaveSettings => {
                 if let Some(ref helper) = self.helper {
                     let mut options = std::collections::HashMap::new();
-                    options.insert("servers.startlast".into(), if self.settings_startlast { "True" } else { "False" }.into());
-                    options.insert("servers.locklast".into(), if self.settings_locklast { "True" } else { "False" }.into());
-                    options.insert("network.ipv6.mode".into(), self.settings_ipv6_mode.clone());
-                    options.insert("dns.servers".into(), self.settings_dns.clone());
+                    options.insert(options::SERVERS_STARTLAST.into(), self.settings_startlast.to_string());
+                    options.insert(options::SERVERS_LOCKLAST.into(), self.settings_locklast.to_string());
+                    options.insert(options::NETWORK_IPV6_MODE.into(), self.settings_ipv6_mode.clone());
+                    options.insert(options::DNS_SERVERS.into(), self.settings_dns.clone());
+                    // Connection flags (saved as positive option names)
+                    options.insert(options::NETLOCK.into(), (!self.connect_no_lock).to_string());
+                    options.insert(options::NETLOCK_ALLOW_PRIVATE.into(), self.connect_allow_lan.to_string());
+                    options.insert(options::RECONNECT.into(), (!self.connect_no_reconnect).to_string());
+                    options.insert(options::VERIFY.into(), (!self.connect_no_verify).to_string());
                     let req = SaveProfileRequest { options };
                     match serde_json::to_vec(&req) {
                         Ok(body) => match helper.send_command("POST", "/profile", Some(&body)) {
@@ -423,18 +428,22 @@ impl App {
             }
             Message::ConnectNoLockToggle(val) => {
                 self.connect_no_lock = val;
+                self.settings_dirty = true;
                 Task::none()
             }
             Message::ConnectAllowLanToggle(val) => {
                 self.connect_allow_lan = val;
+                self.settings_dirty = true;
                 Task::none()
             }
             Message::ConnectNoReconnectToggle(val) => {
                 self.connect_no_reconnect = val;
+                self.settings_dirty = true;
                 Task::none()
             }
             Message::ConnectNoVerifyToggle(val) => {
                 self.connect_no_verify = val;
+                self.settings_dirty = true;
                 Task::none()
             }
             Message::LockInstall => {
@@ -575,10 +584,28 @@ impl App {
             }
             HelperEvent::Profile { options, credentials_configured } => {
                 self.settings_credentials_configured = credentials_configured;
-                self.settings_startlast = options.get("servers.startlast").map(|v| v == "True").unwrap_or(false);
-                self.settings_locklast = options.get("servers.locklast").map(|v| v == "True").unwrap_or(false);
-                self.settings_ipv6_mode = options.get("network.ipv6.mode").cloned().unwrap_or_else(|| "in-block".into());
-                self.settings_dns = options.get("dns.servers").cloned().unwrap_or_default();
+                self.settings_startlast = options.get(options::SERVERS_STARTLAST)
+                    .map(|v| v.eq_ignore_ascii_case("true")).unwrap_or(false);
+                self.settings_locklast = options.get(options::SERVERS_LOCKLAST)
+                    .map(|v| v.eq_ignore_ascii_case("true")).unwrap_or(false);
+                self.settings_ipv6_mode = options.get(options::NETWORK_IPV6_MODE)
+                    .cloned().unwrap_or_else(|| "in-block".into());
+                self.settings_dns = options.get(options::DNS_SERVERS).cloned().unwrap_or_default();
+
+                // Connection flags (inverted: profile uses positive names)
+                self.connect_no_lock = !options.get(options::NETLOCK)
+                    .map(|v| v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(true); // default: lock ON (netlock=true, no_lock=false)
+                self.connect_allow_lan = options.get(options::NETLOCK_ALLOW_PRIVATE)
+                    .map(|v| v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(true); // default: allow LAN
+                self.connect_no_reconnect = !options.get(options::RECONNECT)
+                    .map(|v| v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(true); // default: reconnect ON
+                self.connect_no_verify = !options.get(options::VERIFY)
+                    .map(|v| v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(true); // default: verify ON
+
                 self.settings_loaded = true;
                 self.settings_dirty = false;
             }
