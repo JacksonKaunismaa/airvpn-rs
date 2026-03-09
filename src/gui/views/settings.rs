@@ -1,9 +1,42 @@
 //! Settings tab: profile options, per-connect flags, persistent lock controls.
+//! Organized into sub-tabs: General, Network, WireGuard, Network Lock, Advanced.
 
 use iced::widget::{button, checkbox, column, container, pick_list, row, scrollable, text, text_input, Space};
 use iced::{Element, Fill};
 
 use crate::Message;
+
+/// Sub-tab within the Settings view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsSubTab {
+    General,
+    Network,
+    WireGuard,
+    NetworkLock,
+    Advanced,
+}
+
+impl SettingsSubTab {
+    pub fn all() -> &'static [SettingsSubTab] {
+        &[
+            SettingsSubTab::General,
+            SettingsSubTab::Network,
+            SettingsSubTab::WireGuard,
+            SettingsSubTab::NetworkLock,
+            SettingsSubTab::Advanced,
+        ]
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            SettingsSubTab::General => "General",
+            SettingsSubTab::Network => "Network",
+            SettingsSubTab::WireGuard => "WireGuard",
+            SettingsSubTab::NetworkLock => "Network Lock",
+            SettingsSubTab::Advanced => "Advanced",
+        }
+    }
+}
 
 /// Section header styled text.
 fn section_header(label: &str) -> iced::widget::Text<'_> {
@@ -15,14 +48,56 @@ fn label(s: &str) -> iced::widget::Text<'_> {
     text(s).size(14)
 }
 
+/// A single sub-tab button in the tab bar.
+fn tab_button(tab: SettingsSubTab, active: bool) -> Element<'static, Message> {
+    let btn = button(text(tab.label()).size(13))
+        .on_press(Message::SettingsSubTabChanged(tab));
+    if active {
+        btn.style(iced::widget::button::primary)
+    } else {
+        btn.style(iced::widget::button::secondary)
+    }
+    .into()
+}
+
+/// A labeled text input row.
+fn text_field<'a>(
+    field_label: &'a str,
+    placeholder: &'a str,
+    value: &'a str,
+    on_input: fn(String) -> Message,
+) -> Element<'a, Message> {
+    row![
+        label(field_label).width(220),
+        text_input(placeholder, value)
+            .on_input(on_input)
+            .width(Fill),
+    ]
+    .spacing(8)
+    .align_y(iced::Alignment::Center)
+    .into()
+}
+
+/// Save button (always at the bottom).
+fn save_button(dirty: bool, loaded: bool) -> Element<'static, Message> {
+    let mut content = column![].spacing(8);
+    content = content.push(Space::new().height(8));
+    let mut save_btn = button(text("Save Settings").size(16));
+    if dirty && loaded {
+        save_btn = save_btn.on_press(Message::SaveSettings);
+    }
+    content = content.push(save_btn);
+    content.into()
+}
+
 /// Render the settings tab.
 #[allow(clippy::too_many_arguments)]
 pub fn view<'a>(
     credentials_configured: bool,
     startlast: bool,
     locklast: bool,
-    ipv6_mode: &str,
-    dns: &str,
+    ipv6_mode: &'a str,
+    dns: &'a str,
     loaded: bool,
     dirty: bool,
     show_errors: bool,
@@ -32,6 +107,21 @@ pub fn view<'a>(
     no_verify: bool,
     lock_installed: bool,
     lock_persistent: bool,
+    sub_tab: SettingsSubTab,
+    // WireGuard settings
+    wg_mtu: &'a str,
+    wg_keepalive: &'a str,
+    wg_handshake_first: &'a str,
+    wg_handshake_connected: &'a str,
+    // Network Lock settings
+    netlock_incoming: &'a str,
+    netlock_allow_ping: bool,
+    // Advanced settings
+    pinger_timeout: &'a str,
+    manifest_refresh: &'a str,
+    penality: &'a str,
+    http_timeout: &'a str,
+    checking_ntry: &'a str,
 ) -> Element<'a, Message> {
     if !loaded {
         return container(text("Loading settings...").size(16))
@@ -39,9 +129,70 @@ pub fn view<'a>(
             .into();
     }
 
+    // Sub-tab bar
+    let mut tab_bar = row![].spacing(4);
+    for &tab in SettingsSubTab::all() {
+        tab_bar = tab_bar.push(tab_button(tab, tab == sub_tab));
+    }
+
+    // Content for the selected sub-tab
+    let tab_content: Element<'a, Message> = match sub_tab {
+        SettingsSubTab::General => view_general(
+            credentials_configured,
+            startlast,
+            locklast,
+            show_errors,
+        ),
+        SettingsSubTab::Network => view_network(ipv6_mode, dns),
+        SettingsSubTab::WireGuard => view_wireguard(
+            wg_mtu,
+            wg_keepalive,
+            wg_handshake_first,
+            wg_handshake_connected,
+        ),
+        SettingsSubTab::NetworkLock => view_network_lock(
+            no_lock,
+            allow_lan,
+            no_reconnect,
+            no_verify,
+            lock_installed,
+            lock_persistent,
+            netlock_incoming,
+            netlock_allow_ping,
+        ),
+        SettingsSubTab::Advanced => view_advanced(
+            pinger_timeout,
+            manifest_refresh,
+            penality,
+            http_timeout,
+            checking_ntry,
+        ),
+    };
+
+    let content = column![
+        tab_bar,
+        Space::new().height(8),
+        tab_content,
+        save_button(dirty, loaded),
+    ]
+    .spacing(4);
+
+    scrollable(container(content).padding(4))
+        .height(Fill)
+        .into()
+}
+
+// ── General sub-tab ────────────────────────────────────────────────────
+
+fn view_general<'a>(
+    credentials_configured: bool,
+    startlast: bool,
+    locklast: bool,
+    show_errors: bool,
+) -> Element<'a, Message> {
     let mut content = column![].spacing(16);
 
-    // ── Credentials ──────────────────────────────────────
+    // Credentials
     content = content.push(section_header("Credentials"));
     if credentials_configured {
         content = content.push(
@@ -62,7 +213,7 @@ pub fn view<'a>(
         );
     }
 
-    // ── Server Preferences ───────────────────────────────
+    // Server Preferences
     content = content.push(section_header("Server Preferences"));
     content = content.push(
         column![
@@ -76,7 +227,108 @@ pub fn view<'a>(
         .spacing(6),
     );
 
-    // ── Connection (per-connect flags) ───────────────────
+    // GUI
+    content = content.push(section_header("GUI"));
+    content = content.push(
+        checkbox(show_errors)
+            .label("Show error messages")
+            .on_toggle(Message::ShowErrorsToggle),
+    );
+
+    content.into()
+}
+
+// ── Network sub-tab ────────────────────────────────────────────────────
+
+fn view_network<'a>(ipv6_mode: &'a str, dns: &'a str) -> Element<'a, Message> {
+    let mut content = column![].spacing(16);
+
+    content = content.push(section_header("Network"));
+
+    let ipv6_options: Vec<&str> = vec!["in", "in-block", "block"];
+    let ipv6_selected: Option<&str> = ipv6_options.iter().find(|&&o| o == ipv6_mode).copied();
+
+    content = content.push(
+        column![
+            row![
+                label("IPv6 Mode").width(220),
+                pick_list(ipv6_options, ipv6_selected, |selected: &str| {
+                    Message::SettingsIpv6ModeChanged(selected.to_string())
+                })
+                .width(160),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+            row![
+                label("Custom DNS").width(220),
+                text_input("8.8.8.8, 1.1.1.1", dns)
+                    .on_input(Message::SettingsDnsChanged)
+                    .width(Fill),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        ]
+        .spacing(8),
+    );
+
+    content.into()
+}
+
+// ── WireGuard sub-tab ──────────────────────────────────────────────────
+
+fn view_wireguard<'a>(
+    wg_mtu: &'a str,
+    wg_keepalive: &'a str,
+    wg_handshake_first: &'a str,
+    wg_handshake_connected: &'a str,
+) -> Element<'a, Message> {
+    let mut content = column![].spacing(16);
+
+    content = content.push(section_header("WireGuard"));
+
+    content = content.push(
+        column![
+            text_field("Interface MTU", "1320", wg_mtu, Message::SettingsWgMtuChanged),
+            text_field(
+                "Persistent Keepalive (s)",
+                "15",
+                wg_keepalive,
+                Message::SettingsWgKeepaliveChanged,
+            ),
+            text_field(
+                "Handshake Timeout — First (s)",
+                "50",
+                wg_handshake_first,
+                Message::SettingsWgHandshakeFirstChanged,
+            ),
+            text_field(
+                "Handshake Timeout — Connected (s)",
+                "200",
+                wg_handshake_connected,
+                Message::SettingsWgHandshakeConnectedChanged,
+            ),
+        ]
+        .spacing(8),
+    );
+
+    content.into()
+}
+
+// ── Network Lock sub-tab ───────────────────────────────────────────────
+
+fn view_network_lock<'a>(
+    no_lock: bool,
+    allow_lan: bool,
+    no_reconnect: bool,
+    no_verify: bool,
+    lock_installed: bool,
+    lock_persistent: bool,
+    netlock_incoming: &'a str,
+    netlock_allow_ping: bool,
+) -> Element<'a, Message> {
+    let mut content = column![].spacing(16);
+
+    // Connection settings
     content = content.push(section_header("Connection"));
     content = content.push(
         column![
@@ -98,44 +350,34 @@ pub fn view<'a>(
         .spacing(6),
     );
 
-    // ── GUI ───────────────────────────────────────────────
-    content = content.push(section_header("GUI"));
-    content = content.push(
-        checkbox(show_errors)
-            .label("Show error messages")
-            .on_toggle(Message::ShowErrorsToggle),
-    );
+    // Policy settings
+    content = content.push(section_header("Lock Policy"));
 
-    // ── Network ──────────────────────────────────────────
-    content = content.push(section_header("Network"));
-
-    let ipv6_options: Vec<&str> = vec!["in", "in-block", "block"];
-    let ipv6_selected: Option<&str> = ipv6_options.iter().find(|&&o| o == ipv6_mode).copied();
+    let incoming_options: Vec<&str> = vec!["block", "allow"];
+    let incoming_selected: Option<&str> = incoming_options
+        .iter()
+        .find(|&&o| o == netlock_incoming)
+        .copied();
 
     content = content.push(
         column![
             row![
-                label("IPv6 Mode").width(120),
-                pick_list(ipv6_options, ipv6_selected, |selected: &str| {
-                    Message::SettingsIpv6ModeChanged(selected.to_string())
+                label("Incoming Policy").width(220),
+                pick_list(incoming_options, incoming_selected, |selected: &str| {
+                    Message::SettingsNetlockIncomingChanged(selected.to_string())
                 })
                 .width(160),
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center),
-            row![
-                label("Custom DNS").width(120),
-                text_input("8.8.8.8, 1.1.1.1", dns)
-                    .on_input(Message::SettingsDnsChanged)
-                    .width(Fill),
-            ]
-            .spacing(8)
-            .align_y(iced::Alignment::Center),
+            checkbox(netlock_allow_ping)
+                .label("Allow ICMP ping")
+                .on_toggle(Message::SettingsNetlockAllowPingToggle),
         ]
-        .spacing(8),
+        .spacing(6),
     );
 
-    // ── Persistent Lock ──────────────────────────────────
+    // Persistent Lock controls
     content = content.push(section_header("Persistent Lock"));
 
     let lock_status = if lock_installed && lock_persistent {
@@ -179,15 +421,57 @@ pub fn view<'a>(
 
     content = content.push(lock_row);
 
-    // ── Save button ──────────────────────────────────────
-    content = content.push(Space::new().height(8));
-    let mut save_btn = button(text("Save Settings").size(16));
-    if dirty && loaded {
-        save_btn = save_btn.on_press(Message::SaveSettings);
-    }
-    content = content.push(save_btn);
+    content.into()
+}
 
-    scrollable(container(content).padding(4))
-        .height(Fill)
-        .into()
+// ── Advanced sub-tab ───────────────────────────────────────────────────
+
+fn view_advanced<'a>(
+    pinger_timeout: &'a str,
+    manifest_refresh: &'a str,
+    penality: &'a str,
+    http_timeout: &'a str,
+    checking_ntry: &'a str,
+) -> Element<'a, Message> {
+    let mut content = column![].spacing(16);
+
+    content = content.push(section_header("Advanced"));
+
+    content = content.push(
+        column![
+            text_field(
+                "Pinger Timeout (s)",
+                "3",
+                pinger_timeout,
+                Message::SettingsPingerTimeoutChanged,
+            ),
+            text_field(
+                "Manifest Refresh Interval (s)",
+                "1800",
+                manifest_refresh,
+                Message::SettingsManifestRefreshChanged,
+            ),
+            text_field(
+                "Penalty on Error",
+                "30",
+                penality,
+                Message::SettingsPenalityChanged,
+            ),
+            text_field(
+                "HTTP Timeout (s)",
+                "10",
+                http_timeout,
+                Message::SettingsHttpTimeoutChanged,
+            ),
+            text_field(
+                "Verification Retries",
+                "3",
+                checking_ntry,
+                Message::SettingsCheckingNtryChanged,
+            ),
+        ]
+        .spacing(8),
+    );
+
+    content.into()
 }

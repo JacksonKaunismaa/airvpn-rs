@@ -84,6 +84,26 @@ struct App {
     connect_no_reconnect: bool,
     connect_no_verify: bool,
 
+    // Settings sub-tab navigation
+    settings_sub_tab: views::settings::SettingsSubTab,
+
+    // WireGuard settings (profile-backed, text for text_input widget)
+    settings_wg_mtu: String,
+    settings_wg_keepalive: String,
+    settings_wg_handshake_first: String,
+    settings_wg_handshake_connected: String,
+
+    // Network Lock settings (profile-backed)
+    settings_netlock_incoming: String,
+    settings_netlock_allow_ping: bool,
+
+    // Advanced settings (profile-backed, text for text_input widget)
+    settings_pinger_timeout: String,
+    settings_manifest_refresh: String,
+    settings_penality: String,
+    settings_http_timeout: String,
+    settings_checking_ntry: String,
+
     // Auto-refresh timer for server list
     last_server_fetch: Instant,
 
@@ -116,6 +136,21 @@ pub enum Message {
     ConnectAllowLanToggle(bool),
     ConnectNoReconnectToggle(bool),
     ConnectNoVerifyToggle(bool),
+    SettingsSubTabChanged(views::settings::SettingsSubTab),
+    // WireGuard settings
+    SettingsWgMtuChanged(String),
+    SettingsWgKeepaliveChanged(String),
+    SettingsWgHandshakeFirstChanged(String),
+    SettingsWgHandshakeConnectedChanged(String),
+    // Network Lock settings
+    SettingsNetlockIncomingChanged(String),
+    SettingsNetlockAllowPingToggle(bool),
+    // Advanced settings
+    SettingsPingerTimeoutChanged(String),
+    SettingsManifestRefreshChanged(String),
+    SettingsPenalityChanged(String),
+    SettingsHttpTimeoutChanged(String),
+    SettingsCheckingNtryChanged(String),
     LockInstall,
     LockUninstall,
     LockEnable,
@@ -173,6 +208,22 @@ impl App {
             connect_allow_lan: true,
             connect_no_reconnect: false,
             connect_no_verify: false,
+
+            settings_sub_tab: views::settings::SettingsSubTab::General,
+
+            settings_wg_mtu: String::new(),
+            settings_wg_keepalive: String::new(),
+            settings_wg_handshake_first: String::new(),
+            settings_wg_handshake_connected: String::new(),
+
+            settings_netlock_incoming: String::new(),
+            settings_netlock_allow_ping: true,
+
+            settings_pinger_timeout: String::new(),
+            settings_manifest_refresh: String::new(),
+            settings_penality: String::new(),
+            settings_http_timeout: String::new(),
+            settings_checking_ntry: String::new(),
 
             last_server_fetch: Instant::now(),
 
@@ -381,6 +432,20 @@ impl App {
                     options.insert(options::NETLOCK_ALLOW_PRIVATE.into(), self.connect_allow_lan.to_string());
                     options.insert(options::RECONNECT.into(), (!self.connect_no_reconnect).to_string());
                     options.insert(options::VERIFY.into(), (!self.connect_no_verify).to_string());
+                    // WireGuard settings
+                    options.insert(options::WG_MTU.into(), self.settings_wg_mtu.clone());
+                    options.insert(options::WG_KEEPALIVE.into(), self.settings_wg_keepalive.clone());
+                    options.insert(options::WG_HANDSHAKE_FIRST.into(), self.settings_wg_handshake_first.clone());
+                    options.insert(options::WG_HANDSHAKE_CONNECTED.into(), self.settings_wg_handshake_connected.clone());
+                    // Network Lock settings
+                    options.insert(options::NETLOCK_INCOMING.into(), self.settings_netlock_incoming.clone());
+                    options.insert(options::NETLOCK_ALLOW_PING.into(), self.settings_netlock_allow_ping.to_string());
+                    // Advanced settings
+                    options.insert(options::PINGER_TIMEOUT.into(), self.settings_pinger_timeout.clone());
+                    options.insert(options::MANIFEST_REFRESH.into(), self.settings_manifest_refresh.clone());
+                    options.insert(options::PENALITY_ON_ERROR.into(), self.settings_penality.clone());
+                    options.insert(options::HTTP_TIMEOUT.into(), self.settings_http_timeout.clone());
+                    options.insert(options::CHECKING_NTRY.into(), self.settings_checking_ntry.clone());
                     let req = SaveProfileRequest { options };
                     match serde_json::to_vec(&req) {
                         Ok(body) => match helper.send_command("POST", "/profile", Some(&body)) {
@@ -424,6 +489,65 @@ impl App {
             }
             Message::ShowErrorsToggle(val) => {
                 self.show_errors = val;
+                Task::none()
+            }
+            Message::SettingsSubTabChanged(tab) => {
+                self.settings_sub_tab = tab;
+                Task::none()
+            }
+            Message::SettingsWgMtuChanged(val) => {
+                self.settings_wg_mtu = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsWgKeepaliveChanged(val) => {
+                self.settings_wg_keepalive = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsWgHandshakeFirstChanged(val) => {
+                self.settings_wg_handshake_first = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsWgHandshakeConnectedChanged(val) => {
+                self.settings_wg_handshake_connected = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsNetlockIncomingChanged(val) => {
+                self.settings_netlock_incoming = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsNetlockAllowPingToggle(val) => {
+                self.settings_netlock_allow_ping = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsPingerTimeoutChanged(val) => {
+                self.settings_pinger_timeout = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsManifestRefreshChanged(val) => {
+                self.settings_manifest_refresh = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsPenalityChanged(val) => {
+                self.settings_penality = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsHttpTimeoutChanged(val) => {
+                self.settings_http_timeout = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsCheckingNtryChanged(val) => {
+                self.settings_checking_ntry = val;
+                self.settings_dirty = true;
                 Task::none()
             }
             Message::ConnectNoLockToggle(val) => {
@@ -606,6 +730,35 @@ impl App {
                     .map(|v| v.eq_ignore_ascii_case("true"))
                     .unwrap_or(true); // default: verify ON
 
+                // WireGuard settings
+                self.settings_wg_mtu = options.get(options::WG_MTU)
+                    .cloned().unwrap_or_else(|| "1320".into());
+                self.settings_wg_keepalive = options.get(options::WG_KEEPALIVE)
+                    .cloned().unwrap_or_else(|| "15".into());
+                self.settings_wg_handshake_first = options.get(options::WG_HANDSHAKE_FIRST)
+                    .cloned().unwrap_or_else(|| "50".into());
+                self.settings_wg_handshake_connected = options.get(options::WG_HANDSHAKE_CONNECTED)
+                    .cloned().unwrap_or_else(|| "200".into());
+
+                // Network Lock settings
+                self.settings_netlock_incoming = options.get(options::NETLOCK_INCOMING)
+                    .cloned().unwrap_or_else(|| "block".into());
+                self.settings_netlock_allow_ping = options.get(options::NETLOCK_ALLOW_PING)
+                    .map(|v| v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(true);
+
+                // Advanced settings
+                self.settings_pinger_timeout = options.get(options::PINGER_TIMEOUT)
+                    .cloned().unwrap_or_else(|| "3".into());
+                self.settings_manifest_refresh = options.get(options::MANIFEST_REFRESH)
+                    .cloned().unwrap_or_else(|| "1800".into());
+                self.settings_penality = options.get(options::PENALITY_ON_ERROR)
+                    .cloned().unwrap_or_else(|| "30".into());
+                self.settings_http_timeout = options.get(options::HTTP_TIMEOUT)
+                    .cloned().unwrap_or_else(|| "10".into());
+                self.settings_checking_ntry = options.get(options::CHECKING_NTRY)
+                    .cloned().unwrap_or_else(|| "3".into());
+
                 self.settings_loaded = true;
                 self.settings_dirty = false;
             }
@@ -737,6 +890,21 @@ impl App {
                 self.connect_no_verify,
                 self.lock_installed,
                 self.lock_persistent,
+                self.settings_sub_tab,
+                // WireGuard
+                &self.settings_wg_mtu,
+                &self.settings_wg_keepalive,
+                &self.settings_wg_handshake_first,
+                &self.settings_wg_handshake_connected,
+                // Network Lock
+                &self.settings_netlock_incoming,
+                self.settings_netlock_allow_ping,
+                // Advanced
+                &self.settings_pinger_timeout,
+                &self.settings_manifest_refresh,
+                &self.settings_penality,
+                &self.settings_http_timeout,
+                &self.settings_checking_ntry,
             ),
         };
         // Per-tab error display (inline at top of content area, only when show_errors is on)
