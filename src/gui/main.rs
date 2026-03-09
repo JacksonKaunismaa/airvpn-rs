@@ -98,6 +98,10 @@ struct App {
     // Network Lock settings (profile-backed)
     settings_netlock_incoming: String,
     settings_netlock_allow_ping: bool,
+    settings_netlock_allowlist_ips: String,
+
+    // Routes (profile-backed)
+    settings_routes_custom: String,
 
     // Area filter settings (profile-backed)
     settings_areas_allowlist: String,
@@ -161,6 +165,9 @@ pub enum Message {
     // Network Lock settings
     SettingsNetlockIncomingChanged(String),
     SettingsNetlockAllowPingToggle(bool),
+    SettingsNetlockAllowlistIpsChanged(String),
+    // Routes
+    SettingsRoutesCustomChanged(String),
     // Advanced settings
     SettingsPingerTimeoutChanged(String),
     SettingsManifestRefreshChanged(String),
@@ -237,6 +244,9 @@ impl App {
 
             settings_netlock_incoming: String::new(),
             settings_netlock_allow_ping: true,
+            settings_netlock_allowlist_ips: String::new(),
+
+            settings_routes_custom: String::new(),
 
             settings_areas_allowlist: String::new(),
             settings_areas_denylist: String::new(),
@@ -500,6 +510,9 @@ impl App {
                     // Network Lock settings
                     options.insert(options::NETLOCK_INCOMING.into(), self.settings_netlock_incoming.clone());
                     options.insert(options::NETLOCK_ALLOW_PING.into(), self.settings_netlock_allow_ping.to_string());
+                    options.insert(options::NETLOCK_ALLOWLIST_IPS.into(), self.settings_netlock_allowlist_ips.clone());
+                    // Routes
+                    options.insert(options::ROUTES_CUSTOM.into(), self.settings_routes_custom.clone());
                     // Advanced settings
                     options.insert(options::PINGER_TIMEOUT.into(), self.settings_pinger_timeout.clone());
                     options.insert(options::MANIFEST_REFRESH.into(), self.settings_manifest_refresh.clone());
@@ -598,6 +611,16 @@ impl App {
             }
             Message::SettingsNetlockAllowPingToggle(val) => {
                 self.settings_netlock_allow_ping = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsNetlockAllowlistIpsChanged(val) => {
+                self.settings_netlock_allowlist_ips = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsRoutesCustomChanged(val) => {
+                self.settings_routes_custom = val;
                 self.settings_dirty = true;
                 Task::none()
             }
@@ -838,6 +861,12 @@ impl App {
                 self.settings_netlock_allow_ping = options.get(options::NETLOCK_ALLOW_PING)
                     .map(|v| v.eq_ignore_ascii_case("true"))
                     .unwrap_or(true);
+                self.settings_netlock_allowlist_ips = options.get(options::NETLOCK_ALLOWLIST_IPS)
+                    .cloned().unwrap_or_default();
+
+                // Routes
+                self.settings_routes_custom = options.get(options::ROUTES_CUSTOM)
+                    .cloned().unwrap_or_default();
 
                 // Advanced settings
                 self.settings_pinger_timeout = options.get(options::PINGER_TIMEOUT)
@@ -1006,6 +1035,9 @@ impl App {
                 // Network Lock
                 &self.settings_netlock_incoming,
                 self.settings_netlock_allow_ping,
+                &self.settings_netlock_allowlist_ips,
+                // Routes
+                &self.settings_routes_custom,
                 // Area filters
                 &self.settings_areas_allowlist,
                 &self.settings_areas_denylist,

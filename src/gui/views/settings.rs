@@ -117,6 +117,9 @@ pub fn view<'a>(
     // Network Lock settings
     netlock_incoming: &'a str,
     netlock_allow_ping: bool,
+    netlock_allowlist_ips: &'a str,
+    // Routes
+    routes_custom: &'a str,
     // Area filters
     areas_allowlist: &'a str,
     areas_denylist: &'a str,
@@ -148,7 +151,7 @@ pub fn view<'a>(
             locklast,
             show_errors,
         ),
-        SettingsSubTab::Network => view_network(ipv6_mode, dns, areas_allowlist, areas_denylist),
+        SettingsSubTab::Network => view_network(ipv6_mode, dns, routes_custom, areas_allowlist, areas_denylist),
         SettingsSubTab::WireGuard => view_wireguard(
             wg_key,
             wg_mtu,
@@ -165,6 +168,7 @@ pub fn view<'a>(
             lock_persistent,
             netlock_incoming,
             netlock_allow_ping,
+            netlock_allowlist_ips,
         ),
         SettingsSubTab::Advanced => view_advanced(
             pinger_timeout,
@@ -250,6 +254,7 @@ fn view_general<'a>(
 fn view_network<'a>(
     ipv6_mode: &'a str,
     dns: &'a str,
+    routes_custom: &'a str,
     areas_allowlist: &'a str,
     areas_denylist: &'a str,
 ) -> Element<'a, Message> {
@@ -279,6 +284,21 @@ fn view_network<'a>(
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center),
+        ]
+        .spacing(8),
+    );
+
+    // Custom routes (out = bypass VPN + open firewall, in = force through tunnel)
+    content = content.push(section_header("Custom Routes"));
+    content = content.push(
+        column![
+            text("Routes with 'out' bypass the VPN and open the kill switch. Routes with 'in' force traffic through the tunnel.").size(12),
+            text_field(
+                "Custom Routes",
+                "192.168.1.0/24,out; 10.0.0.0/8,in",
+                routes_custom,
+                Message::SettingsRoutesCustomChanged,
+            ),
         ]
         .spacing(8),
     );
@@ -360,6 +380,7 @@ fn view_network_lock<'a>(
     lock_persistent: bool,
     netlock_incoming: &'a str,
     netlock_allow_ping: bool,
+    netlock_allowlist_ips: &'a str,
 ) -> Element<'a, Message> {
     let mut content = column![].spacing(16);
 
@@ -410,6 +431,21 @@ fn view_network_lock<'a>(
                 .on_toggle(Message::SettingsNetlockAllowPingToggle),
         ]
         .spacing(6),
+    );
+
+    // Allowlist IPs (firewall-only, no routing change)
+    content = content.push(section_header("Allowlist"));
+    content = content.push(
+        column![
+            text("CIDRs that pass through the kill switch firewall (no routing change). Traffic still uses the VPN tunnel.").size(12),
+            text_field(
+                "Allowlist IPs",
+                "1.2.3.4, 5.6.7.0/24",
+                netlock_allowlist_ips,
+                Message::SettingsNetlockAllowlistIpsChanged,
+            ),
+        ]
+        .spacing(8),
     );
 
     // Persistent Lock controls

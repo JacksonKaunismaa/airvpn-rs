@@ -41,6 +41,10 @@ pub const WG_HANDSHAKE_CONNECTED: &str = "wireguard.handshake.timeout.connected"
 // Network Lock
 pub const NETLOCK_INCOMING: &str = "netlock.incoming";
 pub const NETLOCK_ALLOW_PING: &str = "netlock.allow_ping";
+pub const NETLOCK_ALLOWLIST_IPS: &str = "netlock.allowlist.outgoing.ips";
+
+// Routes
+pub const ROUTES_CUSTOM: &str = "routes.custom";
 
 // Network
 pub const NETWORK_IFACE_NAME: &str = "network.iface.name";
@@ -97,6 +101,9 @@ pub static REGISTRY: &[OptionDef] = &[
     // Network Lock
     OptionDef { name: NETLOCK_INCOMING, default: "block", description: "Incoming policy: block or allow" },
     OptionDef { name: NETLOCK_ALLOW_PING, default: "true", description: "Allow ICMP ping through the lock" },
+    OptionDef { name: NETLOCK_ALLOWLIST_IPS, default: "", description: "CIDRs to allowlist through the kill switch (comma-separated)" },
+    // Routes
+    OptionDef { name: ROUTES_CUSTOM, default: "", description: "Custom routes: CIDR,action pairs separated by semicolons (action = in or out)" },
     // Network
     OptionDef { name: NETWORK_IFACE_NAME, default: "avpn0", description: "WireGuard interface name" },
     OptionDef { name: NETWORK_ENTRY_IPLAYER, default: "ipv4", description: "Preferred entry IP layer: ipv4 or ipv6" },
@@ -191,6 +198,62 @@ pub fn get_list(options: &HashMap<String, String>, key: &str) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Custom route / allowlist parsing
+// ---------------------------------------------------------------------------
+
+/// A custom route entry: CIDR + action ("in" or "out").
+///
+/// Routes with `action = "out"` bypass the VPN tunnel via the default gateway
+/// and automatically open the kill switch firewall for those CIDRs.
+/// Routes with `action = "in"` force traffic through the tunnel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomRoute {
+    pub cidr: String,
+    pub action: String, // "in" or "out"
+}
+
+/// Parse custom routes from semicolon-separated "CIDR,action" pairs.
+///
+/// Format: `"192.168.1.0/24,out; 10.0.0.0/8,in"`
+/// Semicolons or newlines separate entries; commas separate CIDR from action.
+/// Invalid entries (wrong action, missing parts) are silently skipped.
+pub fn parse_custom_routes(input: &str) -> Vec<CustomRoute> {
+    input
+        .split(';')
+        .flat_map(|s| s.split('\n'))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .filter_map(|entry| {
+            let parts: Vec<&str> = entry.splitn(2, ',').collect();
+            if parts.len() == 2 {
+                let cidr = parts[0].trim().to_string();
+                let action = parts[1].trim().to_lowercase();
+                if (action == "in" || action == "out") && !cidr.is_empty() {
+                    Some(CustomRoute { cidr, action })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Parse netlock allowlist IPs from comma-separated CIDRs.
+///
+/// These CIDRs are opened in the kill switch firewall only (no routing change).
+/// Traffic still goes through the VPN tunnel but won't be blocked during
+/// reconnection or kill switch activation.
+pub fn parse_allowlist_ips(input: &str) -> Vec<String> {
+    input
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -275,5 +338,53 @@ mod tests {
         let opts: HashMap<String, String> =
             [("k".into(), String::new())].into_iter().collect();
         assert!(get_list(&opts, "k").is_empty());
+    }
+
+    #[test]
+    fn parse_custom_routes_basic() {
+        let routes = parse_custom_routes("192.168.1.0/24,out; 10.0.0.0/8,in");
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0], CustomRoute { cidr: "192.168.1.0/24".into(), action: "out".into() });
+        assert_eq!(routes[1], CustomRoute { cidr: "10.0.0.0/8".into(), action: "in".into() });
+    }
+
+    #[test]
+    fn parse_custom_routes_newline_separator() {
+        let routes = parse_custom_routes("192.168.1.0/24,out\n10.0.0.0/8,in");
+        assert_eq!(routes.len(), 2);
+    }
+
+    #[test]
+    fn parse_custom_routes_skips_invalid() {
+        // bad action, missing comma, empty entries
+        let routes = parse_custom_routes("192.168.1.0/24,out; bad; ;10.0.0.0/8,maybe; ,in");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].cidr, "192.168.1.0/24");
+    }
+
+    #[test]
+    fn parse_custom_routes_empty_input() {
+        assert!(parse_custom_routes("").is_empty());
+        assert!(parse_custom_routes("  ").is_empty());
+    }
+
+    #[test]
+    fn parse_custom_routes_case_insensitive_action() {
+        let routes = parse_custom_routes("10.0.0.0/8,OUT; 172.16.0.0/12,In");
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].action, "out");
+        assert_eq!(routes[1].action, "in");
+    }
+
+    #[test]
+    fn parse_allowlist_ips_basic() {
+        let ips = parse_allowlist_ips("1.2.3.4, 5.6.7.0/24");
+        assert_eq!(ips, vec!["1.2.3.4", "5.6.7.0/24"]);
+    }
+
+    #[test]
+    fn parse_allowlist_ips_empty() {
+        assert!(parse_allowlist_ips("").is_empty());
+        assert!(parse_allowlist_ips("  ").is_empty());
     }
 }
