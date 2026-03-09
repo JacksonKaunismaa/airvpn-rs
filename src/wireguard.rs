@@ -16,9 +16,6 @@ use crate::manifest::{Mode, Server, UserInfo, WireGuardKey};
 /// Avoids /tmp which is world-readable and vulnerable to symlink attacks.
 const WG_CONFIG_DIR: &str = "/run/airvpn-rs";
 
-/// MTU for the WireGuard interface. Matches Eddie's WireGuard MTU.
-const WG_MTU: u16 = 1320;
-
 /// Fixed WireGuard interface name. Using a constant instead of a random
 /// tempfile-derived name enables exact nftables matching (`oifname "avpn0"`)
 /// rather than wildcard matching (`oifname "avpn-*"`), which is more secure
@@ -135,7 +132,7 @@ fn ensure_cidr(ip: &str, default_suffix: &str) -> String {
 /// interfaces during connection.
 ///
 /// Returns `WgConnectParams` containing the config and separated address/MTU info.
-pub fn generate_config(key: &WireGuardKey, server: &Server, mode: &Mode, user: &UserInfo) -> Result<WgConnectParams> {
+pub fn generate_config(key: &WireGuardKey, server: &Server, mode: &Mode, user: &UserInfo, keepalive: u16) -> Result<WgConnectParams> {
     if key.wg_private_key.is_empty() {
         anyhow::bail!("missing WireGuard private key from API response");
     }
@@ -195,9 +192,9 @@ PublicKey = {}
         "\
 Endpoint = {}
 AllowedIPs = 0.0.0.0/0, ::/0
-PersistentKeepalive = 15
+PersistentKeepalive = {}
 ",
-        endpoint,
+        endpoint, keepalive,
     ));
 
     // wg-native config: only fields `wg setconf` understands.
@@ -232,7 +229,7 @@ PrivateKey = {}
 /// 7. `setup_routing()` — policy routing through the tunnel
 ///
 /// Returns (config_path, interface_name) on success.
-pub fn connect(params: &WgConnectParams, ipv6_enabled: bool) -> Result<(String, String, String)> {
+pub fn connect(params: &WgConnectParams, ipv6_enabled: bool, mtu: u16) -> Result<(String, String, String)> {
     debug!("WireGuard connect: endpoint_ip={}, config_len={} bytes",
            params.endpoint_ip, params.wg_config.len());
 
@@ -348,7 +345,7 @@ pub fn connect(params: &WgConnectParams, ipv6_enabled: bool) -> Result<(String, 
     }
 
     // 4. Set MTU
-    let mtu_str = WG_MTU.to_string();
+    let mtu_str = mtu.to_string();
     let output = Command::new("ip")
         .args(["link", "set", "mtu", &mtu_str, "dev", &iface])
         .output()
@@ -356,7 +353,7 @@ pub fn connect(params: &WgConnectParams, ipv6_enabled: bool) -> Result<(String, 
     if !output.status.success() {
         cleanup_all(&iface, &config_path);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("ip link set mtu {} dev {} failed: {}", WG_MTU, iface, stderr.trim());
+        anyhow::bail!("ip link set mtu {} dev {} failed: {}", mtu, iface, stderr.trim());
     }
 
     // 5. Bring interface up
@@ -963,7 +960,7 @@ mod tests {
         let mode = test_mode();
         let user = test_user();
 
-        let params = generate_config(&key, &server, &mode, &user).unwrap();
+        let params = generate_config(&key, &server, &mode, &user, 15).unwrap();
         let config = &*params.wg_config;
 
         // Verify returned fields
@@ -997,7 +994,7 @@ mod tests {
         let mode = test_mode();
         let user = test_user();
 
-        let params = generate_config(&key, &server, &mode, &user).unwrap();
+        let params = generate_config(&key, &server, &mode, &user, 15).unwrap();
         let config = &*params.wg_config;
         assert!(
             !config.contains("PresharedKey"),
@@ -1019,7 +1016,7 @@ mod tests {
             entry_index: 1,
         };
 
-        let params = generate_config(&key, &server, &mode, &user).unwrap();
+        let params = generate_config(&key, &server, &mode, &user, 15).unwrap();
         let config = &*params.wg_config;
         assert!(
             config.contains("Endpoint = 185.32.12.2:1637"),
@@ -1041,7 +1038,7 @@ mod tests {
             entry_index: 99,
         };
 
-        let params = generate_config(&key, &server, &mode, &user).unwrap();
+        let params = generate_config(&key, &server, &mode, &user, 15).unwrap();
         let config = &*params.wg_config;
         assert!(
             config.contains("Endpoint = 185.32.12.1:1637"),
@@ -1073,7 +1070,7 @@ mod tests {
             warning_closed: String::new(),
         };
 
-        let result = generate_config(&key, &server, &mode, &user);
+        let result = generate_config(&key, &server, &mode, &user, 15);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("no entry IPs"));
     }
@@ -1102,7 +1099,7 @@ mod tests {
             warning_closed: String::new(),
         };
 
-        let params = generate_config(&key, &server, &mode, &user).unwrap();
+        let params = generate_config(&key, &server, &mode, &user, 15).unwrap();
         let config = &*params.wg_config;
         assert!(
             config.contains("Endpoint = [fd00::1]:1637"),
@@ -1143,7 +1140,7 @@ mod tests {
             warning_closed: String::new(),
         };
 
-        let params = generate_config(&key, &server, &mode, &user).unwrap();
+        let params = generate_config(&key, &server, &mode, &user, 15).unwrap();
         let config = &*params.wg_config;
         assert!(
             config.contains("Endpoint = 203.0.113.1:1637"),
@@ -1183,7 +1180,7 @@ mod tests {
             warning_closed: String::new(),
         };
 
-        let params = generate_config(&key, &server, &mode, &user).unwrap();
+        let params = generate_config(&key, &server, &mode, &user, 15).unwrap();
         let config = &*params.wg_config;
         assert!(
             config.contains("Endpoint = [2001:db8::1]:1637"),
@@ -1204,7 +1201,7 @@ mod tests {
         let mode = test_mode();
         let user = test_user();
 
-        let result = generate_config(&key, &server, &mode, &user);
+        let result = generate_config(&key, &server, &mode, &user, 15);
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("private key"),
@@ -1224,7 +1221,7 @@ mod tests {
         let mut user = test_user();
         user.wg_public_key = String::new();
 
-        let result = generate_config(&key, &server, &mode, &user);
+        let result = generate_config(&key, &server, &mode, &user, 15);
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("public key"),
@@ -1249,7 +1246,7 @@ mod tests {
             entry_index: 0,
         };
 
-        let result = generate_config(&key, &server, &mode, &user);
+        let result = generate_config(&key, &server, &mode, &user, 15);
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("no port"),
@@ -1348,7 +1345,7 @@ mod tests {
         let mode = test_mode();
         let user = test_user();
 
-        let result = generate_config(&key, &server, &mode, &user);
+        let result = generate_config(&key, &server, &mode, &user, 15);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -1366,7 +1363,7 @@ mod tests {
         let mode = test_mode();
         let user = test_user();
 
-        let result = generate_config(&key, &server, &mode, &user);
+        let result = generate_config(&key, &server, &mode, &user, 15);
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("invalid characters"),

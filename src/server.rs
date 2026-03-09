@@ -219,6 +219,7 @@ pub fn score_with_penalty(
     penalties: &ServerPenalties,
     ping_ms: i64,
     score_type: ScoreType,
+    penality_factor: i64,
 ) -> i64 {
     let base = score_with_ping(server, ping_ms, score_type);
     // Don't inflate sentinel values (warnings/errors/unmeasured ping)
@@ -227,7 +228,7 @@ pub fn score_with_penalty(
     }
     let penalty = penalties.get(&server.name);
     // Eddie: Penality * penality_factor where penality_factor defaults to 1000
-    base + penalty * 1000
+    base + penalty * penality_factor
 }
 
 /// Filter servers by allowlist/denylist rules (matching Eddie's GetConnections filtering).
@@ -314,6 +315,7 @@ pub fn select_server_with_penalties<'a>(
     penalties: &ServerPenalties,
     pings: &LatencyCache,
     score_type: ScoreType,
+    penality_factor: i64,
 ) -> anyhow::Result<&'a Server> {
     if servers.is_empty() {
         bail!("no servers available");
@@ -331,8 +333,8 @@ pub fn select_server_with_penalties<'a>(
     servers
         .iter()
         .min_by(|a, b| {
-            let sa = score_with_penalty(a, penalties, pings.get(&a.name), score_type);
-            let sb = score_with_penalty(b, penalties, pings.get(&b.name), score_type);
+            let sa = score_with_penalty(a, penalties, pings.get(&a.name), score_type, penality_factor);
+            let sb = score_with_penalty(b, penalties, pings.get(&b.name), score_type, penality_factor);
             sa.cmp(&sb)
         })
         .context("no servers available")
@@ -543,7 +545,7 @@ mod tests {
         penalties.penalize("Alpha", 30);
         // Base score with ping=10ms: 10 + 0 + 10 + 20 = 40
         // Penalty contribution = 30 * 1000 = 30000
-        assert_eq!(score_with_penalty(&s, &penalties, 10, ScoreType::Speed), 30040);
+        assert_eq!(score_with_penalty(&s, &penalties, 10, ScoreType::Speed, 1000), 30040);
     }
 
     #[test]
@@ -554,7 +556,7 @@ mod tests {
         let s = make_server("Alpha", 500_000, 1000, 50, 250, 10, "", "");
         let mut penalties = ServerPenalties::new();
         penalties.penalize("Alpha", 30);
-        assert_eq!(score_with_penalty(&s, &penalties, -1, ScoreType::Speed), 30030);
+        assert_eq!(score_with_penalty(&s, &penalties, -1, ScoreType::Speed, 1000), 30030);
     }
 
     #[test]
@@ -563,7 +565,7 @@ mod tests {
         let s = make_server("Closed", 500_000, 1000, 50, 250, 10, "", "maintenance");
         let mut penalties = ServerPenalties::new();
         penalties.penalize("Closed", 30);
-        assert_eq!(score_with_penalty(&s, &penalties, 10, ScoreType::Speed), 99998);
+        assert_eq!(score_with_penalty(&s, &penalties, 10, ScoreType::Speed, 1000), 99998);
     }
 
     // -------------------------------------------------------------------
@@ -601,12 +603,12 @@ mod tests {
         pings.update("Second", 5);
 
         // Without penalty, "Best" wins (score 35 vs 165)
-        let selected = select_server_with_penalties(&servers, None, &penalties, &pings, ScoreType::Speed).unwrap();
+        let selected = select_server_with_penalties(&servers, None, &penalties, &pings, ScoreType::Speed, 1000).unwrap();
         assert_eq!(selected.name, "Best");
 
         // Penalize "Best" -- now "Second" should win (35 + 30*1000 = 30035 > 165)
         penalties.penalize("Best", 30);
-        let selected = select_server_with_penalties(&servers, None, &penalties, &pings, ScoreType::Speed).unwrap();
+        let selected = select_server_with_penalties(&servers, None, &penalties, &pings, ScoreType::Speed, 1000).unwrap();
         assert_eq!(selected.name, "Second");
     }
 
@@ -621,7 +623,7 @@ mod tests {
         let pings = LatencyCache::new();
         // Explicit name should still find Alpha despite penalty
         let selected =
-            select_server_with_penalties(&servers, Some("Alpha"), &penalties, &pings, ScoreType::Speed).unwrap();
+            select_server_with_penalties(&servers, Some("Alpha"), &penalties, &pings, ScoreType::Speed, 1000).unwrap();
         assert_eq!(selected.name, "Alpha");
     }
 
@@ -636,7 +638,7 @@ mod tests {
         pings.update("Far", 200);
         pings.update("Near", 5);
 
-        let selected = select_server_with_penalties(&servers, None, &penalties, &pings, ScoreType::Speed).unwrap();
+        let selected = select_server_with_penalties(&servers, None, &penalties, &pings, ScoreType::Speed, 1000).unwrap();
         assert_eq!(selected.name, "Near");
     }
 
@@ -654,7 +656,7 @@ mod tests {
         // Only "Measured" has a ping result; "Unmeasured" defaults to -1 (→ 0 contribution)
         pings.update("Measured", 50);
 
-        let selected = select_server_with_penalties(&servers, None, &penalties, &pings, ScoreType::Speed).unwrap();
+        let selected = select_server_with_penalties(&servers, None, &penalties, &pings, ScoreType::Speed, 1000).unwrap();
         // Unmeasured: base 30 + ping 0 = 30
         // Measured: base 30 + ping 50 = 80
         assert_eq!(selected.name, "Unmeasured");
@@ -673,12 +675,12 @@ mod tests {
         let pings = LatencyCache::new(); // No pings (--skip-ping)
 
         // Without penalty, both score 30; min_by picks first (Achernar)
-        let selected = select_server_with_penalties(&servers, None, &penalties, &pings, ScoreType::Speed).unwrap();
+        let selected = select_server_with_penalties(&servers, None, &penalties, &pings, ScoreType::Speed, 1000).unwrap();
         assert_eq!(selected.name, "Achernar");
 
         // Penalize Achernar — Geminorum should now win
         penalties.penalize("Achernar", 30);
-        let selected = select_server_with_penalties(&servers, None, &penalties, &pings, ScoreType::Speed).unwrap();
+        let selected = select_server_with_penalties(&servers, None, &penalties, &pings, ScoreType::Speed, 1000).unwrap();
         assert_eq!(selected.name, "Geminorum");
     }
 
@@ -952,7 +954,7 @@ mod tests {
         // Speed mode: LowLoad wins (20+200=220 vs 160+10=170) — actually LowPing wins
         // Latency mode: LowPing definitely wins (8+8+10=26 vs 0+2+200=202)
         let selected = select_server_with_penalties(
-            &servers, None, &penalties, &pings, ScoreType::Latency,
+            &servers, None, &penalties, &pings, ScoreType::Latency, 1000,
         ).unwrap();
         assert_eq!(selected.name, "LowPing");
     }

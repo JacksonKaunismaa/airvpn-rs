@@ -30,9 +30,33 @@ pub const SERVERS_STARTLAST: &str = "servers.startlast";
 pub const SERVERS_LAST: &str = "servers.last";
 pub const SERVERS_SCORETYPE: &str = "servers.scoretype";
 
+// WireGuard
+pub const WG_MTU: &str = "wireguard.interface.mtu";
+pub const WG_KEEPALIVE: &str = "wireguard.peer.persistentkeepalive";
+pub const WG_HANDSHAKE_FIRST: &str = "wireguard.handshake.timeout.first";
+pub const WG_HANDSHAKE_CONNECTED: &str = "wireguard.handshake.timeout.connected";
+
+// Network Lock
+pub const NETLOCK_INCOMING: &str = "netlock.incoming";
+pub const NETLOCK_ALLOW_PING: &str = "netlock.allow_ping";
+
 // Network
+pub const NETWORK_IFACE_NAME: &str = "network.iface.name";
+pub const NETWORK_ENTRY_IPLAYER: &str = "network.entry.iplayer";
 pub const NETWORK_IPV6_MODE: &str = "network.ipv6.mode";
 pub const DNS_SERVERS: &str = "dns.servers";
+
+// Scoring
+pub const SCORING_PENALITY_FACTOR: &str = "scoring.penality_factor";
+
+// Advanced / Pinger
+pub const PINGER_TIMEOUT: &str = "pinger.timeout";
+pub const PINGER_ENABLED: &str = "pinger.enabled";
+pub const PINGER_JOBS: &str = "pinger.jobs";
+pub const MANIFEST_REFRESH: &str = "advanced.manifest.refresh";
+pub const PENALITY_ON_ERROR: &str = "advanced.penality_on_error";
+pub const HTTP_TIMEOUT: &str = "http.timeout";
+pub const CHECKING_NTRY: &str = "checking.ntry";
 
 // ---------------------------------------------------------------------------
 // Option registry
@@ -60,9 +84,29 @@ pub static REGISTRY: &[OptionDef] = &[
     OptionDef { name: SERVERS_STARTLAST, default: "false", description: "Resume last-used server on startup" },
     OptionDef { name: SERVERS_LAST, default: "", description: "SHA256 hash of last-used server name" },
     OptionDef { name: SERVERS_SCORETYPE, default: "Speed", description: "Server scoring mode: Speed or Latency" },
+    // WireGuard
+    OptionDef { name: WG_MTU, default: "1320", description: "MTU for the WireGuard interface" },
+    OptionDef { name: WG_KEEPALIVE, default: "15", description: "WireGuard PersistentKeepalive interval (seconds)" },
+    OptionDef { name: WG_HANDSHAKE_FIRST, default: "50", description: "Timeout for initial WireGuard handshake (seconds)" },
+    OptionDef { name: WG_HANDSHAKE_CONNECTED, default: "200", description: "Max age of handshake before treating tunnel as dead (seconds)" },
+    // Network Lock
+    OptionDef { name: NETLOCK_INCOMING, default: "block", description: "Incoming policy: block or allow" },
+    OptionDef { name: NETLOCK_ALLOW_PING, default: "true", description: "Allow ICMP ping through the lock" },
     // Network
+    OptionDef { name: NETWORK_IFACE_NAME, default: "avpn0", description: "WireGuard interface name" },
+    OptionDef { name: NETWORK_ENTRY_IPLAYER, default: "ipv4", description: "Preferred entry IP layer: ipv4 or ipv6" },
     OptionDef { name: NETWORK_IPV6_MODE, default: "in-block", description: "IPv6 mode: in, in-block, or block" },
     OptionDef { name: DNS_SERVERS, default: "", description: "Custom DNS servers (comma-separated IPs)" },
+    // Scoring
+    OptionDef { name: SCORING_PENALITY_FACTOR, default: "1000", description: "Multiplier for server penalties in scoring" },
+    // Advanced / Pinger
+    OptionDef { name: PINGER_TIMEOUT, default: "3", description: "ICMP ping timeout per server (seconds)" },
+    OptionDef { name: PINGER_ENABLED, default: "true", description: "Enable background latency pinger" },
+    OptionDef { name: PINGER_JOBS, default: "25", description: "Max concurrent ping jobs" },
+    OptionDef { name: MANIFEST_REFRESH, default: "1800", description: "Manifest refresh interval (seconds)" },
+    OptionDef { name: PENALITY_ON_ERROR, default: "30", description: "Penalty added to server score on connection error" },
+    OptionDef { name: HTTP_TIMEOUT, default: "10", description: "HTTP request timeout for API calls (seconds)" },
+    OptionDef { name: CHECKING_NTRY, default: "3", description: "Number of retries for tunnel/DNS verification" },
 ];
 
 // ---------------------------------------------------------------------------
@@ -112,6 +156,22 @@ pub fn get_bool(options: &HashMap<String, String>, key: &str) -> bool {
 /// Get a string option. Returns empty string if missing.
 pub fn get_str<'a>(options: &'a HashMap<String, String>, key: &str) -> &'a str {
     options.get(key).map(|s| s.as_str()).unwrap_or("")
+}
+
+/// Get a u64 option. Returns 0 if missing or unparseable.
+pub fn get_u64(options: &HashMap<String, String>, key: &str) -> u64 {
+    options
+        .get(key)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Get an i64 option. Returns 0 if missing or unparseable.
+pub fn get_i64(options: &HashMap<String, String>, key: &str) -> i64 {
+    options
+        .get(key)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
 }
 
 /// Get a comma-separated list option as `Vec<String>`.

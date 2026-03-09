@@ -390,9 +390,10 @@ struct SessionData {
 fn fetch_user(
     provider_config: &mut api::ProviderConfig,
     params: &SessionParams,
+    http_timeout_secs: u64,
 ) -> anyhow::Result<manifest::UserInfo> {
     info!("Fetching user data (WireGuard keys)...");
-    let user_xml = api::fetch_user(provider_config, &params.username, &params.password)?;
+    let user_xml = api::fetch_user_with_urls_timeout(provider_config, &params.username, &params.password, &[], http_timeout_secs)?;
     let user_info = manifest::parse_user(&user_xml)?;
     debug!("User info: login={}, {} WireGuard keys", user_info.login, user_info.keys.len());
     if user_info.keys.is_empty() {
@@ -417,7 +418,8 @@ fn fetch_initial_data(
     });
 
     // Fetch user info (WG keys — needed fresh per-connect)
-    let user_info = fetch_user(provider_config, params)?;
+    let http_timeout_secs = options::get_u64(&config.resolved, options::HTTP_TIMEOUT);
+    let user_info = fetch_user(provider_config, params, http_timeout_secs)?;
 
     // Server filtering (Eddie: GetConnections allow/deny filtering)
     let filtered_servers: Vec<manifest::Server> = server::filter_servers(
@@ -495,8 +497,9 @@ fn refresh_manifest_if_needed(
     data: &mut SessionData,
     config: &ConnectConfig,
 ) {
+    let http_timeout_secs = options::get_u64(&config.resolved, options::HTTP_TIMEOUT);
     info!("Re-fetching manifest for updated server data...");
-    match api::fetch_manifest(provider_config, &params.username, &params.password) {
+    match api::fetch_manifest_with_timeout(provider_config, &params.username, &params.password, http_timeout_secs) {
         Ok(new_xml) => match manifest::parse_manifest(&new_xml) {
             Ok(new_manifest) => {
                 let new_filtered: Vec<manifest::Server> = server::filter_servers(
@@ -531,7 +534,7 @@ fn refresh_manifest_if_needed(
         Err(e) => warn!("Failed to re-fetch manifest, using stale data: {:#}", e),
     }
     // Also refresh user data (WireGuard keys may have changed)
-    match api::fetch_user_with_urls(provider_config, &params.username, &params.password, &data.manifest.bootstrap_urls) {
+    match api::fetch_user_with_urls_timeout(provider_config, &params.username, &params.password, &data.manifest.bootstrap_urls, http_timeout_secs) {
         Ok(new_user_xml) => match manifest::parse_user(&new_user_xml) {
             Ok(new_user) => {
                 data.user_info = new_user;
@@ -551,6 +554,7 @@ fn run_monitor_loop(
     no_lock: bool,
     dns_ipv4: &str,
     dns_ipv6: &str,
+    handshake_timeout_connected: u64,
 ) -> ResetLevel {
     let mut dns_fail_count: u32 = 0;
     loop {
@@ -564,8 +568,8 @@ fn run_monitor_loop(
             break ResetLevel::Error;
         }
 
-        if wireguard::is_handshake_stale(iface, 200) {
-            error!("WireGuard handshake stale (>200s) -- tunnel may be dead");
+        if wireguard::is_handshake_stale(iface, handshake_timeout_connected) {
+            error!("WireGuard handshake stale (>{}s) -- tunnel may be dead", handshake_timeout_connected);
             break ResetLevel::Error;
         }
 
@@ -643,11 +647,11 @@ fn activate_netlock(
     let lock_config = netlock::NetlockConfig {
         allow_lan: config.allow_lan,
         allow_dhcp: true,
-        allow_ping: true,
+        allow_ping: options::get_bool(&config.resolved, options::NETLOCK_ALLOW_PING),
         allow_ipv4ipv6translation: true,
         allowed_ips_incoming: vec![],
         allowed_ips_outgoing: allowed_ips,
-        incoming_policy_accept: false,
+        incoming_policy_accept: options::get_str(&config.resolved, options::NETLOCK_INCOMING) == "allow",
     };
     netlock::activate(&lock_config)?;
     info!("Network lock active (dedicated nftables table)");
@@ -731,6 +735,7 @@ fn handle_connection_failure(
     forced_server: &mut Option<String>,
     consecutive_failures: &mut u32,
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    penality_on_error: i64,
 ) {
     let network_down = check_network && !wireguard::has_default_gateway();
     if network_down || lock_last {
@@ -739,7 +744,7 @@ fn handle_connection_failure(
         }
         // Don't penalize, don't clear forced_server (retry same server)
     } else {
-        penalties.penalize(server_name, 30);
+        penalties.penalize(server_name, penality_on_error);
         *forced_server = None;
     }
     *consecutive_failures += 1;
@@ -774,6 +779,7 @@ fn verify_connection(
     wg_ipv4: &str,
     dns_ipv4: &str,
     dns_ipv6: &str,
+    checking_ntry: u32,
 ) -> bool {
     let check_domain = manifest.check_domain.as_str();
     let check_dns_query = manifest.check_dns_query.as_str();
@@ -782,7 +788,7 @@ fn verify_connection(
     debug!("Verification: check_domain={:?}, check_dns_query={:?}, exit_ip={:?}, server={}", check_domain, check_dns_query, exit_ip, server_ref.name);
 
     info!("Verifying tunnel...");
-    match verify::check_tunnel(&server_ref.name, wg_ipv4, check_domain, exit_ip, check_protocol) {
+    match verify::check_tunnel(&server_ref.name, wg_ipv4, check_domain, exit_ip, check_protocol, checking_ntry) {
         Ok(()) => info!("Tunnel verified."),
         Err(e) => {
             warn!("Tunnel verification failed: {:#}", e);
@@ -793,7 +799,7 @@ fn verify_connection(
     if shutdown.load(Ordering::Relaxed) { return true; }
 
     info!("Verifying DNS...");
-    match verify::check_dns(&server_ref.name, check_domain, exit_ip, check_dns_query, check_protocol) {
+    match verify::check_dns(&server_ref.name, check_domain, exit_ip, check_dns_query, check_protocol, checking_ntry) {
         Ok(()) => info!("DNS verified."),
         Err(e) => {
             warn!("DNS verification failed: {:#}", e);
@@ -869,10 +875,11 @@ fn handle_reset_level(
                 return Ok(true);
             }
             let _ = partial_disconnect(config_path, iface, !config.no_lock, endpoint_ip);
+            let penality_on_error = options::get_i64(&config.resolved, options::PENALITY_ON_ERROR);
             handle_connection_failure(
                 server_name, lock_last, true,
                 penalties, forced_server, consecutive_failures,
-                &params.shutdown,
+                &params.shutdown, penality_on_error,
             );
             Ok(false)
         }
@@ -1012,12 +1019,14 @@ pub fn run(
         };
 
         // 6. Select server (penalty-aware + ping-aware, from filtered list)
+        let penality_factor = options::get_i64(&config.resolved, options::SCORING_PENALITY_FACTOR);
         let server_ref = server::select_server_with_penalties(
             &data.filtered_servers,
             forced_server.as_deref(),
             &penalties,
             &data.ping_results,
             params.score_type,
+            penality_factor,
         )?;
         info!(
             "Selected server: {} ({}, {})",
@@ -1064,12 +1073,14 @@ pub fn run(
         let dns_ipv6: &str = &effective_dns_ipv6_owned;
 
         // 7b. Pre-connection authorization (Eddie: Session.cs:173-218)
-        let reset_from_auth = match api::fetch_connect_with_urls(
+        let http_timeout_secs = options::get_u64(&config.resolved, options::HTTP_TIMEOUT);
+        let reset_from_auth = match api::fetch_connect_with_urls_timeout(
             provider_config,
             &params.username,
             &params.password,
             &server_ref.name,
             &data.manifest.bootstrap_urls,
+            http_timeout_secs,
         ) {
             Ok(api::ConnectDirective::Ok) => {
                 info!("Authorizing connection... OK");
@@ -1102,7 +1113,8 @@ pub fn run(
                 }
                 ResetLevel::Error => {
                     // Server explicitly directed us to try another — always rotate.
-                    penalties.penalize(&server_ref.name, 30);
+                    let penality_on_error = options::get_i64(&config.resolved, options::PENALITY_ON_ERROR);
+                    penalties.penalize(&server_ref.name, penality_on_error);
                     forced_server = Option::None;
                     if config.no_reconnect {
                         cleanup_and_bail(config.no_lock, &params.blocked_ipv6_ifaces);
@@ -1135,7 +1147,8 @@ pub fn run(
         save_recovery(&params, config.no_lock, "", "", "", "", "")?;
 
         // 8. Generate WireGuard config and connect
-        let wg_params = wireguard::generate_config(wg_key, server_ref, mode, &data.user_info)?;
+        let wg_keepalive = options::get_u64(&config.resolved, options::WG_KEEPALIVE) as u16;
+        let wg_params = wireguard::generate_config(wg_key, server_ref, mode, &data.user_info, wg_keepalive)?;
         let endpoint_ip = wg_params.endpoint_ip.clone();
         debug!(
             "WireGuard config: endpoint={}, ipv4={}, ipv6={}, dns={}/{}, mode={} (keys redacted)",
@@ -1154,7 +1167,8 @@ pub fn run(
             level: "info".into(),
             message: format!("Connecting to {} via {}...", server_ref.name, mode.title),
         });
-        let (config_path, iface, original_gw) = match wireguard::connect(&wg_params, ipv6_enabled) {
+        let wg_mtu = options::get_u64(&config.resolved, options::WG_MTU) as u16;
+        let (config_path, iface, original_gw) = match wireguard::connect(&wg_params, ipv6_enabled, wg_mtu) {
             Ok(result) => {
                 consecutive_failures = 0;
                 result
@@ -1165,10 +1179,11 @@ pub fn run(
                     cleanup_and_bail(config.no_lock, &params.blocked_ipv6_ifaces);
                     return Err(e.context("WireGuard connection failed"));
                 }
+                let penality_on_error = options::get_i64(&config.resolved, options::PENALITY_ON_ERROR);
                 handle_connection_failure(
                     &server_ref.name, data.lock_last, true,
                     &mut penalties, &mut forced_server, &mut consecutive_failures,
-                    &params.shutdown,
+                    &params.shutdown, penality_on_error,
                 );
                 emit(config, crate::ipc::EngineEvent::StateChanged(
                     crate::ipc::ConnectionState::Reconnecting,
@@ -1195,7 +1210,8 @@ pub fn run(
             level: "info".into(),
             message: "Waiting for WireGuard handshake...".into(),
         });
-        if let Err(e) = wireguard::wait_for_handshake(&iface, 50) {
+        let handshake_timeout_first = options::get_u64(&config.resolved, options::WG_HANDSHAKE_FIRST);
+        if let Err(e) = wireguard::wait_for_handshake(&iface, handshake_timeout_first) {
             error!("Handshake failed: {:#}", e);
             let _ = wireguard::disconnect(&config_path, &endpoint_ip);
             if config.no_reconnect {
@@ -1203,10 +1219,11 @@ pub fn run(
                 cleanup_and_bail(config.no_lock, &params.blocked_ipv6_ifaces);
                 return Err(e);
             }
+            let penality_on_error = options::get_i64(&config.resolved, options::PENALITY_ON_ERROR);
             handle_connection_failure(
                 &server_ref.name, data.lock_last, false,
                 &mut penalties, &mut forced_server, &mut consecutive_failures,
-                &params.shutdown,
+                &params.shutdown, penality_on_error,
             );
             emit(config, crate::ipc::EngineEvent::StateChanged(
                 crate::ipc::ConnectionState::Reconnecting,
@@ -1242,9 +1259,11 @@ pub fn run(
                 level: "info".into(),
                 message: "Verifying tunnel and DNS...".into(),
             });
+            let checking_ntry = options::get_u64(&config.resolved, options::CHECKING_NTRY) as u32;
             let verify_ok = verify_connection(
                 &params.shutdown, &data.manifest, server_ref,
                 &wg_key.wg_ipv4, &effective_dns_ipv4, dns_ipv6,
+                checking_ntry,
             );
             if !verify_ok && !params.shutdown.load(Ordering::Relaxed) {
                 warn!("Verification failed, treating as connection failure, reconnecting...");
@@ -1254,10 +1273,11 @@ pub fn run(
                     cleanup_and_bail(config.no_lock, &params.blocked_ipv6_ifaces);
                     anyhow::bail!("Verification failed (--no-reconnect)");
                 }
+                let penality_on_error = options::get_i64(&config.resolved, options::PENALITY_ON_ERROR);
                 handle_connection_failure(
                     &server_ref.name, data.lock_last, false,
                     &mut penalties, &mut forced_server, &mut consecutive_failures,
-                    &params.shutdown,
+                    &params.shutdown, penality_on_error,
                 );
                 emit(config, crate::ipc::EngineEvent::StateChanged(
                     crate::ipc::ConnectionState::Reconnecting,
@@ -1285,12 +1305,14 @@ pub fn run(
         ));
 
         // 13. Monitor loop — determines ResetLevel when connection ends
+        let handshake_timeout_connected = options::get_u64(&config.resolved, options::WG_HANDSHAKE_CONNECTED);
         let reset_level = run_monitor_loop(
             &params.shutdown,
             &iface,
             config.no_lock,
             &effective_dns_ipv4,
             dns_ipv6,
+            handshake_timeout_connected,
         );
 
         // Handle reset level (Eddie: Session.cs phase 6 cleanup + wait)

@@ -623,7 +623,7 @@ AllowedIPs = 0.0.0.0/0
     // connect() will fail because the endpoint is unreachable / keys are fake,
     // but we can check the file was created with correct permissions.
     // The function cleans up the config file on failure.
-    let result = wireguard::connect(&params, false);
+    let result = wireguard::connect(&params, false, 1320);
 
     // connect() should fail (no real server), but we need to verify the file
     // handling behavior. The config file should be cleaned up after failure.

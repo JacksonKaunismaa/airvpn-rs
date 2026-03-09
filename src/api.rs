@@ -216,10 +216,14 @@ fn parse_connect_response(xml: &str) -> Result<ConnectDirective> {
 // ---------------------------------------------------------------------------
 
 pub fn fetch_manifest(config: &ProviderConfig, username: &str, password: &str) -> Result<Zeroizing<String>> {
+    fetch_manifest_with_timeout(config, username, password, 10)
+}
+
+pub fn fetch_manifest_with_timeout(config: &ProviderConfig, username: &str, password: &str, http_timeout_secs: u64) -> Result<Zeroizing<String>> {
     let mut params = base_params(username, password);
     params.insert(0, ("act".into(), "manifest".into()));
     params.insert(1, ("ts".into(), "0".into()));
-    fetch_encrypted(config, &params, &[])
+    fetch_encrypted(config, &params, &[], http_timeout_secs)
 }
 
 pub fn fetch_user(config: &ProviderConfig, username: &str, password: &str) -> Result<Zeroizing<String>> {
@@ -232,9 +236,19 @@ pub fn fetch_user_with_urls(
     password: &str,
     extra_urls: &[String],
 ) -> Result<Zeroizing<String>> {
+    fetch_user_with_urls_timeout(config, username, password, extra_urls, 10)
+}
+
+pub fn fetch_user_with_urls_timeout(
+    config: &ProviderConfig,
+    username: &str,
+    password: &str,
+    extra_urls: &[String],
+    http_timeout_secs: u64,
+) -> Result<Zeroizing<String>> {
     let mut params = base_params(username, password);
     params.insert(0, ("act".into(), "user".into()));
-    fetch_encrypted(config, &params, extra_urls)
+    fetch_encrypted(config, &params, extra_urls, http_timeout_secs)
 }
 
 pub fn fetch_connect(
@@ -253,10 +267,21 @@ pub fn fetch_connect_with_urls(
     server_name: &str,
     extra_urls: &[String],
 ) -> Result<ConnectDirective> {
+    fetch_connect_with_urls_timeout(config, username, password, server_name, extra_urls, 10)
+}
+
+pub fn fetch_connect_with_urls_timeout(
+    config: &ProviderConfig,
+    username: &str,
+    password: &str,
+    server_name: &str,
+    extra_urls: &[String],
+    http_timeout_secs: u64,
+) -> Result<ConnectDirective> {
     let mut params = base_params(username, password);
     params.insert(0, ("act".into(), "connect".into()));
     params.insert(1, ("server".into(), server_name.into()));
-    let xml = fetch_encrypted(config, &params, extra_urls)?;
+    let xml = fetch_encrypted(config, &params, extra_urls, http_timeout_secs)?;
     parse_connect_response(&xml)
 }
 
@@ -294,6 +319,7 @@ fn fetch_encrypted(
     config: &ProviderConfig,
     params: &[(String, String)],
     extra_urls: &[String],
+    http_timeout_secs: u64,
 ) -> Result<Zeroizing<String>> {
     let safe_params: Vec<(&str, &str)> = params.iter()
         .map(|(k, v)| {
@@ -317,7 +343,7 @@ fn fetch_encrypted(
     // (AirVPN's servers don't have IP-matching TLS certificates).
     // The RSA+AES application-layer envelope is the security layer.
     let client = Client::builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(http_timeout_secs))
         .user_agent("Eddie/2.24.6")
         .build()
         .context("failed to build HTTP client")?;

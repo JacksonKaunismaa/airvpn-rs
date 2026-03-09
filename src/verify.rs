@@ -55,7 +55,7 @@ fn split_domain_port(check_domain: &str) -> (&str, u16) {
 /// The caller should treat errors as non-fatal warnings.
 ///
 /// `check_domain` comes from the provider manifest (e.g. "airservers.org:89").
-pub fn check_tunnel(server_name: &str, expected_ipv4: &str, check_domain: &str, exit_ip: &str, check_protocol: &str) -> Result<()> {
+pub fn check_tunnel(server_name: &str, expected_ipv4: &str, check_domain: &str, exit_ip: &str, check_protocol: &str, max_retries: u32) -> Result<()> {
     let server_name = server_name.to_string();
     let expected_ipv4 = expected_ipv4.to_string();
     let check_domain = check_domain.to_string();
@@ -65,7 +65,7 @@ pub fn check_tunnel(server_name: &str, expected_ipv4: &str, check_domain: &str, 
     let (tx, rx) = mpsc::channel();
 
     std::thread::spawn(move || {
-        let result = check_tunnel_inner(&server_name, &expected_ipv4, &check_domain, &exit_ip, &check_protocol);
+        let result = check_tunnel_inner(&server_name, &expected_ipv4, &check_domain, &exit_ip, &check_protocol, max_retries);
         let _ = tx.send(result);
     });
 
@@ -81,7 +81,7 @@ pub fn check_tunnel(server_name: &str, expected_ipv4: &str, check_domain: &str, 
 }
 
 /// Inner tunnel check logic, run inside a thread with a hard timeout.
-fn check_tunnel_inner(server_name: &str, expected_ipv4: &str, check_domain: &str, exit_ip: &str, check_protocol: &str) -> Result<()> {
+fn check_tunnel_inner(server_name: &str, expected_ipv4: &str, check_domain: &str, exit_ip: &str, check_protocol: &str, max_retries: u32) -> Result<()> {
     // Strip CIDR suffix: "10.167.32.97/32" -> "10.167.32.97"
     let expected_ip = strip_cidr(expected_ipv4);
 
@@ -117,8 +117,8 @@ fn check_tunnel_inner(server_name: &str, expected_ipv4: &str, check_domain: &str
     // Track last error for the final bail message.
     let mut last_error: Option<String> = None;
 
-    // Try up to 3 times (with the outer timeout as the real deadline).
-    for attempt in 1..=3 {
+    // Try up to max_retries times (with the outer timeout as the real deadline).
+    for attempt in 1..=max_retries {
         if attempt > 1 {
             std::thread::sleep(Duration::from_secs(1));
         }
@@ -176,8 +176,8 @@ fn check_tunnel_inner(server_name: &str, expected_ipv4: &str, check_domain: &str
         }
     }
 
-    anyhow::bail!("tunnel check failed after 3 attempts (last: {})",
-        last_error.unwrap_or_else(|| "unknown".to_string()))
+    anyhow::bail!("tunnel check failed after {} attempts (last: {})",
+        max_retries, last_error.unwrap_or_else(|| "unknown".to_string()))
 }
 
 /// Verify DNS is routed through the VPN tunnel.
@@ -196,7 +196,7 @@ fn check_tunnel_inner(server_name: &str, expected_ipv4: &str, check_domain: &str
 ///
 /// `check_domain` comes from the provider manifest (e.g. "airservers.org:89").
 /// `check_dns_query` is the DNS query template (e.g. "{hash}.airvpn.org").
-pub fn check_dns(server_name: &str, check_domain: &str, exit_ip: &str, check_dns_query: &str, check_protocol: &str) -> Result<()> {
+pub fn check_dns(server_name: &str, check_domain: &str, exit_ip: &str, check_dns_query: &str, check_protocol: &str, max_retries: u32) -> Result<()> {
     if check_dns_query.is_empty() {
         anyhow::bail!("DNS check skipped: manifest has no check_dns_query template");
     }
@@ -210,7 +210,7 @@ pub fn check_dns(server_name: &str, check_domain: &str, exit_ip: &str, check_dns
     let (tx, rx) = mpsc::channel();
 
     std::thread::spawn(move || {
-        let result = check_dns_inner(&server_name, &check_domain, &exit_ip, &check_dns_query, &check_protocol);
+        let result = check_dns_inner(&server_name, &check_domain, &exit_ip, &check_dns_query, &check_protocol, max_retries);
         let _ = tx.send(result);
     });
 
@@ -226,7 +226,7 @@ pub fn check_dns(server_name: &str, check_domain: &str, exit_ip: &str, check_dns
 }
 
 /// Inner DNS check logic, run inside a thread with a hard timeout.
-fn check_dns_inner(server_name: &str, check_domain: &str, exit_ip: &str, check_dns_query: &str, check_protocol: &str) -> Result<()> {
+fn check_dns_inner(server_name: &str, check_domain: &str, exit_ip: &str, check_dns_query: &str, check_protocol: &str, max_retries: u32) -> Result<()> {
     // Split "airservers.org:89" into ("airservers.org", 89)
     let (domain, port) = split_domain_port(check_domain);
 
@@ -254,8 +254,8 @@ fn check_dns_inner(server_name: &str, check_domain: &str, exit_ip: &str, check_d
     // Track last error for the final bail message.
     let mut last_error: Option<String> = None;
 
-    // Try up to 3 times (with the outer timeout as the real deadline).
-    for attempt in 1..=3 {
+    // Try up to max_retries times (with the outer timeout as the real deadline).
+    for attempt in 1..=max_retries {
         if attempt > 1 {
             std::thread::sleep(Duration::from_secs(1));
         }
@@ -322,8 +322,8 @@ fn check_dns_inner(server_name: &str, check_domain: &str, exit_ip: &str, check_d
         }
     }
 
-    anyhow::bail!("DNS check failed after 3 attempts (last: {})",
-        last_error.unwrap_or_else(|| "unknown".to_string()))
+    anyhow::bail!("DNS check failed after {} attempts (last: {})",
+        max_retries, last_error.unwrap_or_else(|| "unknown".to_string()))
 }
 
 /// Generate a short random hex token for DNS verification.
@@ -389,7 +389,7 @@ mod tests {
     fn test_check_tunnel_timeout_on_bad_ip() {
         // With a non-routable exit IP, the check should time out (not hang).
         let start = std::time::Instant::now();
-        let result = check_tunnel("TestServer", "10.0.0.1", "example.invalid", "192.0.2.1", "https");
+        let result = check_tunnel("TestServer", "10.0.0.1", "example.invalid", "192.0.2.1", "https", 3);
         let elapsed = start.elapsed();
         assert!(result.is_err());
         // Must complete within VERIFY_TIMEOUT + small margin (not hang forever)
@@ -401,7 +401,7 @@ mod tests {
     fn test_check_dns_timeout_on_bad_ip() {
         // With a non-routable exit IP, the check should time out (not hang).
         let start = std::time::Instant::now();
-        let result = check_dns("TestServer", "example.invalid", "192.0.2.1", "{hash}.example.invalid", "https");
+        let result = check_dns("TestServer", "example.invalid", "192.0.2.1", "{hash}.example.invalid", "https", 3);
         let elapsed = start.elapsed();
         assert!(result.is_err());
         // Must complete within VERIFY_TIMEOUT + small margin (not hang forever)
@@ -412,7 +412,7 @@ mod tests {
     #[test]
     fn test_check_dns_empty_query_template() {
         // Empty check_dns_query should bail immediately, not hang.
-        let result = check_dns("TestServer", "example.invalid", "192.0.2.1", "", "https");
+        let result = check_dns("TestServer", "example.invalid", "192.0.2.1", "", "https", 3);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("no check_dns_query"));
     }

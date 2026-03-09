@@ -130,9 +130,10 @@ impl LatencyCache {
 }
 
 /// Ping an IP via the default route (host routes send it through physical NIC).
-fn ping_ip(ip: &str) -> Option<u64> {
+fn ping_ip(ip: &str, timeout_secs: u64) -> Option<u64> {
+    let timeout_str = timeout_secs.to_string();
     let mut cmd = Command::new("ping");
-    cmd.args(["-c", "1", "-W", "3", "-q"]);
+    cmd.args(["-c", "1", "-W", &timeout_str, "-q"]);
     cmd.arg(ip);
     let output = cmd.output().ok()?;
 
@@ -277,6 +278,7 @@ mod tests {
 /// EWMA smoothing handles outliers across cycles.
 pub fn measure_all_from_ips(
     pairs: &[(String, String)],
+    ping_timeout_secs: u64,
 ) -> Vec<(String, i64)> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -296,8 +298,9 @@ pub fn measure_all_from_ips(
             let ip = ip.clone();
             let completed = Arc::clone(&completed);
 
+            let timeout = ping_timeout_secs;
             thread::spawn(move || {
-                let latency = match ping_ip(&ip) {
+                let latency = match ping_ip(&ip, timeout) {
                     Some(ms) => ms as i64,
                     None => -1,
                 };
@@ -344,7 +347,7 @@ pub fn measure_all(servers: &[crate::manifest::Server]) -> LatencyCache {
         })
         .collect();
 
-    let results = measure_all_from_ips(&pairs);
+    let results = measure_all_from_ips(&pairs, 3);
 
     let mut cache = LatencyCache::new();
     for (name, latency) in &results {
