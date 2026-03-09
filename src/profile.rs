@@ -345,6 +345,8 @@ pub fn save_profile(
                 .with_context(|| format!("failed to create temp profile: {}", temp.display()))?;
             f.write_all(&file_data)
                 .with_context(|| format!("failed to write temp profile: {}", temp.display()))?;
+            f.sync_all()
+                .with_context(|| format!("failed to sync temp profile: {}", temp.display()))?;
             drop(f); // ensure file handle is closed before rename
             Ok(())
         })();

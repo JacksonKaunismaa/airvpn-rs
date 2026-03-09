@@ -1108,12 +1108,9 @@ fn dispatch_get_profile() -> Result<std::collections::HashMap<String, String>> {
     Ok(config::load_profile_options())
 }
 
-/// Save profile options to the config file (one key at a time).
+/// Save profile options to the config file (single read-modify-write cycle).
 fn dispatch_save_profile(options: &std::collections::HashMap<String, String>) -> Result<()> {
-    for (key, value) in options {
-        config::save_profile_option(key, value)?;
-    }
-    Ok(())
+    config::save_profile_options(options)
 }
 
 /// Fetch the server list from the API, optionally measure pings, and return

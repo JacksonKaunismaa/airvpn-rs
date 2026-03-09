@@ -391,6 +391,27 @@ pub fn save_profile_option(key: &str, value: &str) -> Result<()> {
     save_options(&path, &options)
 }
 
+/// Save multiple options to the profile in a single read-modify-write cycle.
+///
+/// Unlike calling `save_profile_option` in a loop (which does N full
+/// read-decrypt-modify-encrypt-write-rename cycles), this loads once,
+/// patches all keys, and saves once — atomic and crash-safe.
+pub fn save_profile_options(updates: &HashMap<String, String>) -> Result<()> {
+    let path = profile_path();
+
+    let mut options = if path.exists() {
+        load_options_from_path(&path).unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+
+    for (key, value) in updates {
+        options.insert(key.clone(), value.clone());
+    }
+
+    save_options(&path, &options)
+}
+
 /// Save credentials and optionally other options to the profile.
 ///
 /// Preserves existing options (e.g., servers.last) while updating credentials.
