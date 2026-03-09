@@ -10,6 +10,7 @@ pub mod ipc;
 pub mod ipv6;
 pub mod manifest;
 pub mod netlock;
+pub mod options;
 pub mod pinger;
 pub mod profile;
 pub mod recovery;
