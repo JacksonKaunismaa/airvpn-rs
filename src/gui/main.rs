@@ -701,6 +701,7 @@ impl App {
                 self.connected_since,
                 self.connection_count,
                 &self.selected_server,
+                self.settings_startlast,
                 &self.activity,
                 &self.eddie_import_pending,
             ),

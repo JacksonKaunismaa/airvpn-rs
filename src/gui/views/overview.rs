@@ -20,6 +20,7 @@ pub fn view<'a>(
     connected_since: Option<std::time::Instant>,
     connection_count: u32,
     selected_server: &Option<String>,
+    startlast: bool,
     activity: &'a str,
     eddie_import_pending: &'a Option<String>,
 ) -> Element<'a, Message> {
@@ -94,7 +95,8 @@ pub fn view<'a>(
         _ => {
             let connect_label = match selected_server {
                 Some(server) => format!("Connect to {}", server),
-                None => "Connect".to_string(),
+                None if startlast => "Connect (last server)".to_string(),
+                None => "Connect (best server)".to_string(),
             };
             let mut btn = button(text(connect_label));
             if !is_transitioning {
