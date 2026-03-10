@@ -1120,18 +1120,23 @@ impl App {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        // Left sidebar: tab buttons
-        let mut sidebar = column![].spacing(4).width(180);
+        // Left sidebar: tab buttons with active accent
+        let mut sidebar = column![].spacing(theme::SPACE_SM).width(theme::SIDEBAR_WIDTH);
         for tab in views::Tab::all() {
             let is_active = *tab == self.active_tab;
-            let label = text(tab.label()).size(16);
-            let mut btn = button(label).width(Fill);
-            if !is_active {
-                btn = btn.on_press(Message::TabSelected(*tab));
+            let label = text(tab.label()).size(15);
+            let mut btn = button(label).width(Fill).padding([10, 16]);
+            if is_active {
+                btn = btn.style(theme::sidebar_tab_active);
+            } else {
+                btn = btn.on_press(Message::TabSelected(*tab))
+                    .style(theme::sidebar_tab_inactive);
             }
             sidebar = sidebar.push(btn);
         }
-        let sidebar = container(sidebar).padding(8);
+        let sidebar = container(sidebar)
+            .padding([theme::SPACE_MD, theme::SPACE_SM + 4.0])
+            .style(theme::sidebar);
 
         // Right content area
         let content: Element<Message> = match self.active_tab {
@@ -1238,26 +1243,28 @@ impl App {
         };
 
         let content_with_error: Element<Message> = if let Some(err) = tab_error {
-            let err_text = text(err)
-                .size(13)
-                .color(iced::Color::from_rgb(0.91, 0.27, 0.38));
-            column![err_text, content].spacing(4).into()
+            let err_banner = container(
+                text(err).size(13).color(theme::DANGER)
+            )
+            .padding([8, 12])
+            .width(Fill)
+            .style(|_theme: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(iced::Color { r: 0.35, g: 0.12, b: 0.12, a: 1.0 })),
+                border: iced::Border { radius: theme::RADIUS_MD.into(), ..Default::default() },
+                ..Default::default()
+            });
+            column![err_banner, content].spacing(theme::SPACE_MD).into()
         } else {
             content
         };
 
-        let content = container(content_with_error).padding(16).width(Fill);
+        let content = container(content_with_error)
+            .padding(theme::SPACE_LG)
+            .width(Fill);
 
-        let mut main_col = column![];
-        main_col = main_col.push(
-            row![sidebar, content]
-                .height(Fill)
-                .spacing(0),
-        );
-
-        container(main_col)
-            .width(Fill)
+        row![sidebar, content]
             .height(Fill)
+            .spacing(0)
             .into()
     }
 

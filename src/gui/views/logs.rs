@@ -2,9 +2,10 @@
 
 use std::collections::VecDeque;
 
-use iced::widget::{button, checkbox, column, container, row, scrollable, text, Space};
+use iced::widget::{button, column, container, row, scrollable, text, Space};
 use iced::{Element, Fill};
 
+use crate::theme;
 use crate::{LogEntry, Message};
 
 /// Render the logs tab.
@@ -15,29 +16,25 @@ pub fn view<'a>(
     filter_warn: bool,
     filter_error: bool,
 ) -> Element<'a, Message> {
-    // Top bar: filter checkboxes + clear button
+    // Top bar: pill filter toggles + clear button
     let top_bar = row![
-        checkbox(filter_debug)
-            .label("Debug")
-            .on_toggle(|_| Message::LogFilterToggle("debug".into())),
-        checkbox(filter_info)
-            .label("Info")
-            .on_toggle(|_| Message::LogFilterToggle("info".into())),
-        checkbox(filter_warn)
-            .label("Warn")
-            .on_toggle(|_| Message::LogFilterToggle("warn".into())),
-        checkbox(filter_error)
-            .label("Error")
-            .on_toggle(|_| Message::LogFilterToggle("error".into())),
+        filter_pill("Debug", filter_debug, "debug"),
+        filter_pill("Info", filter_info, "info"),
+        filter_pill("Warn", filter_warn, "warn"),
+        filter_pill("Error", filter_error, "error"),
         Space::new().width(Fill),
-        button(text("Clear").size(14)).on_press(Message::LogClear),
+        button(text("Clear").size(13))
+            .padding([6, 14])
+            .style(theme::secondary_button)
+            .on_press(Message::LogClear),
     ]
-    .spacing(16)
+    .spacing(theme::SPACE_SM)
     .align_y(iced::Alignment::Center);
 
     // Filter and render log entries
-    let mut log_col = column![].spacing(2);
+    let mut log_col = column![].spacing(1.0);
     let mut count = 0;
+    let mut even = false;
 
     for entry in logs {
         if !is_visible(&entry.level, filter_debug, filter_info, filter_warn, filter_error) {
@@ -50,19 +47,51 @@ pub fn view<'a>(
         ))
         .size(12)
         .color(color);
-        log_col = log_col.push(line);
+
+        // Alternating row backgrounds for readability
+        let bg = if even {
+            iced::Color { r: 1.0, g: 1.0, b: 1.0, a: 0.03 }
+        } else {
+            iced::Color::TRANSPARENT
+        };
+
+        let row_container = container(line)
+            .width(Fill)
+            .padding([3, 8])
+            .style(move |_theme: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(bg)),
+                ..Default::default()
+            });
+
+        log_col = log_col.push(row_container);
         count += 1;
+        even = !even;
     }
 
     if count == 0 {
-        log_col = log_col.push(text("No log entries.").size(14));
+        log_col = log_col.push(
+            text("No log entries.").size(14).color(theme::TEXT_SECONDARY),
+        );
     }
 
-    let log_area = scrollable(container(log_col).padding(4))
+    let log_area = scrollable(container(log_col).padding([4.0, 0.0]))
         .anchor_bottom()
         .height(Fill);
 
-    column![top_bar, log_area].spacing(8).into()
+    column![top_bar, log_area].spacing(theme::SPACE_SM).into()
+}
+
+/// A pill toggle button for log level filtering.
+fn filter_pill<'a>(label: &'a str, active: bool, level: &'a str) -> Element<'a, Message> {
+    let btn = button(text(label).size(13))
+        .padding([5, 14])
+        .on_press(Message::LogFilterToggle(level.into()));
+    if active {
+        btn.style(theme::pill_active)
+    } else {
+        btn.style(theme::pill_inactive)
+    }
+    .into()
 }
 
 /// Check whether a log level should be displayed given the current filters.
@@ -78,17 +107,17 @@ fn is_visible(
         "info" => filter_info,
         "warn" | "warning" => filter_warn,
         "error" => filter_error,
-        _ => true, // unknown levels always shown
+        _ => true,
     }
 }
 
 /// Map log level to a display color.
 fn level_color(level: &str) -> iced::Color {
     match level.to_lowercase().as_str() {
-        "debug" => iced::Color::from_rgb(0.6, 0.6, 0.6),        // grey
-        "info" => iced::Color::from_rgb(0.85, 0.85, 0.85),       // light grey / default
-        "warn" | "warning" => iced::Color::from_rgb(1.0, 0.76, 0.03), // amber
-        "error" => iced::Color::from_rgb(0.91, 0.27, 0.38),      // red (matches error banner)
+        "debug" => iced::Color::from_rgb(0.55, 0.55, 0.55),
+        "info" => theme::TEXT,
+        "warn" | "warning" => theme::WARNING,
+        "error" => theme::DANGER,
         _ => iced::Color::WHITE,
     }
 }

@@ -1,9 +1,10 @@
 //! Settings tab: profile options, per-connect flags, persistent lock controls.
 //! Organized into sub-tabs: General, Network, WireGuard, Network Lock, Advanced.
 
-use iced::widget::{button, checkbox, column, container, pick_list, row, scrollable, text, text_input, Space};
+use iced::widget::{button, checkbox, column, container, pick_list, row, scrollable, text, text_input};
 use iced::{Element, Fill};
 
+use crate::theme;
 use crate::Message;
 
 /// Sub-tab within the Settings view.
@@ -40,54 +41,83 @@ impl SettingsSubTab {
 
 /// Section header styled text.
 fn section_header(label: &str) -> iced::widget::Text<'_> {
-    text(label).size(18)
+    text(label).size(16).color(theme::TEXT)
 }
 
-/// Label text for form fields.
-fn label(s: &str) -> iced::widget::Text<'_> {
-    text(s).size(14)
+/// Hint text below a field.
+fn hint(s: &str) -> iced::widget::Text<'_> {
+    text(s).size(12).color(theme::TEXT_SECONDARY)
 }
 
-/// A single sub-tab button in the tab bar.
+/// A single sub-tab button in the pill bar.
 fn tab_button(tab: SettingsSubTab, active: bool) -> Element<'static, Message> {
     let btn = button(text(tab.label()).size(13))
-        .on_press(Message::SettingsSubTabChanged(tab));
+        .on_press(Message::SettingsSubTabChanged(tab))
+        .padding([6, 16]);
     if active {
-        btn.style(iced::widget::button::primary)
+        btn.style(theme::pill_active)
     } else {
-        btn.style(iced::widget::button::secondary)
+        btn.style(theme::pill_inactive)
     }
     .into()
 }
 
-/// A labeled text input row.
+/// A labeled text input row (label above).
 fn text_field<'a>(
     field_label: &'a str,
     placeholder: &'a str,
     value: &'a str,
     on_input: fn(String) -> Message,
 ) -> Element<'a, Message> {
-    row![
-        label(field_label).width(220),
+    column![
+        text(field_label).size(13).color(theme::TEXT_SECONDARY),
         text_input(placeholder, value)
             .on_input(on_input)
+            .style(theme::text_input_style)
             .width(Fill),
     ]
-    .spacing(8)
-    .align_y(iced::Alignment::Center)
+    .spacing(4.0)
     .into()
+}
+
+/// A labeled dropdown row.
+fn dropdown_field<'a>(
+    field_label: &'a str,
+    options: Vec<&'a str>,
+    selected: Option<&'a str>,
+    on_select: impl Fn(&'a str) -> Message + 'a,
+) -> Element<'a, Message> {
+    column![
+        text(field_label).size(13).color(theme::TEXT_SECONDARY),
+        pick_list(options, selected, on_select).width(200),
+    ]
+    .spacing(4.0)
+    .into()
+}
+
+/// Wrap content in a card.
+fn section_card<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    container(content)
+        .padding(theme::SPACE_MD)
+        .width(Fill)
+        .style(theme::card)
+        .into()
 }
 
 /// Save button (always at the bottom).
 fn save_button(dirty: bool, loaded: bool) -> Element<'static, Message> {
-    let mut content = column![].spacing(8);
-    content = content.push(Space::new().height(8));
-    let mut save_btn = button(text("Save Settings").size(16));
+    let mut btn = button(
+        container(text("Save Settings").size(15).color(iced::Color::WHITE))
+            .width(Fill)
+            .center_x(Fill),
+    )
+    .width(Fill)
+    .padding([10, 20])
+    .style(theme::primary_button);
     if dirty && loaded {
-        save_btn = save_btn.on_press(Message::SaveSettings);
+        btn = btn.on_press(Message::SaveSettings);
     }
-    content = content.push(save_btn);
-    content.into()
+    btn.into()
 }
 
 /// Render the settings tab.
@@ -147,13 +177,13 @@ pub fn view<'a>(
     check_route: bool,
 ) -> Element<'a, Message> {
     if !loaded {
-        return container(text("Loading settings...").size(16))
-            .padding(16)
+        return container(text("Loading settings...").size(16).color(theme::TEXT_SECONDARY))
+            .padding(theme::SPACE_MD)
             .into();
     }
 
-    // Sub-tab bar
-    let mut tab_bar = row![].spacing(4);
+    // Sub-tab pill bar
+    let mut tab_bar = row![].spacing(4.0);
     for &tab in SettingsSubTab::all() {
         tab_bar = tab_bar.push(tab_button(tab, tab == sub_tab));
     }
@@ -204,13 +234,12 @@ pub fn view<'a>(
 
     let content = column![
         tab_bar,
-        Space::new().height(8),
         tab_content,
         save_button(dirty, loaded),
     ]
-    .spacing(4);
+    .spacing(theme::SPACE_MD);
 
-    scrollable(container(content).padding(4))
+    scrollable(container(content).padding([0.0, 4.0]))
         .height(Fill)
         .into()
 }
@@ -225,33 +254,26 @@ fn view_general<'a>(
     ui_unit: &'a str,
     ui_iec: bool,
 ) -> Element<'a, Message> {
-    let mut content = column![].spacing(16);
+    let mut sections = column![].spacing(theme::SPACE_MD);
 
     // Credentials
-    content = content.push(section_header("Credentials"));
-    if credentials_configured {
-        content = content.push(
-            text("Credentials: Configured")
-                .size(14)
-                .color(iced::Color::from_rgb(0.3, 0.75, 0.4)),
-        );
+    let cred_content = if credentials_configured {
+        text("Credentials configured")
+            .size(14)
+            .color(theme::SUCCESS)
     } else {
-        content = content.push(
-            column![
-                text("Credentials: Not configured")
-                    .size(14)
-                    .color(iced::Color::from_rgb(0.91, 0.65, 0.2)),
-                text("Run `sudo airvpn connect` to set up credentials, or import from Eddie profile.")
-                    .size(12),
-            ]
-            .spacing(4),
-        );
-    }
+        text("Credentials not configured — run `sudo airvpn connect` or import from Eddie")
+            .size(14)
+            .color(theme::WARNING)
+    };
+    sections = sections.push(section_card(
+        column![section_header("Credentials"), cred_content].spacing(theme::SPACE_SM),
+    ));
 
     // Server Preferences
-    content = content.push(section_header("Server Preferences"));
-    content = content.push(
+    sections = sections.push(section_card(
         column![
+            section_header("Server Preferences"),
             checkbox(startlast)
                 .label("Start with last server")
                 .on_toggle(Message::SettingsStartlastToggle),
@@ -259,42 +281,38 @@ fn view_general<'a>(
                 .label("Lock to server during session")
                 .on_toggle(Message::SettingsLocklastToggle),
         ]
-        .spacing(6),
-    );
+        .spacing(theme::SPACE_SM),
+    ));
 
     // GUI
-    content = content.push(section_header("GUI"));
-    content = content.push(
-        checkbox(show_errors)
-            .label("Show error messages")
-            .on_toggle(Message::ShowErrorsToggle),
-    );
+    sections = sections.push(section_card(
+        column![
+            section_header("GUI"),
+            checkbox(show_errors)
+                .label("Show error messages")
+                .on_toggle(Message::ShowErrorsToggle),
+        ]
+        .spacing(theme::SPACE_SM),
+    ));
 
     // Display Units
-    content = content.push(section_header("Display Units"));
-
     let unit_options: Vec<&str> = vec!["bytes", "bits"];
     let unit_selected: Option<&str> = unit_options.iter().find(|&&o| o == ui_unit).copied();
 
-    content = content.push(
+    sections = sections.push(section_card(
         column![
-            row![
-                label("Speed / Transfer Unit").width(220),
-                pick_list(unit_options, unit_selected, |selected: &str| {
-                    Message::SettingsUiUnitChanged(selected.to_string())
-                })
-                .width(160),
-            ]
-            .spacing(8)
-            .align_y(iced::Alignment::Center),
+            section_header("Display Units"),
+            dropdown_field("Speed / Transfer Unit", unit_options, unit_selected, |selected: &str| {
+                Message::SettingsUiUnitChanged(selected.to_string())
+            }),
             checkbox(ui_iec)
                 .label("Use binary IEC units (KiB/MiB instead of KB/MB)")
                 .on_toggle(Message::SettingsUiIecToggle),
         ]
-        .spacing(6),
-    );
+        .spacing(theme::SPACE_SM),
+    ));
 
-    content.into()
+    sections.into()
 }
 
 // ── Network sub-tab ────────────────────────────────────────────────────
@@ -310,87 +328,66 @@ fn view_network<'a>(
     areas_allowlist: &'a str,
     areas_denylist: &'a str,
 ) -> Element<'a, Message> {
-    let mut content = column![].spacing(16);
+    let mut sections = column![].spacing(theme::SPACE_MD);
 
-    content = content.push(section_header("Network"));
-
+    // IP modes
     let ipv6_options: Vec<&str> = vec!["in", "in-block", "block"];
     let ipv6_selected: Option<&str> = ipv6_options.iter().find(|&&o| o == ipv6_mode).copied();
     let ipv4_options: Vec<&str> = vec!["in", "block"];
     let ipv4_selected: Option<&str> = ipv4_options.iter().find(|&&o| o == ipv4_mode).copied();
 
-    content = content.push(
+    sections = sections.push(section_card(
         column![
-            row![
-                label("IPv6 Mode").width(220),
-                pick_list(ipv6_options, ipv6_selected, |selected: &str| {
-                    Message::SettingsIpv6ModeChanged(selected.to_string())
-                })
-                .width(160),
-            ]
-            .spacing(8)
-            .align_y(iced::Alignment::Center),
-            row![
-                label("IPv4 Mode").width(220),
-                pick_list(ipv4_options, ipv4_selected, |selected: &str| {
-                    Message::SettingsIpv4ModeChanged(selected.to_string())
-                })
-                .width(160),
-            ]
-            .spacing(8)
-            .align_y(iced::Alignment::Center),
+            section_header("Network"),
+            dropdown_field("IPv6 Mode", ipv6_options, ipv6_selected, |selected: &str| {
+                Message::SettingsIpv6ModeChanged(selected.to_string())
+            }),
+            dropdown_field("IPv4 Mode", ipv4_options, ipv4_selected, |selected: &str| {
+                Message::SettingsIpv4ModeChanged(selected.to_string())
+            }),
             text_field(
                 "Entry Interface",
                 "empty = auto (e.g. eth0, wlan0)",
                 entry_iface,
                 Message::SettingsEntryIfaceChanged,
             ),
-            row![
-                label("Custom DNS").width(220),
-                text_input("8.8.8.8, 1.1.1.1", dns)
-                    .on_input(Message::SettingsDnsChanged)
-                    .width(Fill),
-            ]
-            .spacing(8)
-            .align_y(iced::Alignment::Center),
+            text_field(
+                "Custom DNS",
+                "8.8.8.8, 1.1.1.1",
+                dns,
+                Message::SettingsDnsChanged,
+            ),
         ]
-        .spacing(8),
-    );
+        .spacing(theme::SPACE_SM),
+    ));
 
     // DNS Configuration
-    content = content.push(section_header("DNS Configuration"));
-
     let dns_mode_options: Vec<&str> = vec!["auto", "resolvconf", "systemd-resolved"];
     let dns_mode_selected: Option<&str> = dns_mode_options.iter().find(|&&o| o == dns_mode).copied();
 
-    content = content.push(
+    sections = sections.push(section_card(
         column![
-            row![
-                label("DNS Mode").width(220),
-                pick_list(dns_mode_options, dns_mode_selected, |selected: &str| {
-                    Message::SettingsDnsModeChanged(selected.to_string())
-                })
-                .width(200),
-            ]
-            .spacing(8)
-            .align_y(iced::Alignment::Center),
-            text("auto = detect systemd-resolved; resolvconf = force /etc/resolv.conf swap; systemd-resolved = force resolvectl").size(12),
+            section_header("DNS Configuration"),
+            dropdown_field("DNS Mode", dns_mode_options, dns_mode_selected, |selected: &str| {
+                Message::SettingsDnsModeChanged(selected.to_string())
+            }),
+            hint("auto = detect systemd-resolved; resolvconf = force /etc/resolv.conf swap"),
             text_field(
                 "DNS Cache Services",
                 "nscd,dnsmasq,named,bind9",
                 dns_services,
                 Message::SettingsDnsServicesChanged,
             ),
-            text("Services restarted on DNS flush (comma-separated)").size(12),
+            hint("Services restarted on DNS flush (comma-separated)"),
         ]
-        .spacing(6),
-    );
+        .spacing(theme::SPACE_SM),
+    ));
 
-    // Custom routes (out = bypass VPN + open firewall, in = force through tunnel)
-    content = content.push(section_header("Custom Routes"));
-    content = content.push(
+    // Custom routes
+    sections = sections.push(section_card(
         column![
-            text("Routes with 'out' bypass the VPN and open the kill switch. Routes with 'in' force traffic through the tunnel.").size(12),
+            section_header("Custom Routes"),
+            hint("Routes with 'out' bypass the VPN. Routes with 'in' force through tunnel."),
             text_field(
                 "Custom Routes",
                 "192.168.1.0/24,out; 10.0.0.0/8,in",
@@ -398,14 +395,14 @@ fn view_network<'a>(
                 Message::SettingsRoutesCustomChanged,
             ),
         ]
-        .spacing(8),
-    );
+        .spacing(theme::SPACE_SM),
+    ));
 
-    // Area filter settings (persistent, affect server selection during connect)
-    content = content.push(section_header("Country Filters"));
-    content = content.push(
+    // Country filters
+    sections = sections.push(section_card(
         column![
-            text("Restrict which countries are used for server selection during connect.").size(12),
+            section_header("Country Filters"),
+            hint("Restrict which countries are used for server selection."),
             text_field(
                 "Allowed Countries",
                 "US, NL, DE (empty = all)",
@@ -419,10 +416,10 @@ fn view_network<'a>(
                 Message::SettingsAreasDenylistChanged,
             ),
         ]
-        .spacing(8),
-    );
+        .spacing(theme::SPACE_SM),
+    ));
 
-    content.into()
+    sections.into()
 }
 
 // ── WireGuard sub-tab ──────────────────────────────────────────────────
@@ -434,12 +431,9 @@ fn view_wireguard<'a>(
     wg_handshake_first: &'a str,
     wg_handshake_connected: &'a str,
 ) -> Element<'a, Message> {
-    let mut content = column![].spacing(16);
-
-    content = content.push(section_header("WireGuard"));
-
-    content = content.push(
+    section_card(
         column![
+            section_header("WireGuard"),
             text_field("Device / Key Name", "Default", wg_key, Message::SettingsWgKeyChanged),
             text_field("Interface MTU", "1320", wg_mtu, Message::SettingsWgMtuChanged),
             text_field(
@@ -461,10 +455,8 @@ fn view_wireguard<'a>(
                 Message::SettingsWgHandshakeConnectedChanged,
             ),
         ]
-        .spacing(8),
-    );
-
-    content.into()
+        .spacing(theme::SPACE_SM),
+    )
 }
 
 // ── Network Lock sub-tab ───────────────────────────────────────────────
@@ -480,20 +472,18 @@ fn view_network_lock<'a>(
     netlock_allow_ping: bool,
     netlock_allowlist_ips: &'a str,
 ) -> Element<'a, Message> {
-    let mut content = column![].spacing(16);
+    let mut sections = column![].spacing(theme::SPACE_MD);
 
     // Connection settings
-    content = content.push(section_header("Connection"));
-    content = content.push(
+    sections = sections.push(section_card(
         column![
-            // Inverted: checked = lock ON = no_lock is false
+            section_header("Connection"),
             checkbox(!no_lock)
                 .label("Network lock (kill switch)")
                 .on_toggle(|checked| Message::ConnectNoLockToggle(!checked)),
             checkbox(allow_lan)
                 .label("Allow LAN traffic")
                 .on_toggle(Message::ConnectAllowLanToggle),
-            // Inverted: checked = reconnect ON = no_reconnect is false
             checkbox(!no_reconnect)
                 .label("Auto-reconnect")
                 .on_toggle(|checked| Message::ConnectNoReconnectToggle(!checked)),
@@ -501,41 +491,34 @@ fn view_network_lock<'a>(
                 .label("Skip tunnel verification")
                 .on_toggle(Message::ConnectNoVerifyToggle),
         ]
-        .spacing(6),
-    );
+        .spacing(theme::SPACE_SM),
+    ));
 
     // Policy settings
-    content = content.push(section_header("Lock Policy"));
-
     let incoming_options: Vec<&str> = vec!["block", "allow"];
     let incoming_selected: Option<&str> = incoming_options
         .iter()
         .find(|&&o| o == netlock_incoming)
         .copied();
 
-    content = content.push(
+    sections = sections.push(section_card(
         column![
-            row![
-                label("Incoming Policy").width(220),
-                pick_list(incoming_options, incoming_selected, |selected: &str| {
-                    Message::SettingsNetlockIncomingChanged(selected.to_string())
-                })
-                .width(160),
-            ]
-            .spacing(8)
-            .align_y(iced::Alignment::Center),
+            section_header("Lock Policy"),
+            dropdown_field("Incoming Policy", incoming_options, incoming_selected, |selected: &str| {
+                Message::SettingsNetlockIncomingChanged(selected.to_string())
+            }),
             checkbox(netlock_allow_ping)
                 .label("Allow ICMP ping")
                 .on_toggle(Message::SettingsNetlockAllowPingToggle),
         ]
-        .spacing(6),
-    );
+        .spacing(theme::SPACE_SM),
+    ));
 
-    // Allowlist IPs (firewall-only, no routing change)
-    content = content.push(section_header("Allowlist"));
-    content = content.push(
+    // Allowlist IPs
+    sections = sections.push(section_card(
         column![
-            text("CIDRs that pass through the kill switch firewall (no routing change). Traffic still uses the VPN tunnel.").size(12),
+            section_header("Allowlist"),
+            hint("CIDRs that pass through the kill switch (no routing change)."),
             text_field(
                 "Allowlist IPs",
                 "1.2.3.4, 5.6.7.0/24",
@@ -543,12 +526,10 @@ fn view_network_lock<'a>(
                 Message::SettingsNetlockAllowlistIpsChanged,
             ),
         ]
-        .spacing(8),
-    );
+        .spacing(theme::SPACE_SM),
+    ));
 
     // Persistent Lock controls
-    content = content.push(section_header("Persistent Lock"));
-
     let lock_status = if lock_installed && lock_persistent {
         "Installed and active"
     } else if lock_installed {
@@ -556,41 +537,58 @@ fn view_network_lock<'a>(
     } else {
         "Not installed"
     };
-    content = content.push(text(lock_status).size(14));
+    let lock_status_color = if lock_installed && lock_persistent {
+        theme::SUCCESS
+    } else if lock_installed {
+        theme::WARNING
+    } else {
+        theme::TEXT_SECONDARY
+    };
 
-    let mut lock_row = row![].spacing(8);
+    let mut lock_buttons = row![].spacing(theme::SPACE_SM);
 
-    // Install: enabled when NOT installed
-    let mut install_btn = button(text("Install").size(14));
+    let mut install_btn = button(text("Install").size(14))
+        .padding([8, 16])
+        .style(theme::secondary_button);
     if !lock_installed {
         install_btn = install_btn.on_press(Message::LockInstall);
     }
-    lock_row = lock_row.push(install_btn);
+    lock_buttons = lock_buttons.push(install_btn);
 
-    // Uninstall: enabled when installed
-    let mut uninstall_btn = button(text("Uninstall").size(14));
+    let mut uninstall_btn = button(text("Uninstall").size(14))
+        .padding([8, 16])
+        .style(theme::secondary_button);
     if lock_installed {
         uninstall_btn = uninstall_btn.on_press(Message::LockUninstall);
     }
-    lock_row = lock_row.push(uninstall_btn);
+    lock_buttons = lock_buttons.push(uninstall_btn);
 
-    // Enable: enabled when installed and NOT active
-    let mut enable_btn = button(text("Enable").size(14));
+    let mut enable_btn = button(text("Enable").size(14))
+        .padding([8, 16])
+        .style(theme::secondary_button);
     if lock_installed && !lock_persistent {
         enable_btn = enable_btn.on_press(Message::LockEnable);
     }
-    lock_row = lock_row.push(enable_btn);
+    lock_buttons = lock_buttons.push(enable_btn);
 
-    // Disable: enabled when installed and active
-    let mut disable_btn = button(text("Disable").size(14));
+    let mut disable_btn = button(text("Disable").size(14))
+        .padding([8, 16])
+        .style(theme::secondary_button);
     if lock_installed && lock_persistent {
         disable_btn = disable_btn.on_press(Message::LockDisable);
     }
-    lock_row = lock_row.push(disable_btn);
+    lock_buttons = lock_buttons.push(disable_btn);
 
-    content = content.push(lock_row);
+    sections = sections.push(section_card(
+        column![
+            section_header("Persistent Lock"),
+            text(lock_status).size(14).color(lock_status_color),
+            lock_buttons,
+        ]
+        .spacing(theme::SPACE_SM),
+    ));
 
-    content.into()
+    sections.into()
 }
 
 // ── Advanced sub-tab ───────────────────────────────────────────────────
@@ -608,99 +606,59 @@ fn view_advanced<'a>(
     mode_port: &'a str,
     check_route: bool,
 ) -> Element<'a, Message> {
-    let mut content = column![].spacing(16);
+    let mut sections = column![].spacing(theme::SPACE_MD);
 
-    content = content.push(section_header("Advanced"));
-
-    content = content.push(
+    // Tuning
+    sections = sections.push(section_card(
         column![
-            text_field(
-                "Pinger Timeout (s)",
-                "3",
-                pinger_timeout,
-                Message::SettingsPingerTimeoutChanged,
-            ),
-            text_field(
-                "Manifest Refresh Interval (s)",
-                "1800",
-                manifest_refresh,
-                Message::SettingsManifestRefreshChanged,
-            ),
-            text_field(
-                "Penalty on Error",
-                "30",
-                penality,
-                Message::SettingsPenalityChanged,
-            ),
-            text_field(
-                "HTTP Timeout (s)",
-                "10",
-                http_timeout,
-                Message::SettingsHttpTimeoutChanged,
-            ),
-            text_field(
-                "Verification Retries",
-                "3",
-                checking_ntry,
-                Message::SettingsCheckingNtryChanged,
-            ),
-            text_field(
-                "Capacity Factor (0 = off)",
-                "0",
-                capacity_factor,
-                Message::SettingsCapacityFactorChanged,
-            ),
+            section_header("Tuning"),
+            text_field("Pinger Timeout (s)", "3", pinger_timeout, Message::SettingsPingerTimeoutChanged),
+            text_field("Manifest Refresh Interval (s)", "1800", manifest_refresh, Message::SettingsManifestRefreshChanged),
+            text_field("Penalty on Error", "30", penality, Message::SettingsPenalityChanged),
+            text_field("HTTP Timeout (s)", "10", http_timeout, Message::SettingsHttpTimeoutChanged),
+            text_field("Verification Retries", "3", checking_ntry, Message::SettingsCheckingNtryChanged),
+            text_field("Capacity Factor (0 = off)", "0", capacity_factor, Message::SettingsCapacityFactorChanged),
         ]
-        .spacing(8),
-    );
+        .spacing(theme::SPACE_SM),
+    ));
 
     // WireGuard Mode
-    content = content.push(section_header("WireGuard Mode"));
-    content = content.push(
+    sections = sections.push(section_card(
         column![
-            text_field(
-                "Force Port",
-                "empty = auto",
-                mode_port,
-                Message::SettingsModePortChanged,
-            ),
-            text("Force a specific WireGuard port (e.g. 1637). Empty = auto-select from manifest.").size(12),
+            section_header("WireGuard Mode"),
+            text_field("Force Port", "empty = auto", mode_port, Message::SettingsModePortChanged),
+            hint("Force a specific WireGuard port (e.g. 1637). Empty = auto-select."),
         ]
-        .spacing(6),
-    );
+        .spacing(theme::SPACE_SM),
+    ));
 
-    // File Logging
-    content = content.push(section_header("Logging"));
-    content = content.push(
+    // Logging
+    sections = sections.push(section_card(
         column![
+            section_header("Logging"),
             checkbox(log_file_enabled)
                 .label("Enable file logging")
                 .on_toggle(Message::SettingsLogFileEnabledToggle),
-            text_field(
-                "Log File Path",
-                "/var/log/airvpn-rs/helper.log",
-                log_file_path,
-                Message::SettingsLogFilePathChanged,
-            ),
+            text_field("Log File Path", "/var/log/airvpn-rs/helper.log", log_file_path, Message::SettingsLogFilePathChanged),
             checkbox(log_level_debug)
                 .label("Enable debug logging")
                 .on_toggle(Message::SettingsLogLevelDebugToggle),
-            text("Debug level applies immediately. File path changes require helper restart.").size(12),
+            hint("Debug level applies immediately. File path changes require helper restart."),
         ]
-        .spacing(6),
-    );
+        .spacing(theme::SPACE_SM),
+    ));
 
     // Verification
-    content = content.push(section_header("Verification"));
-    content = content.push(
+    sections = sections.push(section_card(
         column![
+            section_header("Verification"),
             checkbox(check_route)
                 .label("Verify routes after connect")
                 .on_toggle(Message::SettingsCheckRouteToggle),
-            text("Check routing table is correctly configured post-connection (Eddie: advanced.check.route).").size(12),
+            hint("Check routing table is correctly configured post-connection."),
         ]
-        .spacing(6),
-    );
+        .spacing(theme::SPACE_SM),
+    ));
 
-    content.into()
+    sections.into()
 }
