@@ -40,6 +40,10 @@ pub struct ConnectConfig {
     pub manifest: manifest::Manifest,
     /// Pre-resolved options (defaults -> profile -> session overrides).
     pub resolved: std::collections::HashMap<String, String>,
+    /// External shutdown flag (helper daemon sets this on disconnect).
+    /// When provided, the connect engine uses this instead of installing
+    /// its own signal handler — avoids poisoning the helper's accept loop.
+    pub shutdown: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Emit an engine event to the event channel.
@@ -409,10 +413,13 @@ fn preflight_and_cleanup() -> anyhow::Result<()> {
 /// Installs the signal handler, resolves credentials, IPv6 mode,
 /// custom DNS, and blocks IPv6 on all interfaces.
 fn resolve_session(config: &ConnectConfig) -> anyhow::Result<SessionParams> {
-    // Install signal handler EARLY — before any infrastructure changes
-    // so Ctrl+C / SIGTERM during netlock/WireGuard/DNS setup sets the flag
-    // instead of killing the process with no cleanup.
-    let shutdown = recovery::setup_signal_handler()?;
+    // Use externally-provided shutdown flag (helper daemon) or install our own
+    // signal handler (standalone CLI). The helper provides a per-connection flag
+    // so that disconnect doesn't poison the helper's accept loop.
+    let shutdown = match &config.shutdown {
+        Some(flag) => flag.clone(),
+        None => recovery::setup_signal_handler()?,
+    };
     let nonce = recovery::generate_nonce();
 
     // Credentials arrive pre-resolved from the caller (CLI or helper daemon).

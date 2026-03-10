@@ -15,14 +15,18 @@ use crate::ipc::{self, ConnectionState, HelperEvent, ServerInfo};
 /// Connect to the helper socket. If the socket doesn't exist, the error
 /// message guides the user to enable the systemd socket unit.
 fn connect_to_helper() -> Result<UnixStream> {
-    UnixStream::connect(SOCKET_PATH).with_context(|| {
+    let stream = UnixStream::connect(SOCKET_PATH).with_context(|| {
         format!(
             "Could not connect to helper at {}.\n\
              Enable the socket unit:\n\n  \
              sudo systemctl enable --now airvpn-helper.socket",
             SOCKET_PATH
         )
-    })
+    })?;
+    // Timeout prevents the CLI from hanging indefinitely if the helper is
+    // alive but unresponsive (e.g. stuck in shutdown).
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+    Ok(stream)
 }
 
 /// Parsed HTTP response headers.
@@ -171,6 +175,8 @@ fn http_stream(
     on_event: impl Fn(&HelperEvent) -> EventAction,
 ) -> Result<(u16, String)> {
     let stream = connect_to_helper()?;
+    // Streaming endpoints send events over minutes/hours — disable read timeout.
+    stream.set_read_timeout(None)?;
     let mut writer = stream.try_clone().context("clone socket")?;
 
     // Write request
