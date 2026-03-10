@@ -5,7 +5,7 @@
 > code comments (search for "Eddie" or "diverge") and compare against
 > [Eddie's source](https://github.com/AirVPN/Eddie).
 >
-> Last reviewed: 2026-03-07
+> Last reviewed: 2026-03-10
 
 This codebase is a faithful Rust reimplementation of Eddie (AirVPN's official
 C# client). The vast majority of behavior — scoring formulas, penalty system,
@@ -97,20 +97,16 @@ tools to accidentally remove than a flushed-and-replaced ruleset.
 
 ---
 
-## 4. servers.startlast defaults to true
+## 4. ~~servers.startlast defaults to true~~ — RESOLVED
 
 **Eddie:** Both `servers.locklast` and `servers.startlast` default to `false`
-(ProfileOptions.cs lines 435-436). Users must explicitly enable them in the
-GUI.
+(ProfileOptions.cs lines 435-436).
 
-**airvpn-rs:** `servers.locklast` now defaults to `false` (matching Eddie).
-`servers.startlast` still defaults to `true` — a laptop-first preference for
-resuming the last-used server on startup.
+**airvpn-rs:** Both now default to `false`, matching Eddie exactly (fixed in M3).
 
-Network-down detection (`has_default_gateway()`) handles the WiFi-drop case
-that originally motivated the `locklast=true` default: when there's no gateway,
-the server is not penalized and is retried. When the gateway exists, the server
-is penalized and rotation occurs.
+Network-down detection (`has_default_gateway()`) handles the WiFi-drop case:
+when there's no gateway, the server is not penalized and is retried. When the
+gateway exists, the server is penalized and rotation occurs.
 
 **Files:** `src/connect.rs` — lock_last/start_last resolution
 
