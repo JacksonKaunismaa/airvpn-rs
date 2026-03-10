@@ -97,24 +97,7 @@ tools to accidentally remove than a flushed-and-replaced ruleset.
 
 ---
 
-## 4. ~~servers.startlast defaults to true~~ — RESOLVED
-
-**Eddie:** Both `servers.locklast` and `servers.startlast` default to `false`
-(ProfileOptions.cs lines 435-436).
-
-**airvpn-rs:** Both now default to `false`, matching Eddie exactly (fixed in M3).
-
-Network-down detection (`has_default_gateway()`) handles the WiFi-drop case:
-when there's no gateway, the server is not penalized and is retried. When the
-gateway exists, the server is penalized and rotation occurs.
-
-**Files:** `src/connect.rs` — lock_last/start_last resolution
-
-**Eddie ref:** `ProfileOptions.cs` lines 435-436
-
----
-
-## 5. WireGuard-only, via `wg` CLI instead of `libwg` kernel API
+## 4. WireGuard-only, via `wg` CLI instead of `libwg` kernel API
 
 **Eddie:** Supports both OpenVPN and WireGuard. Eddie's WireGuard
 implementation on Linux uses the `libwg` C kernel API (`wg_add_device`,
@@ -139,7 +122,7 @@ created, so it inherits disabled IPv6 with no race condition.
 
 ---
 
-## 6. Persistent network lock (kill switch)
+## 5. Persistent network lock (kill switch)
 
 **Eddie:** Network lock activates at session start and deactivates at session end.
 Between sessions, traffic is unrestricted. Eddie uses a single nftables table and
@@ -179,7 +162,7 @@ doesn't have per-app UIDs, so the nftables approach is more appropriate).
 
 ---
 
-## 8. Single control plane with systemd socket activation
+## 6. Single control plane with systemd socket activation
 
 **Eddie:** CLI connects directly (elevated via pkexec, sudo, or suid root,
 depending on what's available). GUI launches a separate elevated C++ binary,
@@ -215,7 +198,7 @@ Eddie profile discovery and audit logging).
 
 ---
 
-## 9. Persistent lock: ICMP allowlist for background pinger
+## 7. Persistent lock: ICMP allowlist for background pinger
 
 **Eddie:** Session lock allows ICMP when `netlock.allow_ping = true` (default).
 Input: echo-request accept. Output: echo-reply accept (IPv4) or all ICMPv6
@@ -242,7 +225,7 @@ only needs echo-request/reply.
 
 ---
 
-## 10. Background pinger with EWMA smoothing
+## 8. Background pinger with EWMA smoothing
 
 **Eddie:** Background `Jobs/Latency.cs` pings servers sequentially, every 180s
 (success) or 5s (retry). Uses running average `(old + new) / 2` (α=0.5). Stops
@@ -281,7 +264,7 @@ background pinger's ICMP access.
 
 ---
 
-## 11. Exponential backoff on reconnection
+## 9. Exponential backoff on reconnection
 
 **Eddie:** Uses fixed delays between reconnection attempts: 3 seconds for
 connection errors (Session.cs line 484-485), 5 seconds for server-initiated
@@ -300,7 +283,7 @@ reconnecting quickly after transient failures.
 
 ---
 
-## 12. V2N-only credential storage
+## 10. V2N-only credential storage
 
 **Eddie:** Supports V2N (hardcoded key, no real encryption), V2S (Linux
 secret-tool / keyring), and V2P (password-protected) profile formats. Profile
@@ -322,7 +305,7 @@ root-owned file.
 
 ---
 
-## 13. Penalty cap at 120
+## 11. Penalty cap at 120
 
 **Eddie:** Penalties accumulate without an upper bound. `ConnectionInfo.Penality`
 is incremented by `advanced.penality_on_error` (default 30) on each failure,
@@ -342,7 +325,7 @@ cap ensures servers return to the selection pool within a reasonable time.
 
 ---
 
-## 14. No pre-connection ping gate
+## 12. No pre-connection ping gate
 
 **Eddie:** Blocks the connection loop until ALL server pings complete
 (`PingerInvalid() == 0` loop in Session.cs lines 121-142). This ensures the
@@ -365,7 +348,7 @@ EWMA smoothing (divergence #10) ensures data stays fresh across cycles.
 
 ---
 
-## 15. No event hooks (event.vpn.pre/up/down)
+## 13. No event hooks (event.vpn.pre/up/down)
 
 **Eddie:** Supports lifecycle event hooks (`event.vpn.pre`, `event.vpn.up`,
 `event.vpn.down`) that execute arbitrary shell commands at connection
