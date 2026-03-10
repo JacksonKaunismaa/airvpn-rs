@@ -873,7 +873,21 @@ fn handle_save_profile(body_bytes: &Bytes) -> Response<HyperBody> {
     };
 
     match dispatch_save_profile(&save_req.options) {
-        Ok(()) => json_response(StatusCode::OK, &json!({"saved": true})),
+        Ok(()) => {
+            // Apply log level changes at runtime (no helper restart needed).
+            // File path changes still require restart since simplelog doesn't
+            // support reconfiguring file handles.
+            if let Some(debug_val) = save_req.options.get(options::LOG_LEVEL_DEBUG) {
+                let new_level = if debug_val.eq_ignore_ascii_case("true") {
+                    log::LevelFilter::Debug
+                } else {
+                    log::LevelFilter::Info
+                };
+                log::set_max_level(new_level);
+                info!("Log level changed to {:?}", new_level);
+            }
+            json_response(StatusCode::OK, &json!({"saved": true}))
+        }
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to save profile: {:#}", e)),
     }
 }

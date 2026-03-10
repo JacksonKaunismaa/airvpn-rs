@@ -685,7 +685,7 @@ fn view_advanced<'a>(
             checkbox(log_level_debug)
                 .label("Enable debug logging")
                 .on_toggle(Message::SettingsLogLevelDebugToggle),
-            text("Logging changes require helper restart to take effect.").size(12),
+            text("Debug level applies immediately. File path changes require helper restart.").size(12),
         ]
         .spacing(6),
     );
