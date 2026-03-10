@@ -237,7 +237,7 @@ PrivateKey = {}
 /// 7. `setup_routing()` — policy routing through the tunnel
 ///
 /// Returns (config_path, interface_name) on success.
-pub fn connect(params: &WgConnectParams, ipv6_enabled: bool, mtu: u16, iface_name: &str) -> Result<(String, String, String)> {
+pub fn connect(params: &WgConnectParams, ipv6_enabled: bool, ipv4_enabled: bool, mtu: u16, iface_name: &str, entry_iface: &str) -> Result<(String, String, String)> {
     debug!("WireGuard connect: endpoint_ip={}, config_len={} bytes",
            params.endpoint_ip, params.wg_config.len());
 
@@ -346,15 +346,19 @@ pub fn connect(params: &WgConnectParams, ipv6_enabled: bool, mtu: u16, iface_nam
         anyhow::bail!("wg setconf {} {} failed: {}", iface, config_path, stderr.trim());
     }
 
-    // 3. Add IPv4 address only (no IPv6 — matches Eddie's in-block mode)
-    let output = Command::new("ip")
-        .args(["-4", "address", "add", &params.ipv4_address, "dev", &iface])
-        .output()
-        .context("failed to execute: ip address add")?;
-    if !output.status.success() {
-        cleanup_all(&iface, &config_path);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("ip -4 address add {} dev {} failed: {}", params.ipv4_address, iface, stderr.trim());
+    // 3. Add IPv4 address (skip if IPv4 mode is "block" — IPv6-only VPN)
+    if ipv4_enabled {
+        let output = Command::new("ip")
+            .args(["-4", "address", "add", &params.ipv4_address, "dev", &iface])
+            .output()
+            .context("failed to execute: ip address add")?;
+        if !output.status.success() {
+            cleanup_all(&iface, &config_path);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("ip -4 address add {} dev {} failed: {}", params.ipv4_address, iface, stderr.trim());
+        }
+    } else {
+        debug!("IPv4 address skipped (network.ipv4.mode = block)");
     }
 
     // 4. Set MTU
@@ -404,7 +408,7 @@ pub fn connect(params: &WgConnectParams, ipv6_enabled: bool, mtu: u16, iface_nam
     }
 
     // 7. Set up policy routing through the tunnel
-    let original_gw = match setup_routing(&iface, &params.endpoint_ip) {
+    let original_gw = match setup_routing(&iface, &params.endpoint_ip, ipv4_enabled, entry_iface) {
         Ok(gw) => gw,
         Err(e) => {
             cleanup_all(&iface, &config_path);
@@ -483,7 +487,7 @@ fn get_default_gateway_v6() -> Result<String> {
 /// 4. Add default route through VPN interface in table 51820.
 /// 5. Add policy rule: unmarked traffic uses table 51820.
 /// 6. Suppress default route from main table to prevent leaks.
-fn setup_routing(iface: &str, endpoint_ip: &str) -> Result<String> {
+fn setup_routing(iface: &str, endpoint_ip: &str, ipv4_enabled: bool, entry_iface: &str) -> Result<String> {
     debug!("Setting up routing: iface={}, endpoint_ip={}", iface, endpoint_ip);
     // 1. Set fwmark on WireGuard interface — MUST be first, before any policy
     //    routing rules. Without this, WireGuard's own encrypted packets (going
@@ -512,11 +516,21 @@ fn setup_routing(iface: &str, endpoint_ip: &str) -> Result<String> {
     // 3. Add host route for VPN endpoint through original gateway.
     //    This ensures encrypted WireGuard packets reach the server even after
     //    our policy routing redirects everything else through the tunnel.
+    //    If entry_iface is specified, bind to that physical NIC.
     let cidr_suffix = if is_ipv6_endpoint { "/128" } else { "/32" };
     let ip_version = if is_ipv6_endpoint { "-6" } else { "-4" };
     let endpoint_route = format!("{}{}", endpoint_ip, cidr_suffix);
+    let mut route_args = vec![ip_version, "route", "add", &endpoint_route, "via", &original_gw];
+    if !entry_iface.is_empty() {
+        if !crate::common::validate_interface_name(entry_iface) {
+            anyhow::bail!("invalid entry interface name: {:?}", entry_iface);
+        }
+        route_args.push("dev");
+        route_args.push(entry_iface);
+        debug!("Binding endpoint route to physical NIC: {}", entry_iface);
+    }
     let output = Command::new("ip")
-        .args([ip_version, "route", "add", &endpoint_route, "via", &original_gw])
+        .args(&route_args)
         .output()
         .with_context(|| format!("failed to add host route for endpoint {}", endpoint_ip))?;
     if !output.status.success() {
@@ -533,12 +547,12 @@ fn setup_routing(iface: &str, endpoint_ip: &str) -> Result<String> {
     }
 
     // 4-5. Add default routes through the VPN interface in table 51820
-    let route_commands = [
-        // IPv4 default route through VPN
-        vec!["ip", "-4", "route", "add", "0.0.0.0/0", "dev", iface, "table", "51820"],
-        // IPv6 default route through VPN
-        vec!["ip", "-6", "route", "add", "::/0", "dev", iface, "table", "51820"],
-    ];
+    let mut route_commands: Vec<Vec<&str>> = Vec::new();
+    if ipv4_enabled {
+        route_commands.push(vec!["ip", "-4", "route", "add", "0.0.0.0/0", "dev", iface, "table", "51820"]);
+    }
+    // IPv6 default route through VPN (always added, IPv6 blocking is handled separately)
+    route_commands.push(vec!["ip", "-6", "route", "add", "::/0", "dev", iface, "table", "51820"]);
 
     for cmd in &route_commands {
         debug!("Routing command: {}", cmd.join(" "));
@@ -555,7 +569,8 @@ fn setup_routing(iface: &str, endpoint_ip: &str) -> Result<String> {
 
     // 6. IPv4 fwmark policy rule — CRITICAL for VPN security.
     //    Without this rule, all non-VPN traffic bypasses the tunnel.
-    {
+    //    Skip when IPv4 is blocked (no IPv4 routes to protect).
+    if ipv4_enabled {
         let cmd = vec!["ip", "-4", "rule", "add", "not", "fwmark", "51820", "table", "51820"];
         debug!("Routing command (critical): {}", cmd.join(" "));
         let output = Command::new(cmd[0])
@@ -587,10 +602,11 @@ fn setup_routing(iface: &str, endpoint_ip: &str) -> Result<String> {
     }
 
     // 7. Suppress default route from main table to prevent leaks
-    let suppress_commands = [
-        vec!["ip", "-4", "rule", "add", "table", "main", "suppress_prefixlength", "0"],
-        vec!["ip", "-6", "rule", "add", "table", "main", "suppress_prefixlength", "0"],
-    ];
+    let mut suppress_commands: Vec<Vec<&str>> = Vec::new();
+    if ipv4_enabled {
+        suppress_commands.push(vec!["ip", "-4", "rule", "add", "table", "main", "suppress_prefixlength", "0"]);
+    }
+    suppress_commands.push(vec!["ip", "-6", "rule", "add", "table", "main", "suppress_prefixlength", "0"]);
 
     for cmd in &suppress_commands {
         debug!("Routing command: {}", cmd.join(" "));

@@ -76,6 +76,33 @@ impl Ipv6Mode {
 }
 
 // ---------------------------------------------------------------------------
+// IPv4 mode (Eddie: network.ipv4.mode)
+// ---------------------------------------------------------------------------
+
+/// IPv4 mode matching Eddie's `network.ipv4.mode` setting.
+///
+/// For WireGuard-only, only "in" (default, all IPv4 through tunnel) and "block"
+/// (disable IPv4 entirely) are meaningful. Eddie's "in-out", "in-block", "out"
+/// modes are OpenVPN split-tunnel concepts that don't apply to WireGuard.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Ipv4Mode {
+    /// Route all IPv4 through the VPN tunnel (default).
+    In,
+    /// Block all IPv4 traffic (IPv6-only VPN).
+    Block,
+}
+
+impl Ipv4Mode {
+    fn parse(s: &str) -> anyhow::Result<Self> {
+        match s.to_lowercase().as_str() {
+            "in" => Ok(Ipv4Mode::In),
+            "block" => Ok(Ipv4Mode::Block),
+            _ => anyhow::bail!("invalid network.ipv4.mode '{}': expected 'in' or 'block'", s),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Reset levels (Eddie: Session.cs)
 // ---------------------------------------------------------------------------
 
@@ -317,12 +344,17 @@ struct SessionParams {
     username: Zeroizing<String>,
     password: Zeroizing<String>,
     ipv6_mode: Ipv6Mode,
+    ipv4_mode: Ipv4Mode,
     custom_dns_ips: Vec<String>,
     blocked_ipv6_ifaces: Vec<String>,
     scoring: server::ScoringConfig,
     profile_options: std::collections::HashMap<String, String>,
     dns_mode: dns::DnsMode,
     dns_services: Vec<String>,
+    /// Physical NIC to bind WireGuard endpoint traffic to (empty = system default).
+    entry_iface: String,
+    /// Verify routing table after connect.
+    check_route: bool,
 }
 
 /// Pre-flight checks and orphaned state cleanup.
@@ -399,6 +431,16 @@ fn resolve_session(config: &ConnectConfig) -> anyhow::Result<SessionParams> {
     };
     info!("IPv6 mode: {:?}", ipv6_mode);
 
+    // IPv4 mode from pre-resolved options
+    let ipv4_mode = {
+        let mode_str = options::get_str(&config.resolved, options::NETWORK_IPV4_MODE);
+        let mode_str = if mode_str.is_empty() { "in" } else { mode_str };
+        Ipv4Mode::parse(mode_str)?
+    };
+    if ipv4_mode == Ipv4Mode::Block {
+        info!("IPv4 mode: Block (IPv6-only VPN)");
+    }
+
     // Custom DNS from pre-resolved options
     let custom_dns_ips = options::get_list(&config.resolved, options::DNS_SERVERS);
     if !custom_dns_ips.is_empty() {
@@ -431,18 +473,28 @@ fn resolve_session(config: &ConnectConfig) -> anyhow::Result<SessionParams> {
     info!("DNS mode: {:?}", dns_mode);
     let dns_services = options::get_list(&config.resolved, options::LINUX_DNS_SERVICES);
 
+    // Entry interface and route check from pre-resolved options
+    let entry_iface = options::get_str(&config.resolved, options::NETWORK_ENTRY_IFACE).to_string();
+    if !entry_iface.is_empty() {
+        info!("Entry interface: {}", entry_iface);
+    }
+    let check_route = options::get_bool(&config.resolved, options::CHECK_ROUTE);
+
     Ok(SessionParams {
         shutdown,
         nonce,
         username,
         password,
         ipv6_mode,
+        ipv4_mode,
         custom_dns_ips,
         blocked_ipv6_ifaces,
         scoring,
         profile_options: config.resolved.clone(),
         dns_mode,
         dns_services,
+        entry_iface,
+        check_route,
     })
 }
 
@@ -960,12 +1012,27 @@ fn verify_connection(
     dns_ipv4: &str,
     dns_ipv6: &str,
     checking_ntry: u32,
+    iface_name: &str,
+    do_check_route: bool,
 ) -> bool {
     let check_domain = manifest.check_domain.as_str();
     let check_dns_query = manifest.check_dns_query.as_str();
     let check_protocol = manifest.check_protocol.as_str();
     let exit_ip = server_ref.ips_exit.first().map(|s| s.as_str()).unwrap_or("");
     debug!("Verification: check_domain={:?}, check_dns_query={:?}, exit_ip={:?}, server={}", check_domain, check_dns_query, exit_ip, server_ref.name);
+
+    // Route verification (Eddie: advanced.check.route)
+    if do_check_route {
+        info!("Verifying routes...");
+        match verify::check_route(iface_name, wg_ipv4) {
+            Ok(()) => info!("Routes verified."),
+            Err(e) => {
+                warn!("Route verification failed: {:#}", e);
+                return false;
+            }
+        }
+        if shutdown.load(Ordering::Relaxed) { return true; }
+    }
 
     info!("Verifying tunnel...");
     match verify::check_tunnel(&server_ref.name, wg_ipv4, check_domain, exit_ip, check_protocol, checking_ntry) {
@@ -1377,7 +1444,8 @@ pub fn run(
             let v = options::get_str(&config.resolved, options::NETWORK_IFACE_NAME);
             if v.is_empty() { wireguard::VPN_INTERFACE } else { v }
         };
-        let (config_path, iface, original_gw) = match wireguard::connect(&wg_params, ipv6_enabled, wg_mtu, iface_name) {
+        let ipv4_enabled = params.ipv4_mode != Ipv4Mode::Block;
+        let (config_path, iface, original_gw) = match wireguard::connect(&wg_params, ipv6_enabled, ipv4_enabled, wg_mtu, iface_name, &params.entry_iface) {
             Ok(result) => {
                 consecutive_failures = 0;
                 result
@@ -1478,7 +1546,7 @@ pub fn run(
             let verify_ok = verify_connection(
                 &params.shutdown, &data.manifest, server_ref,
                 &wg_key.wg_ipv4, &effective_dns_ipv4, dns_ipv6,
-                checking_ntry,
+                checking_ntry, &iface, params.check_route,
             );
             if !verify_ok && !params.shutdown.load(Ordering::Relaxed) {
                 warn!("Verification failed, treating as connection failure, reconnecting...");

@@ -97,6 +97,8 @@ pub fn view<'a>(
     startlast: bool,
     locklast: bool,
     ipv6_mode: &'a str,
+    ipv4_mode: &'a str,
+    entry_iface: &'a str,
     dns: &'a str,
     loaded: bool,
     dirty: bool,
@@ -132,6 +134,7 @@ pub fn view<'a>(
     // Logging settings
     log_file_enabled: bool,
     log_file_path: &'a str,
+    log_level_debug: bool,
     // Mode settings
     mode_port: &'a str,
     // Advanced settings
@@ -141,6 +144,7 @@ pub fn view<'a>(
     http_timeout: &'a str,
     checking_ntry: &'a str,
     capacity_factor: &'a str,
+    check_route: bool,
 ) -> Element<'a, Message> {
     if !loaded {
         return container(text("Loading settings...").size(16))
@@ -164,7 +168,7 @@ pub fn view<'a>(
             ui_unit,
             ui_iec,
         ),
-        SettingsSubTab::Network => view_network(ipv6_mode, dns, dns_mode, dns_services, routes_custom, areas_allowlist, areas_denylist),
+        SettingsSubTab::Network => view_network(ipv6_mode, ipv4_mode, entry_iface, dns, dns_mode, dns_services, routes_custom, areas_allowlist, areas_denylist),
         SettingsSubTab::WireGuard => view_wireguard(
             wg_key,
             wg_mtu,
@@ -192,7 +196,9 @@ pub fn view<'a>(
             capacity_factor,
             log_file_enabled,
             log_file_path,
+            log_level_debug,
             mode_port,
+            check_route,
         ),
     };
 
@@ -295,6 +301,8 @@ fn view_general<'a>(
 
 fn view_network<'a>(
     ipv6_mode: &'a str,
+    ipv4_mode: &'a str,
+    entry_iface: &'a str,
     dns: &'a str,
     dns_mode: &'a str,
     dns_services: &'a str,
@@ -308,6 +316,8 @@ fn view_network<'a>(
 
     let ipv6_options: Vec<&str> = vec!["in", "in-block", "block"];
     let ipv6_selected: Option<&str> = ipv6_options.iter().find(|&&o| o == ipv6_mode).copied();
+    let ipv4_options: Vec<&str> = vec!["in", "block"];
+    let ipv4_selected: Option<&str> = ipv4_options.iter().find(|&&o| o == ipv4_mode).copied();
 
     content = content.push(
         column![
@@ -320,6 +330,21 @@ fn view_network<'a>(
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center),
+            row![
+                label("IPv4 Mode").width(220),
+                pick_list(ipv4_options, ipv4_selected, |selected: &str| {
+                    Message::SettingsIpv4ModeChanged(selected.to_string())
+                })
+                .width(160),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+            text_field(
+                "Entry Interface",
+                "empty = auto (e.g. eth0, wlan0)",
+                entry_iface,
+                Message::SettingsEntryIfaceChanged,
+            ),
             row![
                 label("Custom DNS").width(220),
                 text_input("8.8.8.8, 1.1.1.1", dns)
@@ -579,7 +604,9 @@ fn view_advanced<'a>(
     capacity_factor: &'a str,
     log_file_enabled: bool,
     log_file_path: &'a str,
+    log_level_debug: bool,
     mode_port: &'a str,
+    check_route: bool,
 ) -> Element<'a, Message> {
     let mut content = column![].spacing(16);
 
@@ -643,10 +670,7 @@ fn view_advanced<'a>(
     );
 
     // File Logging
-    // TODO: Wire log.file.enabled / log.file.path into the helper daemon's
-    // logging setup (main.rs env_logger or tracing init). Currently only
-    // registered as profile options; the helper does not read them yet.
-    content = content.push(section_header("File Logging"));
+    content = content.push(section_header("Logging"));
     content = content.push(
         column![
             checkbox(log_file_enabled)
@@ -658,7 +682,22 @@ fn view_advanced<'a>(
                 log_file_path,
                 Message::SettingsLogFilePathChanged,
             ),
-            text("Requires helper restart to take effect.").size(12),
+            checkbox(log_level_debug)
+                .label("Enable debug logging")
+                .on_toggle(Message::SettingsLogLevelDebugToggle),
+            text("Logging changes require helper restart to take effect.").size(12),
+        ]
+        .spacing(6),
+    );
+
+    // Verification
+    content = content.push(section_header("Verification"));
+    content = content.push(
+        column![
+            checkbox(check_route)
+                .label("Verify routes after connect")
+                .on_toggle(Message::SettingsCheckRouteToggle),
+            text("Check routing table is correctly configured post-connection (Eddie: advanced.check.route).").size(12),
         ]
         .spacing(6),
     );

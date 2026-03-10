@@ -69,6 +69,8 @@ struct App {
     settings_startlast: bool,
     settings_locklast: bool,
     settings_ipv6_mode: String,
+    settings_ipv4_mode: String,
+    settings_entry_iface: String,
     settings_dns: String,
     settings_loaded: bool,
     settings_dirty: bool,
@@ -118,6 +120,7 @@ struct App {
     // Logging settings (profile-backed)
     settings_log_file_enabled: bool,
     settings_log_file_path: String,
+    settings_log_level_debug: bool,
 
     // Mode settings (profile-backed)
     settings_mode_port: String,
@@ -129,6 +132,7 @@ struct App {
     settings_http_timeout: String,
     settings_checking_ntry: String,
     settings_capacity_factor: String,
+    settings_check_route: bool,
 
     // Auto-refresh timer for server list
     last_server_fetch: Instant,
@@ -161,6 +165,8 @@ pub enum Message {
     SettingsStartlastToggle(bool),
     SettingsLocklastToggle(bool),
     SettingsIpv6ModeChanged(String),
+    SettingsIpv4ModeChanged(String),
+    SettingsEntryIfaceChanged(String),
     SettingsDnsChanged(String),
     ShowErrorsToggle(bool),
     ConnectNoLockToggle(bool),
@@ -192,6 +198,7 @@ pub enum Message {
     // Logging settings
     SettingsLogFileEnabledToggle(bool),
     SettingsLogFilePathChanged(String),
+    SettingsLogLevelDebugToggle(bool),
     // Mode settings
     SettingsModePortChanged(String),
     // Advanced settings
@@ -201,6 +208,7 @@ pub enum Message {
     SettingsHttpTimeoutChanged(String),
     SettingsCheckingNtryChanged(String),
     SettingsCapacityFactorChanged(String),
+    SettingsCheckRouteToggle(bool),
     LockInstall,
     LockUninstall,
     LockEnable,
@@ -248,6 +256,8 @@ impl App {
             settings_startlast: false,
             settings_locklast: false,
             settings_ipv6_mode: String::new(),
+            settings_ipv4_mode: String::new(),
+            settings_entry_iface: String::new(),
             settings_dns: String::new(),
             settings_loaded: false,
             settings_dirty: false,
@@ -285,6 +295,7 @@ impl App {
 
             settings_log_file_enabled: false,
             settings_log_file_path: String::new(),
+            settings_log_level_debug: false,
 
             settings_mode_port: String::new(),
 
@@ -294,6 +305,7 @@ impl App {
             settings_http_timeout: String::new(),
             settings_checking_ntry: String::new(),
             settings_capacity_factor: String::new(),
+            settings_check_route: true,
 
             last_server_fetch: Instant::now(),
 
@@ -529,6 +541,8 @@ impl App {
                     options.insert(options::SERVERS_STARTLAST.into(), self.settings_startlast.to_string());
                     options.insert(options::SERVERS_LOCKLAST.into(), self.settings_locklast.to_string());
                     options.insert(options::NETWORK_IPV6_MODE.into(), self.settings_ipv6_mode.clone());
+                    options.insert(options::NETWORK_IPV4_MODE.into(), self.settings_ipv4_mode.clone());
+                    options.insert(options::NETWORK_ENTRY_IFACE.into(), self.settings_entry_iface.clone());
                     options.insert(options::DNS_SERVERS.into(), self.settings_dns.clone());
                     // Connection flags (saved as positive option names)
                     options.insert(options::NETLOCK.into(), (!self.connect_no_lock).to_string());
@@ -559,6 +573,7 @@ impl App {
                     // Logging settings
                     options.insert(options::LOG_FILE_ENABLED.into(), self.settings_log_file_enabled.to_string());
                     options.insert(options::LOG_FILE_PATH.into(), self.settings_log_file_path.clone());
+                    options.insert(options::LOG_LEVEL_DEBUG.into(), self.settings_log_level_debug.to_string());
                     // Mode settings
                     options.insert(options::MODE_PORT.into(), self.settings_mode_port.clone());
                     // Advanced settings
@@ -568,6 +583,7 @@ impl App {
                     options.insert(options::HTTP_TIMEOUT.into(), self.settings_http_timeout.clone());
                     options.insert(options::CHECKING_NTRY.into(), self.settings_checking_ntry.clone());
                     options.insert(options::SERVERS_CAPACITY_FACTOR.into(), self.settings_capacity_factor.clone());
+                    options.insert(options::CHECK_ROUTE.into(), self.settings_check_route.to_string());
                     let req = SaveProfileRequest { options };
                     match serde_json::to_vec(&req) {
                         Ok(body) => match helper.send_command("POST", "/profile", Some(&body)) {
@@ -601,6 +617,16 @@ impl App {
             }
             Message::SettingsIpv6ModeChanged(val) => {
                 self.settings_ipv6_mode = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsIpv4ModeChanged(val) => {
+                self.settings_ipv4_mode = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsEntryIfaceChanged(val) => {
+                self.settings_entry_iface = val;
                 self.settings_dirty = true;
                 Task::none()
             }
@@ -702,6 +728,11 @@ impl App {
                 self.settings_dirty = true;
                 Task::none()
             }
+            Message::SettingsCheckRouteToggle(val) => {
+                self.settings_check_route = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
             Message::SettingsDnsModeChanged(val) => {
                 self.settings_dns_mode = val;
                 self.settings_dirty = true;
@@ -729,6 +760,11 @@ impl App {
             }
             Message::SettingsLogFilePathChanged(val) => {
                 self.settings_log_file_path = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsLogLevelDebugToggle(val) => {
+                self.settings_log_level_debug = val;
                 self.settings_dirty = true;
                 Task::none()
             }
@@ -904,6 +940,10 @@ impl App {
                     .map(|v| v.eq_ignore_ascii_case("true")).unwrap_or(false);
                 self.settings_ipv6_mode = options.get(options::NETWORK_IPV6_MODE)
                     .cloned().unwrap_or_else(|| "in-block".into());
+                self.settings_ipv4_mode = options.get(options::NETWORK_IPV4_MODE)
+                    .cloned().unwrap_or_else(|| "in".into());
+                self.settings_entry_iface = options.get(options::NETWORK_ENTRY_IFACE)
+                    .cloned().unwrap_or_default();
                 self.settings_dns = options.get(options::DNS_SERVERS).cloned().unwrap_or_default();
 
                 // Connection flags (inverted: profile uses positive names)
@@ -970,6 +1010,9 @@ impl App {
                     .unwrap_or(false);
                 self.settings_log_file_path = options.get(options::LOG_FILE_PATH)
                     .cloned().unwrap_or_else(|| "/var/log/airvpn-rs/helper.log".into());
+                self.settings_log_level_debug = options.get(options::LOG_LEVEL_DEBUG)
+                    .map(|v| v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
 
                 // Mode settings
                 self.settings_mode_port = options.get(options::MODE_PORT)
@@ -988,6 +1031,9 @@ impl App {
                     .cloned().unwrap_or_else(|| "3".into());
                 self.settings_capacity_factor = options.get(options::SERVERS_CAPACITY_FACTOR)
                     .cloned().unwrap_or_else(|| "0".into());
+                self.settings_check_route = options.get(options::CHECK_ROUTE)
+                    .map(|v| v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(true);
 
                 self.settings_loaded = true;
                 self.settings_dirty = false;
@@ -1019,6 +1065,12 @@ impl App {
         overrides.insert(options::VERIFY.into(), (!self.connect_no_verify).to_string());
         if !self.settings_ipv6_mode.is_empty() {
             overrides.insert(options::NETWORK_IPV6_MODE.into(), self.settings_ipv6_mode.clone());
+        }
+        if !self.settings_ipv4_mode.is_empty() {
+            overrides.insert(options::NETWORK_IPV4_MODE.into(), self.settings_ipv4_mode.clone());
+        }
+        if !self.settings_entry_iface.is_empty() {
+            overrides.insert(options::NETWORK_ENTRY_IFACE.into(), self.settings_entry_iface.clone());
         }
         if !self.settings_dns.is_empty() {
             overrides.insert(options::DNS_SERVERS.into(), self.settings_dns.clone());
@@ -1123,6 +1175,8 @@ impl App {
                 self.settings_startlast,
                 self.settings_locklast,
                 &self.settings_ipv6_mode,
+                &self.settings_ipv4_mode,
+                &self.settings_entry_iface,
                 &self.settings_dns,
                 self.settings_loaded,
                 self.settings_dirty,
@@ -1158,6 +1212,7 @@ impl App {
                 // Logging settings
                 self.settings_log_file_enabled,
                 &self.settings_log_file_path,
+                self.settings_log_level_debug,
                 // Mode settings
                 &self.settings_mode_port,
                 // Advanced
@@ -1167,6 +1222,7 @@ impl App {
                 &self.settings_http_timeout,
                 &self.settings_checking_ntry,
                 &self.settings_capacity_factor,
+                self.settings_check_route,
             ),
         };
         // Per-tab error display (inline at top of content area, only when show_errors is on)

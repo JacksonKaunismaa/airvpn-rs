@@ -337,6 +337,63 @@ fn generate_random_token() -> String {
     hex::encode(buf)
 }
 
+/// Verify the routing table is correctly configured for the VPN tunnel.
+///
+/// Checks:
+/// 1. The WireGuard interface has the expected IPv4 address
+/// 2. A default route exists through the tunnel in table 51820
+/// 3. The fwmark policy rule exists
+///
+/// Returns `Ok(())` if all checks pass, `Err` with details on failure.
+/// Caller should treat errors as non-fatal warnings.
+pub fn check_route(iface: &str, expected_ipv4: &str) -> Result<()> {
+    // 1. Check interface has the expected IPv4 address
+    let output = std::process::Command::new("ip")
+        .args(["-4", "addr", "show", "dev", iface])
+        .output()
+        .context("failed to execute: ip addr show")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let expected_ip = strip_cidr(expected_ipv4);
+    if !stdout.contains(expected_ip) {
+        anyhow::bail!(
+            "interface {} does not have expected IP {} (got: {})",
+            iface, expected_ip, stdout.trim()
+        );
+    }
+    debug!("Route check: {} has IP {}", iface, expected_ip);
+
+    // 2. Check default route through tunnel in table 51820
+    let output = std::process::Command::new("ip")
+        .args(["-4", "route", "show", "table", "51820"])
+        .output()
+        .context("failed to execute: ip route show table 51820")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.contains("0.0.0.0/0") && !stdout.contains("default") {
+        anyhow::bail!(
+            "no default route in table 51820 (routes: {})",
+            stdout.trim()
+        );
+    }
+    debug!("Route check: table 51820 has default route");
+
+    // 3. Check fwmark policy rule exists
+    let output = std::process::Command::new("ip")
+        .args(["-4", "rule", "show"])
+        .output()
+        .context("failed to execute: ip rule show")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.contains("51820") {
+        anyhow::bail!(
+            "fwmark policy rule for table 51820 not found (rules: {})",
+            stdout.trim()
+        );
+    }
+    debug!("Route check: fwmark policy rule exists");
+
+    info!("Route verification passed");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

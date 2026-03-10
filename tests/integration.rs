@@ -39,9 +39,6 @@ fn test_netlock_config() -> NetlockConfig {
         allowed_ips_incoming: vec![],
         allowed_ips_outgoing: vec![],
         incoming_policy_accept: false,
-        iface_name: airvpn::wireguard::VPN_INTERFACE.to_string(),
-        custom_route_out_cidrs: vec![],
-        allowlist_out_cidrs: vec![],
     }
 }
 
@@ -55,9 +52,6 @@ fn full_netlock_config() -> NetlockConfig {
         allowed_ips_incoming: vec!["198.51.100.1".to_string()],
         allowed_ips_outgoing: vec!["203.0.113.5".to_string()],
         incoming_policy_accept: false,
-        iface_name: airvpn::wireguard::VPN_INTERFACE.to_string(),
-        custom_route_out_cidrs: vec![],
-        allowlist_out_cidrs: vec![],
     }
 }
 
@@ -385,7 +379,7 @@ fn test_dns_activate_deactivate() {
     // configuration for this interface will fail silently if it doesn't exist.
     let test_iface = "lo";
 
-    dns::activate(test_ipv4, test_ipv6, test_iface, dns::DnsMode::Auto, &[]).expect("dns activate");
+    dns::activate(test_ipv4, test_ipv6, test_iface).expect("dns activate");
 
     // Verify /etc/resolv.conf contains our nameservers
     let content =
@@ -439,7 +433,7 @@ fn test_dns_check_and_reapply() {
     let test_ipv6 = "fd99::2";
     let test_iface = "lo";
 
-    dns::activate(test_ipv4, test_ipv6, test_iface, dns::DnsMode::Auto, &[]).expect("dns activate");
+    dns::activate(test_ipv4, test_ipv6, test_iface).expect("dns activate");
 
     // Verify our DNS is in place
     let content = fs::read_to_string("/etc/resolv.conf").expect("read resolv.conf");
@@ -450,7 +444,7 @@ fn test_dns_check_and_reapply() {
         .expect("overwrite resolv.conf with garbage");
 
     // check_and_reapply should detect drift and restore our DNS
-    let reapplied = dns::check_and_reapply(test_ipv4, test_ipv6, test_iface, dns::DnsMode::Auto, &[]).expect("check_and_reapply");
+    let reapplied = dns::check_and_reapply(test_ipv4, test_ipv6, test_iface).expect("check_and_reapply");
     assert!(reapplied, "should detect drift and reapply DNS");
 
     // Verify DNS was restored
@@ -462,7 +456,7 @@ fn test_dns_check_and_reapply() {
     );
 
     // check_and_reapply again should find no drift
-    let reapplied2 = dns::check_and_reapply(test_ipv4, test_ipv6, test_iface, dns::DnsMode::Auto, &[]).expect("second check_and_reapply");
+    let reapplied2 = dns::check_and_reapply(test_ipv4, test_ipv6, test_iface).expect("second check_and_reapply");
     assert!(!reapplied2, "should not reapply when DNS is correct");
 
     dns::deactivate().expect("dns deactivate");
@@ -501,7 +495,7 @@ fn test_dns_immutability_handling() {
     // Activate should succeed — it clears the immutable flag internally
     let test_ipv4 = "10.99.99.3";
     let test_ipv6 = "fd99::3";
-    let result = dns::activate(test_ipv4, test_ipv6, "lo", dns::DnsMode::Auto, &[]);
+    let result = dns::activate(test_ipv4, test_ipv6, "lo");
     // Clear immutable flag in case activate failed (cleanup safety)
     let _ = Command::new("chattr")
         .args(["-i", "/etc/resolv.conf"])
@@ -629,7 +623,7 @@ AllowedIPs = 0.0.0.0/0
     // connect() will fail because the endpoint is unreachable / keys are fake,
     // but we can check the file was created with correct permissions.
     // The function cleans up the config file on failure.
-    let result = wireguard::connect(&params, false, 1320, wireguard::VPN_INTERFACE);
+    let result = wireguard::connect(&params, false);
 
     // connect() should fail (no real server), but we need to verify the file
     // handling behavior. The config file should be cleaned up after failure.
@@ -641,7 +635,7 @@ AllowedIPs = 0.0.0.0/0
         .flatten()
         .any(|e| {
             let name = e.file_name().to_string_lossy().to_string();
-            (name == "avpn0.conf" || name.starts_with("avpn-")) && name.ends_with(".conf")
+            name.starts_with("avpn-") && name.ends_with(".conf")
         });
     assert!(
         !has_orphan,

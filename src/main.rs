@@ -121,38 +121,70 @@ fn rotate_log(path: &str) {
     let _ = std::fs::rename(path, &p1);
 }
 
-fn init_logging() {
+/// Validate a log file path: reject traversal, symlinks, and paths outside allowed prefixes.
+fn validate_log_path(path: &str) -> Option<String> {
+    let log_p = std::path::Path::new(path);
+    let allowed_prefixes = ["/var/log/", "/run/airvpn-rs/"];
+    if path.contains("..") {
+        eprintln!("warning: log path contains '..', ignoring (path traversal rejected)");
+        None
+    } else if log_p.is_symlink() {
+        eprintln!("warning: log path points to a symlink, ignoring (symlink rejected)");
+        None
+    } else if !allowed_prefixes.iter().any(|p| path.starts_with(p)) {
+        eprintln!("warning: log path must be under /var/log/ or /run/airvpn-rs/, ignoring");
+        None
+    } else {
+        Some(path.to_string())
+    }
+}
+
+fn init_logging(file_logging_enabled: bool, profile_log_path: &str, debug_level: bool) {
     use simplelog::*;
     use std::os::unix::fs::OpenOptionsExt;
 
-    let log_path = std::env::var("AIRVPN_LOG").unwrap_or_default();
-    // Prefer /var/log (root-owned, standard location), fall back to /run/airvpn-rs/
-    // (root-owned, restricted permissions). Never use /tmp — symlink attack vector.
-    let log_path = if !log_path.is_empty() {
-        // Validate AIRVPN_LOG: reject path traversal and symlinks to prevent
-        // arbitrary file writes when running as root (e.g. sudo -E).
-        let log_p = std::path::Path::new(&log_path);
-        let allowed_prefixes = ["/var/log/", "/run/airvpn-rs/"];
-        if log_path.contains("..") {
-            eprintln!("warning: AIRVPN_LOG contains '..', ignoring (path traversal rejected)");
-            String::new()
-        } else if log_p.is_symlink() {
-            eprintln!("warning: AIRVPN_LOG points to a symlink, ignoring (symlink rejected)");
-            String::new()
-        } else if !allowed_prefixes.iter().any(|p| log_path.starts_with(p)) {
-            eprintln!("warning: AIRVPN_LOG must be under /var/log/ or /run/airvpn-rs/, ignoring");
-            String::new()
-        } else {
-            log_path
-        }
+    // Determine stderr log level: debug if profile says so, else info
+    let stderr_level = if debug_level { LevelFilter::Debug } else { LevelFilter::Info };
+
+    let mut loggers: Vec<Box<dyn SharedLogger>> = vec![
+        TermLogger::new(
+            stderr_level,
+            ConfigBuilder::new()
+                .set_time_level(LevelFilter::Off)
+                .set_target_level(LevelFilter::Off)
+                .set_thread_level(LevelFilter::Off)
+                .build(),
+            TerminalMode::Stderr,
+            ColorChoice::Auto,
+        ),
+    ];
+
+    // File logging: use AIRVPN_LOG env var (highest priority), then profile option,
+    // then auto-detect a writable path.
+    let env_log_path = std::env::var("AIRVPN_LOG").unwrap_or_default();
+    let log_path = if !env_log_path.is_empty() {
+        validate_log_path(&env_log_path).unwrap_or_default()
+    } else if file_logging_enabled && !profile_log_path.is_empty() {
+        validate_log_path(profile_log_path).unwrap_or_default()
+    } else if file_logging_enabled {
+        // Enabled but no explicit path — use default
+        let preferred = "/var/log/airvpn-rs/helper.log";
+        validate_log_path(preferred).unwrap_or_default()
     } else {
+        // File logging disabled — use default auto-detect (backwards compat)
         String::new()
     };
+
+    // Resolve to a concrete file path if empty (auto-detect mode)
     let log_path = if !log_path.is_empty() {
         log_path
+    } else if !file_logging_enabled && env_log_path.is_empty() {
+        // File logging explicitly disabled and no env override — stderr only
+        return CombinedLogger::init(loggers).unwrap_or_else(|e| {
+            eprintln!("warning: failed to initialize logging: {}", e);
+        });
     } else {
         let preferred = "/var/log/airvpn-rs.log";
-        // Test if we can open/create the preferred path
         if std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -162,8 +194,6 @@ fn init_logging() {
         {
             preferred.to_string()
         } else {
-            // Create /run/airvpn-rs/ with mode 0o700 (root-only) to prevent
-            // symlink attacks that /tmp would be vulnerable to.
             let run_dir = std::path::Path::new("/run/airvpn-rs");
             if !run_dir.exists() {
                 if let Err(e) = std::fs::create_dir(run_dir) {
@@ -179,24 +209,23 @@ fn init_logging() {
         }
     };
 
-    let mut loggers: Vec<Box<dyn SharedLogger>> = vec![
-        // stderr: INFO level, no timestamps (clean user-facing output)
-        TermLogger::new(
-            LevelFilter::Info,
-            ConfigBuilder::new()
-                .set_time_level(LevelFilter::Off)
-                .set_target_level(LevelFilter::Off)
-                .set_thread_level(LevelFilter::Off)
-                .build(),
-            TerminalMode::Stderr,
-            ColorChoice::Auto,
-        ),
-    ];
+    // Ensure parent directory exists for profile-specified paths
+    if let Some(parent) = std::path::Path::new(&log_path).parent() {
+        if !parent.exists() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                eprintln!("warning: could not create log directory {}: {}", parent.display(), e);
+            } else {
+                let _ = std::fs::set_permissions(
+                    parent,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o700),
+                );
+            }
+        }
+    }
 
-    // Rotate log file if it's grown too large (>5MB → keep 3 files max).
     rotate_log(&log_path);
 
-    // File logger: DEBUG level with timestamps — mode 0o600 (owner-only read/write)
+    let file_level = if debug_level { LevelFilter::Debug } else { LevelFilter::Debug };
     match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -205,7 +234,7 @@ fn init_logging() {
     {
         Ok(file) => {
             loggers.push(WriteLogger::new(
-                LevelFilter::Debug,
+                file_level,
                 ConfigBuilder::new()
                     .set_target_level(LevelFilter::Off)
                     .set_thread_level(LevelFilter::Off)
@@ -229,7 +258,16 @@ fn main() -> anyhow::Result<()> {
     // Only init full logging for the helper daemon process.
     // All other commands are thin socket clients — output comes from the helper.
     match &cli.command {
-        Commands::Helper => init_logging(),
+        Commands::Helper => {
+            // Read logging options from profile BEFORE initializing logging.
+            // This lets profile settings control file logging and debug level.
+            use airvpn::config;
+            let profile_opts = config::load_profile_options();
+            let file_enabled = options::get_bool(&profile_opts, options::LOG_FILE_ENABLED);
+            let file_path = options::get_str(&profile_opts, options::LOG_FILE_PATH).to_string();
+            let debug_level = options::get_bool(&profile_opts, options::LOG_LEVEL_DEBUG);
+            init_logging(file_enabled, &file_path, debug_level);
+        }
         _ => {}
     }
 

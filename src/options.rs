@@ -42,6 +42,7 @@ pub const WG_HANDSHAKE_CONNECTED: &str = "wireguard.handshake.timeout.connected"
 pub const NETLOCK_INCOMING: &str = "netlock.incoming";
 pub const NETLOCK_ALLOW_PING: &str = "netlock.allow_ping";
 pub const NETLOCK_ALLOWLIST_IPS: &str = "netlock.allowlist.outgoing.ips";
+pub const NETLOCK_LOCAL_FORWARD_IFACES: &str = "netlock.local_forward_ifaces";
 
 // Routes
 pub const ROUTES_CUSTOM: &str = "routes.custom";
@@ -49,7 +50,9 @@ pub const ROUTES_CUSTOM: &str = "routes.custom";
 // Network
 pub const NETWORK_IFACE_NAME: &str = "network.iface.name";
 pub const NETWORK_ENTRY_IPLAYER: &str = "network.entry.iplayer";
+pub const NETWORK_ENTRY_IFACE: &str = "network.entry.iface";
 pub const NETWORK_IPV6_MODE: &str = "network.ipv6.mode";
+pub const NETWORK_IPV4_MODE: &str = "network.ipv4.mode";
 pub const DNS_SERVERS: &str = "dns.servers";
 
 // Scoring
@@ -71,6 +74,7 @@ pub const UI_IEC: &str = "ui.iec";
 // Logging
 pub const LOG_FILE_ENABLED: &str = "log.file.enabled";
 pub const LOG_FILE_PATH: &str = "log.file.path";
+pub const LOG_LEVEL_DEBUG: &str = "log.level.debug";
 
 // Mode
 pub const MODE_PORT: &str = "mode.port";
@@ -83,6 +87,7 @@ pub const MANIFEST_REFRESH: &str = "advanced.manifest.refresh";
 pub const PENALITY_ON_ERROR: &str = "advanced.penality_on_error";
 pub const HTTP_TIMEOUT: &str = "http.timeout";
 pub const CHECKING_NTRY: &str = "checking.ntry";
+pub const CHECK_ROUTE: &str = "advanced.check.route";
 
 // ---------------------------------------------------------------------------
 // Option registry
@@ -121,12 +126,15 @@ pub static REGISTRY: &[OptionDef] = &[
     OptionDef { name: NETLOCK_INCOMING, default: "block", description: "Incoming policy: block or allow" },
     OptionDef { name: NETLOCK_ALLOW_PING, default: "true", description: "Allow ICMP ping through the lock" },
     OptionDef { name: NETLOCK_ALLOWLIST_IPS, default: "", description: "CIDRs to allowlist through the kill switch (comma-separated)" },
+    OptionDef { name: NETLOCK_LOCAL_FORWARD_IFACES, default: "", description: "Local interfaces to forward through the VPN tunnel with masquerade (comma-separated, e.g. phone-relay)" },
     // Routes
     OptionDef { name: ROUTES_CUSTOM, default: "", description: "Custom routes: CIDR,action pairs separated by semicolons (action = in or out)" },
     // Network
     OptionDef { name: NETWORK_IFACE_NAME, default: "avpn0", description: "WireGuard interface name" },
     OptionDef { name: NETWORK_ENTRY_IPLAYER, default: "ipv4", description: "Preferred entry IP layer: ipv4 or ipv6" },
+    OptionDef { name: NETWORK_ENTRY_IFACE, default: "", description: "Bind WireGuard endpoint traffic to a specific physical NIC (e.g. eth0). Empty = system default" },
     OptionDef { name: NETWORK_IPV6_MODE, default: "in-block", description: "IPv6 mode: in, in-block, or block" },
+    OptionDef { name: NETWORK_IPV4_MODE, default: "in", description: "IPv4 mode: in (all through tunnel) or block (disable IPv4)" },
     OptionDef { name: DNS_SERVERS, default: "", description: "Custom DNS servers (comma-separated IPs)" },
     // Scoring
     OptionDef { name: SCORING_PENALITY_FACTOR, default: "1000", description: "Multiplier for server penalties in scoring" },
@@ -144,6 +152,7 @@ pub static REGISTRY: &[OptionDef] = &[
     // Logging
     OptionDef { name: LOG_FILE_ENABLED, default: "false", description: "Enable file logging for the helper daemon" },
     OptionDef { name: LOG_FILE_PATH, default: "/var/log/airvpn-rs/helper.log", description: "Path for the helper daemon log file" },
+    OptionDef { name: LOG_LEVEL_DEBUG, default: "false", description: "Enable debug-level logging (default: info level only)" },
     // Mode
     OptionDef { name: MODE_PORT, default: "", description: "Force WireGuard port (empty = auto-select from manifest)" },
     // Advanced / Pinger
@@ -154,6 +163,7 @@ pub static REGISTRY: &[OptionDef] = &[
     OptionDef { name: PENALITY_ON_ERROR, default: "30", description: "Penalty added to server score on connection error" },
     OptionDef { name: HTTP_TIMEOUT, default: "10", description: "HTTP request timeout for API calls (seconds)" },
     OptionDef { name: CHECKING_NTRY, default: "3", description: "Number of retries for tunnel/DNS verification" },
+    OptionDef { name: CHECK_ROUTE, default: "true", description: "Verify routing table after connection is established" },
 ];
 
 // ---------------------------------------------------------------------------
