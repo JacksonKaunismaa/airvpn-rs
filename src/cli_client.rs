@@ -361,6 +361,22 @@ pub fn send_status() -> Result<()> {
         }
     );
 
+    // Print pinger status
+    println!("Pinger:");
+    println!(
+        "  Ready:           {}",
+        if resp.pinger.ready { "yes" } else { "no" }
+    );
+    println!(
+        "  Measured:        {}/{}",
+        resp.pinger.measured, resp.pinger.total
+    );
+    if let (Some(min), Some(avg), Some(max)) =
+        (resp.pinger.latency_min_ms, resp.pinger.latency_avg_ms, resp.pinger.latency_max_ms)
+    {
+        println!("  Latency (EWMA):  min={}ms avg={}ms max={}ms", min, avg, max);
+    }
+
     Ok(())
 }
 

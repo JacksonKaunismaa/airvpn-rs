@@ -81,6 +81,25 @@ pub struct ConnectRequest {
 pub struct StatusResponse {
     pub state: ConnectionState,
     pub lock: LockStatusInfo,
+    pub pinger: PingerInfo,
+}
+
+/// Background pinger health info (included in /status).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PingerInfo {
+    /// True after the first ping cycle completes (or warm-start from cache).
+    pub ready: bool,
+    /// Number of servers with EWMA latency data.
+    pub measured: usize,
+    /// Total servers the pinger knows about (from manifest).
+    pub total: usize,
+    /// EWMA latency summary: (min, avg, max) in ms. None if no data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_min_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_avg_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_max_ms: Option<i64>,
 }
 
 /// Lock status info (reusable across responses).

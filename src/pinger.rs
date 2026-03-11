@@ -94,6 +94,25 @@ impl LatencyCache {
         &self.server_ips
     }
 
+    /// Summary statistics for logging: (measured_count, min_ms, avg_ms, max_ms).
+    /// Returns `None` if no servers have been measured.
+    pub fn summary(&self) -> Option<(usize, i64, i64, i64)> {
+        if self.ewma.is_empty() {
+            return None;
+        }
+        let mut min = i64::MAX;
+        let mut max = i64::MIN;
+        let mut sum: i64 = 0;
+        let count = self.ewma.len();
+        for &v in self.ewma.values() {
+            let ms = v.round() as i64;
+            min = min.min(ms);
+            max = max.max(ms);
+            sum += ms;
+        }
+        Some((count, min, sum / count as i64, max))
+    }
+
     /// Persist the cache to a JSON file.
     pub fn save(&self, path: &str) -> anyhow::Result<()> {
         let parent = std::path::Path::new(path).parent();
@@ -328,41 +347,4 @@ pub fn measure_all_from_ips(
         }
     }
     results
-}
-
-/// Measure latency for all servers (pings first IPv4 entry IP of each).
-///
-/// One-shot fallback for `/servers` when background pinger has no data yet.
-/// Eddie pings `IpsEntry.FirstPreferIPv4` (Latency.cs line 75).
-pub fn measure_all(servers: &[crate::manifest::Server]) -> LatencyCache {
-    // Extract (name, ip) pairs — prefer first IPv4, fall back to first entry IP.
-    let pairs: Vec<(String, String)> = servers
-        .iter()
-        .filter_map(|server| {
-            let ip = server
-                .ips_entry
-                .iter()
-                .find(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())
-                .or_else(|| server.ips_entry.first())
-                .cloned()?;
-            if ip.parse::<std::net::IpAddr>().is_ok() {
-                Some((server.name.clone(), ip))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let results = measure_all_from_ips(&pairs, 3, pairs.len());
-
-    let mut cache = LatencyCache::new();
-    for (name, latency) in &results {
-        if *latency >= 0 {
-            cache.update(name, *latency);
-        } else {
-            cache.update_failed(name);
-        }
-    }
-
-    cache
 }
