@@ -136,14 +136,19 @@ pub fn sidebar_tab_inactive(_theme: &Theme, status: button::Status) -> button::S
 
 /// Big primary action button (Connect, Save, etc).
 pub fn primary_button(_theme: &Theme, status: button::Status) -> button::Style {
+    let is_disabled = matches!(status, button::Status::Disabled);
     let bg = match status {
         button::Status::Hovered => PRIMARY_HOVER,
-        button::Status::Disabled => Color { r: PRIMARY.r, g: PRIMARY.g, b: PRIMARY.b, a: 0.4 },
+        button::Status::Disabled => Color { r: PRIMARY.r, g: PRIMARY.g, b: PRIMARY.b, a: 0.25 },
         _ => PRIMARY,
     };
     button::Style {
         background: Some(iced::Background::Color(bg)),
-        text_color: Color::WHITE,
+        text_color: if is_disabled {
+            Color { r: 1.0, g: 1.0, b: 1.0, a: 0.3 }
+        } else {
+            Color::WHITE
+        },
         border: Border {
             radius: RADIUS_MD.into(),
             ..Default::default()
@@ -182,18 +187,27 @@ pub fn danger_button(_theme: &Theme, status: button::Status) -> button::Style {
 
 /// Small secondary button (Refresh, Clear, etc).
 pub fn secondary_button(_theme: &Theme, status: button::Status) -> button::Style {
+    let is_disabled = matches!(status, button::Status::Disabled);
     let bg = match status {
         button::Status::Hovered => SURFACE_HOVER,
-        button::Status::Disabled => Color { r: SURFACE.r, g: SURFACE.g, b: SURFACE.b, a: 0.4 },
+        button::Status::Disabled => Color { r: BACKGROUND.r, g: BACKGROUND.g, b: BACKGROUND.b, a: 0.6 },
         _ => SURFACE,
     };
     button::Style {
         background: Some(iced::Background::Color(bg)),
-        text_color: TEXT,
+        text_color: if is_disabled {
+            Color { r: 1.0, g: 1.0, b: 1.0, a: 0.25 }
+        } else {
+            TEXT
+        },
         border: Border {
             radius: RADIUS_MD.into(),
             width: 1.0,
-            color: BORDER,
+            color: if is_disabled {
+                Color { r: BORDER.r, g: BORDER.g, b: BORDER.b, a: 0.3 }
+            } else {
+                BORDER
+            },
         },
         ..Default::default()
     }

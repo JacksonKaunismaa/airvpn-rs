@@ -795,38 +795,22 @@ impl App {
             }
             Message::LockInstall => {
                 self.error_settings = None;
-                if let Some(ref helper) = self.helper {
-                    if helper.send_command("POST", "/lock/install", None).is_err() {
-                        self.enter_reconnection();
-                    }
-                }
+                self.handle_lock_command("/lock/install");
                 Task::none()
             }
             Message::LockUninstall => {
                 self.error_settings = None;
-                if let Some(ref helper) = self.helper {
-                    if helper.send_command("POST", "/lock/uninstall", None).is_err() {
-                        self.enter_reconnection();
-                    }
-                }
+                self.handle_lock_command("/lock/uninstall");
                 Task::none()
             }
             Message::LockEnable => {
                 self.error_settings = None;
-                if let Some(ref helper) = self.helper {
-                    if helper.send_command("POST", "/lock/enable", None).is_err() {
-                        self.enter_reconnection();
-                    }
-                }
+                self.handle_lock_command("/lock/enable");
                 Task::none()
             }
             Message::LockDisable => {
                 self.error_settings = None;
-                if let Some(ref helper) = self.helper {
-                    if helper.send_command("POST", "/lock/disable", None).is_err() {
-                        self.enter_reconnection();
-                    }
-                }
+                self.handle_lock_command("/lock/disable");
                 Task::none()
             }
             Message::EddieImportAccept => {
@@ -1053,6 +1037,35 @@ impl App {
         self.helper_reconnecting = true;
         self.helper_reconnect_at = Instant::now() + Duration::from_secs(1);
         self.activity = "Reconnecting to helper...".into();
+    }
+
+    /// Send a lock command and update local lock state from the response.
+    fn handle_lock_command(&mut self, path: &str) {
+        let Some(ref helper) = self.helper else { return };
+        match helper.send_command("POST", path, None) {
+            Ok((status, body)) => {
+                if status != 200 {
+                    self.error_settings = Some(format!("Lock command failed: {}", body));
+                    return;
+                }
+                // enable/disable return LockStatusInfo directly.
+                // install/uninstall return {"message": ..., "lock": LockStatusInfo}.
+                // Try nested first, then direct.
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
+                    let lock_val = parsed.get("lock").unwrap_or(&parsed);
+                    if let (Some(sa), Some(pa), Some(pi)) = (
+                        lock_val.get("session_active").and_then(|v| v.as_bool()),
+                        lock_val.get("persistent_active").and_then(|v| v.as_bool()),
+                        lock_val.get("persistent_installed").and_then(|v| v.as_bool()),
+                    ) {
+                        self.lock_session = sa;
+                        self.lock_persistent = pa;
+                        self.lock_installed = pi;
+                    }
+                }
+            }
+            Err(_) => self.enter_reconnection(),
+        }
     }
 
     /// Build a ConnectRequest from current settings.
