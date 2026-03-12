@@ -842,11 +842,19 @@ fn activate_netlock(
             allowed_ips.push(host);
         }
     }
-    // Resolve hostnames to IPs before netlock activation
+    // Resolve hostnames to IPs before netlock activation.
+    // Skip DNS resolution when the persistent lock is active — outbound DNS is
+    // blocked by the persistent lock (port 53/853 dropped on non-tunnel interfaces),
+    // so getaddrinfo() blocks for ~30s per nameserver before timing out.
+    // The persistent lock already allowlists bootstrap IPs, so the session lock
+    // only needs the server entry IPs (always numeric) for its allowlist.
+    let persist_active = netlock::is_persist_active();
     let mut resolved_ips: Vec<String> = Vec::new();
     for entry in &allowed_ips {
         if entry.parse::<std::net::IpAddr>().is_ok() {
             resolved_ips.push(entry.clone());
+        } else if persist_active {
+            debug!("skipping hostname resolution for {} (persistent lock active, DNS blocked)", entry);
         } else {
             let addrs = resolve_bootstrap_host(entry);
             if addrs.is_empty() {
@@ -891,6 +899,10 @@ fn activate_netlock(
         iface_name: iface_name.to_string(),
         custom_route_out_cidrs,
         allowlist_out_cidrs,
+        local_forward_ifaces: {
+            let v = options::get_str(&config.resolved, options::NETLOCK_LOCAL_FORWARD_IFACES);
+            if v.is_empty() { vec![] } else { v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect() }
+        },
     };
     netlock::activate(&lock_config)?;
     info!("Network lock active (dedicated nftables table)");

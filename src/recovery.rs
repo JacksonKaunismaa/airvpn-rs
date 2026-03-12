@@ -422,17 +422,79 @@ pub fn check_and_recover() -> Result<()> {
 }
 
 /// Force recovery regardless of PID status.
+///
+/// If a state file exists, runs full `recover_from_state`. If no state file
+/// exists, still checks for and cleans up orphaned system state (session lock,
+/// DNS backup, WireGuard configs) that may have been left behind by a crash
+/// where state.json was already removed (e.g., successful disconnect followed
+/// by a helper kill that left the persistent lock blocking DNS).
 pub fn force_recover() -> Result<()> {
-    let state = match load()? {
-        Some(s) => s,
-        None => {
-            info!("no state file found, nothing to recover");
-            return Ok(());
+    match load()? {
+        Some(s) => {
+            info!("force recovering from state file...");
+            return recover_from_state(&s);
         }
-    };
+        None => {
+            info!("no state file found, checking for orphaned system state...");
+        }
+    }
 
-    info!("force recovering...");
-    recover_from_state(&state)
+    // Even without state.json, clean up anything that might be stuck.
+    let mut found_orphans = false;
+
+    // Orphaned DNS backup
+    let dns_backup = std::path::Path::new("/etc/resolv.conf.airvpn-rs");
+    if dns_backup.exists() {
+        warn!("restoring orphaned DNS backup");
+        let _ = dns::deactivate();
+        found_orphans = true;
+    }
+
+    // Orphaned session lock (persistent lock is intentionally left alone)
+    if netlock::is_active() {
+        warn!("removing orphaned session nftables table");
+        let _ = netlock::deactivate();
+        found_orphans = true;
+    }
+
+    // Orphaned WireGuard configs
+    if let Ok(entries) = std::fs::read_dir(STATE_DIR) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if (name == "avpn0.conf" || name.starts_with("avpn-")) && name.ends_with(".conf") {
+                let _ = std::fs::remove_file(entry.path());
+                found_orphans = true;
+            }
+        }
+    }
+
+    // Orphaned routing policy rules
+    let routing_cleanups: &[&[&str]] = &[
+        &["ip", "-4", "rule", "delete", "table", "main", "suppress_prefixlength", "0"],
+        &["ip", "-6", "rule", "delete", "table", "main", "suppress_prefixlength", "0"],
+        &["ip", "-4", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
+        &["ip", "-6", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
+    ];
+    for cmd in routing_cleanups {
+        if let Ok(output) = std::process::Command::new(cmd[0]).args(&cmd[1..]).output() {
+            if output.status.success() {
+                found_orphans = true;
+                // Delete remaining duplicates
+                for _ in 0..crate::common::MAX_RULE_DELETIONS {
+                    match std::process::Command::new(cmd[0]).args(&cmd[1..]).output() {
+                        Ok(o) if o.status.success() => continue,
+                        _ => break,
+                    }
+                }
+            }
+        }
+    }
+
+    if !found_orphans {
+        info!("no orphaned state found");
+    }
+
+    Ok(())
 }
 
 /// Set up SIGINT/SIGTERM handler that sets a flag.

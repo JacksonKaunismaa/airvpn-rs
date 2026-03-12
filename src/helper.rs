@@ -311,7 +311,7 @@ async fn router(req: Request<hyper::body::Incoming>, state: State, peer_uid: Opt
                     ("POST", "/lock/install") => handle_lock_install(),
                     ("POST", "/lock/uninstall") => handle_lock_uninstall(),
                     ("GET", "/lock/status") => handle_lock_status(),
-                    ("POST", "/recover") => handle_recover(),
+                    ("POST", "/recover") => handle_recover(&state),
                     ("POST", "/shutdown") => handle_shutdown(&state),
                     _ => error_response(StatusCode::NOT_FOUND, &format!("not found: {} {}", method, path)),
                 }
@@ -684,6 +684,21 @@ fn handle_disconnect(state: &State) -> Response<HyperBody> {
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("orphaned disconnect failed: {}", e));
         }
 
+        // Clean up server host routes (force_recover doesn't know server IPs)
+        {
+            let st = state.0.lock().unwrap();
+            if let Some(ref manifest) = st.manifest {
+                let server_ips: Vec<String> = manifest.servers
+                    .iter()
+                    .flat_map(|s| s.ips_entry.iter().cloned())
+                    .collect();
+                drop(st);
+                if let Ok(gw) = wireguard::get_default_gateway_pub() {
+                    let _ = wireguard::remove_server_host_routes(&server_ips, &gw);
+                }
+            }
+        }
+
         // Stop stats poller and clear server info
         {
             let mut st = state.lock().unwrap();
@@ -929,12 +944,31 @@ fn handle_lock_status() -> Response<HyperBody> {
     json_response(StatusCode::OK, &build_lock_status_info())
 }
 
-/// POST /recover
-fn handle_recover() -> Response<HyperBody> {
-    match recovery::force_recover() {
-        Ok(()) => json_response(StatusCode::OK, &json!({"recovered": true})),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("recovery failed: {}", e)),
+/// POST /recover — clean up orphaned VPN state.
+///
+/// Runs force_recover (DNS, locks, WireGuard) and also cleans up stale
+/// server host routes that force_recover can't handle (needs manifest IPs).
+fn handle_recover(state: &State) -> Response<HyperBody> {
+    if let Err(e) = recovery::force_recover() {
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("recovery failed: {}", e));
     }
+
+    // Best-effort cleanup of server host routes (the ~1000 /32 routes to server IPs).
+    // force_recover can't do this because it doesn't know the server IPs.
+    // We get them from the cached manifest in SharedState.
+    let st = state.0.lock().unwrap();
+    if let Some(ref manifest) = st.manifest {
+        let server_ips: Vec<String> = manifest.servers
+            .iter()
+            .flat_map(|s| s.ips_entry.iter().cloned())
+            .collect();
+        drop(st);
+        if let Ok(gw) = wireguard::get_default_gateway_pub() {
+            let _ = wireguard::remove_server_host_routes(&server_ips, &gw);
+        }
+    }
+
+    json_response(StatusCode::OK, &json!({"recovered": true}))
 }
 
 /// POST /shutdown — trigger shutdown and exit helper.

@@ -451,6 +451,11 @@ fn get_default_gateway() -> Result<String> {
     anyhow::bail!("no IPv4 default gateway found (is the network up?)")
 }
 
+/// Public wrapper for recovery/cleanup paths that need the default gateway.
+pub fn get_default_gateway_pub() -> Result<String> {
+    get_default_gateway()
+}
+
 /// Get the current IPv6 default gateway from the main routing table.
 ///
 /// Parses `ip -6 route show default` output which looks like:
