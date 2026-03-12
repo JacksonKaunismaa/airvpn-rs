@@ -73,3 +73,4 @@ Profile at `/etc/airvpn-rs/default.profile` (0600 root:root).
 - DNS deadlock in `activate_netlock()`: `resolve_bootstrap_host("bootme.org")` blocks ~30s when persistent lock drops port 53. Fix: skip hostname resolution when persistent lock active (IPs sufficient) (2026-03-12)
 - `force_recover()` was useless without state.json — returned "nothing to recover" even with orphaned session locks, stale DNS, routing rules. Now does unconditional orphan cleanup (2026-03-12)
 - Server host routes (~1000 /32 routes from pinger) not cleaned by `recover_from_state()`. Helper's `handle_recover` and orphan disconnect path now use manifest IPs from SharedState to clean them (2026-03-12)
+- Connect thread error left stale state.json + locks: `check_and_recover()` found helper's own PID alive → "another instance running". Fix: connect thread calls `force_recover()` on error exit; helper pre-cleans stale state with own PID before starting new connect (2026-03-12)
