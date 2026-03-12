@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::process::Command;
 
-use log::{info, warn};
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 
 /// EWMA smoothing factor. Higher values weight new samples more heavily.
@@ -332,7 +332,7 @@ pub fn measure_all_from_ips(
 
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                     if done % 50 == 0 || done == total {
-                        info!("Ping cycle progress: {}/{}", done, total);
+                        debug!("Ping cycle progress: {}/{}", done, total);
                     }
 
                     (name, latency)
@@ -348,3 +348,4 @@ pub fn measure_all_from_ips(
     }
     results
 }
+
