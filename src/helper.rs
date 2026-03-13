@@ -8,12 +8,12 @@
 //! polled separately every 2s. Long-lived streaming connections (NDJSON
 //! chunked responses) are used for `/connect` and `/events`.
 
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::os::fd::FromRawFd;
 use std::os::unix::net::UnixListener;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -23,13 +23,14 @@ use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
 use hyper::body::Frame;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode};
+use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use log::{debug, error, info, warn};
 use serde_json::json;
 use tokio::net::UnixListener as TokioUnixListener;
+use zeroize::Zeroizing;
 
-use crate::{api, config, connect, ipc, manifest, netlock, pinger, recovery, server, wireguard};
+use crate::{api, config, connect, ipc, manifest, netlock, options, pinger, recovery, server, wireguard};
 
 pub const SOCKET_PATH: &str = "/run/airvpn-rs/helper.sock";
 const PID_FILE: &str = "/run/airvpn-rs/helper.pid";
@@ -45,6 +46,7 @@ fn json_response(status: StatusCode, body: &impl serde::Serialize) -> Response<H
     Response::builder()
         .status(status)
         .header("Content-Type", "application/json")
+        // Infallible → Infallible: Full<Bytes> never errors
         .body(Full::new(Bytes::from(json)).map_err(|never| match never {}).boxed())
         .unwrap()
 }
@@ -58,26 +60,6 @@ fn error_response(status: StatusCode, msg: &str) -> Response<HyperBody> {
 }
 
 // ---------------------------------------------------------------------------
-// Query string parser (moved from deleted http.rs)
-// ---------------------------------------------------------------------------
-
-/// Parse a `key=value&key2=value2` query string into a map.
-fn parse_query_string(qs: &str) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    for pair in qs.split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        if let Some((k, v)) = pair.split_once('=') {
-            map.insert(k.to_string(), v.to_string());
-        } else {
-            map.insert(pair.to_string(), String::new());
-        }
-    }
-    map
-}
-
-// ---------------------------------------------------------------------------
 // Shared state
 // ---------------------------------------------------------------------------
 
@@ -85,9 +67,17 @@ fn parse_query_string(qs: &str) -> HashMap<String, String> {
 struct ConnState {
     connect_handle: Option<thread::JoinHandle<()>>,
     stats_handle: Option<thread::JoinHandle<()>>,
-    stats_stop: Arc<std::sync::atomic::AtomicBool>,
+    stats_stop: Arc<AtomicBool>,
+    /// Per-connection shutdown flag. Set by perform_disconnect() to stop the
+    /// connect thread without poisoning the helper's global shutdown flag.
+    disconnect_flag: Arc<AtomicBool>,
     /// Server info captured from engine events, readable across sessions.
     server_info: Arc<Mutex<(String, String, String)>>,
+    /// Guards against concurrent connect operations (direct or server_switch).
+    /// Set to true when a connect starts, cleared when the connect thread exits
+    /// or when perform_disconnect completes. Checked at the top of
+    /// handle_connect_async to reject rapid-fire requests.
+    connect_in_progress: Arc<AtomicBool>,
 }
 
 impl ConnState {
@@ -95,8 +85,10 @@ impl ConnState {
         Self {
             connect_handle: None,
             stats_handle: None,
-            stats_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stats_stop: Arc::new(AtomicBool::new(false)),
+            disconnect_flag: Arc::new(AtomicBool::new(false)),
             server_info: Arc::new(Mutex::new((String::new(), String::new(), String::new()))),
+            connect_in_progress: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -111,13 +103,35 @@ struct SharedState {
     conn: ConnState,
     /// Event subscribers (long-lived `/events` connections).
     subscribers: Vec<mpsc::Sender<ipc::HelperEvent>>,
+    /// EWMA-smoothed latency cache, updated by background pinger.
+    latency: pinger::LatencyCache,
+    /// Cached manifest from background refresh loop.
+    manifest: Option<manifest::Manifest>,
+    /// True after the background pinger completes its first cycle.
+    ready: bool,
+    /// Cached WireGuard key names from user info (for GUI device dropdown).
+    key_names: Vec<String>,
 }
 
 impl SharedState {
     fn new() -> Self {
+        let latency = pinger::LatencyCache::load(pinger::LATENCY_CACHE_PATH);
+        // Populate persistent lock's ping_allow from cached server IPs so the
+        // background pinger can reach servers immediately on startup.
+        if !latency.server_ips().is_empty() {
+            let ips: Vec<String> = latency.server_ips().values().cloned().collect();
+            if let Err(e) = netlock::populate_ping_allow(&ips) {
+                log::warn!("Failed to populate ping_allow from cached IPs: {e}");
+            }
+        }
+        let ready = latency.has_data(); // warm start = ready immediately
         Self {
             conn: ConnState::new(),
             subscribers: Vec::new(),
+            latency,
+            manifest: None,
+            ready,
+            key_names: Vec::new(),
         }
     }
 
@@ -127,7 +141,17 @@ impl SharedState {
     }
 }
 
-type State = Arc<Mutex<SharedState>>;
+/// Condvars for cold-start coordination between background loops and connect.
+struct Notify {
+    /// Signaled when credentials become available (eddie import, profile save).
+    manifest_cv: Condvar,
+    /// Signaled when manifest loop populates server IPs.
+    pinger_cv: Condvar,
+    /// Signaled when pinger completes its first cycle.
+    ready_cv: Condvar,
+}
+
+type State = Arc<(Mutex<SharedState>, Notify)>;
 
 // ---------------------------------------------------------------------------
 // Systemd socket activation + PID file (unchanged from old code)
@@ -204,64 +228,91 @@ async fn async_run(std_listener: std::os::unix::net::UnixListener) -> Result<()>
     let listener = TokioUnixListener::from_std(std_listener)
         .context("failed to create tokio UnixListener")?;
 
+    // Signal handler: sets the recovery shutdown flag AND notifies the accept loop.
     let shutdown = recovery::setup_signal_handler()?;
-    let state: State = Arc::new(Mutex::new(SharedState::new()));
+    let state: State = Arc::new((
+        Mutex::new(SharedState::new()),
+        Notify {
+            manifest_cv: Condvar::new(),
+            pinger_cv: Condvar::new(),
+            ready_cv: Condvar::new(),
+        },
+    ));
+
+    // Spawn background pinger task (runs every 3 minutes)
+    {
+        let state_for_pinger = Arc::clone(&state);
+        let shutdown_for_pinger = Arc::clone(&shutdown);
+        tokio::task::spawn_blocking(move || {
+            background_pinger_loop(state_for_pinger, shutdown_for_pinger);
+        });
+    }
+
+    // Spawn background manifest refresh task (runs every 30 minutes)
+    {
+        let state_for_manifest = Arc::clone(&state);
+        let shutdown_for_manifest = Arc::clone(&shutdown);
+        tokio::task::spawn_blocking(move || {
+            background_manifest_loop(state_for_manifest, shutdown_for_manifest);
+        });
+    }
 
     loop {
-        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            info!("Shutdown signal received, exiting helper");
-            break;
-        }
+        tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, _addr)) => {
+                        let peer_uid = stream.peer_cred()
+                            .ok()
+                            .map(|cred| {
+                                info!("Client connected: uid={} pid={}", cred.uid(), cred.pid().unwrap_or(0));
+                                cred.uid()
+                            });
 
-        // Use tokio::select with a timeout to periodically check shutdown flag
-        let accept_result = tokio::time::timeout(
-            Duration::from_secs(1),
-            listener.accept()
-        ).await;
-
-        match accept_result {
-            Ok(Ok((stream, _addr))) => {
-                // Get peer credentials from the tokio UnixStream
-                let peer_uid = stream.peer_cred()
-                    .ok()
-                    .map(|cred| {
-                        info!("Client connected: uid={} pid={}", cred.uid(), cred.pid().unwrap_or(0));
-                        cred.uid()
-                    });
-
-                let io = TokioIo::new(stream);
-                let state = Arc::clone(&state);
-
-                tokio::task::spawn(async move {
-                    let service = service_fn(move |req| {
+                        let io = TokioIo::new(stream);
                         let state = Arc::clone(&state);
-                        async move { Ok::<_, Infallible>(router(req, state, peer_uid).await) }
-                    });
 
-                    if let Err(e) = http1::Builder::new()
-                        .keep_alive(false)
-                        .serve_connection(io, service)
-                        .await
-                    {
-                        debug!("Connection error: {}", e);
+                        tokio::task::spawn(async move {
+                            let service = service_fn(move |req| {
+                                let state = Arc::clone(&state);
+                                async move { Ok::<_, Infallible>(router(req, state, peer_uid).await) }
+                            });
+
+                            // One request per connection — CLI/GUI clients don't reuse connections
+                            if let Err(e) = http1::Builder::new()
+                                .keep_alive(false)
+                                .serve_connection(io, service)
+                                .await
+                            {
+                                debug!("Connection error: {}", e);
+                            }
+                        });
                     }
-                });
+                    Err(e) => {
+                        error!("Failed to accept connection: {}", e);
+                    }
+                }
             }
-            Ok(Err(e)) => {
-                error!("Failed to accept connection: {}", e);
-                tokio::time::sleep(Duration::from_secs(1)).await;
+            // Check shutdown flag every second (signal handler sets it)
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                if shutdown.load(Ordering::Relaxed) {
+                    info!("Shutdown signal received, exiting helper");
+                    break;
+                }
             }
-            Err(_) => {} // Timeout, loop back to check shutdown
         }
     }
 
     // Graceful shutdown
     {
-        let mut st = state.lock().unwrap();
+        let mut st = state.0.lock().unwrap();
         if st.conn.is_connected() {
             info!("Disconnecting active VPN before shutdown...");
+            // Signal the connect thread via its per-connection flag
+            // (the global shutdown flag is already set by the signal handler).
+            st.conn.disconnect_flag.store(true, Ordering::SeqCst);
             let connect_handle = st.conn.connect_handle.take();
-            st.conn.stats_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            st.conn.stats_stop.store(true, Ordering::SeqCst);
             let stats_handle = st.conn.stats_handle.take();
             drop(st);
             if let Some(h) = connect_handle { let _ = h.join(); }
@@ -273,16 +324,286 @@ async fn async_run(std_listener: std::os::unix::net::UnixListener) -> Result<()>
 }
 
 // ---------------------------------------------------------------------------
+// Background pinger
+// ---------------------------------------------------------------------------
+
+/// Background pinger loop — runs every 3 minutes, measures all server latencies.
+///
+/// Copies the server IP list out of SharedState (quick lock), pings without
+/// holding the lock (~30-60s), then merges results back (quick lock).
+fn lock_state(state: &State) -> std::sync::MutexGuard<'_, SharedState> {
+    state.0.lock().unwrap_or_else(|e| {
+        warn!("SharedState mutex was poisoned, recovering");
+        e.into_inner()
+    })
+}
+
+fn background_pinger_loop(state: State, shutdown: Arc<AtomicBool>) {
+    const CYCLE_INTERVAL_SECS: u64 = 180; // 3 minutes
+    // Resolve pinger options from profile
+    let profile_opts = config::load_profile_options();
+    let resolved = options::resolve(&profile_opts, &std::collections::HashMap::new());
+    let ping_timeout_secs = options::get_u64(&resolved, options::PINGER_TIMEOUT);
+    let pinger_enabled = options::get_bool(&resolved, options::PINGER_ENABLED);
+    let pinger_jobs = options::get_u64(&resolved, options::PINGER_JOBS) as usize;
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Wait until server IPs are available (manifest loop signals pinger_cv)
+        {
+            let guard = lock_state(&state);
+            let _guard = state.1.pinger_cv.wait_while(guard, |st| {
+                if shutdown.load(Ordering::Relaxed) {
+                    return false; // unblock on shutdown
+                }
+                st.latency.server_ips().is_empty()
+            }).unwrap_or_else(|e| e.into_inner());
+        }
+
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
+        debug!("Pinger woke: server IPs available, starting cycle");
+
+        // When pinger is disabled, skip pinging but keep the loop alive
+        // to avoid blocking the condvar chain (ready_cv must still fire).
+        if !pinger_enabled {
+            {
+                let mut st = lock_state(&state);
+                if !st.ready {
+                    st.ready = true;
+                    state.1.ready_cv.notify_all();
+                }
+            }
+            debug!("Pinger disabled, skipping ping cycle");
+            interruptible_sleep_secs(&shutdown, CYCLE_INTERVAL_SECS);
+            continue;
+        }
+
+        // Copy IPs out of shared state (quick lock)
+        let ips: Vec<(String, String)> = {
+            let st = lock_state(&state);
+            st.latency.server_ips()
+                .iter()
+                .map(|(n, ip)| (n.clone(), ip.clone()))
+                .collect()
+        };
+
+        if ips.is_empty() {
+            continue; // spurious wakeup
+        }
+
+        debug!("Starting ping cycle ({} servers, max {} concurrent)", ips.len(), pinger_jobs);
+
+        // Ping all servers via host routes (direct, not through tunnel).
+        // All servers are treated equally — no special-casing for the
+        // connected server. This gives consistent raw network latency.
+        let results = pinger::measure_all_from_ips(&ips, ping_timeout_secs, pinger_jobs);
+
+        // Merge results back into shared state (quick lock)
+        {
+            let mut st = lock_state(&state);
+            for (name, latency) in &results {
+                if *latency >= 0 {
+                    st.latency.update(name, *latency);
+                } else {
+                    st.latency.update_failed(name);
+                }
+            }
+            if !st.ready {
+                st.ready = true;
+                state.1.ready_cv.notify_all();
+            }
+            if let Err(e) = st.latency.save(pinger::LATENCY_CACHE_PATH) {
+                warn!("Failed to persist latency cache: {e}");
+            }
+        }
+
+        let measured = results.iter().filter(|(_, l)| *l >= 0).count();
+        let failed = results.len() - measured;
+        // One line per cycle: concise summary. Warn only if significant failures.
+        {
+            let st = lock_state(&state);
+            if let Some((_count, min, avg, max)) = st.latency.summary() {
+                if failed > results.len() / 4 {
+                    warn!(
+                        "Ping: {}/{} measured ({} failed) — {}ms/{}ms/{}ms min/avg/max",
+                        measured, results.len(), failed, min, avg, max,
+                    );
+                } else {
+                    info!(
+                        "Ping: {}/{} — {}ms/{}ms/{}ms min/avg/max",
+                        measured, results.len(), min, avg, max,
+                    );
+                }
+            } else {
+                info!("Ping: {}/{} measured — no latency data yet", measured, results.len());
+            }
+        }
+
+        // Sleep for 3 minutes (interruptible by shutdown)
+        interruptible_sleep_secs(&shutdown, CYCLE_INTERVAL_SECS);
+    }
+}
+
+/// Sleep for the given duration, checking shutdown flag every second.
+fn interruptible_sleep_secs(shutdown: &AtomicBool, seconds: u64) {
+    for _ in 0..seconds {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Background manifest refresh
+// ---------------------------------------------------------------------------
+
+/// Background manifest refresh loop — fetches manifest every 30 minutes.
+///
+/// On startup, waits for credentials (via manifest_cv) if none available.
+/// After each successful fetch, populates server IPs and signals pinger_cv.
+fn background_manifest_loop(state: State, shutdown: Arc<AtomicBool>) {
+    // Resolve from profile; falls back to registry defaults
+    let profile_opts = config::load_profile_options();
+    let resolved = options::resolve(&profile_opts, &std::collections::HashMap::new());
+    let refresh_interval_secs = options::get_u64(&resolved, options::MANIFEST_REFRESH);
+    let ip_layer = options::get_str(&resolved, options::NETWORK_ENTRY_IPLAYER).to_string();
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Load credentials from profile
+        let profile_options = config::load_profile_options();
+        let username = Zeroizing::new(profile_options.get("login").cloned().unwrap_or_default());
+        let password = Zeroizing::new(profile_options.get("password").cloned().unwrap_or_default());
+
+        if username.is_empty() || password.is_empty() {
+            // No creds yet — clear cached keys and wait for manifest_cv signal
+            {
+                let mut st = lock_state(&state);
+                st.key_names.clear();
+            }
+            info!("No credentials available, manifest loop waiting for profile setup...");
+            let guard = lock_state(&state);
+            // wait_while blocks until the predicate returns false (i.e., creds available or shutdown)
+            let _guard = state.1.manifest_cv.wait_while(guard, |_st| {
+                if shutdown.load(Ordering::Relaxed) {
+                    return false; // unblock on shutdown
+                }
+                let opts = config::load_profile_options();
+                let u = opts.get("login").cloned().unwrap_or_default();
+                let p = opts.get("password").cloned().unwrap_or_default();
+                u.is_empty() || p.is_empty() // keep waiting while creds empty
+            }).unwrap_or_else(|e| e.into_inner());
+            continue; // re-check creds at top of loop
+        }
+
+        // Fetch manifest
+        match api::load_provider_config() {
+            Ok(provider_config) => {
+                match api::fetch_manifest(&provider_config, &username, &password) {
+                    Ok(manifest_xml) => {
+                        match manifest::parse_manifest(&manifest_xml) {
+                            Ok(new_manifest) => {
+                                info!("Background manifest refresh: {} servers", new_manifest.servers.len());
+
+                                // Extract (name, preferred_entry_ip) pairs,
+                                // respecting ip_layer preference with fallback.
+                                let prefer_ipv6 = ip_layer == "ipv6";
+                                let server_ip_pairs: Vec<(String, String)> = new_manifest.servers
+                                    .iter()
+                                    .filter_map(|s| {
+                                        let ip = if prefer_ipv6 {
+                                            s.ips_entry.iter()
+                                                .find(|ip| ip.parse::<std::net::Ipv6Addr>().is_ok())
+                                                .or_else(|| s.ips_entry.iter()
+                                                    .find(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok()))
+                                                .or_else(|| s.ips_entry.first())
+                                        } else {
+                                            s.ips_entry.iter()
+                                                .find(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())
+                                                .or_else(|| s.ips_entry.first())
+                                        };
+                                        ip.map(|ip| (s.name.clone(), ip.clone()))
+                                    })
+                                    .collect();
+
+                                // Update shared state
+                                {
+                                    let mut st = lock_state(&state);
+                                    st.manifest = Some(new_manifest);
+                                    if !server_ip_pairs.is_empty() {
+                                        let ips: Vec<String> = server_ip_pairs.iter()
+                                            .map(|(_, ip)| ip.clone()).collect();
+                                        st.latency.set_server_ips(server_ip_pairs);
+                                        drop(st);
+                                        if let Err(e) = netlock::populate_ping_allow(&ips) {
+                                            warn!("Failed to update ping_allow: {e}");
+                                        }
+                                    }
+                                }
+
+                                // Signal pinger that IPs are available
+                                state.1.pinger_cv.notify_all();
+                                // Signal ready_cv so warm-start connects unblock
+                                // (ready=true from latency.json, was just waiting for manifest)
+                                state.1.ready_cv.notify_all();
+                            }
+                            Err(e) => warn!("Failed to parse manifest: {:#}", e),
+                        }
+                    }
+                    Err(e) => warn!("Failed to fetch manifest: {:#}", e),
+                }
+
+                // Fetch user info for key names (needed by GUI device dropdown).
+                // Called outside the lock — network call can take 5-30s.
+                match api::fetch_user(&provider_config, &username, &password) {
+                    Ok(user_xml) => {
+                        match manifest::parse_user(&user_xml) {
+                            Ok(user_info) => {
+                                let names: Vec<String> = user_info.keys.iter()
+                                    .map(|k| k.name.clone())
+                                    .collect();
+                                debug!("Cached {} WireGuard key names", names.len());
+                                let mut st = lock_state(&state);
+                                st.key_names = names;
+                            }
+                            Err(e) => {
+                                warn!("Failed to parse user info for keys: {:#}", e);
+                                let mut st = lock_state(&state);
+                                st.key_names.clear();
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to fetch user info for keys: {:#}", e);
+                        let mut st = lock_state(&state);
+                        st.key_names.clear();
+                    }
+                }
+            }
+            Err(e) => warn!("Failed to load provider config: {:#}", e),
+        }
+
+        interruptible_sleep_secs(&shutdown, refresh_interval_secs);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
 async fn router(req: Request<hyper::body::Incoming>, state: State, peer_uid: Option<u32>) -> Response<HyperBody> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    let _query: HashMap<String, String> = req.uri().query()
-        .map(|q| parse_query_string(q))
-        .unwrap_or_default();
-
     debug!("HTTP {} {}", method, path);
 
     // Read body for all requests (no-op for GET with empty body)
@@ -302,13 +623,14 @@ async fn router(req: Request<hyper::body::Incoming>, state: State, peer_uid: Opt
                 match (method.as_str(), path.as_str()) {
                     ("GET", "/status") => handle_status(&state),
                     ("POST", "/disconnect") => handle_disconnect(&state),
-                    ("GET", "/servers") => handle_list_servers(&query),
+                    ("GET", "/servers") => handle_list_servers(&state),
+                    ("GET", "/keys") => handle_get_keys(&state),
                     ("GET", "/profile") => handle_get_profile(),
-                    ("POST", "/profile") => handle_save_profile(&body_bytes),
-                    ("POST", "/import-eddie") => handle_import_eddie(&body_bytes, peer_uid),
-                    ("POST", "/lock/enable") => handle_lock_enable(),
+                    ("POST", "/profile") => handle_save_profile(&body_bytes, &state),
+                    ("POST", "/import-eddie") => handle_import_eddie(&body_bytes, peer_uid, &state),
+                    ("POST", "/lock/enable") => handle_lock_enable(&state),
                     ("POST", "/lock/disable") => handle_lock_disable(),
-                    ("POST", "/lock/install") => handle_lock_install(),
+                    ("POST", "/lock/install") => handle_lock_install(&state),
                     ("POST", "/lock/uninstall") => handle_lock_uninstall(),
                     ("GET", "/lock/status") => handle_lock_status(),
                     ("POST", "/recover") => handle_recover(&state),
@@ -343,11 +665,9 @@ fn build_lock_status_info() -> ipc::LockStatusInfo {
     }
 }
 
-/// GET /status — return connection state + lock status.
-fn handle_status(state: &State) -> Response<HyperBody> {
-    let st = state.lock().unwrap();
-
-    let conn_state = if st.conn.is_connected() {
+/// Determine the current connection state from shared state + recovery + wireguard.
+fn current_connection_state(st: &SharedState) -> ipc::ConnectionState {
+    if st.conn.is_connected() {
         match recovery::load() {
             Ok(Some(rec)) if wireguard::is_connected(&rec.wg_interface) => {
                 let (name, country, location) = st.conn.server_info
@@ -373,14 +693,48 @@ fn handle_status(state: &State) -> Response<HyperBody> {
             }
             _ => ipc::ConnectionState::Disconnected,
         }
-    };
+    }
+}
+
+/// GET /status — return connection state + lock status + pinger health.
+fn handle_status(state: &State) -> Response<HyperBody> {
+    let st = state.0.lock().unwrap();
+    let conn_state = current_connection_state(&st);
+    let pinger = build_pinger_info(&st);
     drop(st);
 
     let status = ipc::StatusResponse {
         state: conn_state,
         lock: build_lock_status_info(),
+        pinger,
     };
     json_response(StatusCode::OK, &status)
+}
+
+fn build_pinger_info(st: &SharedState) -> ipc::PingerInfo {
+    let total = st.latency.server_ips().len();
+    let measured = st.latency.len();
+    let (latency_min_ms, latency_avg_ms, latency_max_ms) = match st.latency.summary() {
+        Some((_, min, avg, max)) => (Some(min), Some(avg), Some(max)),
+        None => (None, None, None),
+    };
+    ipc::PingerInfo {
+        ready: st.ready,
+        measured,
+        total,
+        latency_min_ms,
+        latency_avg_ms,
+        latency_max_ms,
+    }
+}
+
+/// RAII guard that clears `connect_in_progress` on drop.
+/// Defused via `forget()` when the connect thread takes ownership of the flag.
+struct ConnectGuard(Arc<AtomicBool>);
+impl Drop for ConnectGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 /// POST /connect — start VPN connection, stream events via chunked response.
@@ -394,18 +748,24 @@ async fn handle_connect_async(
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("invalid ConnectRequest JSON: {}", e)),
     };
 
-    // Lock briefly to check if already connected
-    {
-        let st = state.lock().unwrap();
-        if st.conn.is_connected() {
-            return json_response(StatusCode::CONFLICT, &json!({"error": "already connected — disconnect first"}));
+    // Reject concurrent connect operations. This prevents rapid-fire requests
+    // (e.g., GUI spam-clicking) from spawning multiple server_switch threads
+    // that race on state.json cleanup.
+    let connect_guard = {
+        let st = state.0.lock().unwrap();
+        if st.conn.connect_in_progress.load(Ordering::SeqCst) {
+            return error_response(StatusCode::CONFLICT, "connect already in progress");
         }
-    }
+        st.conn.connect_in_progress.store(true, Ordering::SeqCst);
+        // RAII guard: clears the flag if we return early (credential errors,
+        // warmup timeout, etc.). The connect thread clears it on normal exit.
+        ConnectGuard(st.conn.connect_in_progress.clone())
+    };
 
-    // Resolve credentials from saved profile
+    // Resolve credentials from saved profile (fast, no blocking)
     let profile_options = config::load_profile_options();
-    let prof_user = profile_options.get("login").cloned().unwrap_or_default();
-    let prof_pass = profile_options.get("password").cloned().unwrap_or_default();
+    let prof_user = Zeroizing::new(profile_options.get("login").cloned().unwrap_or_default());
+    let prof_pass = Zeroizing::new(profile_options.get("password").cloned().unwrap_or_default());
 
     let (resolved_username, resolved_password) = if !prof_user.is_empty() && !prof_pass.is_empty() {
         (prof_user, prof_pass)
@@ -417,161 +777,68 @@ async fn handle_connect_async(
         return error_response(StatusCode::BAD_REQUEST, "no credentials available — run `sudo airvpn connect` for first-time setup");
     };
 
-    // Reset shutdown flag for the new connection
-    recovery::reset_shutdown();
-
-    // Create mpsc channel for engine events
-    let (event_tx, event_rx) = mpsc::channel::<ipc::EngineEvent>();
-
-    // Capture server info for the shared state
-    let server_info = {
-        let st = state.lock().unwrap();
-        st.conn.server_info.clone()
-    };
-
-    // Spawn engine→broadcast forwarder thread
-    let broadcast_state = Arc::clone(&state);
-    let fwd_server_info = server_info.clone();
-    let event_fwd = thread::spawn(move || {
-        for engine_event in event_rx {
-            let helper_event = match engine_event {
-                ipc::EngineEvent::StateChanged(s) => {
-                    ipc::HelperEvent::StateChanged { state: s }
-                }
-                ipc::EngineEvent::Log { level, message } => {
-                    ipc::HelperEvent::Log { level, message }
-                }
-                ipc::EngineEvent::ServerSelected { name, country, location } => {
-                    if let Ok(mut info) = fwd_server_info.lock() {
-                        *info = (name.clone(), country.clone(), location.clone());
-                    }
-                    ipc::HelperEvent::Log {
-                        level: "info".to_string(),
-                        message: format!("Selected server: {} ({}, {})", name, location, country),
-                    }
-                }
-            };
-            if let Ok(mut st) = broadcast_state.lock() {
-                st.broadcast(&helper_event);
-            }
-        }
-    });
-
-    // Stop any previous stats poller
+    // Check warmup (fast, no blocking in steady state)
     {
-        let mut st = state.lock().unwrap();
-        st.conn.stats_stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        let prev_stats = st.conn.stats_handle.take();
-        drop(st);
-        if let Some(h) = prev_stats {
-            let _ = h.join();
+        let guard = lock_state(&state);
+        if !guard.ready || guard.manifest.is_none() {
+            info!("Waiting for helper warmup (manifest + first ping cycle)...");
+            let result = state.1.ready_cv.wait_timeout_while(
+                guard,
+                Duration::from_secs(60),
+                |st| !st.ready || st.manifest.is_none(),
+            ).unwrap_or_else(|e| e.into_inner());
+            if !result.0.ready || result.0.manifest.is_none() {
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Helper still warming up (waiting for first latency measurement). Try again shortly.",
+                );
+            }
         }
     }
 
-    // Spawn connect thread
-    let connect_broadcast_state = Arc::clone(&state);
-    let connect_config = connect::ConnectConfig {
-        server_name: connect_req.server,
-        no_lock: connect_req.no_lock,
-        allow_lan: connect_req.allow_lan,
-        no_reconnect: connect_req.no_reconnect,
-        username: resolved_username,
-        password: resolved_password,
-        allow_server: connect_req.allow_server,
-        deny_server: connect_req.deny_server,
-        allow_country: connect_req.allow_country,
-        deny_country: connect_req.deny_country,
-        skip_ping: connect_req.skip_ping,
-        no_verify: connect_req.no_verify,
-        no_lock_last: connect_req.no_lock_last,
-        no_start_last: connect_req.no_start_last,
-        cli_ipv6_mode: connect_req.ipv6_mode,
-        cli_dns_servers: connect_req.dns_servers,
-        cli_event_pre: connect_req.event_pre,
-        cli_event_up: connect_req.event_up,
-        cli_event_down: connect_req.event_down,
-        event_tx: event_tx.clone(),
-    };
-
-    let conn_handle = thread::spawn(move || {
-        let result = (|| -> Result<()> {
-            let mut provider_config = api::load_provider_config()?;
-            api::verify_rsa_key_integrity(&provider_config);
-            connect::run(&mut provider_config, &connect_config)?;
-            Ok(())
-        })();
-
-        if let Err(e) = &result {
-            error!("Connect thread exited with error: {}", e);
-            if let Ok(mut st) = connect_broadcast_state.lock() {
-                st.broadcast(&ipc::HelperEvent::Error {
-                    message: format!("{}", e),
-                });
-            }
-        }
-
-        // Signal disconnected
-        drop(result);
-        if let Ok(mut st) = connect_broadcast_state.lock() {
-            st.broadcast(&ipc::HelperEvent::StateChanged {
-                state: ipc::ConnectionState::Disconnected,
+    // If already connected, do the full disconnect→connect in a detached thread
+    // and return immediately. The HTTP connection may die during disconnect
+    // (cancelling this handler), so we must not await the disconnect.
+    // Events flow through the /events stream.
+    {
+        let is_connected = state.0.lock().unwrap().conn.is_connected();
+        if is_connected {
+            // Defuse — the server_switch thread's start_connect will spawn a
+            // connect thread that owns clearing connect_in_progress.
+            std::mem::forget(connect_guard);
+            let switch_state = Arc::clone(&state);
+            thread::spawn(move || {
+                perform_disconnect(&switch_state);
+                start_connect(switch_state, connect_req, resolved_username, resolved_password);
             });
+            return json_response(StatusCode::OK, &json!({"server_switch": true}));
         }
-    });
-
-    // Spawn stats polling thread
-    let stats_state = Arc::clone(&state);
-    let stats_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stats_stop_clone = stats_stop.clone();
-    let stats_handle = thread::spawn(move || {
-        loop {
-            thread::sleep(Duration::from_secs(2));
-            if stats_stop_clone.load(std::sync::atomic::Ordering::SeqCst) {
-                break;
-            }
-
-            let iface = match recovery::load() {
-                Ok(Some(state)) => state.wg_interface,
-                _ => continue,
-            };
-
-            if iface.is_empty() || !wireguard::is_connected(&iface) {
-                continue;
-            }
-
-            match wireguard::get_transfer_stats(&iface) {
-                Ok((rx, tx)) => {
-                    if let Ok(mut st) = stats_state.lock() {
-                        st.broadcast(&ipc::HelperEvent::Stats {
-                            rx_bytes: rx,
-                            tx_bytes: tx,
-                        });
-                    }
-                }
-                Err(e) => {
-                    debug!("Failed to get transfer stats: {}", e);
-                }
-            }
-        }
-    });
-
-    // Store handles in shared state
-    {
-        let mut st = state.lock().unwrap();
-        st.conn.connect_handle = Some(conn_handle);
-        st.conn.stats_stop = stats_stop;
-        st.conn.stats_handle = Some(stats_handle);
     }
 
-    // Wait for the event forwarder in a background thread
-    thread::spawn(move || {
-        let _ = event_fwd.join();
-    });
+    // Clean up stale state from a previous connect session that crashed/failed
+    // without running its cleanup path. The state.json records the helper's PID
+    // (std::process::id()), so check_and_recover() inside connect::run() would
+    // find our own PID alive and bail with "another instance running" — even
+    // though the connect thread is long dead. We know it's safe to recover here
+    // because is_connected() returned false above.
+    if let Ok(Some(stale)) = recovery::load() {
+        if stale.pid == std::process::id() {
+            info!("cleaning up stale state from previous connect session (our PID, no active connect thread)");
+            if let Err(e) = recovery::force_recover() {
+                warn!("stale state cleanup failed: {}", e);
+            }
+        }
+    }
+
+    // Start the connect engine (disconnect_flag is created fresh inside start_connect).
+    // Defuse the guard — the connect thread now owns clearing connect_in_progress.
+    std::mem::forget(connect_guard);
+    start_connect(Arc::clone(&state), connect_req, resolved_username, resolved_password);
 
     // Subscribe to events and stream them back as chunked NDJSON response
     let (sub_tx, sub_rx) = mpsc::channel::<ipc::HelperEvent>();
     {
-        let mut st = state.lock().unwrap();
+        let mut st = state.0.lock().unwrap();
         st.subscribers.push(sub_tx);
     }
 
@@ -610,9 +877,245 @@ async fn handle_connect_async(
     Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/x-ndjson")
-        .header("Transfer-Encoding", "chunked")
         .body(body)
         .unwrap()
+}
+
+/// Disconnect the active VPN connection (blocking: joins threads).
+/// Returns true if a connection was active and torn down.
+fn perform_disconnect(state: &State) -> bool {
+    let is_connected = state.0.lock().unwrap().conn.is_connected();
+    if !is_connected {
+        return false;
+    }
+
+    // Signal the connect thread via its per-connection flag.
+    // Do NOT call recovery::trigger_shutdown() here — that sets the global
+    // flag which also kills the helper's accept loop (the zombie-helper bug).
+    state.0.lock().unwrap().conn.disconnect_flag.store(true, Ordering::SeqCst);
+
+    {
+        let mut st = state.0.lock().unwrap();
+        st.broadcast(&ipc::HelperEvent::StateChanged {
+            state: ipc::ConnectionState::Disconnecting,
+        });
+    }
+
+    // Take handles — drop lock before joining threads (they may need the lock)
+    let (connect_handle, stats_handle) = {
+        let mut st = state.0.lock().unwrap();
+        let ch = st.conn.connect_handle.take();
+        st.conn.stats_stop.store(true, Ordering::SeqCst);
+        let sh = st.conn.stats_handle.take();
+        (ch, sh)
+    };
+
+    if let Some(h) = connect_handle {
+        let _ = h.join();
+    }
+    if let Some(h) = stats_handle {
+        let _ = h.join();
+    }
+
+    // The connect thread may have exited without full cleanup (e.g., shutdown
+    // caught between reconnection iterations at connect.rs:1071). Force-recover
+    // from the state file to clean up DNS, WireGuard, netlock, IPv6, etc.
+    // If the connect thread already cleaned up, force_recover finds no state
+    // file and is a no-op.
+    if let Err(e) = recovery::force_recover() {
+        warn!("force_recover after disconnect: {}", e);
+    }
+
+    // Clear server info and broadcast disconnected
+    {
+        let mut st = state.0.lock().unwrap();
+        if let Ok(mut info) = st.conn.server_info.lock() {
+            *info = Default::default();
+        }
+        st.broadcast(&ipc::HelperEvent::StateChanged {
+            state: ipc::ConnectionState::Disconnected,
+        });
+    }
+
+    true
+}
+
+/// Start a connect engine in background threads (no HTTP response needed).
+/// Used by server-switch path where the HTTP handler returns immediately.
+/// Events are broadcast to all /events subscribers.
+fn start_connect(state: State, connect_req: ipc::ConnectRequest, username: Zeroizing<String>, password: Zeroizing<String>) {
+    let (event_tx, event_rx) = mpsc::channel::<ipc::EngineEvent>();
+
+    let server_info = {
+        let st = state.0.lock().unwrap();
+        st.conn.server_info.clone()
+    };
+
+    // Spawn engine→broadcast forwarder thread
+    let broadcast_state = Arc::clone(&state);
+    let fwd_server_info = server_info.clone();
+    let event_fwd = thread::spawn(move || {
+        for engine_event in event_rx {
+            let helper_event = match engine_event {
+                ipc::EngineEvent::StateChanged(s) => {
+                    ipc::HelperEvent::StateChanged { state: s }
+                }
+                ipc::EngineEvent::Log { level, message } => {
+                    ipc::HelperEvent::Log { level, message }
+                }
+                ipc::EngineEvent::ServerSelected { name, country, location } => {
+                    if let Ok(mut info) = fwd_server_info.lock() {
+                        *info = (name.clone(), country.clone(), location.clone());
+                    }
+                    ipc::HelperEvent::Log {
+                        level: "info".to_string(),
+                        message: format!("Selected server: {} ({}, {})", name, location, country),
+                    }
+                }
+            };
+            if let Ok(mut st) = broadcast_state.0.lock() {
+                st.broadcast(&helper_event);
+            }
+        }
+    });
+
+    // Stop any previous stats poller
+    {
+        let mut st = state.0.lock().unwrap();
+        st.conn.stats_stop.store(true, Ordering::SeqCst);
+        let prev_stats = st.conn.stats_handle.take();
+        drop(st);
+        if let Some(h) = prev_stats {
+            let _ = h.join();
+        }
+    }
+
+    let connect_broadcast_state = Arc::clone(&state);
+    let (cached_manifest, cached_latency) = {
+        let st = lock_state(&state);
+        (st.manifest.clone().expect("ready=true implies manifest"), st.latency.clone())
+    };
+
+    // Create a fresh per-connection disconnect flag.
+    // perform_disconnect() sets this to signal the connect thread to stop,
+    // without touching the global shutdown flag (which would kill the accept loop).
+    let disconnect_flag = Arc::new(AtomicBool::new(false));
+    {
+        let mut st = state.0.lock().unwrap();
+        st.conn.disconnect_flag = disconnect_flag.clone();
+    }
+
+    // Resolve options: defaults -> profile -> per-session overrides
+    let profile_options = config::load_profile_options();
+    let resolved = options::resolve(&profile_options, &connect_req.overrides);
+
+    let connect_config = connect::ConnectConfig {
+        server_name: connect_req.server,
+        no_lock: !options::get_bool(&resolved, options::NETLOCK),
+        allow_lan: options::get_bool(&resolved, options::NETLOCK_ALLOW_PRIVATE),
+        no_reconnect: !options::get_bool(&resolved, options::RECONNECT),
+        username,
+        password,
+        allow_server: options::get_list(&resolved, options::SERVERS_ALLOWLIST),
+        deny_server: options::get_list(&resolved, options::SERVERS_DENYLIST),
+        allow_country: options::get_list(&resolved, options::AREAS_ALLOWLIST),
+        deny_country: options::get_list(&resolved, options::AREAS_DENYLIST),
+        no_verify: !options::get_bool(&resolved, options::VERIFY),
+        no_lock_last: !options::get_bool(&resolved, options::SERVERS_LOCKLAST),
+        no_start_last: !options::get_bool(&resolved, options::SERVERS_STARTLAST),
+        cli_ipv6_mode: {
+            let v = options::get_str(&resolved, options::NETWORK_IPV6_MODE);
+            if v.is_empty() || v == "in-block" { None } else { Some(v.to_string()) }
+        },
+        cli_dns_servers: options::get_list(&resolved, options::DNS_SERVERS),
+        event_tx: event_tx.clone(),
+        cached_latency,
+        manifest: cached_manifest,
+        resolved,
+        shutdown: Some(disconnect_flag),
+    };
+
+    let conn_handle = thread::spawn(move || {
+        let result = (|| -> Result<()> {
+            let mut provider_config = api::load_provider_config()?;
+            api::verify_rsa_key_integrity(&provider_config);
+            connect::run(&mut provider_config, &connect_config)?;
+            Ok(())
+        })();
+
+        if let Err(e) = &result {
+            error!("Connect thread exited with error: {}", e);
+            // Clean up state left behind by the failed connect session.
+            // Without this, state.json + nftables rules persist and the next
+            // connect attempt bails with "another instance running" (the helper
+            // finds its own PID alive in state.json).
+            if let Err(re) = recovery::force_recover() {
+                warn!("post-error recovery failed: {}", re);
+            }
+            if let Ok(mut st) = connect_broadcast_state.0.lock() {
+                st.broadcast(&ipc::HelperEvent::Error {
+                    message: format!("{}", e),
+                });
+            }
+        }
+
+        // Signal disconnected and clear the connect_in_progress guard
+        if let Ok(mut st) = connect_broadcast_state.0.lock() {
+            st.conn.connect_in_progress.store(false, Ordering::SeqCst);
+            st.broadcast(&ipc::HelperEvent::StateChanged {
+                state: ipc::ConnectionState::Disconnected,
+            });
+        }
+    });
+
+    // Spawn stats polling thread
+    let stats_state = Arc::clone(&state);
+    let stats_stop = Arc::new(AtomicBool::new(false));
+    let stats_stop_clone = stats_stop.clone();
+    let stats_handle = thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_secs(2));
+            if stats_stop_clone.load(Ordering::SeqCst) {
+                break;
+            }
+
+            let iface = match recovery::load() {
+                Ok(Some(state)) => state.wg_interface,
+                _ => continue,
+            };
+
+            if iface.is_empty() || !wireguard::is_connected(&iface) {
+                continue;
+            }
+
+            match wireguard::get_transfer_stats(&iface) {
+                Ok((rx, tx)) => {
+                    if let Ok(mut st) = stats_state.0.lock() {
+                        st.broadcast(&ipc::HelperEvent::Stats {
+                            rx_bytes: rx,
+                            tx_bytes: tx,
+                        });
+                    }
+                }
+                Err(e) => {
+                    debug!("Failed to get transfer stats: {}", e);
+                }
+            }
+        }
+    });
+
+    // Store handles in shared state
+    {
+        let mut st = state.0.lock().unwrap();
+        st.conn.connect_handle = Some(conn_handle);
+        st.conn.stats_stop = stats_stop;
+        st.conn.stats_handle = Some(stats_handle);
+    }
+
+    // Detach: event_fwd exits when event_rx drops (connect thread finishes)
+    thread::spawn(move || {
+        let _ = event_fwd.join();
+    });
 }
 
 /// POST /disconnect — stop VPN connection.
@@ -621,7 +1124,7 @@ fn handle_disconnect(state: &State) -> Response<HyperBody> {
     let has_orphan;
 
     {
-        let st = state.lock().unwrap();
+        let st = state.0.lock().unwrap();
         is_connected = st.conn.is_connected();
         has_orphan = !is_connected && matches!(
             recovery::load(),
@@ -630,50 +1133,14 @@ fn handle_disconnect(state: &State) -> Response<HyperBody> {
     }
 
     if is_connected {
-        // Normal disconnect: connect thread is alive, signal it to stop.
-        recovery::trigger_shutdown();
-
-        {
-            let mut st = state.lock().unwrap();
-            st.broadcast(&ipc::HelperEvent::StateChanged {
-                state: ipc::ConnectionState::Disconnecting,
-            });
-        }
-
-        // Take handles — drop lock before joining threads (they may need the lock)
-        let (connect_handle, stats_handle) = {
-            let mut st = state.lock().unwrap();
-            let ch = st.conn.connect_handle.take();
-            st.conn.stats_stop.store(true, std::sync::atomic::Ordering::SeqCst);
-            let sh = st.conn.stats_handle.take();
-            (ch, sh)
-        };
-
-        if let Some(h) = connect_handle {
-            let _ = h.join();
-        }
-        if let Some(h) = stats_handle {
-            let _ = h.join();
-        }
-
-        // Clear server info and broadcast disconnected
-        {
-            let mut st = state.lock().unwrap();
-            if let Ok(mut info) = st.conn.server_info.lock() {
-                *info = Default::default();
-            }
-            st.broadcast(&ipc::HelperEvent::StateChanged {
-                state: ipc::ConnectionState::Disconnected,
-            });
-        }
-
+        perform_disconnect(state);
         json_response(StatusCode::OK, &json!({"disconnected": true}))
     } else if has_orphan {
         // Orphaned connection: no connect thread but WireGuard interface is still up.
         info!("no connect thread but orphaned WireGuard interface found, recovering");
 
         {
-            let mut st = state.lock().unwrap();
+            let mut st = state.0.lock().unwrap();
             st.broadcast(&ipc::HelperEvent::StateChanged {
                 state: ipc::ConnectionState::Disconnecting,
             });
@@ -701,8 +1168,8 @@ fn handle_disconnect(state: &State) -> Response<HyperBody> {
 
         // Stop stats poller and clear server info
         {
-            let mut st = state.lock().unwrap();
-            st.conn.stats_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            let mut st = state.0.lock().unwrap();
+            st.conn.stats_stop.store(true, Ordering::SeqCst);
             let sh = st.conn.stats_handle.take();
             drop(st);
             if let Some(h) = sh {
@@ -711,7 +1178,7 @@ fn handle_disconnect(state: &State) -> Response<HyperBody> {
         }
 
         {
-            let mut st = state.lock().unwrap();
+            let mut st = state.0.lock().unwrap();
             if let Ok(mut info) = st.conn.server_info.lock() {
                 *info = Default::default();
             }
@@ -733,51 +1200,24 @@ async fn handle_events_async(state: State) -> Response<HyperBody> {
     let lock_info = build_lock_status_info();
 
     {
-        let st = state.lock().unwrap();
-        initial_state = if st.conn.is_connected() {
-            match recovery::load() {
-                Ok(Some(rec)) if wireguard::is_connected(&rec.wg_interface) => {
-                    let (name, country, location) = st.conn.server_info
-                        .lock()
-                        .map(|info| info.clone())
-                        .unwrap_or_default();
-                    ipc::ConnectionState::Connected {
-                        server_name: name,
-                        server_country: country,
-                        server_location: location,
-                    }
-                }
-                _ => ipc::ConnectionState::Connecting,
-            }
-        } else {
-            match recovery::load() {
-                Ok(Some(rec)) if wireguard::is_connected(&rec.wg_interface) => {
-                    ipc::ConnectionState::Connected {
-                        server_name: rec.wg_interface.clone(),
-                        server_country: String::new(),
-                        server_location: String::new(),
-                    }
-                }
-                _ => ipc::ConnectionState::Disconnected,
-            }
-        };
+        let st = state.0.lock().unwrap();
+        initial_state = current_connection_state(&st);
     }
 
     // Create subscriber channel
     let (sub_tx, sub_rx) = mpsc::channel::<ipc::HelperEvent>();
     {
-        let mut st = state.lock().unwrap();
+        let mut st = state.0.lock().unwrap();
         st.subscribers.push(sub_tx);
     }
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(32);
 
     // Spawn blocking thread that reads from sub_rx and sends to tokio tx
-    let tx_clone = tx.clone();
     tokio::task::spawn_blocking(move || {
         // Send initial events
-        let _ = send_event_frame(&tx_clone, &ipc::HelperEvent::StateChanged { state: initial_state });
-        let _ = send_event_frame(&tx_clone, &ipc::HelperEvent::LockStatus {
+        let _ = send_event_frame(&tx, &ipc::HelperEvent::StateChanged { state: initial_state });
+        let _ = send_event_frame(&tx, &ipc::HelperEvent::LockStatus {
             session_active: lock_info.session_active,
             persistent_active: lock_info.persistent_active,
             persistent_installed: lock_info.persistent_installed,
@@ -787,10 +1227,10 @@ async fn handle_events_async(state: State) -> Response<HyperBody> {
         loop {
             match sub_rx.recv_timeout(Duration::from_secs(30)) {
                 Ok(event) => {
-                    if send_event_frame(&tx_clone, &event).is_err() { break; }
+                    if send_event_frame(&tx, &event).is_err() { break; }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if send_event_frame(&tx_clone, &json!({"keepalive": true})).is_err() { break; }
+                    if send_event_frame(&tx, &json!({"keepalive": true})).is_err() { break; }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
@@ -804,13 +1244,12 @@ async fn handle_events_async(state: State) -> Response<HyperBody> {
     Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/x-ndjson")
-        .header("Transfer-Encoding", "chunked")
         .body(body)
         .unwrap()
 }
 
 /// POST /import-eddie — import credentials from Eddie profile.
-fn handle_import_eddie(body_bytes: &Bytes, peer_uid: Option<u32>) -> Response<HyperBody> {
+fn handle_import_eddie(body_bytes: &Bytes, peer_uid: Option<u32>, state: &State) -> Response<HyperBody> {
     let import_req: ipc::ImportEddieRequest = match serde_json::from_slice(body_bytes) {
         Ok(r) => r,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("invalid ImportEddieRequest JSON: {}", e)),
@@ -834,6 +1273,9 @@ fn handle_import_eddie(body_bytes: &Bytes, peer_uid: Option<u32>) -> Response<Hy
             }
             if let Err(e) = config::save_credentials(&eddie_user, &eddie_pass) {
                 warn!("Could not save credentials to profile: {:#}", e);
+            } else {
+                // Wake manifest loop now that creds are available
+                state.1.manifest_cv.notify_all();
             }
             json_response(StatusCode::OK, &json!({"imported": true}))
         }
@@ -843,24 +1285,36 @@ fn handle_import_eddie(body_bytes: &Bytes, peer_uid: Option<u32>) -> Response<Hy
     }
 }
 
-/// GET /servers — fetch and return scored server list.
-fn handle_list_servers(query: &HashMap<String, String>) -> Response<HyperBody> {
-    let skip_ping = query.get("skip_ping").map_or(false, |v| v == "true");
-    let sort = query.get("sort").map(|s| s.as_str());
+/// GET /servers — return scored server list from cached manifest.
+///
+/// Uses cached manifest and latency from background loops.
+/// Returns 503 if the helper hasn't fetched a manifest yet.
+fn handle_list_servers(state: &State) -> Response<HyperBody> {
+    let (manifest, latency) = {
+        let st = lock_state(state);
+        match &st.manifest {
+            Some(m) => (m.clone(), st.latency.clone()),
+            None => return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Server list not yet available — helper is warming up.",
+            ),
+        }
+    };
 
-    // Resolve credentials from profile
     let profile_options = config::load_profile_options();
-    let prof_user = profile_options.get("login").cloned().unwrap_or_default();
-    let prof_pass = profile_options.get("password").cloned().unwrap_or_default();
+    let resolved = options::resolve(&profile_options, &std::collections::HashMap::new());
+    let scoring = server::ScoringConfig::from_options(&resolved);
 
-    if prof_user.is_empty() || prof_pass.is_empty() {
-        return error_response(StatusCode::BAD_REQUEST, "No credentials configured. Run `sudo airvpn connect` first to set up credentials.");
-    }
+    let servers = dispatch_list_servers(&manifest, &latency, &scoring);
+    json_response(StatusCode::OK, &json!({"servers": servers}))
+}
 
-    match dispatch_list_servers(skip_ping, sort, &prof_user, &prof_pass) {
-        Ok(servers) => json_response(StatusCode::OK, &json!({"servers": servers})),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to list servers: {:#}", e)),
-    }
+/// GET /keys — return cached WireGuard key names.
+fn handle_get_keys(state: &State) -> Response<HyperBody> {
+    let st = lock_state(state);
+    let names = st.key_names.clone();
+    drop(st);
+    json_response(StatusCode::OK, &json!({"keys": names}))
 }
 
 /// GET /profile — return profile options (credentials stripped).
@@ -881,11 +1335,21 @@ fn handle_get_profile() -> Response<HyperBody> {
 }
 
 /// POST /profile — save profile options.
-fn handle_save_profile(body_bytes: &Bytes) -> Response<HyperBody> {
+/// Credential keys (login/password) are rejected — credentials must go through
+/// `sudo airvpn connect` or the `/import-eddie` endpoint.
+fn handle_save_profile(body_bytes: &Bytes, _state: &State) -> Response<HyperBody> {
     let save_req: ipc::SaveProfileRequest = match serde_json::from_slice(body_bytes) {
         Ok(r) => r,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("invalid SaveProfileRequest JSON: {}", e)),
     };
+
+    if save_req.options.contains_key("login") || save_req.options.contains_key("password") {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "credential writes not allowed via SaveProfile \
+             — use sudo airvpn connect or Eddie import",
+        );
+    }
 
     match dispatch_save_profile(&save_req.options) {
         Ok(()) => {
@@ -908,10 +1372,11 @@ fn handle_save_profile(body_bytes: &Bytes) -> Response<HyperBody> {
 }
 
 /// POST /lock/enable
-fn handle_lock_enable() -> Response<HyperBody> {
+fn handle_lock_enable(state: &State) -> Response<HyperBody> {
     if let Err(e) = dispatch_lock_enable() {
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("lock enable failed: {}", e));
     }
+    repopulate_ping_allow(state);
     json_response(StatusCode::OK, &build_lock_status_info())
 }
 
@@ -924,10 +1389,27 @@ fn handle_lock_disable() -> Response<HyperBody> {
 }
 
 /// POST /lock/install
-fn handle_lock_install() -> Response<HyperBody> {
+fn handle_lock_install(state: &State) -> Response<HyperBody> {
     match dispatch_lock_install() {
-        Ok(msg) => json_response(StatusCode::OK, &json!({"message": msg, "lock": build_lock_status_info()})),
+        Ok(msg) => {
+            repopulate_ping_allow(state);
+            json_response(StatusCode::OK, &json!({"message": msg, "lock": build_lock_status_info()}))
+        }
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("lock install failed: {}", e)),
+    }
+}
+
+/// Re-populate the persistent lock's ping_allow chain from current server IPs.
+/// Called after any operation that recreates the persistent table (enable, install).
+fn repopulate_ping_allow(state: &State) {
+    let ips: Vec<String> = {
+        let st = state.0.lock().unwrap();
+        st.latency.server_ips().values().cloned().collect()
+    };
+    if !ips.is_empty() {
+        if let Err(e) = netlock::populate_ping_allow(&ips) {
+            warn!("Failed to repopulate ping_allow after lock operation: {e}");
+        }
     }
 }
 
@@ -973,12 +1455,15 @@ fn handle_recover(state: &State) -> Response<HyperBody> {
 
 /// POST /shutdown — trigger shutdown and exit helper.
 fn handle_shutdown(state: &State) -> Response<HyperBody> {
+    // Set BOTH: the global flag (to exit accept loop) and the per-connection
+    // flag (to stop the connect thread's reconnection loop).
     recovery::trigger_shutdown();
 
     // Take handles — drop lock before joining
     let (connect_handle, stats_handle) = {
-        let mut st = state.lock().unwrap();
-        st.conn.stats_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut st = state.0.lock().unwrap();
+        st.conn.disconnect_flag.store(true, Ordering::SeqCst);
+        st.conn.stats_stop.store(true, Ordering::SeqCst);
         (st.conn.connect_handle.take(), st.conn.stats_handle.take())
     };
 
@@ -1044,7 +1529,11 @@ fn dispatch_lock_install() -> Result<String> {
     let allowlist_ips = options::parse_allowlist_ips(
         options::get_str(&resolved, options::NETLOCK_ALLOWLIST_IPS),
     );
-    let ruleset = netlock::generate_persistent_ruleset(&bootstrap_ips, iface_name, &allowlist_ips);
+    let local_forward_ifaces: Vec<String> = {
+        let v = options::get_str(&resolved, options::NETLOCK_LOCAL_FORWARD_IFACES);
+        if v.is_empty() { vec![] } else { v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect() }
+    };
+    let ruleset = netlock::generate_persistent_ruleset(&bootstrap_ips, iface_name, &allowlist_ips, &local_forward_ifaces);
 
     // Write rules file
     std::fs::create_dir_all("/etc/airvpn-rs")
@@ -1170,20 +1659,9 @@ fn dispatch_save_profile(options: &std::collections::HashMap<String, String>) ->
     config::save_profile_options(options)
 }
 
-/// Fetch the server list from the API, optionally measure pings, and return
-/// scored ServerInfo structs for the GUI.
-fn dispatch_list_servers(skip_ping: bool, sort: Option<&str>, username: &str, password: &str) -> Result<Vec<ipc::ServerInfo>> {
-    let provider_config = api::load_provider_config()?;
-
-    let manifest_xml = api::fetch_manifest(&provider_config, username, password)?;
-    let manifest = manifest::parse_manifest(&manifest_xml)?;
-
-    let pings = if skip_ping {
-        pinger::PingResults::default()
-    } else {
-        pinger::measure_all(&manifest.servers)
-    };
-
+/// Score and sort servers from a cached manifest + latency cache.
+/// Always sorts by score (GUI re-sorts client-side as needed).
+fn dispatch_list_servers(manifest: &manifest::Manifest, pings: &pinger::LatencyCache, scoring: &server::ScoringConfig) -> Vec<ipc::ServerInfo> {
     let mut servers: Vec<ipc::ServerInfo> = manifest
         .servers
         .iter()
@@ -1194,7 +1672,7 @@ fn dispatch_list_servers(skip_ping: bool, sort: Option<&str>, username: &str, pa
             } else {
                 Some(ping_ms_raw)
             };
-            let score = server::score_with_ping(s, ping_ms_raw);
+            let score = server::score_with_ping(s, ping_ms_raw, scoring);
             let load = server::load_perc(s) as f64;
             let warning = if !s.warning_closed.is_empty() {
                 Some(s.warning_closed.clone())
@@ -1210,6 +1688,8 @@ fn dispatch_list_servers(skip_ping: bool, sort: Option<&str>, username: &str, pa
                 users: s.users,
                 users_max: s.users_max,
                 load_percent: load,
+                bandwidth_cur: 2_i64.saturating_mul(s.bandwidth.saturating_mul(8)) / (1_000 * 1_000),
+                bandwidth_max: s.bandwidth_max,
                 score,
                 ping_ms,
                 warning,
@@ -1221,7 +1701,7 @@ fn dispatch_list_servers(skip_ping: bool, sort: Option<&str>, username: &str, pa
 
     servers.sort_by_key(|s| s.score);
 
-    Ok(servers)
+    servers
 }
 
 // ---------------------------------------------------------------------------
@@ -1232,23 +1712,4 @@ fn dispatch_list_servers(skip_ping: bool, sort: Option<&str>, username: &str, pa
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_parse_query_string_basic() {
-        let qs = parse_query_string("skip_ping=true&sort=name");
-        assert_eq!(qs.get("skip_ping").unwrap(), "true");
-        assert_eq!(qs.get("sort").unwrap(), "name");
-    }
-
-    #[test]
-    fn test_parse_query_string_empty() {
-        let qs = parse_query_string("");
-        assert!(qs.is_empty());
-    }
-
-    #[test]
-    fn test_parse_query_string_no_value() {
-        let qs = parse_query_string("flag&key=val");
-        assert_eq!(qs.get("flag").unwrap(), "");
-        assert_eq!(qs.get("key").unwrap(), "val");
-    }
 }
