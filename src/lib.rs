@@ -2,6 +2,7 @@ pub mod api;
 pub mod cli_client;
 pub mod common;
 pub mod config;
+pub mod countries;
 pub mod connect;
 pub mod crypto;
 pub mod dns;
