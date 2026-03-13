@@ -52,7 +52,6 @@ struct App {
     server_sort: views::servers::SortColumn,
     server_sort_ascending: bool,
     server_search: String,
-    server_country_filter: String,
     helper: Option<ipc::HelperClient>,
     error_overview: Option<String>,
     error_servers: Option<String>,
@@ -159,7 +158,6 @@ pub enum Message {
     ServerClicked(usize),
     ServerSort(views::servers::SortColumn),
     ServerSearchChanged(String),
-    ServerCountryFilterChanged(String),
     LogFilterToggle(String),
     LogClear,
     FetchProfile,
@@ -243,7 +241,6 @@ impl App {
             server_sort: views::servers::SortColumn::Score,
             server_sort_ascending: true,
             server_search: String::new(),
-            server_country_filter: String::new(),
             helper: None,
             error_overview: None,
             error_servers: None,
@@ -479,7 +476,6 @@ impl App {
                 let filtered = views::servers::filter_and_sort(
                     &self.servers,
                     &self.server_search,
-                    &self.server_country_filter,
                     self.server_sort,
                     self.server_sort_ascending,
                 );
@@ -501,11 +497,6 @@ impl App {
             }
             Message::ServerSearchChanged(query) => {
                 self.server_search = query;
-                self.selected_server_idx = None;
-                Task::none()
-            }
-            Message::ServerCountryFilterChanged(country) => {
-                self.server_country_filter = country;
                 self.selected_server_idx = None;
                 Task::none()
             }
@@ -1214,7 +1205,6 @@ impl App {
                 self.server_sort,
                 self.server_sort_ascending,
                 &self.server_search,
-                &self.server_country_filter,
                 &self.connection_state,
             ),
             views::Tab::Logs => views::logs::view(

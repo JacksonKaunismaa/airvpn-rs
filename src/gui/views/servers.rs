@@ -1,6 +1,6 @@
 //! Servers tab: sortable, searchable table of VPN servers.
 
-use iced::widget::{button, column, container, pick_list, row, scrollable, text, text_input, Space};
+use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
 use iced::{Element, Fill};
 
 use airvpn::ipc::{ConnectionState, ServerInfo};
@@ -28,53 +28,28 @@ pub fn view<'a>(
     sort_column: SortColumn,
     sort_ascending: bool,
     search: &str,
-    country_filter: &str,
     connection_state: &ConnectionState,
 ) -> Element<'a, Message> {
     let mut content = column![].spacing(theme::SPACE_SM);
 
-    // Build sorted unique country list for the dropdown
-    let mut countries: Vec<String> = servers
-        .iter()
-        .map(|s| s.country_code.clone())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    countries.insert(0, "All Countries".to_string());
-
-    let selected_country: Option<String> = if country_filter.is_empty() {
-        Some("All Countries".to_string())
-    } else {
-        Some(country_filter.to_string())
-    };
-
-    // Top bar: search + country filter + refresh + connect button
-    let search_input = text_input("Search servers...", search)
+    // Top bar: search + refresh + connect button
+    let search_input = text_input("Search servers, countries...", search)
         .on_input(Message::ServerSearchChanged)
         .style(theme::text_input_style)
-        .width(250);
-
-    let country_picker = pick_list(countries, selected_country, |selected: String| {
-        if selected == "All Countries" {
-            Message::ServerCountryFilterChanged(String::new())
-        } else {
-            Message::ServerCountryFilterChanged(selected)
-        }
-    })
-    .width(140);
+        .width(350);
 
     let refresh_btn = button(text("Refresh").size(14))
         .on_press(Message::FetchServers)
         .padding([8, 16])
         .style(theme::secondary_button);
 
-    let mut top_bar = row![search_input, country_picker, refresh_btn]
+    let mut top_bar = row![search_input, refresh_btn]
         .spacing(theme::SPACE_SM)
         .align_y(iced::Alignment::Center);
 
     // "Connect to {server}" button when one is selected
     if let Some(idx) = selected_idx {
-        let filtered = filter_and_sort(servers, search, country_filter, sort_column, sort_ascending);
+        let filtered = filter_and_sort(servers, search, sort_column, sort_ascending);
         if let Some(server) = filtered.get(idx) {
             let label = format!("Connect to {}", server.name);
             top_bar = top_bar.push(Space::new().width(Fill));
@@ -114,7 +89,7 @@ pub fn view<'a>(
     content = content.push(header);
 
     // Filter and sort
-    let displayed = filter_and_sort(servers, search, country_filter, sort_column, sort_ascending);
+    let displayed = filter_and_sort(servers, search, sort_column, sort_ascending);
 
     // Connected server name for highlighting
     let connected_name = match connection_state {
@@ -259,12 +234,11 @@ fn build_row<'a>(server: &ServerInfo, is_warning: bool) -> Element<'a, Message> 
     .into()
 }
 
-/// Filter servers by country and search query (case-insensitive on name, country, location)
+/// Filter servers by search query (case-insensitive on name, country code, country name, location)
 /// then sort by the given column.
 pub fn filter_and_sort<'a>(
     servers: &'a [ServerInfo],
     search: &str,
-    country_filter: &str,
     sort_column: SortColumn,
     ascending: bool,
 ) -> Vec<&'a ServerInfo> {
@@ -272,14 +246,12 @@ pub fn filter_and_sort<'a>(
     let mut filtered: Vec<&ServerInfo> = servers
         .iter()
         .filter(|s| {
-            if !country_filter.is_empty() && s.country_code != country_filter {
-                return false;
-            }
             if query.is_empty() {
                 return true;
             }
             s.name.to_lowercase().contains(&query)
                 || s.country_code.to_lowercase().contains(&query)
+                || airvpn::countries::country_name(&s.country_code).to_lowercase().contains(&query)
                 || s.location.to_lowercase().contains(&query)
         })
         .collect();
