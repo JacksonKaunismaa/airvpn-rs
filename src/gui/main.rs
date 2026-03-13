@@ -335,6 +335,9 @@ impl App {
                 Task::none()
             }
             Message::Connect => {
+                // Set state immediately to disable the button and prevent
+                // rapid-fire connect requests that race in the helper.
+                self.connection_state = ConnectionState::Connecting;
                 let server = self.selected_server.clone();
                 self.send_connect(server);
                 Task::none()
@@ -342,6 +345,7 @@ impl App {
             Message::ConnectToServer(server_name) => {
                 self.selected_server = Some(server_name.clone());
                 self.error_overview = None;
+                self.connection_state = ConnectionState::Connecting;
                 // Fire-and-forget: helper auto-disconnects if needed.
                 // Don't block the GUI — state updates arrive via /events stream.
                 let req = self.build_connect_request(Some(server_name));
