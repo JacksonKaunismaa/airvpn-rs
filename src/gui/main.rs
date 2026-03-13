@@ -92,6 +92,8 @@ struct App {
 
     // WireGuard settings (profile-backed, text for text_input widget)
     settings_wg_key: String,
+    /// Available WireGuard key names from helper (for device dropdown).
+    available_keys: Vec<String>,
     settings_wg_mtu: String,
     settings_wg_keepalive: String,
     settings_wg_handshake_first: String,
@@ -174,6 +176,7 @@ pub enum Message {
     ConnectNoReconnectToggle(bool),
     ConnectNoVerifyToggle(bool),
     SettingsSubTabChanged(views::settings::SettingsSubTab),
+    FetchKeys,
     // WireGuard settings
     SettingsWgKeyChanged(String),
     SettingsWgMtuChanged(String),
@@ -273,6 +276,7 @@ impl App {
             settings_sub_tab: views::settings::SettingsSubTab::General,
 
             settings_wg_key: String::new(),
+            available_keys: Vec::new(),
             settings_wg_mtu: String::new(),
             settings_wg_keepalive: String::new(),
             settings_wg_handshake_first: String::new(),
@@ -329,8 +333,15 @@ impl App {
                 if tab == views::Tab::Servers && self.servers.is_empty() && !self.servers_loading {
                     return Task::done(Message::FetchServers);
                 }
-                if tab == views::Tab::Settings && !self.settings_loaded {
-                    return Task::done(Message::FetchProfile);
+                if tab == views::Tab::Settings {
+                    if !self.settings_loaded {
+                        return Task::batch([
+                            Task::done(Message::FetchProfile),
+                            Task::done(Message::FetchKeys),
+                        ]);
+                    }
+                    // Re-fetch keys each time (may have been empty on first try)
+                    return Task::done(Message::FetchKeys);
                 }
                 Task::none()
             }
@@ -510,6 +521,27 @@ impl App {
             }
             Message::LogClear => {
                 self.logs.clear();
+                Task::none()
+            }
+            Message::FetchKeys => {
+                if let Some(ref helper) = self.helper {
+                    match helper.send_command("GET", "/keys", None) {
+                        Ok((status, body)) => {
+                            if status == 200 {
+                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
+                                    if let Some(arr) = parsed.get("keys") {
+                                        if let Ok(keys) = serde_json::from_value::<Vec<String>>(arr.clone()) {
+                                            self.available_keys = keys;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            self.enter_reconnection();
+                        }
+                    }
+                }
                 Task::none()
             }
             Message::FetchProfile => {
@@ -1212,6 +1244,7 @@ impl App {
                 self.settings_sub_tab,
                 // WireGuard
                 &self.settings_wg_key,
+                &self.available_keys,
                 &self.settings_wg_mtu,
                 &self.settings_wg_keepalive,
                 &self.settings_wg_handshake_first,
