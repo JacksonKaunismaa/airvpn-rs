@@ -151,6 +151,7 @@ pub fn view<'a>(
     netlock_incoming: &'a str,
     netlock_allow_ping: bool,
     netlock_allowlist_ips: &'a str,
+    netlock_local_forward_ifaces: &'a str,
     // Routes
     routes_custom: &'a str,
     // Area filters
@@ -219,6 +220,7 @@ pub fn view<'a>(
             netlock_incoming,
             netlock_allow_ping,
             netlock_allowlist_ips,
+            netlock_local_forward_ifaces,
         ),
         SettingsSubTab::Advanced => view_advanced(
             pinger_timeout,
@@ -495,6 +497,7 @@ fn view_network_lock<'a>(
     netlock_incoming: &'a str,
     netlock_allow_ping: bool,
     netlock_allowlist_ips: &'a str,
+    netlock_local_forward_ifaces: &'a str,
 ) -> Element<'a, Message> {
     let mut sections = column![].spacing(theme::SPACE_MD);
 
@@ -549,6 +552,24 @@ fn view_network_lock<'a>(
                 netlock_allowlist_ips,
                 Message::SettingsNetlockAllowlistIpsChanged,
             ),
+        ]
+        .spacing(theme::SPACE_SM),
+    ));
+
+    // Local Forward Interfaces
+    sections = sections.push(section_card(
+        column![
+            section_header("Local Forward"),
+            hint("Local interfaces forwarded through the VPN tunnel with masquerade (e.g. phone-relay)."),
+            text_field(
+                "Forward Interfaces",
+                "phone-relay",
+                netlock_local_forward_ifaces,
+                Message::SettingsNetlockLocalForwardIfacesChanged,
+            ),
+            hint("Comma-separated. Adds FORWARD + NAT rules so these interfaces route through the tunnel."),
+            text("Requires persistent lock reinstall + reconnect to take effect.")
+                .size(12).color(theme::WARNING),
         ]
         .spacing(theme::SPACE_SM),
     ));

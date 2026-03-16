@@ -102,6 +102,7 @@ struct App {
     settings_netlock_incoming: String,
     settings_netlock_allow_ping: bool,
     settings_netlock_allowlist_ips: String,
+    settings_netlock_local_forward_ifaces: String,
 
     // Routes (profile-backed)
     settings_routes_custom: String,
@@ -188,6 +189,7 @@ pub enum Message {
     SettingsNetlockIncomingChanged(String),
     SettingsNetlockAllowPingToggle(bool),
     SettingsNetlockAllowlistIpsChanged(String),
+    SettingsNetlockLocalForwardIfacesChanged(String),
     // Routes
     SettingsRoutesCustomChanged(String),
     // DNS settings
@@ -282,6 +284,7 @@ impl App {
             settings_netlock_incoming: String::new(),
             settings_netlock_allow_ping: true,
             settings_netlock_allowlist_ips: String::new(),
+            settings_netlock_local_forward_ifaces: String::new(),
 
             settings_routes_custom: String::new(),
 
@@ -589,6 +592,7 @@ impl App {
                     options.insert(options::NETLOCK_INCOMING.into(), self.settings_netlock_incoming.clone());
                     options.insert(options::NETLOCK_ALLOW_PING.into(), self.settings_netlock_allow_ping.to_string());
                     options.insert(options::NETLOCK_ALLOWLIST_IPS.into(), self.settings_netlock_allowlist_ips.clone());
+                    options.insert(options::NETLOCK_LOCAL_FORWARD_IFACES.into(), self.settings_netlock_local_forward_ifaces.clone());
                     // Routes
                     options.insert(options::ROUTES_CUSTOM.into(), self.settings_routes_custom.clone());
                     // DNS settings
@@ -717,6 +721,11 @@ impl App {
             }
             Message::SettingsNetlockAllowlistIpsChanged(val) => {
                 self.settings_netlock_allowlist_ips = val;
+                self.settings_dirty = true;
+                Task::none()
+            }
+            Message::SettingsNetlockLocalForwardIfacesChanged(val) => {
+                self.settings_netlock_local_forward_ifaces = val;
                 self.settings_dirty = true;
                 Task::none()
             }
@@ -997,6 +1006,8 @@ impl App {
                     .unwrap_or(true);
                 self.settings_netlock_allowlist_ips = options.get(options::NETLOCK_ALLOWLIST_IPS)
                     .cloned().unwrap_or_default();
+                self.settings_netlock_local_forward_ifaces = options.get(options::NETLOCK_LOCAL_FORWARD_IFACES)
+                    .cloned().unwrap_or_default();
 
                 // Routes
                 self.settings_routes_custom = options.get(options::ROUTES_CUSTOM)
@@ -1243,6 +1254,7 @@ impl App {
                 &self.settings_netlock_incoming,
                 self.settings_netlock_allow_ping,
                 &self.settings_netlock_allowlist_ips,
+                &self.settings_netlock_local_forward_ifaces,
                 // Routes
                 &self.settings_routes_custom,
                 // Area filters
