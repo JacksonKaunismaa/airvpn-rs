@@ -229,5 +229,9 @@ fn render_event(event: &HelperEvent) -> EventAction {
             EventAction::Continue
         }
         HelperEvent::Shutdown => EventAction::Done,
+        // GUI-only events — CLI ignores these
+        HelperEvent::ServerListDetailed { .. }
+        | HelperEvent::Profile { .. }
+        | HelperEvent::ProfileSaved => EventAction::Continue,
     }
 }
