@@ -1199,11 +1199,472 @@ fn save_recovery(
     })
 }
 
+// ---------------------------------------------------------------------------
+// LoopState — mutable per-loop state for the reconnection loop
+// ---------------------------------------------------------------------------
+
+/// Mutable state that persists across reconnection loop iterations.
+///
+/// Extracted from `run()` so that phase functions can take `&mut LoopState`
+/// instead of 5+ individual `&mut` parameters.
+struct LoopState {
+    penalties: server::ServerPenalties,
+    forced_server: Option<String>,
+    first_iteration: bool,
+    consecutive_failures: u32,
+    all_entry_ips: Vec<String>,
+    /// Custom "out" route CIDRs (session-constant, parsed once before the loop).
+    custom_route_out_cidrs: Vec<String>,
+}
+
+/// Control flow signal from phase functions back to the main loop.
+enum LoopAction {
+    /// Continue to the next phase within this iteration.
+    Continue,
+    /// Restart the loop from the top (`continue` in the original code).
+    Retry,
+    /// Exit the loop (`break` in the original code).
+    Break,
+    /// Return an error from `run()`.
+    Bail(anyhow::Error),
+}
+
+// ---------------------------------------------------------------------------
+// Phase functions — each handles one logical step of the reconnection loop
+// ---------------------------------------------------------------------------
+
+/// Phase 1: Refresh manifest on reconnection and rebuild lock if entry IPs changed.
+fn refresh_and_rebuild_lock(
+    state: &mut LoopState,
+    provider_config: &mut api::ProviderConfig,
+    params: &SessionParams,
+    data: &mut SessionData,
+    config: &ConnectConfig,
+) {
+    if !state.first_iteration {
+        refresh_manifest_if_needed(provider_config, params, data, config);
+        // New servers may have appeared — rebuild allowlist and reload lock atomically.
+        let new_entry_ips: Vec<String> = data.filtered_servers
+            .iter()
+            .flat_map(|s| s.ips_entry.iter().cloned())
+            .collect();
+        if new_entry_ips != state.all_entry_ips {
+            state.all_entry_ips = new_entry_ips;
+            if !config.no_lock {
+                if let Err(e) = activate_netlock(params, config, provider_config, &data.manifest.bootstrap_urls, &state.all_entry_ips) {
+                    warn!("Failed to reload netlock with updated server IPs: {}", e);
+                }
+            }
+        }
+    }
+    state.first_iteration = false;
+}
+
+/// Phase 2: Select WireGuard mode and key from manifest/user data.
+///
+/// Returns `None` if no mode or key is available (caller should sleep and retry).
+fn resolve_wg_mode_and_key<'a>(
+    params: &SessionParams,
+    data: &'a SessionData,
+    config: &ConnectConfig,
+) -> Option<(&'a manifest::Mode, &'a manifest::WireGuardKey)> {
+    // If mode.port is set, prefer the mode with that port; fall back to first available.
+    let forced_port: u16 = options::get_str(&config.resolved, options::MODE_PORT)
+        .parse()
+        .unwrap_or(0);
+    let mode = if forced_port > 0 {
+        data.manifest.modes.iter()
+            .find(|m| m.port == forced_port)
+            .or_else(|| {
+                warn!("Requested port {} not found in manifest modes, using first available", forced_port);
+                data.manifest.modes.first()
+            })
+    } else {
+        data.manifest.modes.first()
+    };
+    let mode = match mode {
+        Some(m) => m,
+        None => {
+            warn!("Refreshed manifest has no WireGuard modes, cannot connect");
+            interruptible_sleep(&params.shutdown, 10);
+            return None;
+        }
+    };
+    let wg_key = match select_key(&data.user_info.keys, &config.resolved) {
+        Some(k) => k,
+        None => {
+            warn!("Refreshed user data has no WireGuard keys, cannot connect");
+            interruptible_sleep(&params.shutdown, 10);
+            return None;
+        }
+    };
+    Some((mode, wg_key))
+}
+
+/// Phase 3: Select server and resolve connection-specific parameters (IPv6, DNS).
+///
+/// Returns the selected server reference, ipv6_enabled flag, and effective DNS addresses.
+fn select_and_resolve_server<'a>(
+    state: &LoopState,
+    params: &SessionParams,
+    data: &'a SessionData,
+    config: &ConnectConfig,
+    wg_key: &manifest::WireGuardKey,
+) -> anyhow::Result<(&'a manifest::Server, bool, String, String)> {
+    let server_ref = server::select_server_with_penalties(
+        &data.filtered_servers,
+        state.forced_server.as_deref(),
+        &state.penalties,
+        &data.ping_results,
+        &params.scoring,
+    )?;
+    info!(
+        "Selected server: {} ({}, {})",
+        server_ref.name, server_ref.location, server_ref.country_code
+    );
+    emit(config, crate::ipc::EngineEvent::ServerSelected {
+        name: server_ref.name.clone(),
+        country: server_ref.country_code.clone(),
+        location: server_ref.location.clone(),
+    });
+    debug!(
+        "Server details: name={}, group={}, entry_ips={:?}, exit_ips={:?}, score={}, bw={}/{}, users={}/{}, ipv4={}, ipv6={}",
+        server_ref.name,
+        server_ref.group,
+        server_ref.ips_entry,
+        server_ref.ips_exit,
+        server::score(server_ref, &params.scoring),
+        server_ref.bandwidth,
+        server_ref.bandwidth_max,
+        server_ref.users,
+        server_ref.users_max,
+        server_ref.support_ipv4,
+        server_ref.support_ipv6,
+    );
+
+    // Validate server supports required protocols
+    if !server_ref.support_ipv4 {
+        warn!("server {} does not advertise IPv4 support", server_ref.name);
+    }
+
+    // Compute effective IPv6 for this connection (depends on server + mode)
+    let ipv6_enabled = match params.ipv6_mode {
+        Ipv6Mode::In => true,
+        Ipv6Mode::InBlock => server_ref.support_ipv6,
+        Ipv6Mode::Block => false,
+    };
+    if ipv6_enabled {
+        info!("IPv6 enabled for {} (mode={:?}, server.support_ipv6={})",
+              server_ref.name, params.ipv6_mode, server_ref.support_ipv6);
+    }
+    // Effective DNS: custom dns.servers override AirVPN's DNS (Eddie: WireGuard.cs line 69).
+    let (effective_dns_ipv4, effective_dns_ipv6) =
+        resolve_effective_dns(&params.custom_dns_ips, wg_key, ipv6_enabled);
+
+    Ok((server_ref, ipv6_enabled, effective_dns_ipv4, effective_dns_ipv6))
+}
+
+/// Phase 4: Pre-connection authorization (Eddie: Session.cs:173-218).
+///
+/// Returns `LoopAction::Continue` to proceed, or `Retry`/`Break`/`Bail` to
+/// short-circuit the current iteration.
+fn perform_pre_connection_auth(
+    state: &mut LoopState,
+    provider_config: &mut api::ProviderConfig,
+    params: &SessionParams,
+    data: &SessionData,
+    config: &ConnectConfig,
+    server_name: &str,
+) -> LoopAction {
+    let http_timeout_secs = options::get_u64(&config.resolved, options::HTTP_TIMEOUT);
+    let reset_from_auth = match api::fetch_connect_with_urls_timeout(
+        provider_config,
+        &params.username,
+        &params.password,
+        server_name,
+        &data.manifest.bootstrap_urls,
+        http_timeout_secs,
+    ) {
+        Ok(api::ConnectDirective::Ok) => {
+            info!("Authorizing connection... OK");
+            Option::<ResetLevel>::None
+        }
+        Ok(api::ConnectDirective::Stop(msg)) => {
+            error!("Server rejected connection: {}", msg);
+            Some(ResetLevel::Fatal)
+        }
+        Ok(api::ConnectDirective::Next(msg)) => {
+            warn!("Server says try another: {}", msg);
+            Some(ResetLevel::Error)
+        }
+        Ok(api::ConnectDirective::Retry(msg)) => {
+            warn!("Server message: {}", msg);
+            Some(ResetLevel::Retry)
+        }
+        Err(e) => {
+            warn!("pre-connection authorization failed: {:#}", e);
+            Option::<ResetLevel>::None
+        }
+    };
+
+    // Handle auth-level reset
+    if let Some(level) = reset_from_auth {
+        match level {
+            ResetLevel::Fatal => {
+                cleanup_and_bail(config.no_lock, &params.blocked_ipv6_ifaces);
+                return LoopAction::Bail(anyhow::anyhow!("Fatal: server rejected connection"));
+            }
+            ResetLevel::Error => {
+                // Server explicitly directed us to try another — always rotate.
+                let penality_on_error = options::get_i64(&config.resolved, options::PENALITY_ON_ERROR);
+                state.penalties.penalize(server_name, penality_on_error);
+                state.forced_server = Option::None;
+                if config.no_reconnect {
+                    cleanup_and_bail(config.no_lock, &params.blocked_ipv6_ifaces);
+                    return LoopAction::Bail(anyhow::anyhow!("Server directed to try another (--no-reconnect)"));
+                }
+                warn!("Penalized {}. Trying another server in 5s...", server_name);
+                interruptible_sleep(&params.shutdown, 5);
+                emit(config, crate::ipc::EngineEvent::StateChanged(
+                    crate::ipc::ConnectionState::Reconnecting,
+                ));
+                return LoopAction::Retry;
+            }
+            ResetLevel::Retry => {
+                if config.no_reconnect {
+                    cleanup_and_bail(config.no_lock, &params.blocked_ipv6_ifaces);
+                    return LoopAction::Bail(anyhow::anyhow!("Server asked to retry (--no-reconnect)"));
+                }
+                warn!("Retrying in 10s...");
+                interruptible_sleep(&params.shutdown, 10);
+                emit(config, crate::ipc::EngineEvent::StateChanged(
+                    crate::ipc::ConnectionState::Reconnecting,
+                ));
+                return LoopAction::Retry;
+            }
+            _ => {} // None/Switch don't occur from auth
+        }
+    }
+
+    LoopAction::Continue
+}
+
+/// Phase 5: Generate WireGuard config and establish tunnel.
+///
+/// On success, returns `(config_path, iface, original_gw, endpoint_ip)`.
+/// On failure, returns a `LoopAction` indicating how to proceed.
+#[allow(clippy::too_many_arguments)]
+fn establish_wireguard_tunnel(
+    state: &mut LoopState,
+    params: &SessionParams,
+    data: &SessionData,
+    config: &ConnectConfig,
+    server_ref: &manifest::Server,
+    mode: &manifest::Mode,
+    wg_key: &manifest::WireGuardKey,
+    ipv6_enabled: bool,
+    effective_dns_ipv4: &str,
+    effective_dns_ipv6: &str,
+) -> Result<(String, String, String, String), LoopAction> {
+    // Save recovery state with blocked IPv6 interfaces
+    if let Err(e) = save_recovery(params, config.no_lock, "", "", "", "", "") {
+        return Err(LoopAction::Bail(e));
+    }
+
+    // Generate WireGuard config and connect
+    let wg_keepalive = options::get_u64(&config.resolved, options::WG_KEEPALIVE) as u16;
+    let ip_layer = options::get_str(&config.resolved, options::NETWORK_ENTRY_IPLAYER);
+    let wg_params = match wireguard::generate_config(wg_key, server_ref, mode, &data.user_info, wg_keepalive, ip_layer) {
+        Ok(p) => p,
+        Err(e) => return Err(LoopAction::Bail(e)),
+    };
+    let endpoint_ip = wg_params.endpoint_ip.clone();
+    debug!(
+        "WireGuard config: endpoint={}, ipv4={}, ipv6={}, dns={}/{}, mode={} (keys redacted)",
+        endpoint_ip,
+        wg_key.wg_ipv4,
+        wg_key.wg_ipv6,
+        effective_dns_ipv4,
+        effective_dns_ipv6,
+        mode.title,
+    );
+    info!("Connecting to {} via mode {}...", server_ref.name, mode.title);
+    emit(config, crate::ipc::EngineEvent::StateChanged(
+        crate::ipc::ConnectionState::Connecting,
+    ));
+    emit(config, crate::ipc::EngineEvent::Log {
+        level: "info".into(),
+        message: format!("Connecting to {} via {}...", server_ref.name, mode.title),
+    });
+    let wg_mtu = options::get_u64(&config.resolved, options::WG_MTU) as u16;
+    let iface_name = {
+        let v = options::get_str(&config.resolved, options::NETWORK_IFACE_NAME);
+        if v.is_empty() { wireguard::VPN_INTERFACE } else { v }
+    };
+    let ipv4_enabled = params.ipv4_mode != Ipv4Mode::Block;
+    let (config_path, iface, original_gw) = match wireguard::connect(&wg_params, ipv6_enabled, ipv4_enabled, wg_mtu, iface_name, &params.entry_iface) {
+        Ok(result) => {
+            state.consecutive_failures = 0;
+            result
+        }
+        Err(e) => {
+            error!("WireGuard connection failed: {:#}", e);
+            if config.no_reconnect {
+                cleanup_and_bail(config.no_lock, &params.blocked_ipv6_ifaces);
+                return Err(LoopAction::Bail(e.context("WireGuard connection failed")));
+            }
+            let penality_on_error = options::get_i64(&config.resolved, options::PENALITY_ON_ERROR);
+            handle_connection_failure(
+                &server_ref.name, data.lock_last, true,
+                &mut state.penalties, &mut state.forced_server, &mut state.consecutive_failures,
+                &params.shutdown, penality_on_error,
+            );
+            emit(config, crate::ipc::EngineEvent::StateChanged(
+                crate::ipc::ConnectionState::Reconnecting,
+            ));
+            return Err(LoopAction::Retry);
+        }
+    };
+    if let Err(e) = save_recovery(params, config.no_lock, &iface, &config_path, "", "", &endpoint_ip) {
+        return Err(LoopAction::Bail(e));
+    }
+    info!("WireGuard interface: {}", iface);
+    emit(config, crate::ipc::EngineEvent::Log {
+        level: "info".into(),
+        message: format!("WireGuard interface {} created", iface),
+    });
+
+    // Add /32 host routes for all server entry IPs via physical gateway.
+    // These let the background pinger reach servers outside the tunnel.
+    if let Err(e) = wireguard::add_server_host_routes(&state.all_entry_ips, &original_gw) {
+        warn!("Failed to add server host routes (pinger may not work): {e}");
+    }
+
+    // Add IP routes for custom "out" routes — these bypass the VPN tunnel
+    // by routing through the original default gateway.
+    if !state.custom_route_out_cidrs.is_empty() {
+        add_custom_out_routes(&state.custom_route_out_cidrs, &original_gw);
+    }
+
+    Ok((config_path, iface, original_gw, endpoint_ip))
+}
+
+/// Phase 6: Wait for handshake, run post-connect setup, and verify connection.
+///
+/// Returns `LoopAction::Continue` on success (proceed to monitor loop), or
+/// a `LoopAction` variant to short-circuit.
+#[allow(clippy::too_many_arguments)]
+fn wait_and_verify_connection(
+    state: &mut LoopState,
+    params: &SessionParams,
+    data: &SessionData,
+    config: &ConnectConfig,
+    server_ref: &manifest::Server,
+    wg_key: &manifest::WireGuardKey,
+    effective_dns_ipv4: &str,
+    effective_dns_ipv6: &str,
+    config_path: &str,
+    iface: &str,
+    original_gw: &str,
+    endpoint_ip: &str,
+) -> LoopAction {
+    // Wait for first WireGuard handshake (Eddie: handshake_timeout_first=50s)
+    info!("Waiting for handshake...");
+    emit(config, crate::ipc::EngineEvent::Log {
+        level: "info".into(),
+        message: "Waiting for WireGuard handshake...".into(),
+    });
+    let handshake_timeout_first = options::get_u64(&config.resolved, options::WG_HANDSHAKE_FIRST);
+    if let Err(e) = wireguard::wait_for_handshake(iface, handshake_timeout_first) {
+        error!("Handshake failed: {:#}", e);
+        let _ = wireguard::disconnect(config_path, endpoint_ip, iface);
+        if config.no_reconnect {
+            let _ = wireguard::remove_server_host_routes(&state.all_entry_ips, original_gw);
+            cleanup_and_bail(config.no_lock, &params.blocked_ipv6_ifaces);
+            return LoopAction::Bail(e);
+        }
+        let penality_on_error = options::get_i64(&config.resolved, options::PENALITY_ON_ERROR);
+        handle_connection_failure(
+            &server_ref.name, data.lock_last, false,
+            &mut state.penalties, &mut state.forced_server, &mut state.consecutive_failures,
+            &params.shutdown, penality_on_error,
+        );
+        emit(config, crate::ipc::EngineEvent::StateChanged(
+            crate::ipc::ConnectionState::Reconnecting,
+        ));
+        return LoopAction::Retry;
+    }
+    info!("Handshake established.");
+    emit(config, crate::ipc::EngineEvent::Log {
+        level: "info".into(),
+        message: "Handshake established".into(),
+    });
+
+    // Post-connect setup — if any step fails, clean up and treat as fatal
+    if let Err(e) = post_connect_setup(
+        params, config, &server_ref.name,
+        config_path, iface, endpoint_ip,
+        effective_dns_ipv4, effective_dns_ipv6,
+    ) {
+        if params.shutdown.load(Ordering::Relaxed) {
+            warn!("Setup interrupted by shutdown signal, disconnecting...");
+            let _ = cmd_disconnect_internal(config_path, iface, !config.no_lock, &params.blocked_ipv6_ifaces, endpoint_ip, &state.all_entry_ips, original_gw, &state.custom_route_out_cidrs);
+            return LoopAction::Break;
+        }
+        error!("Setup failed after WireGuard connected: {:#}", e);
+        warn!("Cleaning up...");
+        let _ = cmd_disconnect_internal(config_path, iface, !config.no_lock, &params.blocked_ipv6_ifaces, endpoint_ip, &state.all_entry_ips, original_gw, &state.custom_route_out_cidrs);
+        return LoopAction::Bail(e);
+    }
+
+    // Post-connection verification
+    if !config.no_verify && !params.shutdown.load(Ordering::Relaxed) {
+        emit(config, crate::ipc::EngineEvent::Log {
+            level: "info".into(),
+            message: "Verifying tunnel and DNS...".into(),
+        });
+        let checking_ntry = options::get_u64(&config.resolved, options::CHECKING_NTRY) as u32;
+        let verify_ok = verify_connection(
+            &params.shutdown, &data.manifest, server_ref,
+            &wg_key.wg_ipv4, effective_dns_ipv4, effective_dns_ipv6,
+            checking_ntry, iface, params.check_route,
+        );
+        if !verify_ok && !params.shutdown.load(Ordering::Relaxed) {
+            warn!("Verification failed, treating as connection failure, reconnecting...");
+            let _ = partial_disconnect(config_path, iface, !config.no_lock, endpoint_ip);
+            if config.no_reconnect {
+                let _ = wireguard::remove_server_host_routes(&state.all_entry_ips, original_gw);
+                cleanup_and_bail(config.no_lock, &params.blocked_ipv6_ifaces);
+                return LoopAction::Bail(anyhow::anyhow!("Verification failed (--no-reconnect)"));
+            }
+            let penality_on_error = options::get_i64(&config.resolved, options::PENALITY_ON_ERROR);
+            handle_connection_failure(
+                &server_ref.name, data.lock_last, false,
+                &mut state.penalties, &mut state.forced_server, &mut state.consecutive_failures,
+                &params.shutdown, penality_on_error,
+            );
+            emit(config, crate::ipc::EngineEvent::StateChanged(
+                crate::ipc::ConnectionState::Reconnecting,
+            ));
+            return LoopAction::Retry;
+        }
+    }
+
+    LoopAction::Continue
+}
+
+// ---------------------------------------------------------------------------
+// Connect — main entry point
+// ---------------------------------------------------------------------------
+
 /// Connect to AirVPN (formerly `cmd_connect` in main.rs).
 ///
 /// Handles the full connection lifecycle: pre-flight checks, credential
 /// resolution, manifest fetch, server selection, netlock, WireGuard setup,
 /// DNS configuration, verification, and the reconnection loop.
+///
+/// The loop body is decomposed into phase functions, each taking `&mut LoopState`
+/// for mutable per-loop state and references to session-constant config/params.
 pub fn run(
     provider_config: &mut api::ProviderConfig,
     config: &ConnectConfig,
@@ -1222,20 +1683,6 @@ pub fn run(
     // --server: explicit server name overrides both
     // -----------------------------------------------------------------------
 
-    let mut penalties = server::ServerPenalties::new();
-    let mut forced_server: Option<String> = config.server_name
-        .clone()
-        .or(data.start_last_name.clone());
-    let mut first_iteration = true;
-    let mut consecutive_failures: u32 = 0;
-
-    // Collect ALL server entry IPs for the network lock allowlist (Eddie: allowlists
-    // all servers so reconnection to a different server doesn't require lock rebuild).
-    let mut all_entry_ips: Vec<String> = data.filtered_servers
-        .iter()
-        .flat_map(|s| s.ips_entry.iter().cloned())
-        .collect();
-
     // Parse custom routes once (session-constant, from resolved profile options).
     // "out" routes bypass the VPN tunnel via the original default gateway.
     let custom_routes = options::parse_custom_routes(
@@ -1247,9 +1694,25 @@ pub fn run(
         .map(|r| r.cidr.clone())
         .collect();
 
+    let mut state = LoopState {
+        penalties: server::ServerPenalties::new(),
+        forced_server: config.server_name
+            .clone()
+            .or(data.start_last_name.clone()),
+        first_iteration: true,
+        consecutive_failures: 0,
+        // Collect ALL server entry IPs for the network lock allowlist (Eddie: allowlists
+        // all servers so reconnection to a different server doesn't require lock rebuild).
+        all_entry_ips: data.filtered_servers
+            .iter()
+            .flat_map(|s| s.ips_entry.iter().cloned())
+            .collect(),
+        custom_route_out_cidrs,
+    };
+
     // Activate network lock once before the loop with all server IPs.
     if !config.no_lock {
-        activate_netlock(&params, config, provider_config, &data.manifest.bootstrap_urls, &all_entry_ips)?;
+        activate_netlock(&params, config, provider_config, &data.manifest.bootstrap_urls, &state.all_entry_ips)?;
     }
 
     loop {
@@ -1259,335 +1722,54 @@ pub fn run(
             break;
         }
 
-        // Re-fetch manifest on reconnection (2nd+ iteration)
-        if !first_iteration {
-            refresh_manifest_if_needed(provider_config, &params, &mut data, config);
-            // New servers may have appeared — rebuild allowlist and reload lock atomically.
-            let new_entry_ips: Vec<String> = data.filtered_servers
-                .iter()
-                .flat_map(|s| s.ips_entry.iter().cloned())
-                .collect();
-            if new_entry_ips != all_entry_ips {
-                all_entry_ips = new_entry_ips;
-                if !config.no_lock {
-                    if let Err(e) = activate_netlock(&params, config, provider_config, &data.manifest.bootstrap_urls, &all_entry_ips) {
-                        warn!("Failed to reload netlock with updated server IPs: {}", e);
-                    }
-                }
-            }
-        }
-        first_iteration = false;
+        // Phase 1: Refresh manifest on reconnection + rebuild lock if IPs changed
+        refresh_and_rebuild_lock(&mut state, provider_config, &params, &mut data, config);
 
-        // Select WireGuard mode and key from (possibly refreshed) manifest/user data.
-        // If mode.port is set, prefer the mode with that port; fall back to first available.
-        let forced_port: u16 = options::get_str(&config.resolved, options::MODE_PORT)
-            .parse()
-            .unwrap_or(0);
-        let mode = if forced_port > 0 {
-            data.manifest.modes.iter()
-                .find(|m| m.port == forced_port)
-                .or_else(|| {
-                    warn!("Requested port {} not found in manifest modes, using first available", forced_port);
-                    data.manifest.modes.first()
-                })
-        } else {
-            data.manifest.modes.first()
-        };
-        let mode = match mode {
-            Some(m) => m,
-            None => {
-                warn!("Refreshed manifest has no WireGuard modes, cannot connect");
-                interruptible_sleep(&params.shutdown, 10);
-                continue;
-            }
-        };
-        let wg_key = match select_key(&data.user_info.keys, &config.resolved) {
-            Some(k) => k,
-            None => {
-                warn!("Refreshed user data has no WireGuard keys, cannot connect");
-                interruptible_sleep(&params.shutdown, 10);
-                continue;
-            }
+        // Phase 2: Select WireGuard mode and key
+        let (mode, wg_key) = match resolve_wg_mode_and_key(&params, &data, config) {
+            Some(pair) => pair,
+            None => continue, // no mode/key available, sleep already done
         };
 
-        // 6. Select server (penalty-aware + ping-aware, from filtered list)
-        let server_ref = server::select_server_with_penalties(
-            &data.filtered_servers,
-            forced_server.as_deref(),
-            &penalties,
-            &data.ping_results,
-            &params.scoring,
-        )?;
-        info!(
-            "Selected server: {} ({}, {})",
-            server_ref.name, server_ref.location, server_ref.country_code
-        );
-        emit(config, crate::ipc::EngineEvent::ServerSelected {
-            name: server_ref.name.clone(),
-            country: server_ref.country_code.clone(),
-            location: server_ref.location.clone(),
-        });
-        debug!(
-            "Server details: name={}, group={}, entry_ips={:?}, exit_ips={:?}, score={}, bw={}/{}, users={}/{}, ipv4={}, ipv6={}",
-            server_ref.name,
-            server_ref.group,
-            server_ref.ips_entry,
-            server_ref.ips_exit,
-            server::score(server_ref, &params.scoring),
-            server_ref.bandwidth,
-            server_ref.bandwidth_max,
-            server_ref.users,
-            server_ref.users_max,
-            server_ref.support_ipv4,
-            server_ref.support_ipv6,
-        );
+        // Phase 3: Select server and resolve IPv6/DNS
+        let (server_ref, ipv6_enabled, effective_dns_ipv4, effective_dns_ipv6) =
+            select_and_resolve_server(&state, &params, &data, config, wg_key)?;
 
-        // Validate server supports required protocols
-        if !server_ref.support_ipv4 {
-            warn!("server {} does not advertise IPv4 support", server_ref.name);
+        // Phase 4: Pre-connection authorization
+        match perform_pre_connection_auth(&mut state, provider_config, &params, &data, config, &server_ref.name) {
+            LoopAction::Continue => {}
+            LoopAction::Retry => continue,
+            LoopAction::Break => break,
+            LoopAction::Bail(e) => return Err(e),
         }
 
-        // Compute effective IPv6 for this connection (depends on server + mode)
-        let ipv6_enabled = match params.ipv6_mode {
-            Ipv6Mode::In => true,
-            Ipv6Mode::InBlock => server_ref.support_ipv6,
-            Ipv6Mode::Block => false,
-        };
-        if ipv6_enabled {
-            info!("IPv6 enabled for {} (mode={:?}, server.support_ipv6={})",
-                  server_ref.name, params.ipv6_mode, server_ref.support_ipv6);
-        }
-        // Effective DNS: custom dns.servers override AirVPN's DNS (Eddie: WireGuard.cs line 69).
-        let (effective_dns_ipv4, effective_dns_ipv6_owned) =
-            resolve_effective_dns(&params.custom_dns_ips, wg_key, ipv6_enabled);
-        let dns_ipv6: &str = &effective_dns_ipv6_owned;
-
-        // 7b. Pre-connection authorization (Eddie: Session.cs:173-218)
-        let http_timeout_secs = options::get_u64(&config.resolved, options::HTTP_TIMEOUT);
-        let reset_from_auth = match api::fetch_connect_with_urls_timeout(
-            provider_config,
-            &params.username,
-            &params.password,
-            &server_ref.name,
-            &data.manifest.bootstrap_urls,
-            http_timeout_secs,
+        // Phase 5: Establish WireGuard tunnel
+        let (config_path, iface, original_gw, endpoint_ip) = match establish_wireguard_tunnel(
+            &mut state, &params, &data, config,
+            server_ref, mode, wg_key, ipv6_enabled,
+            &effective_dns_ipv4, &effective_dns_ipv6,
         ) {
-            Ok(api::ConnectDirective::Ok) => {
-                info!("Authorizing connection... OK");
-                Option::<ResetLevel>::None
-            }
-            Ok(api::ConnectDirective::Stop(msg)) => {
-                error!("Server rejected connection: {}", msg);
-                Some(ResetLevel::Fatal)
-            }
-            Ok(api::ConnectDirective::Next(msg)) => {
-                warn!("Server says try another: {}", msg);
-                Some(ResetLevel::Error)
-            }
-            Ok(api::ConnectDirective::Retry(msg)) => {
-                warn!("Server message: {}", msg);
-                Some(ResetLevel::Retry)
-            }
-            Err(e) => {
-                warn!("pre-connection authorization failed: {:#}", e);
-                Option::<ResetLevel>::None
-            }
+            Ok(result) => result,
+            Err(LoopAction::Retry) => continue,
+            Err(LoopAction::Break) => break,
+            Err(LoopAction::Bail(e)) => return Err(e),
+            Err(LoopAction::Continue) => unreachable!(),
         };
 
-        // Handle auth-level reset
-        if let Some(level) = reset_from_auth {
-            match level {
-                ResetLevel::Fatal => {
-                    cleanup_and_bail(config.no_lock, &params.blocked_ipv6_ifaces);
-                    anyhow::bail!("Fatal: server rejected connection");
-                }
-                ResetLevel::Error => {
-                    // Server explicitly directed us to try another — always rotate.
-                    let penality_on_error = options::get_i64(&config.resolved, options::PENALITY_ON_ERROR);
-                    penalties.penalize(&server_ref.name, penality_on_error);
-                    forced_server = Option::None;
-                    if config.no_reconnect {
-                        cleanup_and_bail(config.no_lock, &params.blocked_ipv6_ifaces);
-                        anyhow::bail!("Server directed to try another (--no-reconnect)");
-                    }
-                    warn!("Penalized {}. Trying another server in 5s...", server_ref.name);
-                    interruptible_sleep(&params.shutdown, 5);
-                    emit(config, crate::ipc::EngineEvent::StateChanged(
-                        crate::ipc::ConnectionState::Reconnecting,
-                    ));
-                    continue;
-                }
-                ResetLevel::Retry => {
-                    if config.no_reconnect {
-                        cleanup_and_bail(config.no_lock, &params.blocked_ipv6_ifaces);
-                        anyhow::bail!("Server asked to retry (--no-reconnect)");
-                    }
-                    warn!("Retrying in 10s...");
-                    interruptible_sleep(&params.shutdown, 10);
-                    emit(config, crate::ipc::EngineEvent::StateChanged(
-                        crate::ipc::ConnectionState::Reconnecting,
-                    ));
-                    continue;
-                }
-                _ => {} // None/Switch don't occur from auth
-            }
-        }
-
-        // Save recovery state with blocked IPv6 interfaces
-        save_recovery(&params, config.no_lock, "", "", "", "", "")?;
-
-        // 8. Generate WireGuard config and connect
-        let wg_keepalive = options::get_u64(&config.resolved, options::WG_KEEPALIVE) as u16;
-        let ip_layer = options::get_str(&config.resolved, options::NETWORK_ENTRY_IPLAYER);
-        let wg_params = wireguard::generate_config(wg_key, server_ref, mode, &data.user_info, wg_keepalive, ip_layer)?;
-        let endpoint_ip = wg_params.endpoint_ip.clone();
-        debug!(
-            "WireGuard config: endpoint={}, ipv4={}, ipv6={}, dns={}/{}, mode={} (keys redacted)",
-            endpoint_ip,
-            wg_key.wg_ipv4,
-            wg_key.wg_ipv6,
-            effective_dns_ipv4,
-            effective_dns_ipv6_owned,
-            mode.title,
-        );
-        info!("Connecting to {} via mode {}...", server_ref.name, mode.title);
-        emit(config, crate::ipc::EngineEvent::StateChanged(
-            crate::ipc::ConnectionState::Connecting,
-        ));
-        emit(config, crate::ipc::EngineEvent::Log {
-            level: "info".into(),
-            message: format!("Connecting to {} via {}...", server_ref.name, mode.title),
-        });
-        let wg_mtu = options::get_u64(&config.resolved, options::WG_MTU) as u16;
-        let iface_name = {
-            let v = options::get_str(&config.resolved, options::NETWORK_IFACE_NAME);
-            if v.is_empty() { wireguard::VPN_INTERFACE } else { v }
-        };
-        let ipv4_enabled = params.ipv4_mode != Ipv4Mode::Block;
-        let (config_path, iface, original_gw) = match wireguard::connect(&wg_params, ipv6_enabled, ipv4_enabled, wg_mtu, iface_name, &params.entry_iface) {
-            Ok(result) => {
-                consecutive_failures = 0;
-                result
-            }
-            Err(e) => {
-                error!("WireGuard connection failed: {:#}", e);
-                if config.no_reconnect {
-                    cleanup_and_bail(config.no_lock, &params.blocked_ipv6_ifaces);
-                    return Err(e.context("WireGuard connection failed"));
-                }
-                let penality_on_error = options::get_i64(&config.resolved, options::PENALITY_ON_ERROR);
-                handle_connection_failure(
-                    &server_ref.name, data.lock_last, true,
-                    &mut penalties, &mut forced_server, &mut consecutive_failures,
-                    &params.shutdown, penality_on_error,
-                );
-                emit(config, crate::ipc::EngineEvent::StateChanged(
-                    crate::ipc::ConnectionState::Reconnecting,
-                ));
-                continue;
-            }
-        };
-        save_recovery(&params, config.no_lock, &iface, &config_path, "", "", &endpoint_ip)?;
-        info!("WireGuard interface: {}", iface);
-        emit(config, crate::ipc::EngineEvent::Log {
-            level: "info".into(),
-            message: format!("WireGuard interface {} created", iface),
-        });
-
-        // Add /32 host routes for all server entry IPs via physical gateway.
-        // These let the background pinger reach servers outside the tunnel.
-        if let Err(e) = wireguard::add_server_host_routes(&all_entry_ips, &original_gw) {
-            warn!("Failed to add server host routes (pinger may not work): {e}");
-        }
-
-        // Add IP routes for custom "out" routes — these bypass the VPN tunnel
-        // by routing through the original default gateway.
-        if !custom_route_out_cidrs.is_empty() {
-            add_custom_out_routes(&custom_route_out_cidrs, &original_gw);
-        }
-
-        // Wait for first WireGuard handshake (Eddie: handshake_timeout_first=50s)
-        info!("Waiting for handshake...");
-        emit(config, crate::ipc::EngineEvent::Log {
-            level: "info".into(),
-            message: "Waiting for WireGuard handshake...".into(),
-        });
-        let handshake_timeout_first = options::get_u64(&config.resolved, options::WG_HANDSHAKE_FIRST);
-        if let Err(e) = wireguard::wait_for_handshake(&iface, handshake_timeout_first) {
-            error!("Handshake failed: {:#}", e);
-            let _ = wireguard::disconnect(&config_path, &endpoint_ip, &iface);
-            if config.no_reconnect {
-                let _ = wireguard::remove_server_host_routes(&all_entry_ips, &original_gw);
-                cleanup_and_bail(config.no_lock, &params.blocked_ipv6_ifaces);
-                return Err(e);
-            }
-            let penality_on_error = options::get_i64(&config.resolved, options::PENALITY_ON_ERROR);
-            handle_connection_failure(
-                &server_ref.name, data.lock_last, false,
-                &mut penalties, &mut forced_server, &mut consecutive_failures,
-                &params.shutdown, penality_on_error,
-            );
-            emit(config, crate::ipc::EngineEvent::StateChanged(
-                crate::ipc::ConnectionState::Reconnecting,
-            ));
-            continue;
-        }
-        info!("Handshake established.");
-        emit(config, crate::ipc::EngineEvent::Log {
-            level: "info".into(),
-            message: "Handshake established".into(),
-        });
-
-        // 9-12: Remaining setup — if any step fails, clean up and treat as fatal
-        if let Err(e) = post_connect_setup(
-            &params, config, &server_ref.name,
-            &config_path, &iface, &endpoint_ip,
-            &effective_dns_ipv4, dns_ipv6,
+        // Phase 6: Wait for handshake, post-connect setup, verification
+        match wait_and_verify_connection(
+            &mut state, &params, &data, config,
+            server_ref, wg_key,
+            &effective_dns_ipv4, &effective_dns_ipv6,
+            &config_path, &iface, &original_gw, &endpoint_ip,
         ) {
-            if params.shutdown.load(Ordering::Relaxed) {
-                warn!("Setup interrupted by shutdown signal, disconnecting...");
-                let _ = cmd_disconnect_internal(&config_path, &iface, !config.no_lock, &params.blocked_ipv6_ifaces, &endpoint_ip, &all_entry_ips, &original_gw, &custom_route_out_cidrs);
-                break;
-            }
-            error!("Setup failed after WireGuard connected: {:#}", e);
-            warn!("Cleaning up...");
-            let _ = cmd_disconnect_internal(&config_path, &iface, !config.no_lock, &params.blocked_ipv6_ifaces, &endpoint_ip, &all_entry_ips, &original_gw, &custom_route_out_cidrs);
-            return Err(e);
+            LoopAction::Continue => {}
+            LoopAction::Retry => continue,
+            LoopAction::Break => break,
+            LoopAction::Bail(e) => return Err(e),
         }
 
-        // 10b-10c: Post-connection verification
-        if !config.no_verify && !params.shutdown.load(Ordering::Relaxed) {
-            emit(config, crate::ipc::EngineEvent::Log {
-                level: "info".into(),
-                message: "Verifying tunnel and DNS...".into(),
-            });
-            let checking_ntry = options::get_u64(&config.resolved, options::CHECKING_NTRY) as u32;
-            let verify_ok = verify_connection(
-                &params.shutdown, &data.manifest, server_ref,
-                &wg_key.wg_ipv4, &effective_dns_ipv4, dns_ipv6,
-                checking_ntry, &iface, params.check_route,
-            );
-            if !verify_ok && !params.shutdown.load(Ordering::Relaxed) {
-                warn!("Verification failed, treating as connection failure, reconnecting...");
-                let _ = partial_disconnect(&config_path, &iface, !config.no_lock, &endpoint_ip);
-                if config.no_reconnect {
-                    let _ = wireguard::remove_server_host_routes(&all_entry_ips, &original_gw);
-                    cleanup_and_bail(config.no_lock, &params.blocked_ipv6_ifaces);
-                    anyhow::bail!("Verification failed (--no-reconnect)");
-                }
-                let penality_on_error = options::get_i64(&config.resolved, options::PENALITY_ON_ERROR);
-                handle_connection_failure(
-                    &server_ref.name, data.lock_last, false,
-                    &mut penalties, &mut forced_server, &mut consecutive_failures,
-                    &params.shutdown, penality_on_error,
-                );
-                emit(config, crate::ipc::EngineEvent::StateChanged(
-                    crate::ipc::ConnectionState::Reconnecting,
-                ));
-                continue;
-            }
-        }
-
+        // Connected successfully
         info!(
             "Connected to {} via {}.{}",
             server_ref.name,
@@ -1606,14 +1788,14 @@ pub fn run(
             },
         ));
 
-        // 13. Monitor loop — determines ResetLevel when connection ends
+        // Monitor loop — determines ResetLevel when connection ends
         let handshake_timeout_connected = options::get_u64(&config.resolved, options::WG_HANDSHAKE_CONNECTED);
         let reset_level = run_monitor_loop(
             &params.shutdown,
             &iface,
             config.no_lock,
             &effective_dns_ipv4,
-            dns_ipv6,
+            &effective_dns_ipv6,
             handshake_timeout_connected,
             params.dns_mode,
             &params.dns_services,
@@ -1624,8 +1806,8 @@ pub fn run(
             reset_level, config, &params,
             &config_path, &iface, &endpoint_ip,
             &server_ref.name, data.lock_last,
-            &mut penalties, &mut forced_server, &mut consecutive_failures,
-            &all_entry_ips, &original_gw, &custom_route_out_cidrs,
+            &mut state.penalties, &mut state.forced_server, &mut state.consecutive_failures,
+            &state.all_entry_ips, &original_gw, &state.custom_route_out_cidrs,
         )?;
         if should_break {
             break;
