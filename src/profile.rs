@@ -503,6 +503,23 @@ pub fn keyring_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Parse the output of a `secret-tool lookup` command into an optional password string.
+/// Returns `None` if the command failed (key not found / timeout) or produced empty output.
+fn parse_secret_tool_output(output: &std::process::Output) -> Result<Option<String>> {
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let password = String::from_utf8(output.stdout.clone())
+        .context("keyring value is not valid UTF-8")?
+        .trim_end_matches('\n')
+        .to_string();
+    if password.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(password))
+    }
+}
+
 /// Read a password from the system keyring for the given profile ID.
 /// Uses `timeout` to prevent indefinite hangs if the keyring daemon is stuck
 /// (gnome-keyring issue #116). Matches Eddie's 10-second timeout.
@@ -515,20 +532,7 @@ pub fn keyring_read(id: &str) -> Result<Option<String>> {
         .output()
         .context("failed to run secret-tool for keyring lookup")?;
 
-    if output.status.success() {
-        let password = String::from_utf8(output.stdout)
-            .context("keyring value is not valid UTF-8")?
-            .trim_end_matches('\n')
-            .to_string();
-        if password.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(password))
-        }
-    } else {
-        // secret-tool returns non-zero if key not found (or timeout kills it)
-        Ok(None)
-    }
+    parse_secret_tool_output(&output)
 }
 
 /// Read a password from Eddie's keyring entry for the given profile ID.
@@ -569,19 +573,7 @@ pub fn eddie_keyring_read(id: &str) -> Result<Option<String>> {
             .context("failed to run secret-tool for Eddie keyring lookup")?
     };
 
-    if output.status.success() {
-        let password = String::from_utf8(output.stdout)
-            .context("keyring value is not valid UTF-8")?
-            .trim_end_matches('\n')
-            .to_string();
-        if password.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(password))
-        }
-    } else {
-        Ok(None)
-    }
+    parse_secret_tool_output(&output)
 }
 
 /// Read Eddie keyring entry using a specific UID (for helper daemon use).
@@ -600,19 +592,7 @@ pub fn eddie_keyring_read_for_uid(id: &str, uid: u32) -> Result<Option<String>> 
         .output()
         .context("failed to run secret-tool as user for Eddie keyring lookup")?;
 
-    if output.status.success() {
-        let password = String::from_utf8(output.stdout)
-            .context("keyring value is not valid UTF-8")?
-            .trim_end_matches('\n')
-            .to_string();
-        if password.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(password))
-        }
-    } else {
-        Ok(None)
-    }
+    parse_secret_tool_output(&output)
 }
 
 /// Write a password to the system keyring for the given profile ID.
