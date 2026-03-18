@@ -213,7 +213,14 @@ else
         echo -e "${GREEN}Server IPs (server_ips.txt): ${#SERVER_IPS[@]}${NC}"
     else
         echo -e "${YELLOW}Warning: server_ips.txt not found — only bootstrap IPs will be allowlisted${NC}"
-        echo -e "${YELLOW}Generate it: sudo airvpn-rs servers --debug | grep -oP 'ips_entry=\"[^\"]*\"' | sed 's/ips_entry=\"//;s/\"//' | tr ',' '\\n' | sort -u > resources/server_ips.txt${NC}"
+        echo -e "${YELLOW}Generate it: curl -s --unix-socket /run/airvpn-rs/helper.sock http://localhost/servers | jq -r '.servers[].ips_entry[]' | sort -u > resources/server_ips.txt${NC}"
+    fi
+
+    # Also allowlist the current endpoint from state.json — handles stale server_ips.txt
+    STATE_ENDPOINT="$(load_endpoint_from_state || true)"
+    if [[ -n "${STATE_ENDPOINT:-}" ]]; then
+        ALLOWED_IPS+=("$STATE_ENDPOINT")
+        echo -e "${GREEN}Active endpoint from state.json: $STATE_ENDPOINT${NC}"
     fi
 fi
 
@@ -227,7 +234,7 @@ echo -e "${GREEN}Total allowlisted: ${#ALLOWED_IPS[@]} IPs${NC}"
 if [[ ${#IFACES[@]} -eq 0 ]]; then
     mapfile -t IFACES < <(
         ip -o link show | awk -F': ' '{print $2}' | \
-        grep -v -E '^(lo|docker|veth|br-|virbr|tun|tap|wg|avpn)' | \
+        grep -v -E '^(lo|docker|veth|br-|virbr|tun|tap|wg|avpn|phone-relay)' | \
         grep -v '@' || true
     )
 fi

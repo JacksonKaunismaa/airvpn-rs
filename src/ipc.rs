@@ -22,6 +22,7 @@ pub struct ServerInfo {
     pub warning: Option<String>,
     pub ipv4: bool,
     pub ipv6: bool,
+    pub ips_entry: Vec<String>,
 }
 
 /// Connection state machine.
@@ -223,6 +224,7 @@ mod tests {
                 warning: None,
                 ipv4: true,
                 ipv6: true,
+                ips_entry: vec!["1.2.3.4".to_string()],
             },
             ServerInfo {
                 name: "Pollux".to_string(),
@@ -238,6 +240,7 @@ mod tests {
                 warning: Some("High load".to_string()),
                 ipv4: true,
                 ipv6: false,
+                ips_entry: vec!["5.6.7.8".to_string(), "5.6.7.9".to_string()],
             },
         ];
         let event = HelperEvent::ServerList { servers };

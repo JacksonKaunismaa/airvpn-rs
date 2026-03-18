@@ -1704,6 +1704,7 @@ fn dispatch_list_servers(manifest: &manifest::Manifest, pings: &pinger::LatencyC
                 warning,
                 ipv4: s.support_ipv4,
                 ipv6: s.support_ipv6,
+                ips_entry: s.ips_entry.clone(),
             }
         })
         .collect();
