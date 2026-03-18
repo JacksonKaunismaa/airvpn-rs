@@ -737,6 +737,52 @@ impl Drop for ConnectGuard {
     }
 }
 
+/// Resolve credentials from the saved profile, returning 409 if Eddie import
+/// is needed. Returns `Ok((username, password))` on success, or `Err(response)`
+/// with the appropriate HTTP error/conflict response on failure.
+fn resolve_credentials(
+    peer_uid: Option<u32>,
+) -> Result<(Zeroizing<String>, Zeroizing<String>), Response<HyperBody>> {
+    let profile_options = config::load_profile_options();
+    let prof_user = Zeroizing::new(profile_options.get("login").cloned().unwrap_or_default());
+    let prof_pass = Zeroizing::new(profile_options.get("password").cloned().unwrap_or_default());
+
+    if !prof_user.is_empty() && !prof_pass.is_empty() {
+        Ok((prof_user, prof_pass))
+    } else if let Some(eddie_path) = peer_uid.and_then(config::eddie_profile_path_for_uid) {
+        Err(json_response(StatusCode::CONFLICT, &ipc::EddieImportNeeded {
+            eddie_profile: eddie_path.display().to_string(),
+        }))
+    } else {
+        Err(error_response(StatusCode::BAD_REQUEST, "no credentials available — run `sudo airvpn connect` for first-time setup"))
+    }
+}
+
+/// Wait for the helper to finish warming up (manifest fetched + first ping
+/// cycle complete). Returns `Ok(())` in steady state (already warm) or after
+/// the condvar fires within 60 s. Returns `Err(response)` with a 503 if the
+/// timeout expires before warmup completes.
+fn wait_for_warmup(state: &State) -> Result<(), Response<HyperBody>> {
+    let guard = lock_state(state);
+    if guard.ready && guard.manifest.is_some() {
+        return Ok(());
+    }
+    info!("Waiting for helper warmup (manifest + first ping cycle)...");
+    let result = state.1.ready_cv.wait_timeout_while(
+        guard,
+        Duration::from_secs(60),
+        |st| !st.ready || st.manifest.is_none(),
+    ).unwrap_or_else(|e| e.into_inner());
+    if !result.0.ready || result.0.manifest.is_none() {
+        Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Helper still warming up (waiting for first latency measurement). Try again shortly.",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// POST /connect — start VPN connection, stream events via chunked response.
 async fn handle_connect_async(
     body_bytes: Bytes,
@@ -766,38 +812,13 @@ async fn handle_connect_async(
         ConnectGuard(st.conn.connect_in_progress.clone())
     };
 
-    // Resolve credentials from saved profile (fast, no blocking)
-    let profile_options = config::load_profile_options();
-    let prof_user = Zeroizing::new(profile_options.get("login").cloned().unwrap_or_default());
-    let prof_pass = Zeroizing::new(profile_options.get("password").cloned().unwrap_or_default());
-
-    let (resolved_username, resolved_password) = if !prof_user.is_empty() && !prof_pass.is_empty() {
-        (prof_user, prof_pass)
-    } else if let Some(eddie_path) = peer_uid.and_then(config::eddie_profile_path_for_uid) {
-        return json_response(StatusCode::CONFLICT, &ipc::EddieImportNeeded {
-            eddie_profile: eddie_path.display().to_string(),
-        });
-    } else {
-        return error_response(StatusCode::BAD_REQUEST, "no credentials available — run `sudo airvpn connect` for first-time setup");
+    let (resolved_username, resolved_password) = match resolve_credentials(peer_uid) {
+        Ok(creds) => creds,
+        Err(resp) => return resp,
     };
 
-    // Check warmup (fast, no blocking in steady state)
-    {
-        let guard = lock_state(&state);
-        if !guard.ready || guard.manifest.is_none() {
-            info!("Waiting for helper warmup (manifest + first ping cycle)...");
-            let result = state.1.ready_cv.wait_timeout_while(
-                guard,
-                Duration::from_secs(60),
-                |st| !st.ready || st.manifest.is_none(),
-            ).unwrap_or_else(|e| e.into_inner());
-            if !result.0.ready || result.0.manifest.is_none() {
-                return error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Helper still warming up (waiting for first latency measurement). Try again shortly.",
-                );
-            }
-        }
+    if let Err(resp) = wait_for_warmup(&state) {
+        return resp;
     }
 
     // If already connected, do the full disconnect→connect in a detached thread
@@ -949,21 +970,20 @@ fn perform_disconnect(state: &State) -> bool {
     true
 }
 
-/// Start a connect engine in background threads (no HTTP response needed).
-/// Used by server-switch path where the HTTP handler returns immediately.
-/// Events are broadcast to all /events subscribers.
-fn start_connect(state: State, connect_req: ipc::ConnectRequest, username: Zeroizing<String>, password: Zeroizing<String>) {
-    let (event_tx, event_rx) = mpsc::channel::<ipc::EngineEvent>();
-
-    let server_info = {
-        let st = state.0.lock().unwrap();
-        st.conn.server_info.clone()
-    };
-
-    // Spawn engine→broadcast forwarder thread
-    let broadcast_state = Arc::clone(&state);
+/// Spawn the engine-event → helper-event forwarder thread.
+///
+/// Reads `EngineEvent`s from `event_rx`, maps them to `HelperEvent`s, updates
+/// the server info cache, and broadcasts to all `/events` subscribers. The
+/// returned `JoinHandle` is detached by the caller (exits when the connect
+/// thread drops `event_tx`).
+fn spawn_event_forwarder(
+    event_rx: mpsc::Receiver<ipc::EngineEvent>,
+    state: &State,
+    server_info: &Arc<Mutex<(String, String, String)>>,
+) -> thread::JoinHandle<()> {
+    let broadcast_state = Arc::clone(state);
     let fwd_server_info = server_info.clone();
-    let event_fwd = thread::spawn(move || {
+    thread::spawn(move || {
         for engine_event in event_rx {
             let helper_event = match engine_event {
                 ipc::EngineEvent::StateChanged(s) => {
@@ -986,7 +1006,104 @@ fn start_connect(state: State, connect_req: ipc::ConnectRequest, username: Zeroi
                 st.broadcast(&helper_event);
             }
         }
+    })
+}
+
+/// Spawn the stats polling thread — reads WireGuard transfer stats every 2 s
+/// and broadcasts `HelperEvent::Stats` to all subscribers.
+///
+/// Returns `(JoinHandle, stop_flag)`. Set the stop flag to exit the loop.
+fn spawn_stats_poller(state: &State) -> (thread::JoinHandle<()>, Arc<AtomicBool>) {
+    let stats_state = Arc::clone(state);
+    let stats_stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stats_stop.clone();
+    let handle = thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_secs(2));
+            if stop_clone.load(Ordering::SeqCst) {
+                break;
+            }
+
+            let iface = match recovery::load() {
+                Ok(Some(state)) => state.wg_interface,
+                _ => continue,
+            };
+
+            if iface.is_empty() || !wireguard::is_connected(&iface) {
+                continue;
+            }
+
+            match wireguard::get_transfer_stats(&iface) {
+                Ok((rx, tx)) => {
+                    if let Ok(mut st) = stats_state.0.lock() {
+                        st.broadcast(&ipc::HelperEvent::Stats {
+                            rx_bytes: rx,
+                            tx_bytes: tx,
+                        });
+                    }
+                }
+                Err(e) => {
+                    debug!("Failed to get transfer stats: {}", e);
+                }
+            }
+        }
     });
+    (handle, stats_stop)
+}
+
+/// Build a `ConnectConfig` from the connect request, resolved options, and
+/// cached manifest/latency data.
+fn build_connect_config(
+    connect_req: ipc::ConnectRequest,
+    username: Zeroizing<String>,
+    password: Zeroizing<String>,
+    event_tx: mpsc::Sender<ipc::EngineEvent>,
+    cached_manifest: manifest::Manifest,
+    cached_latency: pinger::LatencyCache,
+    disconnect_flag: Arc<AtomicBool>,
+) -> connect::ConnectConfig {
+    let profile_options = config::load_profile_options();
+    let resolved = options::resolve(&profile_options, &connect_req.overrides);
+
+    connect::ConnectConfig {
+        server_name: connect_req.server,
+        no_lock: !options::get_bool(&resolved, options::NETLOCK),
+        allow_lan: options::get_bool(&resolved, options::NETLOCK_ALLOW_PRIVATE),
+        no_reconnect: !options::get_bool(&resolved, options::RECONNECT),
+        username,
+        password,
+        allow_server: options::get_list(&resolved, options::SERVERS_ALLOWLIST),
+        deny_server: options::get_list(&resolved, options::SERVERS_DENYLIST),
+        allow_country: options::get_list(&resolved, options::AREAS_ALLOWLIST),
+        deny_country: options::get_list(&resolved, options::AREAS_DENYLIST),
+        no_verify: !options::get_bool(&resolved, options::VERIFY),
+        no_lock_last: !options::get_bool(&resolved, options::SERVERS_LOCKLAST),
+        no_start_last: !options::get_bool(&resolved, options::SERVERS_STARTLAST),
+        cli_ipv6_mode: {
+            let v = options::get_str(&resolved, options::NETWORK_IPV6_MODE);
+            if v.is_empty() || v == "in-block" { None } else { Some(v.to_string()) }
+        },
+        cli_dns_servers: options::get_list(&resolved, options::DNS_SERVERS),
+        event_tx,
+        cached_latency,
+        manifest: cached_manifest,
+        resolved,
+        shutdown: Some(disconnect_flag),
+    }
+}
+
+/// Start a connect engine in background threads (no HTTP response needed).
+/// Used by server-switch path where the HTTP handler returns immediately.
+/// Events are broadcast to all /events subscribers.
+fn start_connect(state: State, connect_req: ipc::ConnectRequest, username: Zeroizing<String>, password: Zeroizing<String>) {
+    let (event_tx, event_rx) = mpsc::channel::<ipc::EngineEvent>();
+
+    let server_info = {
+        let st = state.0.lock().unwrap();
+        st.conn.server_info.clone()
+    };
+
+    let event_fwd = spawn_event_forwarder(event_rx, &state, &server_info);
 
     // Stop any previous stats poller
     {
@@ -1014,35 +1131,11 @@ fn start_connect(state: State, connect_req: ipc::ConnectRequest, username: Zeroi
         st.conn.disconnect_flag = disconnect_flag.clone();
     }
 
-    // Resolve options: defaults -> profile -> per-session overrides
-    let profile_options = config::load_profile_options();
-    let resolved = options::resolve(&profile_options, &connect_req.overrides);
-
-    let connect_config = connect::ConnectConfig {
-        server_name: connect_req.server,
-        no_lock: !options::get_bool(&resolved, options::NETLOCK),
-        allow_lan: options::get_bool(&resolved, options::NETLOCK_ALLOW_PRIVATE),
-        no_reconnect: !options::get_bool(&resolved, options::RECONNECT),
-        username,
-        password,
-        allow_server: options::get_list(&resolved, options::SERVERS_ALLOWLIST),
-        deny_server: options::get_list(&resolved, options::SERVERS_DENYLIST),
-        allow_country: options::get_list(&resolved, options::AREAS_ALLOWLIST),
-        deny_country: options::get_list(&resolved, options::AREAS_DENYLIST),
-        no_verify: !options::get_bool(&resolved, options::VERIFY),
-        no_lock_last: !options::get_bool(&resolved, options::SERVERS_LOCKLAST),
-        no_start_last: !options::get_bool(&resolved, options::SERVERS_STARTLAST),
-        cli_ipv6_mode: {
-            let v = options::get_str(&resolved, options::NETWORK_IPV6_MODE);
-            if v.is_empty() || v == "in-block" { None } else { Some(v.to_string()) }
-        },
-        cli_dns_servers: options::get_list(&resolved, options::DNS_SERVERS),
-        event_tx: event_tx.clone(),
-        cached_latency,
-        manifest: cached_manifest,
-        resolved,
-        shutdown: Some(disconnect_flag),
-    };
+    let connect_config = build_connect_config(
+        connect_req, username, password,
+        event_tx.clone(), cached_manifest, cached_latency,
+        disconnect_flag,
+    );
 
     let conn_handle = thread::spawn(move || {
         let result = (|| -> Result<()> {
@@ -1077,41 +1170,7 @@ fn start_connect(state: State, connect_req: ipc::ConnectRequest, username: Zeroi
         }
     });
 
-    // Spawn stats polling thread
-    let stats_state = Arc::clone(&state);
-    let stats_stop = Arc::new(AtomicBool::new(false));
-    let stats_stop_clone = stats_stop.clone();
-    let stats_handle = thread::spawn(move || {
-        loop {
-            thread::sleep(Duration::from_secs(2));
-            if stats_stop_clone.load(Ordering::SeqCst) {
-                break;
-            }
-
-            let iface = match recovery::load() {
-                Ok(Some(state)) => state.wg_interface,
-                _ => continue,
-            };
-
-            if iface.is_empty() || !wireguard::is_connected(&iface) {
-                continue;
-            }
-
-            match wireguard::get_transfer_stats(&iface) {
-                Ok((rx, tx)) => {
-                    if let Ok(mut st) = stats_state.0.lock() {
-                        st.broadcast(&ipc::HelperEvent::Stats {
-                            rx_bytes: rx,
-                            tx_bytes: tx,
-                        });
-                    }
-                }
-                Err(e) => {
-                    debug!("Failed to get transfer stats: {}", e);
-                }
-            }
-        }
-    });
+    let (stats_handle, stats_stop) = spawn_stats_poller(&state);
 
     // Store handles in shared state
     {
