@@ -282,6 +282,67 @@ pub fn is_pid_alive_with_nonce(pid: u32, expected_nonce: u64) -> bool {
     }
 }
 
+/// Delete orphaned WireGuard config files (`avpn0.conf`, `avpn-*.conf`) from
+/// the state directory. These contain private keys and must not linger after
+/// disconnect or crash.
+fn cleanup_wg_configs() {
+    if let Ok(entries) = std::fs::read_dir(STATE_DIR) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if (name == "avpn0.conf" || name.starts_with("avpn-")) && name.ends_with(".conf") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+/// Delete orphaned routing policy rules (table 51820 fwmark and suppress_prefixlength)
+/// and optionally the endpoint host route.
+///
+/// Each rule type is deleted in a bounded loop (up to `MAX_RULE_DELETIONS`) to
+/// clean up duplicates while preventing infinite loops. If `endpoint_ip` is
+/// provided, its host route (`/32` or `/128`) is also removed.
+fn cleanup_routing_rules(endpoint_ip: Option<&str>) {
+    let routing_cleanups: &[&[&str]] = &[
+        &["ip", "-4", "rule", "delete", "table", "main", "suppress_prefixlength", "0"],
+        &["ip", "-6", "rule", "delete", "table", "main", "suppress_prefixlength", "0"],
+        &["ip", "-4", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
+        &["ip", "-6", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
+    ];
+    for cmd in routing_cleanups {
+        let mut deleted = 0;
+        for _ in 0..crate::common::MAX_RULE_DELETIONS {
+            match std::process::Command::new(cmd[0]).args(&cmd[1..]).output() {
+                Ok(output) if output.status.success() => {
+                    deleted += 1;
+                    continue;
+                }
+                _ => break,
+            }
+        }
+        if deleted >= crate::common::MAX_RULE_DELETIONS {
+            warn!(
+                "hit {} rule deletions for {:?} — possible infinite loop",
+                crate::common::MAX_RULE_DELETIONS,
+                cmd.join(" ")
+            );
+        }
+    }
+
+    // Clean up endpoint host route if known
+    if let Some(ip) = endpoint_ip {
+        if !ip.is_empty() {
+            let is_ipv6 = ip.contains(':');
+            let cidr_suffix = if is_ipv6 { "/128" } else { "/32" };
+            let ip_version = if is_ipv6 { "-6" } else { "-4" };
+            let endpoint_route = format!("{}{}", ip, cidr_suffix);
+            let _ = std::process::Command::new("ip")
+                .args([ip_version, "route", "delete", &endpoint_route])
+                .output();
+        }
+    }
+}
+
 /// Run the recovery cleanup sequence (matches normal disconnect order):
 /// 1. wireguard::disconnect(config_path) (ip link delete)
 /// 2. ipv6::restore() (re-enable IPv6 on blocked interfaces)
@@ -317,17 +378,7 @@ fn recover_from_state(state: &State) -> Result<()> {
     }
 
     // 1b. Clean up any orphaned WireGuard config files (contain private keys)
-    if let Ok(entries) = std::fs::read_dir(STATE_DIR) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if (name == "avpn0.conf" || name.starts_with("avpn-")) && name.ends_with(".conf") {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
-    // Legacy /tmp cleanup removed: configs have been in /run/airvpn-rs/ since
-    // the early releases. Scanning /tmp and deleting matching filenames is unsafe
-    // because symlinks in /tmp could cause deletion of arbitrary files.
+    cleanup_wg_configs();
 
     // 2. Restore IPv6 on previously blocked interfaces
     if !state.blocked_ipv6_ifaces.is_empty() {
@@ -345,43 +396,7 @@ fn recover_from_state(state: &State) -> Result<()> {
     // 3b. Clean up routing policy rules (table 51820) that setup_routing adds.
     // wireguard::disconnect calls teardown_routing, but if disconnect failed
     // (e.g., config_path was empty or interface already gone), rules may linger.
-    // Loop each deletion until it fails, to clean up any duplicate rules.
-    let routing_cleanups: &[&[&str]] = &[
-        &["ip", "-4", "rule", "delete", "table", "main", "suppress_prefixlength", "0"],
-        &["ip", "-6", "rule", "delete", "table", "main", "suppress_prefixlength", "0"],
-        &["ip", "-4", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
-        &["ip", "-6", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
-    ];
-    for cmd in routing_cleanups {
-        let mut deleted = 0;
-        for _ in 0..crate::common::MAX_RULE_DELETIONS {
-            match std::process::Command::new(cmd[0]).args(&cmd[1..]).output() {
-                Ok(output) if output.status.success() => {
-                    deleted += 1;
-                    continue;
-                }
-                _ => break,
-            }
-        }
-        if deleted >= crate::common::MAX_RULE_DELETIONS {
-            warn!(
-                "hit {} rule deletions for {:?} — possible infinite loop",
-                crate::common::MAX_RULE_DELETIONS,
-                cmd.join(" ")
-            );
-        }
-    }
-
-    // Also clean up endpoint host route if we know the endpoint IP
-    if !state.endpoint_ip.is_empty() {
-        let is_ipv6 = state.endpoint_ip.contains(':');
-        let cidr_suffix = if is_ipv6 { "/128" } else { "/32" };
-        let ip_version = if is_ipv6 { "-6" } else { "-4" };
-        let endpoint_route = format!("{}{}", state.endpoint_ip, cidr_suffix);
-        let _ = std::process::Command::new("ip")
-            .args([ip_version, "route", "delete", &endpoint_route])
-            .output();
-    }
+    cleanup_routing_rules(Some(&state.endpoint_ip));
 
     // 4. Deactivate network lock if it was active (last — prevents traffic leaks)
     if state.lock_active {
@@ -457,38 +472,30 @@ pub fn force_recover() -> Result<()> {
         found_orphans = true;
     }
 
-    // Orphaned WireGuard configs
+    // Orphaned WireGuard configs — check if any exist before cleanup so we
+    // can track whether orphans were found.
     if let Ok(entries) = std::fs::read_dir(STATE_DIR) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             if (name == "avpn0.conf" || name.starts_with("avpn-")) && name.ends_with(".conf") {
-                let _ = std::fs::remove_file(entry.path());
                 found_orphans = true;
+                break;
             }
         }
     }
+    cleanup_wg_configs();
 
-    // Orphaned routing policy rules
-    let routing_cleanups: &[&[&str]] = &[
-        &["ip", "-4", "rule", "delete", "table", "main", "suppress_prefixlength", "0"],
-        &["ip", "-6", "rule", "delete", "table", "main", "suppress_prefixlength", "0"],
-        &["ip", "-4", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
-        &["ip", "-6", "rule", "delete", "not", "fwmark", "51820", "table", "51820"],
-    ];
-    for cmd in routing_cleanups {
-        if let Ok(output) = std::process::Command::new(cmd[0]).args(&cmd[1..]).output() {
-            if output.status.success() {
-                found_orphans = true;
-                // Delete remaining duplicates
-                for _ in 0..crate::common::MAX_RULE_DELETIONS {
-                    match std::process::Command::new(cmd[0]).args(&cmd[1..]).output() {
-                        Ok(o) if o.status.success() => continue,
-                        _ => break,
-                    }
-                }
-            }
+    // Orphaned routing policy rules — do a trial delete to detect orphans,
+    // then let cleanup_routing_rules handle the bounded loop for all rules.
+    // We check just the first rule type to set found_orphans; the helper
+    // cleans all 4 types regardless.
+    let trial_cmd = ["ip", "-4", "rule", "delete", "table", "main", "suppress_prefixlength", "0"];
+    if let Ok(output) = std::process::Command::new(trial_cmd[0]).args(&trial_cmd[1..]).output() {
+        if output.status.success() {
+            found_orphans = true;
         }
     }
+    cleanup_routing_rules(None);
 
     if !found_orphans {
         info!("no orphaned state found");
