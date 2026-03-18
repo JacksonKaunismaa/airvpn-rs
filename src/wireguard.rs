@@ -50,6 +50,23 @@ impl std::fmt::Debug for WgConnectParams {
     }
 }
 
+/// Run a command and bail with stderr on failure.
+///
+/// Covers the common pattern: execute, check status, bail with context.
+/// Sites that need cleanup-on-failure, fire-and-forget, warn-only,
+/// or piped stdin should use `Command::new` directly.
+fn run_cmd(cmd: &str, args: &[&str], error_context: &str) -> Result<std::process::Output> {
+    let output = Command::new(cmd)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to execute: {}", error_context))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("{} failed: {}", error_context, stderr.trim());
+    }
+    Ok(output)
+}
+
 /// Validate an interface name: alphanumeric + dash + underscore, max 15 chars.
 /// Matches the validation in netlock.rs to prevent path traversal and command injection.
 fn validate_interface_name(iface: &str) -> Result<()> {
@@ -498,14 +515,8 @@ fn setup_routing(iface: &str, endpoint_ip: &str, ipv4_enabled: bool, entry_iface
     //    routing rules. Without this, WireGuard's own encrypted packets (going
     //    to the real VPN server) would be routed through table 51820 (i.e.,
     //    back through the VPN interface), creating a routing loop.
-    let output = Command::new("wg")
-        .args(["set", iface, "fwmark", "51820"])
-        .output()
-        .context("failed to execute: wg set fwmark")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("wg set {} fwmark 51820 failed: {}", iface, stderr.trim());
-    }
+    let fwmark_ctx = format!("wg set {} fwmark 51820", iface);
+    run_cmd("wg", &["set", iface, "fwmark", "51820"], &fwmark_ctx)?;
 
     // 2. Save original default gateway before any route changes.
     //    Use the correct IP version gateway for the endpoint to avoid creating
@@ -911,13 +922,7 @@ pub fn is_handshake_stale(iface: &str, max_age_secs: u64) -> bool {
 /// Parses `wg show <iface> transfer` output: <pubkey>\t<rx>\t<tx>
 pub fn get_transfer_stats(iface: &str) -> Result<(u64, u64)> {
     validate_interface_name(iface)?;
-    let output = Command::new("wg")
-        .args(["show", iface, "transfer"])
-        .output()
-        .context("failed to run wg show transfer")?;
-    if !output.status.success() {
-        anyhow::bail!("wg show transfer failed: {}", String::from_utf8_lossy(&output.stderr));
-    }
+    let output = run_cmd("wg", &["show", iface, "transfer"], "wg show transfer")?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let line = stdout.lines().next().unwrap_or("");
     let parts: Vec<&str> = line.split('\t').collect();
