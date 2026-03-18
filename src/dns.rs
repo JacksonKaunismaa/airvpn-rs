@@ -402,10 +402,12 @@ pub fn activate(dns_ipv4: &str, dns_ipv6: &str, iface: &str, mode: DnsMode, dns_
     Ok(())
 }
 
-/// Deactivate: restore resolv.conf from backup.
+/// Phase 1 of deactivate: restore /etc/resolv.conf from backup.
 ///
-/// Eddie: move backup back, then restart systemd-resolved if active.
-pub fn deactivate() -> Result<()> {
+/// If the backup file exists, atomically renames it back. If not, removes
+/// resolv.conf only if it contains our header marker (prevents data loss on
+/// double-deactivate). Restores the immutable flag if it was set before activation.
+fn restore_resolv_conf() -> Result<()> {
     let resolv_path = Path::new("/etc/resolv.conf");
     let backup_path = Path::new(BACKUP_PATH);
 
@@ -443,12 +445,17 @@ pub fn deactivate() -> Result<()> {
         restore_immutable(resolv_path);
     }
 
-    // Restore per-interface systemd-resolved settings from backups.
-    // Eddie: reads /etc/systemd_resolve_netif_<iface>.eddievpn, restores DNS servers
-    // and default_route via resolvectl, then deletes the backup file.
-    //
-    // Track which interfaces we successfully restored so we only use
-    // `resolvectl revert` as a fallback for interfaces without backup files.
+    Ok(())
+}
+
+/// Phase 2 of deactivate: restore per-interface systemd-resolved settings from backups.
+///
+/// Eddie: reads /etc/systemd_resolve_netif_<iface>.eddievpn, restores DNS servers
+/// and default_route via resolvectl, then deletes the backup file.
+///
+/// Returns the list of interface names that were successfully restored from backups.
+/// Phase 3 needs this to know which interfaces to skip (avoid double-revert).
+fn restore_systemd_per_interface() -> Result<Vec<String>> {
     let mut restored_ifaces: Vec<String> = Vec::new();
     if let Ok(entries) = fs::read_dir("/etc") {
         for entry in entries.flatten() {
@@ -529,22 +536,30 @@ pub fn deactivate() -> Result<()> {
             }
         }
     }
+    Ok(restored_ifaces)
+}
 
-    // Revert DNS on interfaces that did NOT have backup files.
-    // This is a best-effort fallback — `resolvectl revert` factory-resets
-    // the interface, but it's better than leaving VPN DNS on an interface
-    // we have no saved state for.
+/// Phase 3 of deactivate: revert DNS on interfaces that did NOT have backup files.
+///
+/// This is a best-effort fallback — `resolvectl revert` factory-resets
+/// the interface, but it's better than leaving VPN DNS on an interface
+/// we have no saved state for.
+fn revert_remaining_interfaces(restored: &[String]) -> Result<()> {
     let ifaces = list_interfaces();
     for iface in &ifaces {
-        if !restored_ifaces.contains(iface) {
+        if !restored.contains(iface) {
             let _ = Command::new("resolvectl")
                 .args(["revert", iface.as_str()])
                 .output();
         }
     }
+    Ok(())
+}
 
-    // Restart systemd-resolved if active so it picks up the restored resolv.conf
-    // (Eddie: `service systemd-resolved restart`)
+/// Phase 4 of deactivate: restart systemd-resolved if active, flush DNS caches.
+///
+/// Eddie: `service systemd-resolved restart` + flush all DNS cache services.
+fn restart_and_flush() -> Result<()> {
     if is_systemd_resolved_active() {
         let _ = Command::new("systemctl")
             .args(["restart", "systemd-resolved"])
@@ -552,7 +567,17 @@ pub fn deactivate() -> Result<()> {
     }
 
     flush();
+    Ok(())
+}
 
+/// Deactivate: restore resolv.conf from backup.
+///
+/// Eddie: move backup back, then restart systemd-resolved if active.
+pub fn deactivate() -> Result<()> {
+    restore_resolv_conf()?;
+    let restored = restore_systemd_per_interface()?;
+    revert_remaining_interfaces(&restored)?;
+    restart_and_flush()?;
     Ok(())
 }
 
