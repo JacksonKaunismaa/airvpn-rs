@@ -751,9 +751,13 @@ async fn handle_connect_async(
     // Reject concurrent connect operations. This prevents rapid-fire requests
     // (e.g., GUI spam-clicking) from spawning multiple server_switch threads
     // that race on state.json cleanup.
+    // Exception: when already connected, allow through — the server_switch path
+    // (below) handles the disconnect→reconnect sequence. Without this, the
+    // connect_in_progress flag (set while the connect thread is running) would
+    // block every server-switch attempt with a silent 409.
     let connect_guard = {
         let st = state.0.lock().unwrap();
-        if st.conn.connect_in_progress.load(Ordering::SeqCst) {
+        if st.conn.connect_in_progress.load(Ordering::SeqCst) && !st.conn.is_connected() {
             return error_response(StatusCode::CONFLICT, "connect already in progress");
         }
         st.conn.connect_in_progress.store(true, Ordering::SeqCst);
@@ -809,6 +813,11 @@ async fn handle_connect_async(
             let switch_state = Arc::clone(&state);
             thread::spawn(move || {
                 perform_disconnect(&switch_state);
+                // Re-arm the flag: the old connect thread cleared it on exit
+                // (during the join inside perform_disconnect). Without this,
+                // a racing request could sneak through between disconnect and
+                // the new connect thread starting.
+                switch_state.0.lock().unwrap().conn.connect_in_progress.store(true, Ordering::SeqCst);
                 start_connect(switch_state, connect_req, resolved_username, resolved_password);
             });
             return json_response(StatusCode::OK, &json!({"server_switch": true}));

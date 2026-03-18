@@ -355,16 +355,11 @@ impl App {
             }
             Message::ConnectToServer(server_name) => {
                 self.selected_server = Some(server_name.clone());
-                self.error_overview = None;
                 self.connection_state = ConnectionState::Connecting;
-                // Fire-and-forget: helper auto-disconnects if needed.
-                // Don't block the GUI — state updates arrive via /events stream.
-                let req = self.build_connect_request(Some(server_name));
-                if let Ok(body) = serde_json::to_vec(&req) {
-                    if let Some(ref helper) = self.helper {
-                        helper.fire_command("POST", "/connect", Some(&body));
-                    }
-                }
+                // Use send_connect (same as overview Connect button) so errors
+                // (409, credential issues, warmup) are shown instead of silently
+                // swallowed by fire_command.
+                self.send_connect(Some(server_name));
                 Task::none()
             }
             Message::Disconnect => {
@@ -1159,8 +1154,10 @@ impl App {
                     }
                     // 409 but not Eddie — already connected or other error
                     self.error_overview = Some(format!("Connect failed: {}", resp_body));
+                    self.connection_state = ConnectionState::Disconnected;
                 } else if status != 200 {
                     self.error_overview = Some(format!("Connect failed (HTTP {}): {}", status, resp_body));
+                    self.connection_state = ConnectionState::Disconnected;
                 }
                 // 200 = connect started, events arrive via /events stream
             }

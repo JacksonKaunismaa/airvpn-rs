@@ -81,25 +81,6 @@ impl HelperClient {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "IPC task died"))?
     }
 
-    /// Fire a command without waiting for the response.
-    /// Used for POST /connect which may block for a long time (auto-disconnect).
-    /// Errors are logged to stderr; state updates arrive via /events stream.
-    pub fn fire_command(&self, method: &str, path: &str, body: Option<&[u8]>) {
-        let method = method.to_string();
-        let path = path.to_string();
-        let body_owned = body.map(|b| Bytes::copy_from_slice(b));
-
-        self.rt.spawn(async move {
-            match send_request(method, path, body_owned, CONNECT_TIMEOUT_LONG).await {
-                Ok((status, resp_body)) => {
-                    if status != 200 {
-                        eprintln!("[GUI-IPC] fire_command: HTTP {}: {}", status, resp_body);
-                    }
-                }
-                Err(e) => eprintln!("[GUI-IPC] fire_command failed: {}", e),
-            }
-        });
-    }
 
     pub fn try_recv(&self) -> Option<HelperEvent> {
         self.event_rx.try_recv().ok()
