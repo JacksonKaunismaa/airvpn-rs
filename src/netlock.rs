@@ -101,6 +101,172 @@ fn ensure_cidr(ip_str: &str) -> String {
     }
 }
 
+// =============================================================================
+// Shared rule builders
+//
+// Each builder appends a group of nftables rules to the given String buffer.
+// The two generator functions (session + persistent) call these builders;
+// conditionals (allow_dhcp, allow_lan, etc.) stay in the orchestrator.
+// Rule content and ordering are preserved exactly.
+// =============================================================================
+
+/// Append INPUT-chain rules that are always present in both lock types:
+/// loopback accept, IPv6 anti-spoof, RH0 drop, NDP (hoplimit 255), conntrack.
+fn append_input_fixed_rules(r: &mut String) {
+    // Loopback accept (Eddie: ip filter INPUT iifname "lo" + ip6 filter INPUT iifname "lo")
+    r.push_str("    iifname \"lo\" counter accept\n");
+
+    // IPv6 anti-spoof: drop ::1 not from lo
+    //    Eddie uses "reject" in a separate ip6 table. In our inet table,
+    //    bare "reject" fails on some nftables versions (needs icmpx type).
+    //    "drop" achieves the same anti-spoof protection.
+    r.push_str("    iifname != \"lo\" ip6 saddr ::1 counter drop\n");
+}
+
+/// Append DHCP broadcast rules for the INPUT chain.
+/// Eddie: ip filter INPUT ip saddr 255.255.255.255 + ip6 saddr ff02::1:2 + ff05::1:3
+fn append_dhcp_input(r: &mut String) {
+    r.push_str("    ip saddr 255.255.255.255 counter accept\n");
+    r.push_str("    ip6 saddr ff02::1:2 counter accept\n");
+    r.push_str("    ip6 saddr ff05::1:3 counter accept\n");
+}
+
+/// Append NAT64 (IPv4/IPv6 translation — RFC 6052/8215) rules.
+/// Same rules for both INPUT and OUTPUT chains.
+fn append_nat64(r: &mut String) {
+    r.push_str("    ip6 saddr 64:ff9b::/96 ip6 daddr 64:ff9b::/96 counter accept\n");
+    r.push_str("    ip6 saddr 64:ff9b:1::/48 ip6 daddr 64:ff9b:1::/48 counter accept\n");
+}
+
+/// Append RFC1918 + IPv6 LAN bidirectional rules (shared between INPUT and OUTPUT).
+/// IPv4: 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12
+/// IPv6: fe80::/10 (link-local), ff00::/8 (multicast), fc00::/7 (ULA)
+fn append_lan_bidirectional(r: &mut String) {
+    r.push_str("    ip saddr 192.168.0.0/16 ip daddr 192.168.0.0/16 counter accept\n");
+    r.push_str("    ip saddr 10.0.0.0/8 ip daddr 10.0.0.0/8 counter accept\n");
+    r.push_str("    ip saddr 172.16.0.0/12 ip daddr 172.16.0.0/12 counter accept\n");
+    r.push_str("    ip6 saddr fe80::/10 ip6 daddr fe80::/10 counter accept\n");
+    r.push_str("    ip6 saddr ff00::/8 ip6 daddr ff00::/8 counter accept\n");
+    r.push_str("    ip6 saddr fc00::/7 ip6 daddr fc00::/7 counter accept\n");
+}
+
+/// Append ICMP echo-request + ICMPv6 safe diagnostic types for the INPUT chain.
+/// ICMPv6 includes echo-request (unlike output, which varies between lock types).
+fn append_icmp_input(r: &mut String) {
+    // Eddie: ip filter INPUT icmp type echo-request counter accept
+    r.push_str("    icmp type echo-request counter accept\n");
+    // ICMPv6: only allow safe diagnostic types (not all ICMPv6 — broad accept
+    // would permit tunneling via unused types like mobile/experimental).
+    // NDP types are handled separately below with hoplimit 255 restriction.
+    r.push_str("    icmpv6 type { echo-request, echo-reply, destination-unreachable, packet-too-big, time-exceeded, parameter-problem } counter accept\n");
+}
+
+/// Append IPv6 RH0 drop — disable processing of routing header type 0 (ping-pong attack).
+/// Used in INPUT, FORWARD, and OUTPUT chains.
+fn append_rh0_drop(r: &mut String) {
+    r.push_str("    rt type 0 counter drop\n");
+}
+
+/// Append IPv6 NDP rules — required for IPv6 address allocation (hoplimit 255).
+/// Eddie: 4 separate rules for router-advert, neighbor-solicit, neighbor-advert, redirect.
+fn append_ndp(r: &mut String) {
+    r.push_str(
+        "    meta l4proto ipv6-icmp icmpv6 type nd-router-advert ip6 hoplimit 255 counter accept\n",
+    );
+    r.push_str(
+        "    meta l4proto ipv6-icmp icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 counter accept\n",
+    );
+    r.push_str(
+        "    meta l4proto ipv6-icmp icmpv6 type nd-neighbor-advert ip6 hoplimit 255 counter accept\n",
+    );
+    r.push_str(
+        "    meta l4proto ipv6-icmp icmpv6 type nd-redirect ip6 hoplimit 255 counter accept\n",
+    );
+}
+
+/// Append conntrack rule: allow established/related connections.
+/// Eddie: ip filter INPUT ct state related,established + ip6 filter INPUT ct state related,established
+fn append_conntrack_input(r: &mut String) {
+    r.push_str("    ct state related,established counter accept\n");
+}
+
+/// Append DHCP broadcast rules for the OUTPUT chain.
+/// Eddie: ip filter OUTPUT ip daddr 255.255.255.255 + ip6 daddr ff02::1:2 + ff05::1:3
+fn append_dhcp_output(r: &mut String) {
+    r.push_str("    ip daddr 255.255.255.255 counter accept\n");
+    r.push_str("    ip6 daddr ff02::1:2 counter accept\n");
+    r.push_str("    ip6 daddr ff05::1:3 counter accept\n");
+}
+
+/// Append DNS leak block rules for the OUTPUT chain.
+/// Blocks port 53/853 to LAN destinations on non-tunnel interfaces.
+/// Must come before LAN accept rules to prevent DNS from leaking through
+/// RFC1918 accept rules when the tunnel is down.
+fn append_dns_leak_block(r: &mut String, iface_name: &str) {
+    r.push_str(&format!("    oifname != \"{}\" ip daddr {{ 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12 }} udp dport {{ 53, 853 }} counter drop comment \"block_lan_dns_leak\"\n", iface_name));
+    r.push_str(&format!("    oifname != \"{}\" ip daddr {{ 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12 }} tcp dport {{ 53, 853 }} counter drop comment \"block_lan_dns_leak\"\n", iface_name));
+    r.push_str(&format!("    oifname != \"{}\" ip6 daddr {{ fe80::/10, ff00::/8, fc00::/7 }} udp dport {{ 53, 853 }} counter drop comment \"block_lan_dns_leak\"\n", iface_name));
+    r.push_str(&format!("    oifname != \"{}\" ip6 daddr {{ fe80::/10, ff00::/8, fc00::/7 }} tcp dport {{ 53, 853 }} counter drop comment \"block_lan_dns_leak\"\n", iface_name));
+}
+
+/// Append LAN multicast rules for the OUTPUT chain (mDNS, SSDP, SLPv2).
+/// These only appear in OUTPUT, not INPUT.
+fn append_lan_output_multicast(r: &mut String) {
+    for subnet in &["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"] {
+        r.push_str(&format!(
+            "    ip saddr {} ip daddr 224.0.0.0/24 counter accept\n",
+            subnet
+        ));
+        r.push_str(&format!(
+            "    ip saddr {} ip daddr 239.255.255.250 counter accept\n",
+            subnet
+        ));
+        r.push_str(&format!(
+            "    ip saddr {} ip daddr 239.255.255.253 counter accept\n",
+            subnet
+        ));
+    }
+}
+
+/// Append local interface forwarding rules for the FORWARD chain.
+/// Each local interface gets bidirectional stateful rules with the VPN interface.
+fn append_forward_local_ifaces(r: &mut String, local_ifaces: &[String], vpn_iface: &str) {
+    for local_iface in local_ifaces {
+        r.push_str(&format!(
+            "    iifname \"{}\" oifname \"{}\" ct state new,established counter accept\n",
+            local_iface, vpn_iface
+        ));
+        r.push_str(&format!(
+            "    iifname \"{}\" oifname \"{}\" ct state related,established counter accept\n",
+            vpn_iface, local_iface
+        ));
+    }
+}
+
+/// Append allowlist CIDR accept rules for the OUTPUT chain.
+/// The `comment` parameter controls the nftables comment string (e.g.,
+/// `"airvpn_allowlist_out"` for session lock, `"airvpn_persist_allowlist_out"` for persistent).
+fn append_allowlist_out_cidrs(r: &mut String, cidrs: &[String], comment: &str) {
+    for cidr_str in cidrs {
+        let cidr = ensure_cidr(cidr_str);
+        match classify_ip(&cidr) {
+            Some(IpVersion::V4) => {
+                r.push_str(&format!(
+                    "    ip daddr {} counter accept comment \"{}\"\n",
+                    cidr, comment
+                ));
+            }
+            Some(IpVersion::V6) => {
+                r.push_str(&format!(
+                    "    ip6 daddr {} counter accept comment \"{}\"\n",
+                    cidr, comment
+                ));
+            }
+            None => {}
+        }
+    }
+}
+
 /// Generate the full nftables ruleset as a string (for writing to tmpfile + nft -f).
 ///
 /// Rule ordering matches Eddie's NetworkLockNftables.cs Activation() exactly,
@@ -119,76 +285,37 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
         PRIORITY
     ));
 
-    // 1. Loopback accept (Eddie: ip filter INPUT iifname "lo" + ip6 filter INPUT iifname "lo")
-    r.push_str("    iifname \"lo\" counter accept\n");
-
-    // 2. IPv6 anti-spoof: drop ::1 not from lo
-    //    Eddie uses "reject" in a separate ip6 table. In our inet table,
-    //    bare "reject" fails on some nftables versions (needs icmpx type).
-    //    "drop" achieves the same anti-spoof protection.
-    r.push_str("    iifname != \"lo\" ip6 saddr ::1 counter drop\n");
+    // 1-2. Loopback accept + IPv6 anti-spoof
+    append_input_fixed_rules(&mut r);
 
     // 3. DHCP rules
     if config.allow_dhcp {
-        // Eddie: ip filter INPUT ip saddr 255.255.255.255 counter accept
-        r.push_str("    ip saddr 255.255.255.255 counter accept\n");
-        // Eddie: ip6 filter INPUT ip6 saddr ff02::1:2 counter accept
-        r.push_str("    ip6 saddr ff02::1:2 counter accept\n");
-        // Eddie: ip6 filter INPUT ip6 saddr ff05::1:3 counter accept
-        r.push_str("    ip6 saddr ff05::1:3 counter accept\n");
+        append_dhcp_input(&mut r);
     }
 
     // IPv4/IPv6 translation (NAT64 — RFC 6052/8215)
     if config.allow_ipv4ipv6translation {
-        r.push_str("    ip6 saddr 64:ff9b::/96 ip6 daddr 64:ff9b::/96 counter accept\n");
-        r.push_str("    ip6 saddr 64:ff9b:1::/48 ip6 daddr 64:ff9b:1::/48 counter accept\n");
+        append_nat64(&mut r);
     }
 
     // 4. LAN rules (Eddie: netlock.allow_private)
     if config.allow_lan {
-        // IPv4 RFC1918 bidirectional
-        r.push_str("    ip saddr 192.168.0.0/16 ip daddr 192.168.0.0/16 counter accept\n");
-        r.push_str("    ip saddr 10.0.0.0/8 ip daddr 10.0.0.0/8 counter accept\n");
-        r.push_str("    ip saddr 172.16.0.0/12 ip daddr 172.16.0.0/12 counter accept\n");
-
-        // IPv6 link-local, multicast, ULA
-        r.push_str("    ip6 saddr fe80::/10 ip6 daddr fe80::/10 counter accept\n");
-        r.push_str("    ip6 saddr ff00::/8 ip6 daddr ff00::/8 counter accept\n");
-        r.push_str("    ip6 saddr fc00::/7 ip6 daddr fc00::/7 counter accept\n");
+        append_lan_bidirectional(&mut r);
     }
 
     // 5. ICMP/ICMPv6 (Eddie: netlock.allow_ping)
     if config.allow_ping {
-        // Eddie: ip filter INPUT icmp type echo-request counter accept
-        r.push_str("    icmp type echo-request counter accept\n");
-        // ICMPv6: only allow safe diagnostic types (not all ICMPv6 — broad accept
-        // would permit tunneling via unused types like mobile/experimental).
-        // NDP types are handled separately below with hoplimit 255 restriction.
-        r.push_str("    icmpv6 type { echo-request, echo-reply, destination-unreachable, packet-too-big, time-exceeded, parameter-problem } counter accept\n");
+        append_icmp_input(&mut r);
     }
 
-    // 6. IPv6 RH0 drop — disable processing of routing header type 0 (ping-pong attack)
-    //    (Eddie: ip6 filter INPUT rt type 0 counter drop)
-    r.push_str("    rt type 0 counter drop\n");
+    // 6. IPv6 RH0 drop
+    append_rh0_drop(&mut r);
 
-    // 7. IPv6 NDP — required for IPv6 address allocation (hoplimit 255)
-    //    (Eddie: 4 separate rules for router-advert, neighbor-solicit, neighbor-advert, redirect)
-    r.push_str(
-        "    meta l4proto ipv6-icmp icmpv6 type nd-router-advert ip6 hoplimit 255 counter accept\n",
-    );
-    r.push_str(
-        "    meta l4proto ipv6-icmp icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 counter accept\n",
-    );
-    r.push_str(
-        "    meta l4proto ipv6-icmp icmpv6 type nd-neighbor-advert ip6 hoplimit 255 counter accept\n",
-    );
-    r.push_str(
-        "    meta l4proto ipv6-icmp icmpv6 type nd-redirect ip6 hoplimit 255 counter accept\n",
-    );
+    // 7. IPv6 NDP (hoplimit 255)
+    append_ndp(&mut r);
 
     // 8. Conntrack: allow established/related
-    //    (Eddie: ip filter INPUT ct state related,established + ip6 filter INPUT ct state related,established)
-    r.push_str("    ct state related,established counter accept\n");
+    append_conntrack_input(&mut r);
 
     // 9. Per-IP allowlist incoming (only incoming IPs get saddr accept in INPUT)
     for ip_str in &config.allowed_ips_incoming {
@@ -229,19 +356,10 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
     ));
 
     // 1. IPv6 RH0 drop
-    r.push_str("    rt type 0 counter drop\n");
+    append_rh0_drop(&mut r);
 
     // Local interfaces forwarded through VPN (e.g. phone-relay)
-    for local_iface in &config.local_forward_ifaces {
-        r.push_str(&format!(
-            "    iifname \"{}\" oifname \"{}\" ct state new,established counter accept\n",
-            local_iface, config.iface_name
-        ));
-        r.push_str(&format!(
-            "    iifname \"{}\" oifname \"{}\" ct state related,established counter accept\n",
-            config.iface_name, local_iface
-        ));
-    }
+    append_forward_local_ifaces(&mut r, &config.local_forward_ifaces, &config.iface_name);
 
     // Final drop (handle for interface insertion)
     r.push_str("    counter drop comment \"airvpn_filter_forward_latest_rule\"\n");
@@ -260,61 +378,29 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
     r.push_str("    oifname \"lo\" counter accept\n");
 
     // 2. IPv6 RH0 drop (Eddie puts this before DHCP/LAN in output)
-    r.push_str("    rt type 0 counter drop\n");
+    append_rh0_drop(&mut r);
 
     // 3. DHCP rules
     if config.allow_dhcp {
-        // Eddie: ip filter OUTPUT ip daddr 255.255.255.255 counter accept
-        r.push_str("    ip daddr 255.255.255.255 counter accept\n");
-        // Eddie: ip6 filter OUTPUT ip6 daddr ff02::1:2 counter accept
-        r.push_str("    ip6 daddr ff02::1:2 counter accept\n");
-        // Eddie: ip6 filter OUTPUT ip6 daddr ff05::1:3 counter accept
-        r.push_str("    ip6 daddr ff05::1:3 counter accept\n");
+        append_dhcp_output(&mut r);
     }
 
     // IPv4/IPv6 translation (NAT64 — RFC 6052/8215)
     if config.allow_ipv4ipv6translation {
-        r.push_str("    ip6 saddr 64:ff9b::/96 ip6 daddr 64:ff9b::/96 counter accept\n");
-        r.push_str("    ip6 saddr 64:ff9b:1::/48 ip6 daddr 64:ff9b:1::/48 counter accept\n");
+        append_nat64(&mut r);
     }
 
     // 4. Block DNS (port 53/853) to LAN destinations on non-tunnel interfaces.
     // Must come before LAN rules to prevent DNS from leaking through the RFC1918
     // accept rules when the tunnel is down (e.g., WiFi 10.73.x.x -> VPN DNS 10.128.0.1).
     if config.allow_lan {
-        let iface = &config.iface_name;
-        r.push_str(&format!("    oifname != \"{}\" ip daddr {{ 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12 }} udp dport {{ 53, 853 }} counter drop comment \"block_lan_dns_leak\"\n", iface));
-        r.push_str(&format!("    oifname != \"{}\" ip daddr {{ 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12 }} tcp dport {{ 53, 853 }} counter drop comment \"block_lan_dns_leak\"\n", iface));
-        r.push_str(&format!("    oifname != \"{}\" ip6 daddr {{ fe80::/10, ff00::/8, fc00::/7 }} udp dport {{ 53, 853 }} counter drop comment \"block_lan_dns_leak\"\n", iface));
-        r.push_str(&format!("    oifname != \"{}\" ip6 daddr {{ fe80::/10, ff00::/8, fc00::/7 }} tcp dport {{ 53, 853 }} counter drop comment \"block_lan_dns_leak\"\n", iface));
+        append_dns_leak_block(&mut r, &config.iface_name);
     }
 
     // 4b. LAN rules (Eddie: netlock.allow_private)
     if config.allow_lan {
-        // IPv4 RFC1918 bidirectional (same as input)
-        r.push_str("    ip saddr 192.168.0.0/16 ip daddr 192.168.0.0/16 counter accept\n");
-        r.push_str("    ip saddr 10.0.0.0/8 ip daddr 10.0.0.0/8 counter accept\n");
-        r.push_str("    ip saddr 172.16.0.0/12 ip daddr 172.16.0.0/12 counter accept\n");
-
-        // IPv4 multicast (output only — Eddie has these in output but not input)
-        r.push_str("    ip saddr 192.168.0.0/16 ip daddr 224.0.0.0/24 counter accept\n");
-        r.push_str("    ip saddr 10.0.0.0/8 ip daddr 224.0.0.0/24 counter accept\n");
-        r.push_str("    ip saddr 172.16.0.0/12 ip daddr 224.0.0.0/24 counter accept\n");
-
-        // SSDP (Simple Service Discovery Protocol)
-        r.push_str("    ip saddr 192.168.0.0/16 ip daddr 239.255.255.250 counter accept\n");
-        r.push_str("    ip saddr 10.0.0.0/8 ip daddr 239.255.255.250 counter accept\n");
-        r.push_str("    ip saddr 172.16.0.0/12 ip daddr 239.255.255.250 counter accept\n");
-
-        // SLPv2 (Service Location Protocol version 2)
-        r.push_str("    ip saddr 192.168.0.0/16 ip daddr 239.255.255.253 counter accept\n");
-        r.push_str("    ip saddr 10.0.0.0/8 ip daddr 239.255.255.253 counter accept\n");
-        r.push_str("    ip saddr 172.16.0.0/12 ip daddr 239.255.255.253 counter accept\n");
-
-        // IPv6 link-local, multicast, ULA
-        r.push_str("    ip6 saddr fe80::/10 ip6 daddr fe80::/10 counter accept\n");
-        r.push_str("    ip6 saddr ff00::/8 ip6 daddr ff00::/8 counter accept\n");
-        r.push_str("    ip6 saddr fc00::/7 ip6 daddr fc00::/7 counter accept\n");
+        append_lan_bidirectional(&mut r);
+        append_lan_output_multicast(&mut r);
     }
 
     // 5. ICMP/ICMPv6 (Eddie: netlock.allow_ping)
@@ -405,24 +491,7 @@ pub fn generate_ruleset(config: &NetlockConfig) -> String {
     }
 
     // 9. Netlock allowlist CIDRs — firewall passthrough only (no routing change)
-    for cidr_str in &config.allowlist_out_cidrs {
-        let cidr = ensure_cidr(cidr_str);
-        match classify_ip(&cidr) {
-            Some(IpVersion::V4) => {
-                r.push_str(&format!(
-                    "    ip daddr {} counter accept comment \"airvpn_allowlist_out\"\n",
-                    cidr
-                ));
-            }
-            Some(IpVersion::V6) => {
-                r.push_str(&format!(
-                    "    ip6 daddr {} counter accept comment \"airvpn_allowlist_out\"\n",
-                    cidr
-                ));
-            }
-            None => {}
-        }
-    }
+    append_allowlist_out_cidrs(&mut r, &config.allowlist_out_cidrs, "airvpn_allowlist_out");
 
     // 10. Final drop (handle for rule insertion)
     r.push_str("    counter drop comment \"airvpn_filter_output_latest_rule\"\n");
@@ -471,54 +540,29 @@ pub fn generate_persistent_ruleset(bootstrap_ips: &[String], iface_name: &str, a
         PERSIST_PRIORITY
     ));
 
-    // 1. Loopback
-    r.push_str("    iifname \"lo\" counter accept\n");
+    // 1-2. Loopback + IPv6 anti-spoof
+    append_input_fixed_rules(&mut r);
 
-    // 2. IPv6 anti-spoof: drop ::1 not from lo
-    r.push_str("    iifname != \"lo\" ip6 saddr ::1 counter drop\n");
+    // 3. DHCP (always enabled for persistent lock)
+    append_dhcp_input(&mut r);
 
-    // 3. DHCP
-    r.push_str("    ip saddr 255.255.255.255 counter accept\n");
-    r.push_str("    ip6 saddr ff02::1:2 counter accept\n");
-    r.push_str("    ip6 saddr ff05::1:3 counter accept\n");
+    // 4. NAT64 (always enabled)
+    append_nat64(&mut r);
 
-    // 4. NAT64 (IPv4/IPv6 translation — RFC 6052/8215)
-    r.push_str("    ip6 saddr 64:ff9b::/96 ip6 daddr 64:ff9b::/96 counter accept\n");
-    r.push_str("    ip6 saddr 64:ff9b:1::/48 ip6 daddr 64:ff9b:1::/48 counter accept\n");
-
-    // 5. LAN (always enabled for persistent lock)
-    // IPv4 RFC1918 bidirectional
-    r.push_str("    ip saddr 192.168.0.0/16 ip daddr 192.168.0.0/16 counter accept\n");
-    r.push_str("    ip saddr 10.0.0.0/8 ip daddr 10.0.0.0/8 counter accept\n");
-    r.push_str("    ip saddr 172.16.0.0/12 ip daddr 172.16.0.0/12 counter accept\n");
-    // IPv6 link-local, multicast, ULA
-    r.push_str("    ip6 saddr fe80::/10 ip6 daddr fe80::/10 counter accept\n");
-    r.push_str("    ip6 saddr ff00::/8 ip6 daddr ff00::/8 counter accept\n");
-    r.push_str("    ip6 saddr fc00::/7 ip6 daddr fc00::/7 counter accept\n");
+    // 5. LAN (always enabled)
+    append_lan_bidirectional(&mut r);
 
     // 6. ICMP/ICMPv6 (Eddie model: be pingable — accept inbound requests, no outbound initiation)
-    r.push_str("    icmp type echo-request counter accept\n");
-    r.push_str("    icmpv6 type { echo-request, echo-reply, destination-unreachable, packet-too-big, time-exceeded, parameter-problem } counter accept\n");
+    append_icmp_input(&mut r);
 
     // 7. IPv6 RH0 drop
-    r.push_str("    rt type 0 counter drop\n");
+    append_rh0_drop(&mut r);
 
     // 8. IPv6 NDP (hoplimit 255)
-    r.push_str(
-        "    meta l4proto ipv6-icmp icmpv6 type nd-router-advert ip6 hoplimit 255 counter accept\n",
-    );
-    r.push_str(
-        "    meta l4proto ipv6-icmp icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 counter accept\n",
-    );
-    r.push_str(
-        "    meta l4proto ipv6-icmp icmpv6 type nd-neighbor-advert ip6 hoplimit 255 counter accept\n",
-    );
-    r.push_str(
-        "    meta l4proto ipv6-icmp icmpv6 type nd-redirect ip6 hoplimit 255 counter accept\n",
-    );
+    append_ndp(&mut r);
 
     // 9. Conntrack
-    r.push_str("    ct state related,established counter accept\n");
+    append_conntrack_input(&mut r);
 
     // 10. VPN tunnel interface (inner packets arriving from tunnel)
     r.push_str(&format!("    iifname \"{}\" counter accept\n", iface_name));
@@ -537,23 +581,14 @@ pub fn generate_persistent_ruleset(bootstrap_ips: &[String], iface_name: &str, a
     ));
 
     // IPv6 RH0 drop
-    r.push_str("    rt type 0 counter drop\n");
+    append_rh0_drop(&mut r);
 
     // VPN tunnel interface (forwarded traffic through tunnel)
     r.push_str(&format!("    iifname \"{}\" counter accept\n", iface_name));
     r.push_str(&format!("    oifname \"{}\" counter accept\n", iface_name));
 
     // Local interfaces forwarded through VPN (e.g. phone-relay)
-    for local_iface in local_forward_ifaces {
-        r.push_str(&format!(
-            "    iifname \"{}\" oifname \"{}\" ct state new,established counter accept\n",
-            local_iface, iface_name
-        ));
-        r.push_str(&format!(
-            "    iifname \"{}\" oifname \"{}\" ct state related,established counter accept\n",
-            iface_name, local_iface
-        ));
-    }
+    append_forward_local_ifaces(&mut r, local_forward_ifaces, iface_name);
 
     // Final drop sentinel
     r.push_str("    counter drop comment \"airvpn_persist_forward_latest_rule\"\n");
@@ -591,51 +626,24 @@ pub fn generate_persistent_ruleset(bootstrap_ips: &[String], iface_name: &str, a
     r.push_str("    oifname \"lo\" counter accept\n");
 
     // 2. IPv6 RH0 drop
-    r.push_str("    rt type 0 counter drop\n");
+    append_rh0_drop(&mut r);
 
-    // 3. DHCP
-    r.push_str("    ip daddr 255.255.255.255 counter accept\n");
-    r.push_str("    ip6 daddr ff02::1:2 counter accept\n");
-    r.push_str("    ip6 daddr ff05::1:3 counter accept\n");
+    // 3. DHCP (always enabled)
+    append_dhcp_output(&mut r);
 
-    // 4. NAT64
-    r.push_str("    ip6 saddr 64:ff9b::/96 ip6 daddr 64:ff9b::/96 counter accept\n");
-    r.push_str("    ip6 saddr 64:ff9b:1::/48 ip6 daddr 64:ff9b:1::/48 counter accept\n");
+    // 4. NAT64 (always enabled)
+    append_nat64(&mut r);
 
     // 5. Block DNS (port 53/853) to LAN destinations on non-tunnel interfaces.
     // Without this, DNS queries leak through the LAN rules below when the tunnel
     // is down (e.g., during reconnection). The VPN DNS (10.128.0.1) is in the
     // same RFC1918 /8 as many WiFi networks, so the LAN rule accepts it.
     // Queries through the tunnel are unaffected.
-    r.push_str(&format!("    oifname != \"{}\" ip daddr {{ 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12 }} udp dport {{ 53, 853 }} counter drop comment \"block_lan_dns_leak\"\n", iface_name));
-    r.push_str(&format!("    oifname != \"{}\" ip daddr {{ 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12 }} tcp dport {{ 53, 853 }} counter drop comment \"block_lan_dns_leak\"\n", iface_name));
-    r.push_str(&format!("    oifname != \"{}\" ip6 daddr {{ fe80::/10, ff00::/8, fc00::/7 }} udp dport {{ 53, 853 }} counter drop comment \"block_lan_dns_leak\"\n", iface_name));
-    r.push_str(&format!("    oifname != \"{}\" ip6 daddr {{ fe80::/10, ff00::/8, fc00::/7 }} tcp dport {{ 53, 853 }} counter drop comment \"block_lan_dns_leak\"\n", iface_name));
+    append_dns_leak_block(&mut r, iface_name);
 
     // 6. LAN (always enabled)
-    // RFC1918 bidirectional
-    r.push_str("    ip saddr 192.168.0.0/16 ip daddr 192.168.0.0/16 counter accept\n");
-    r.push_str("    ip saddr 10.0.0.0/8 ip daddr 10.0.0.0/8 counter accept\n");
-    r.push_str("    ip saddr 172.16.0.0/12 ip daddr 172.16.0.0/12 counter accept\n");
-    // IPv6
-    r.push_str("    ip6 saddr fe80::/10 ip6 daddr fe80::/10 counter accept\n");
-    r.push_str("    ip6 saddr ff00::/8 ip6 daddr ff00::/8 counter accept\n");
-    r.push_str("    ip6 saddr fc00::/7 ip6 daddr fc00::/7 counter accept\n");
-    // LAN multicast (mDNS, SSDP, SLPv2)
-    for subnet in &["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"] {
-        r.push_str(&format!(
-            "    ip saddr {} ip daddr 224.0.0.0/24 counter accept\n",
-            subnet
-        ));
-        r.push_str(&format!(
-            "    ip saddr {} ip daddr 239.255.255.250 counter accept\n",
-            subnet
-        ));
-        r.push_str(&format!(
-            "    ip saddr {} ip daddr 239.255.255.253 counter accept\n",
-            subnet
-        ));
-    }
+    append_lan_bidirectional(&mut r);
+    append_lan_output_multicast(&mut r);
 
     // 6. ICMP/ICMPv6 (Eddie model: respond to pings only — no outbound initiation)
     r.push_str("    icmp type echo-reply counter accept\n");
@@ -667,24 +675,7 @@ pub fn generate_persistent_ruleset(bootstrap_ips: &[String], iface_name: &str, a
     }
 
     // 9. Netlock allowlist CIDRs — firewall passthrough (persists across reconnections)
-    for cidr_str in allowlist_out_cidrs {
-        let cidr = ensure_cidr(cidr_str);
-        match classify_ip(&cidr) {
-            Some(IpVersion::V4) => {
-                r.push_str(&format!(
-                    "    ip daddr {} counter accept comment \"airvpn_persist_allowlist_out\"\n",
-                    cidr
-                ));
-            }
-            Some(IpVersion::V6) => {
-                r.push_str(&format!(
-                    "    ip6 daddr {} counter accept comment \"airvpn_persist_allowlist_out\"\n",
-                    cidr
-                ));
-            }
-            None => {}
-        }
-    }
+    append_allowlist_out_cidrs(&mut r, allowlist_out_cidrs, "airvpn_persist_allowlist_out");
 
     // 10. VPN tunnel interface (inner packets going into tunnel)
     r.push_str(&format!("    oifname \"{}\" counter accept\n", iface_name));
