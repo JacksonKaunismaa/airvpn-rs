@@ -31,6 +31,111 @@ fn main() -> iced::Result {
         .run()
 }
 
+/// All profile-backed settings fields, extracted from App for clarity.
+struct SettingsState {
+    credentials_configured: bool,
+    startlast: bool,
+    locklast: bool,
+    ipv6_mode: String,
+    ipv4_mode: String,
+    entry_iface: String,
+    dns: String,
+    loaded: bool,
+    dirty: bool,
+
+    // Settings sub-tab navigation
+    sub_tab: views::settings::SettingsSubTab,
+
+    // WireGuard settings (text for text_input widget)
+    wg_key: String,
+    wg_mtu: String,
+    wg_keepalive: String,
+    wg_handshake_first: String,
+    wg_handshake_connected: String,
+
+    // Network Lock settings
+    netlock_incoming: String,
+    netlock_allow_ping: bool,
+    netlock_allowlist_ips: String,
+    netlock_local_forward_ifaces: String,
+
+    // Routes
+    routes_custom: String,
+
+    // Area filter settings
+    areas_allowlist: String,
+    areas_denylist: String,
+
+    // DNS settings
+    dns_mode: String,
+    dns_services: String,
+
+    // UI display settings
+    ui_unit: String,
+    ui_iec: bool,
+
+    // Logging settings
+    log_file_enabled: bool,
+    log_file_path: String,
+    log_level_debug: bool,
+
+    // Mode settings
+    mode_port: String,
+
+    // Advanced settings (text for text_input widget)
+    pinger_timeout: String,
+    manifest_refresh: String,
+    penality: String,
+    http_timeout: String,
+    checking_ntry: String,
+    capacity_factor: String,
+    check_route: bool,
+}
+
+impl Default for SettingsState {
+    fn default() -> Self {
+        Self {
+            credentials_configured: false,
+            startlast: false,
+            locklast: false,
+            ipv6_mode: String::new(),
+            ipv4_mode: String::new(),
+            entry_iface: String::new(),
+            dns: String::new(),
+            loaded: false,
+            dirty: false,
+            sub_tab: views::settings::SettingsSubTab::General,
+            wg_key: String::new(),
+            wg_mtu: String::new(),
+            wg_keepalive: String::new(),
+            wg_handshake_first: String::new(),
+            wg_handshake_connected: String::new(),
+            netlock_incoming: String::new(),
+            netlock_allow_ping: true,
+            netlock_allowlist_ips: String::new(),
+            netlock_local_forward_ifaces: String::new(),
+            routes_custom: String::new(),
+            areas_allowlist: String::new(),
+            areas_denylist: String::new(),
+            dns_mode: String::new(),
+            dns_services: String::new(),
+            ui_unit: String::new(),
+            ui_iec: false,
+            log_file_enabled: false,
+            log_file_path: String::new(),
+            log_level_debug: false,
+            mode_port: String::new(),
+            pinger_timeout: String::new(),
+            manifest_refresh: String::new(),
+            penality: String::new(),
+            http_timeout: String::new(),
+            checking_ntry: String::new(),
+            capacity_factor: String::new(),
+            check_route: true,
+        }
+    }
+}
+
 struct App {
     active_tab: views::Tab,
     connection_state: ConnectionState,
@@ -63,16 +168,8 @@ struct App {
     log_filter_error: bool,
     activity: String,
 
-    // Profile-backed settings (loaded via GetProfile, saved via SaveProfile)
-    settings_credentials_configured: bool,
-    settings_startlast: bool,
-    settings_locklast: bool,
-    settings_ipv6_mode: String,
-    settings_ipv4_mode: String,
-    settings_entry_iface: String,
-    settings_dns: String,
-    settings_loaded: bool,
-    settings_dirty: bool,
+    // Profile-backed settings
+    settings: SettingsState,
 
     // GUI-only toggles (not persisted)
     show_errors: bool,
@@ -86,55 +183,8 @@ struct App {
     connect_no_reconnect: bool,
     connect_no_verify: bool,
 
-    // Settings sub-tab navigation
-    settings_sub_tab: views::settings::SettingsSubTab,
-
-    // WireGuard settings (profile-backed, text for text_input widget)
-    settings_wg_key: String,
     /// Available WireGuard key names from helper (for device dropdown).
     available_keys: Vec<String>,
-    settings_wg_mtu: String,
-    settings_wg_keepalive: String,
-    settings_wg_handshake_first: String,
-    settings_wg_handshake_connected: String,
-
-    // Network Lock settings (profile-backed)
-    settings_netlock_incoming: String,
-    settings_netlock_allow_ping: bool,
-    settings_netlock_allowlist_ips: String,
-    settings_netlock_local_forward_ifaces: String,
-
-    // Routes (profile-backed)
-    settings_routes_custom: String,
-
-    // Area filter settings (profile-backed)
-    settings_areas_allowlist: String,
-    settings_areas_denylist: String,
-
-    // DNS settings (profile-backed)
-    settings_dns_mode: String,
-    settings_dns_services: String,
-
-    // UI display settings (profile-backed)
-    settings_ui_unit: String,
-    settings_ui_iec: bool,
-
-    // Logging settings (profile-backed)
-    settings_log_file_enabled: bool,
-    settings_log_file_path: String,
-    settings_log_level_debug: bool,
-
-    // Mode settings (profile-backed)
-    settings_mode_port: String,
-
-    // Advanced settings (profile-backed, text for text_input widget)
-    settings_pinger_timeout: String,
-    settings_manifest_refresh: String,
-    settings_penality: String,
-    settings_http_timeout: String,
-    settings_checking_ntry: String,
-    settings_capacity_factor: String,
-    settings_check_route: bool,
 
     // Auto-refresh timer for server list
     last_server_fetch: Instant,
@@ -254,15 +304,7 @@ impl App {
             log_filter_error: true,
             activity: String::new(),
 
-            settings_credentials_configured: false,
-            settings_startlast: false,
-            settings_locklast: false,
-            settings_ipv6_mode: String::new(),
-            settings_ipv4_mode: String::new(),
-            settings_entry_iface: String::new(),
-            settings_dns: String::new(),
-            settings_loaded: false,
-            settings_dirty: false,
+            settings: SettingsState::default(),
 
             show_errors: false,
             eddie_import_pending: None,
@@ -272,44 +314,7 @@ impl App {
             connect_no_reconnect: false,
             connect_no_verify: false,
 
-            settings_sub_tab: views::settings::SettingsSubTab::General,
-
-            settings_wg_key: String::new(),
             available_keys: Vec::new(),
-            settings_wg_mtu: String::new(),
-            settings_wg_keepalive: String::new(),
-            settings_wg_handshake_first: String::new(),
-            settings_wg_handshake_connected: String::new(),
-
-            settings_netlock_incoming: String::new(),
-            settings_netlock_allow_ping: true,
-            settings_netlock_allowlist_ips: String::new(),
-            settings_netlock_local_forward_ifaces: String::new(),
-
-            settings_routes_custom: String::new(),
-
-            settings_areas_allowlist: String::new(),
-            settings_areas_denylist: String::new(),
-
-            settings_dns_mode: String::new(),
-            settings_dns_services: String::new(),
-
-            settings_ui_unit: String::new(),
-            settings_ui_iec: false,
-
-            settings_log_file_enabled: false,
-            settings_log_file_path: String::new(),
-            settings_log_level_debug: false,
-
-            settings_mode_port: String::new(),
-
-            settings_pinger_timeout: String::new(),
-            settings_manifest_refresh: String::new(),
-            settings_penality: String::new(),
-            settings_http_timeout: String::new(),
-            settings_checking_ntry: String::new(),
-            settings_capacity_factor: String::new(),
-            settings_check_route: true,
 
             last_server_fetch: Instant::now(),
 
@@ -334,7 +339,7 @@ impl App {
                     return Task::done(Message::FetchServers);
                 }
                 if tab == views::Tab::Settings {
-                    if !self.settings_loaded {
+                    if !self.settings.loaded {
                         return Task::batch([
                             Task::done(Message::FetchProfile),
                             Task::done(Message::FetchKeys),
@@ -563,59 +568,59 @@ impl App {
             Message::SaveSettings => {
                 if let Some(ref helper) = self.helper {
                     let mut options = std::collections::HashMap::new();
-                    options.insert(options::SERVERS_STARTLAST.into(), self.settings_startlast.to_string());
-                    options.insert(options::SERVERS_LOCKLAST.into(), self.settings_locklast.to_string());
-                    options.insert(options::NETWORK_IPV6_MODE.into(), self.settings_ipv6_mode.clone());
-                    options.insert(options::NETWORK_IPV4_MODE.into(), self.settings_ipv4_mode.clone());
-                    options.insert(options::NETWORK_ENTRY_IFACE.into(), self.settings_entry_iface.clone());
-                    options.insert(options::DNS_SERVERS.into(), self.settings_dns.clone());
+                    options.insert(options::SERVERS_STARTLAST.into(), self.settings.startlast.to_string());
+                    options.insert(options::SERVERS_LOCKLAST.into(), self.settings.locklast.to_string());
+                    options.insert(options::NETWORK_IPV6_MODE.into(), self.settings.ipv6_mode.clone());
+                    options.insert(options::NETWORK_IPV4_MODE.into(), self.settings.ipv4_mode.clone());
+                    options.insert(options::NETWORK_ENTRY_IFACE.into(), self.settings.entry_iface.clone());
+                    options.insert(options::DNS_SERVERS.into(), self.settings.dns.clone());
                     // Connection flags (saved as positive option names)
                     options.insert(options::NETLOCK.into(), (!self.connect_no_lock).to_string());
                     options.insert(options::NETLOCK_ALLOW_PRIVATE.into(), self.connect_allow_lan.to_string());
                     options.insert(options::RECONNECT.into(), (!self.connect_no_reconnect).to_string());
                     options.insert(options::VERIFY.into(), (!self.connect_no_verify).to_string());
                     // WireGuard settings
-                    options.insert(options::KEY.into(), self.settings_wg_key.clone());
-                    options.insert(options::WG_MTU.into(), self.settings_wg_mtu.clone());
-                    options.insert(options::WG_KEEPALIVE.into(), self.settings_wg_keepalive.clone());
-                    options.insert(options::WG_HANDSHAKE_FIRST.into(), self.settings_wg_handshake_first.clone());
-                    options.insert(options::WG_HANDSHAKE_CONNECTED.into(), self.settings_wg_handshake_connected.clone());
+                    options.insert(options::KEY.into(), self.settings.wg_key.clone());
+                    options.insert(options::WG_MTU.into(), self.settings.wg_mtu.clone());
+                    options.insert(options::WG_KEEPALIVE.into(), self.settings.wg_keepalive.clone());
+                    options.insert(options::WG_HANDSHAKE_FIRST.into(), self.settings.wg_handshake_first.clone());
+                    options.insert(options::WG_HANDSHAKE_CONNECTED.into(), self.settings.wg_handshake_connected.clone());
                     // Area filter settings
-                    options.insert(options::AREAS_ALLOWLIST.into(), self.settings_areas_allowlist.clone());
-                    options.insert(options::AREAS_DENYLIST.into(), self.settings_areas_denylist.clone());
+                    options.insert(options::AREAS_ALLOWLIST.into(), self.settings.areas_allowlist.clone());
+                    options.insert(options::AREAS_DENYLIST.into(), self.settings.areas_denylist.clone());
                     // Network Lock settings
-                    options.insert(options::NETLOCK_INCOMING.into(), self.settings_netlock_incoming.clone());
-                    options.insert(options::NETLOCK_ALLOW_PING.into(), self.settings_netlock_allow_ping.to_string());
-                    options.insert(options::NETLOCK_ALLOWLIST_IPS.into(), self.settings_netlock_allowlist_ips.clone());
-                    options.insert(options::NETLOCK_LOCAL_FORWARD_IFACES.into(), self.settings_netlock_local_forward_ifaces.clone());
+                    options.insert(options::NETLOCK_INCOMING.into(), self.settings.netlock_incoming.clone());
+                    options.insert(options::NETLOCK_ALLOW_PING.into(), self.settings.netlock_allow_ping.to_string());
+                    options.insert(options::NETLOCK_ALLOWLIST_IPS.into(), self.settings.netlock_allowlist_ips.clone());
+                    options.insert(options::NETLOCK_LOCAL_FORWARD_IFACES.into(), self.settings.netlock_local_forward_ifaces.clone());
                     // Routes
-                    options.insert(options::ROUTES_CUSTOM.into(), self.settings_routes_custom.clone());
+                    options.insert(options::ROUTES_CUSTOM.into(), self.settings.routes_custom.clone());
                     // DNS settings
-                    options.insert(options::DNS_MODE.into(), self.settings_dns_mode.clone());
-                    options.insert(options::LINUX_DNS_SERVICES.into(), self.settings_dns_services.clone());
+                    options.insert(options::DNS_MODE.into(), self.settings.dns_mode.clone());
+                    options.insert(options::LINUX_DNS_SERVICES.into(), self.settings.dns_services.clone());
                     // UI display settings
-                    options.insert(options::UI_UNIT.into(), self.settings_ui_unit.clone());
-                    options.insert(options::UI_IEC.into(), self.settings_ui_iec.to_string());
+                    options.insert(options::UI_UNIT.into(), self.settings.ui_unit.clone());
+                    options.insert(options::UI_IEC.into(), self.settings.ui_iec.to_string());
                     // Logging settings
-                    options.insert(options::LOG_FILE_ENABLED.into(), self.settings_log_file_enabled.to_string());
-                    options.insert(options::LOG_FILE_PATH.into(), self.settings_log_file_path.clone());
-                    options.insert(options::LOG_LEVEL_DEBUG.into(), self.settings_log_level_debug.to_string());
+                    options.insert(options::LOG_FILE_ENABLED.into(), self.settings.log_file_enabled.to_string());
+                    options.insert(options::LOG_FILE_PATH.into(), self.settings.log_file_path.clone());
+                    options.insert(options::LOG_LEVEL_DEBUG.into(), self.settings.log_level_debug.to_string());
                     // Mode settings
-                    options.insert(options::MODE_PORT.into(), self.settings_mode_port.clone());
+                    options.insert(options::MODE_PORT.into(), self.settings.mode_port.clone());
                     // Advanced settings
-                    options.insert(options::PINGER_TIMEOUT.into(), self.settings_pinger_timeout.clone());
-                    options.insert(options::MANIFEST_REFRESH.into(), self.settings_manifest_refresh.clone());
-                    options.insert(options::PENALITY_ON_ERROR.into(), self.settings_penality.clone());
-                    options.insert(options::HTTP_TIMEOUT.into(), self.settings_http_timeout.clone());
-                    options.insert(options::CHECKING_NTRY.into(), self.settings_checking_ntry.clone());
-                    options.insert(options::SERVERS_CAPACITY_FACTOR.into(), self.settings_capacity_factor.clone());
-                    options.insert(options::CHECK_ROUTE.into(), self.settings_check_route.to_string());
+                    options.insert(options::PINGER_TIMEOUT.into(), self.settings.pinger_timeout.clone());
+                    options.insert(options::MANIFEST_REFRESH.into(), self.settings.manifest_refresh.clone());
+                    options.insert(options::PENALITY_ON_ERROR.into(), self.settings.penality.clone());
+                    options.insert(options::HTTP_TIMEOUT.into(), self.settings.http_timeout.clone());
+                    options.insert(options::CHECKING_NTRY.into(), self.settings.checking_ntry.clone());
+                    options.insert(options::SERVERS_CAPACITY_FACTOR.into(), self.settings.capacity_factor.clone());
+                    options.insert(options::CHECK_ROUTE.into(), self.settings.check_route.to_string());
                     let req = SaveProfileRequest { options };
                     match serde_json::to_vec(&req) {
                         Ok(body) => match helper.send_command("POST", "/profile", Some(&body)) {
                             Ok((status, _body)) => {
                                 if status == 200 {
-                                    self.settings_dirty = false;
+                                    self.settings.dirty = false;
                                 } else {
                                     self.error_settings = Some(format!("Failed to save profile (HTTP {})", status));
                                 }
@@ -632,33 +637,33 @@ impl App {
                 Task::none()
             }
             Message::SettingsStartlastToggle(val) => {
-                self.settings_startlast = val;
-                self.settings_dirty = true;
+                self.settings.startlast = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsLocklastToggle(val) => {
-                self.settings_locklast = val;
-                self.settings_dirty = true;
+                self.settings.locklast = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsIpv6ModeChanged(val) => {
-                self.settings_ipv6_mode = val;
-                self.settings_dirty = true;
+                self.settings.ipv6_mode = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsIpv4ModeChanged(val) => {
-                self.settings_ipv4_mode = val;
-                self.settings_dirty = true;
+                self.settings.ipv4_mode = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsEntryIfaceChanged(val) => {
-                self.settings_entry_iface = val;
-                self.settings_dirty = true;
+                self.settings.entry_iface = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsDnsChanged(val) => {
-                self.settings_dns = val;
-                self.settings_dirty = true;
+                self.settings.dns = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::ShowErrorsToggle(val) => {
@@ -666,162 +671,162 @@ impl App {
                 Task::none()
             }
             Message::SettingsSubTabChanged(tab) => {
-                self.settings_sub_tab = tab;
+                self.settings.sub_tab = tab;
                 Task::none()
             }
             Message::SettingsWgKeyChanged(val) => {
-                self.settings_wg_key = val;
-                self.settings_dirty = true;
+                self.settings.wg_key = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsWgMtuChanged(val) => {
-                self.settings_wg_mtu = val;
-                self.settings_dirty = true;
+                self.settings.wg_mtu = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsWgKeepaliveChanged(val) => {
-                self.settings_wg_keepalive = val;
-                self.settings_dirty = true;
+                self.settings.wg_keepalive = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsWgHandshakeFirstChanged(val) => {
-                self.settings_wg_handshake_first = val;
-                self.settings_dirty = true;
+                self.settings.wg_handshake_first = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsWgHandshakeConnectedChanged(val) => {
-                self.settings_wg_handshake_connected = val;
-                self.settings_dirty = true;
+                self.settings.wg_handshake_connected = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsAreasAllowlistChanged(val) => {
-                self.settings_areas_allowlist = val;
-                self.settings_dirty = true;
+                self.settings.areas_allowlist = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsAreasDenylistChanged(val) => {
-                self.settings_areas_denylist = val;
-                self.settings_dirty = true;
+                self.settings.areas_denylist = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsNetlockIncomingChanged(val) => {
-                self.settings_netlock_incoming = val;
-                self.settings_dirty = true;
+                self.settings.netlock_incoming = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsNetlockAllowPingToggle(val) => {
-                self.settings_netlock_allow_ping = val;
-                self.settings_dirty = true;
+                self.settings.netlock_allow_ping = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsNetlockAllowlistIpsChanged(val) => {
-                self.settings_netlock_allowlist_ips = val;
-                self.settings_dirty = true;
+                self.settings.netlock_allowlist_ips = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsNetlockLocalForwardIfacesChanged(val) => {
-                self.settings_netlock_local_forward_ifaces = val;
-                self.settings_dirty = true;
+                self.settings.netlock_local_forward_ifaces = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsRoutesCustomChanged(val) => {
-                self.settings_routes_custom = val;
-                self.settings_dirty = true;
+                self.settings.routes_custom = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsPingerTimeoutChanged(val) => {
-                self.settings_pinger_timeout = val;
-                self.settings_dirty = true;
+                self.settings.pinger_timeout = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsManifestRefreshChanged(val) => {
-                self.settings_manifest_refresh = val;
-                self.settings_dirty = true;
+                self.settings.manifest_refresh = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsPenalityChanged(val) => {
-                self.settings_penality = val;
-                self.settings_dirty = true;
+                self.settings.penality = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsHttpTimeoutChanged(val) => {
-                self.settings_http_timeout = val;
-                self.settings_dirty = true;
+                self.settings.http_timeout = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsCheckingNtryChanged(val) => {
-                self.settings_checking_ntry = val;
-                self.settings_dirty = true;
+                self.settings.checking_ntry = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsCapacityFactorChanged(val) => {
-                self.settings_capacity_factor = val;
-                self.settings_dirty = true;
+                self.settings.capacity_factor = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsCheckRouteToggle(val) => {
-                self.settings_check_route = val;
-                self.settings_dirty = true;
+                self.settings.check_route = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsDnsModeChanged(val) => {
-                self.settings_dns_mode = val;
-                self.settings_dirty = true;
+                self.settings.dns_mode = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsDnsServicesChanged(val) => {
-                self.settings_dns_services = val;
-                self.settings_dirty = true;
+                self.settings.dns_services = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsUiUnitChanged(val) => {
-                self.settings_ui_unit = val;
-                self.settings_dirty = true;
+                self.settings.ui_unit = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsUiIecToggle(val) => {
-                self.settings_ui_iec = val;
-                self.settings_dirty = true;
+                self.settings.ui_iec = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsLogFileEnabledToggle(val) => {
-                self.settings_log_file_enabled = val;
-                self.settings_dirty = true;
+                self.settings.log_file_enabled = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsLogFilePathChanged(val) => {
-                self.settings_log_file_path = val;
-                self.settings_dirty = true;
+                self.settings.log_file_path = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsLogLevelDebugToggle(val) => {
-                self.settings_log_level_debug = val;
-                self.settings_dirty = true;
+                self.settings.log_level_debug = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsModePortChanged(val) => {
-                self.settings_mode_port = val;
-                self.settings_dirty = true;
+                self.settings.mode_port = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::ConnectNoLockToggle(val) => {
                 self.connect_no_lock = val;
-                self.settings_dirty = true;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::ConnectAllowLanToggle(val) => {
                 self.connect_allow_lan = val;
-                self.settings_dirty = true;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::ConnectNoReconnectToggle(val) => {
                 self.connect_no_reconnect = val;
-                self.settings_dirty = true;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::ConnectNoVerifyToggle(val) => {
                 self.connect_no_verify = val;
-                self.settings_dirty = true;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::LockInstall => {
@@ -948,18 +953,18 @@ impl App {
                 self.servers_loading = false;
             }
             HelperEvent::Profile { options, credentials_configured } => {
-                self.settings_credentials_configured = credentials_configured;
-                self.settings_startlast = options.get(options::SERVERS_STARTLAST)
+                self.settings.credentials_configured = credentials_configured;
+                self.settings.startlast = options.get(options::SERVERS_STARTLAST)
                     .map(|v| v.eq_ignore_ascii_case("true")).unwrap_or(false);
-                self.settings_locklast = options.get(options::SERVERS_LOCKLAST)
+                self.settings.locklast = options.get(options::SERVERS_LOCKLAST)
                     .map(|v| v.eq_ignore_ascii_case("true")).unwrap_or(false);
-                self.settings_ipv6_mode = options.get(options::NETWORK_IPV6_MODE)
+                self.settings.ipv6_mode = options.get(options::NETWORK_IPV6_MODE)
                     .cloned().unwrap_or_else(|| "in-block".into());
-                self.settings_ipv4_mode = options.get(options::NETWORK_IPV4_MODE)
+                self.settings.ipv4_mode = options.get(options::NETWORK_IPV4_MODE)
                     .cloned().unwrap_or_else(|| "in".into());
-                self.settings_entry_iface = options.get(options::NETWORK_ENTRY_IFACE)
+                self.settings.entry_iface = options.get(options::NETWORK_ENTRY_IFACE)
                     .cloned().unwrap_or_default();
-                self.settings_dns = options.get(options::DNS_SERVERS).cloned().unwrap_or_default();
+                self.settings.dns = options.get(options::DNS_SERVERS).cloned().unwrap_or_default();
 
                 // Connection flags (inverted: profile uses positive names)
                 self.connect_no_lock = !options.get(options::NETLOCK)
@@ -976,87 +981,87 @@ impl App {
                     .unwrap_or(true); // default: verify ON
 
                 // WireGuard settings
-                self.settings_wg_key = options.get(options::KEY)
+                self.settings.wg_key = options.get(options::KEY)
                     .cloned().unwrap_or_else(|| "Default".into());
-                self.settings_wg_mtu = options.get(options::WG_MTU)
+                self.settings.wg_mtu = options.get(options::WG_MTU)
                     .cloned().unwrap_or_else(|| "1320".into());
-                self.settings_wg_keepalive = options.get(options::WG_KEEPALIVE)
+                self.settings.wg_keepalive = options.get(options::WG_KEEPALIVE)
                     .cloned().unwrap_or_else(|| "15".into());
-                self.settings_wg_handshake_first = options.get(options::WG_HANDSHAKE_FIRST)
+                self.settings.wg_handshake_first = options.get(options::WG_HANDSHAKE_FIRST)
                     .cloned().unwrap_or_else(|| "50".into());
-                self.settings_wg_handshake_connected = options.get(options::WG_HANDSHAKE_CONNECTED)
+                self.settings.wg_handshake_connected = options.get(options::WG_HANDSHAKE_CONNECTED)
                     .cloned().unwrap_or_else(|| "200".into());
 
                 // Area filter settings
-                self.settings_areas_allowlist = options.get(options::AREAS_ALLOWLIST)
+                self.settings.areas_allowlist = options.get(options::AREAS_ALLOWLIST)
                     .cloned().unwrap_or_default();
-                self.settings_areas_denylist = options.get(options::AREAS_DENYLIST)
+                self.settings.areas_denylist = options.get(options::AREAS_DENYLIST)
                     .cloned().unwrap_or_default();
 
                 // Network Lock settings
-                self.settings_netlock_incoming = options.get(options::NETLOCK_INCOMING)
+                self.settings.netlock_incoming = options.get(options::NETLOCK_INCOMING)
                     .cloned().unwrap_or_else(|| "block".into());
-                self.settings_netlock_allow_ping = options.get(options::NETLOCK_ALLOW_PING)
+                self.settings.netlock_allow_ping = options.get(options::NETLOCK_ALLOW_PING)
                     .map(|v| v.eq_ignore_ascii_case("true"))
                     .unwrap_or(true);
-                self.settings_netlock_allowlist_ips = options.get(options::NETLOCK_ALLOWLIST_IPS)
+                self.settings.netlock_allowlist_ips = options.get(options::NETLOCK_ALLOWLIST_IPS)
                     .cloned().unwrap_or_default();
-                self.settings_netlock_local_forward_ifaces = options.get(options::NETLOCK_LOCAL_FORWARD_IFACES)
+                self.settings.netlock_local_forward_ifaces = options.get(options::NETLOCK_LOCAL_FORWARD_IFACES)
                     .cloned().unwrap_or_default();
 
                 // Routes
-                self.settings_routes_custom = options.get(options::ROUTES_CUSTOM)
+                self.settings.routes_custom = options.get(options::ROUTES_CUSTOM)
                     .cloned().unwrap_or_default();
 
                 // DNS settings
-                self.settings_dns_mode = options.get(options::DNS_MODE)
+                self.settings.dns_mode = options.get(options::DNS_MODE)
                     .cloned().unwrap_or_else(|| "auto".into());
-                self.settings_dns_services = options.get(options::LINUX_DNS_SERVICES)
+                self.settings.dns_services = options.get(options::LINUX_DNS_SERVICES)
                     .cloned().unwrap_or_else(|| "nscd,dnsmasq,named,bind9".into());
 
                 // UI display settings
-                self.settings_ui_unit = options.get(options::UI_UNIT)
+                self.settings.ui_unit = options.get(options::UI_UNIT)
                     .cloned().unwrap_or_else(|| "bytes".into());
-                self.settings_ui_iec = options.get(options::UI_IEC)
+                self.settings.ui_iec = options.get(options::UI_IEC)
                     .map(|v| v.eq_ignore_ascii_case("true"))
                     .unwrap_or(false);
 
                 // Logging settings
-                self.settings_log_file_enabled = options.get(options::LOG_FILE_ENABLED)
+                self.settings.log_file_enabled = options.get(options::LOG_FILE_ENABLED)
                     .map(|v| v.eq_ignore_ascii_case("true"))
                     .unwrap_or(false);
-                self.settings_log_file_path = options.get(options::LOG_FILE_PATH)
+                self.settings.log_file_path = options.get(options::LOG_FILE_PATH)
                     .cloned().unwrap_or_else(|| "/var/log/airvpn-rs/helper.log".into());
-                self.settings_log_level_debug = options.get(options::LOG_LEVEL_DEBUG)
+                self.settings.log_level_debug = options.get(options::LOG_LEVEL_DEBUG)
                     .map(|v| v.eq_ignore_ascii_case("true"))
                     .unwrap_or(false);
 
                 // Mode settings
-                self.settings_mode_port = options.get(options::MODE_PORT)
+                self.settings.mode_port = options.get(options::MODE_PORT)
                     .cloned().unwrap_or_default();
 
                 // Advanced settings
-                self.settings_pinger_timeout = options.get(options::PINGER_TIMEOUT)
+                self.settings.pinger_timeout = options.get(options::PINGER_TIMEOUT)
                     .cloned().unwrap_or_else(|| "3".into());
-                self.settings_manifest_refresh = options.get(options::MANIFEST_REFRESH)
+                self.settings.manifest_refresh = options.get(options::MANIFEST_REFRESH)
                     .cloned().unwrap_or_else(|| "1800".into());
-                self.settings_penality = options.get(options::PENALITY_ON_ERROR)
+                self.settings.penality = options.get(options::PENALITY_ON_ERROR)
                     .cloned().unwrap_or_else(|| "30".into());
-                self.settings_http_timeout = options.get(options::HTTP_TIMEOUT)
+                self.settings.http_timeout = options.get(options::HTTP_TIMEOUT)
                     .cloned().unwrap_or_else(|| "10".into());
-                self.settings_checking_ntry = options.get(options::CHECKING_NTRY)
+                self.settings.checking_ntry = options.get(options::CHECKING_NTRY)
                     .cloned().unwrap_or_else(|| "3".into());
-                self.settings_capacity_factor = options.get(options::SERVERS_CAPACITY_FACTOR)
+                self.settings.capacity_factor = options.get(options::SERVERS_CAPACITY_FACTOR)
                     .cloned().unwrap_or_else(|| "0".into());
-                self.settings_check_route = options.get(options::CHECK_ROUTE)
+                self.settings.check_route = options.get(options::CHECK_ROUTE)
                     .map(|v| v.eq_ignore_ascii_case("true"))
                     .unwrap_or(true);
 
-                self.settings_loaded = true;
-                self.settings_dirty = false;
+                self.settings.loaded = true;
+                self.settings.dirty = false;
             }
             HelperEvent::ProfileSaved => {
-                self.settings_dirty = false;
+                self.settings.dirty = false;
             }
         }
     }
@@ -1109,17 +1114,17 @@ impl App {
         overrides.insert(options::NETLOCK_ALLOW_PRIVATE.into(), self.connect_allow_lan.to_string());
         overrides.insert(options::RECONNECT.into(), (!self.connect_no_reconnect).to_string());
         overrides.insert(options::VERIFY.into(), (!self.connect_no_verify).to_string());
-        if !self.settings_ipv6_mode.is_empty() {
-            overrides.insert(options::NETWORK_IPV6_MODE.into(), self.settings_ipv6_mode.clone());
+        if !self.settings.ipv6_mode.is_empty() {
+            overrides.insert(options::NETWORK_IPV6_MODE.into(), self.settings.ipv6_mode.clone());
         }
-        if !self.settings_ipv4_mode.is_empty() {
-            overrides.insert(options::NETWORK_IPV4_MODE.into(), self.settings_ipv4_mode.clone());
+        if !self.settings.ipv4_mode.is_empty() {
+            overrides.insert(options::NETWORK_IPV4_MODE.into(), self.settings.ipv4_mode.clone());
         }
-        if !self.settings_entry_iface.is_empty() {
-            overrides.insert(options::NETWORK_ENTRY_IFACE.into(), self.settings_entry_iface.clone());
+        if !self.settings.entry_iface.is_empty() {
+            overrides.insert(options::NETWORK_ENTRY_IFACE.into(), self.settings.entry_iface.clone());
         }
-        if !self.settings_dns.is_empty() {
-            overrides.insert(options::DNS_SERVERS.into(), self.settings_dns.clone());
+        if !self.settings.dns.is_empty() {
+            overrides.insert(options::DNS_SERVERS.into(), self.settings.dns.clone());
         }
         ConnectRequest { server, overrides }
     }
@@ -1200,10 +1205,10 @@ impl App {
                 self.connected_since,
                 self.connection_count,
                 &self.selected_server,
-                self.settings_startlast,
+                self.settings.startlast,
                 &self.activity,
                 &self.eddie_import_pending,
-                views::overview::UnitConfig::from_options(&self.settings_ui_unit, &self.settings_ui_iec.to_string()),
+                views::overview::UnitConfig::from_options(&self.settings.ui_unit, &self.settings.ui_iec.to_string()),
             ),
             views::Tab::Servers => views::servers::view(
                 &self.servers,
@@ -1223,15 +1228,15 @@ impl App {
                 self.log_filter_error,
             ),
             views::Tab::Settings => views::settings::view(
-                self.settings_credentials_configured,
-                self.settings_startlast,
-                self.settings_locklast,
-                &self.settings_ipv6_mode,
-                &self.settings_ipv4_mode,
-                &self.settings_entry_iface,
-                &self.settings_dns,
-                self.settings_loaded,
-                self.settings_dirty,
+                self.settings.credentials_configured,
+                self.settings.startlast,
+                self.settings.locklast,
+                &self.settings.ipv6_mode,
+                &self.settings.ipv4_mode,
+                &self.settings.entry_iface,
+                &self.settings.dns,
+                self.settings.loaded,
+                self.settings.dirty,
                 self.show_errors,
                 self.connect_no_lock,
                 self.connect_allow_lan,
@@ -1239,44 +1244,44 @@ impl App {
                 self.connect_no_verify,
                 self.lock_installed,
                 self.lock_persistent,
-                self.settings_sub_tab,
+                self.settings.sub_tab,
                 // WireGuard
-                &self.settings_wg_key,
+                &self.settings.wg_key,
                 &self.available_keys,
-                &self.settings_wg_mtu,
-                &self.settings_wg_keepalive,
-                &self.settings_wg_handshake_first,
-                &self.settings_wg_handshake_connected,
+                &self.settings.wg_mtu,
+                &self.settings.wg_keepalive,
+                &self.settings.wg_handshake_first,
+                &self.settings.wg_handshake_connected,
                 // Network Lock
-                &self.settings_netlock_incoming,
-                self.settings_netlock_allow_ping,
-                &self.settings_netlock_allowlist_ips,
-                &self.settings_netlock_local_forward_ifaces,
+                &self.settings.netlock_incoming,
+                self.settings.netlock_allow_ping,
+                &self.settings.netlock_allowlist_ips,
+                &self.settings.netlock_local_forward_ifaces,
                 // Routes
-                &self.settings_routes_custom,
+                &self.settings.routes_custom,
                 // Area filters
-                &self.settings_areas_allowlist,
-                &self.settings_areas_denylist,
+                &self.settings.areas_allowlist,
+                &self.settings.areas_denylist,
                 // DNS settings
-                &self.settings_dns_mode,
-                &self.settings_dns_services,
+                &self.settings.dns_mode,
+                &self.settings.dns_services,
                 // UI display settings
-                &self.settings_ui_unit,
-                self.settings_ui_iec,
+                &self.settings.ui_unit,
+                self.settings.ui_iec,
                 // Logging settings
-                self.settings_log_file_enabled,
-                &self.settings_log_file_path,
-                self.settings_log_level_debug,
+                self.settings.log_file_enabled,
+                &self.settings.log_file_path,
+                self.settings.log_level_debug,
                 // Mode settings
-                &self.settings_mode_port,
+                &self.settings.mode_port,
                 // Advanced
-                &self.settings_pinger_timeout,
-                &self.settings_manifest_refresh,
-                &self.settings_penality,
-                &self.settings_http_timeout,
-                &self.settings_checking_ntry,
-                &self.settings_capacity_factor,
-                self.settings_check_route,
+                &self.settings.pinger_timeout,
+                &self.settings.manifest_refresh,
+                &self.settings.penality,
+                &self.settings.http_timeout,
+                &self.settings.checking_ntry,
+                &self.settings.capacity_factor,
+                self.settings.check_route,
             ),
         };
         // Per-tab error display (inline at top of content area, only when show_errors is on)
