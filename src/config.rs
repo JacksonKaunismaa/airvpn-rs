@@ -239,6 +239,26 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Detect whether decrypted profile data is XML or JSON and parse into options.
+fn detect_and_parse_options(data: &[u8]) -> Result<HashMap<String, String>> {
+    let trimmed = data.iter().position(|&b| !b.is_ascii_whitespace());
+    let is_xml = trimmed.is_some_and(|i| data[i] == b'<');
+    if is_xml {
+        parse_xml_options(data)
+    } else {
+        parse_json_options(data)
+    }
+}
+
+/// Load existing options from the profile, or return an empty map if no profile exists.
+fn load_or_create_options(path: &Path) -> HashMap<String, String> {
+    if path.exists() {
+        load_options_from_path(path).unwrap_or_default()
+    } else {
+        HashMap::new()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -317,14 +337,7 @@ pub fn load_eddie_profile(path: &Path) -> Result<HashMap<String, String>> {
 
     warn_if_insecure_v2n(path, format);
 
-    let trimmed = data.iter().position(|&b| !b.is_ascii_whitespace());
-    let is_xml = trimmed.is_some_and(|i| data[i] == b'<');
-
-    if is_xml {
-        parse_xml_options(&data)
-    } else {
-        parse_json_options(&data)
-    }
+    detect_and_parse_options(&data)
 }
 
 /// Load Eddie profile using a specific UID for keyring access (helper daemon use).
@@ -341,14 +354,7 @@ pub fn load_eddie_profile_for_uid(path: &Path, uid: u32) -> Result<(HashMap<Stri
     let is_v2n = format == crate::profile::ProfileFormat::V2N;
     warn_if_insecure_v2n(path, format);
 
-    let trimmed = data.iter().position(|&b| !b.is_ascii_whitespace());
-    let is_xml = trimmed.is_some_and(|i| data[i] == b'<');
-
-    let opts = if is_xml {
-        parse_xml_options(&data)?
-    } else {
-        parse_json_options(&data)?
-    };
+    let opts = detect_and_parse_options(&data)?;
     Ok((opts, is_v2n))
 }
 
@@ -363,15 +369,7 @@ fn load_options_from_path(path: &Path) -> Result<HashMap<String, String>> {
 
     warn_if_insecure_v2n(path, format);
 
-    // Detect format: XML starts with '<' (possibly after BOM/whitespace)
-    let trimmed = data.iter().position(|&b| !b.is_ascii_whitespace());
-    let is_xml = trimmed.is_some_and(|i| data[i] == b'<');
-
-    if is_xml {
-        parse_xml_options(&data)
-    } else {
-        parse_json_options(&data)
-    }
+    detect_and_parse_options(&data)
 }
 
 /// Save a single option to the profile (read-modify-write).
@@ -380,12 +378,7 @@ fn load_options_from_path(path: &Path) -> Result<HashMap<String, String>> {
 pub fn save_profile_option(key: &str, value: &str) -> Result<()> {
     let path = profile_path();
 
-    // Load existing options (or start fresh)
-    let mut options = if path.exists() {
-        load_options_from_path(&path).unwrap_or_default()
-    } else {
-        HashMap::new()
-    };
+    let mut options = load_or_create_options(&path);
 
     options.insert(key.to_string(), value.to_string());
     save_options(&path, &options)
@@ -399,11 +392,7 @@ pub fn save_profile_option(key: &str, value: &str) -> Result<()> {
 pub fn save_profile_options(updates: &HashMap<String, String>) -> Result<()> {
     let path = profile_path();
 
-    let mut options = if path.exists() {
-        load_options_from_path(&path).unwrap_or_default()
-    } else {
-        HashMap::new()
-    };
+    let mut options = load_or_create_options(&path);
 
     for (key, value) in updates {
         options.insert(key.clone(), value.clone());
@@ -418,12 +407,7 @@ pub fn save_profile_options(updates: &HashMap<String, String>) -> Result<()> {
 pub fn save_credentials(username: &str, password: &str) -> Result<()> {
     let path = profile_path();
 
-    // Load existing options to preserve non-credential fields
-    let mut options = if path.exists() {
-        load_options_from_path(&path).unwrap_or_default()
-    } else {
-        HashMap::new()
-    };
+    let mut options = load_or_create_options(&path);
 
     options.insert("login".to_string(), username.to_string());
     options.insert("password".to_string(), password.to_string());
