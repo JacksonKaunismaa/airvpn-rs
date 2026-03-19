@@ -469,6 +469,25 @@ pub fn parse_manifest(xml: &str) -> anyhow::Result<Manifest> {
     Ok(Manifest { servers, modes, bootstrap_urls, force_reauth_ts, messages, check_domain, check_dns_query, check_protocol, rsa_modulus, rsa_exponent })
 }
 
+/// Extract and validate WireGuard key attributes from a `<key>` element.
+fn parse_wg_key_attrs(e: &quick_xml::events::BytesStart<'_>) -> anyhow::Result<WireGuardKey> {
+    let wg_ipv4 = attr_opt(e, b"wg_ipv4").unwrap_or_default();
+    let wg_ipv6 = attr_opt(e, b"wg_ipv6").unwrap_or_default();
+    let wg_dns_ipv4 = attr_opt(e, b"wg_dns_ipv4").unwrap_or_default();
+    let wg_dns_ipv6 = attr_opt(e, b"wg_dns_ipv6").unwrap_or_default();
+    if !wg_ipv4.is_empty() { validate_ip(&wg_ipv4, "wg_ipv4")?; }
+    if !wg_ipv6.is_empty() { validate_ip(&wg_ipv6, "wg_ipv6")?; }
+    if !wg_dns_ipv4.is_empty() { validate_ip(&wg_dns_ipv4, "wg_dns_ipv4")?; }
+    if !wg_dns_ipv6.is_empty() { validate_ip(&wg_dns_ipv6, "wg_dns_ipv6")?; }
+    Ok(WireGuardKey {
+        name: attr_opt(e, b"name").unwrap_or_default(),
+        wg_private_key: Zeroizing::new(attr_opt(e, b"wg_private_key").unwrap_or_default()),
+        wg_ipv4, wg_ipv6,
+        wg_dns_ipv4, wg_dns_ipv6,
+        wg_preshared: Zeroizing::new(attr_opt(e, b"wg_preshared").unwrap_or_default()),
+    })
+}
+
 pub fn parse_user(xml: &str) -> anyhow::Result<UserInfo> {
     check_api_error(xml)?;
     let mut reader = Reader::from_str(xml);
@@ -485,21 +504,7 @@ pub fn parse_user(xml: &str) -> anyhow::Result<UserInfo> {
             Ok(Event::Eof) => break,
             Ok(Event::Empty(ref e)) => {
                 if e.name().as_ref() == b"key" && in_user {
-                    let wg_ipv4 = attr_opt(e, b"wg_ipv4").unwrap_or_default();
-                    let wg_ipv6 = attr_opt(e, b"wg_ipv6").unwrap_or_default();
-                    let wg_dns_ipv4 = attr_opt(e, b"wg_dns_ipv4").unwrap_or_default();
-                    let wg_dns_ipv6 = attr_opt(e, b"wg_dns_ipv6").unwrap_or_default();
-                    if !wg_ipv4.is_empty() { validate_ip(&wg_ipv4, "wg_ipv4")?; }
-                    if !wg_ipv6.is_empty() { validate_ip(&wg_ipv6, "wg_ipv6")?; }
-                    if !wg_dns_ipv4.is_empty() { validate_ip(&wg_dns_ipv4, "wg_dns_ipv4")?; }
-                    if !wg_dns_ipv6.is_empty() { validate_ip(&wg_dns_ipv6, "wg_dns_ipv6")?; }
-                    keys.push(WireGuardKey {
-                        name: attr_opt(e, b"name").unwrap_or_default(),
-                        wg_private_key: Zeroizing::new(attr_opt(e, b"wg_private_key").unwrap_or_default()),
-                        wg_ipv4, wg_ipv6,
-                        wg_dns_ipv4, wg_dns_ipv6,
-                        wg_preshared: Zeroizing::new(attr_opt(e, b"wg_preshared").unwrap_or_default()),
-                    });
+                    keys.push(parse_wg_key_attrs(e)?);
                 }
             }
             Ok(Event::Start(ref e)) => {
@@ -518,21 +523,7 @@ pub fn parse_user(xml: &str) -> anyhow::Result<UserInfo> {
                         keys.clear();
                     }
                     b"key" if in_user => {
-                        let wg_ipv4 = attr_opt(e, b"wg_ipv4").unwrap_or_default();
-                        let wg_ipv6 = attr_opt(e, b"wg_ipv6").unwrap_or_default();
-                        let wg_dns_ipv4 = attr_opt(e, b"wg_dns_ipv4").unwrap_or_default();
-                        let wg_dns_ipv6 = attr_opt(e, b"wg_dns_ipv6").unwrap_or_default();
-                        if !wg_ipv4.is_empty() { validate_ip(&wg_ipv4, "wg_ipv4")?; }
-                        if !wg_ipv6.is_empty() { validate_ip(&wg_ipv6, "wg_ipv6")?; }
-                        if !wg_dns_ipv4.is_empty() { validate_ip(&wg_dns_ipv4, "wg_dns_ipv4")?; }
-                        if !wg_dns_ipv6.is_empty() { validate_ip(&wg_dns_ipv6, "wg_dns_ipv6")?; }
-                        keys.push(WireGuardKey {
-                            name: attr_opt(e, b"name").unwrap_or_default(),
-                            wg_private_key: Zeroizing::new(attr_opt(e, b"wg_private_key").unwrap_or_default()),
-                            wg_ipv4, wg_ipv6,
-                            wg_dns_ipv4, wg_dns_ipv6,
-                            wg_preshared: Zeroizing::new(attr_opt(e, b"wg_preshared").unwrap_or_default()),
-                        });
+                        keys.push(parse_wg_key_attrs(e)?);
                     }
                     _ => {}
                 }
