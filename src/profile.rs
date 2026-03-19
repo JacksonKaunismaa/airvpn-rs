@@ -386,39 +386,7 @@ pub fn load_profile(
     path: &Path,
     password_provider: impl Fn() -> Result<String>,
 ) -> Result<(ProfileFormat, String, Zeroizing<Vec<u8>>)> {
-    let file_data = std::fs::read(path)
-        .with_context(|| format!("failed to read profile: {}", path.display()))?;
-
-    if file_data.len() < HEADER_LEN + ID_LEN {
-        bail!("profile file too small: {} bytes", file_data.len());
-    }
-
-    // Parse header
-    let format = ProfileFormat::from_header(&file_data[..HEADER_LEN])?;
-
-    // Parse ID
-    let id = std::str::from_utf8(&file_data[HEADER_LEN..HEADER_LEN + ID_LEN])
-        .context("profile ID is not valid ASCII")?
-        .to_string();
-
-    // Extract encrypted blob
-    let encrypted = &file_data[HEADER_LEN + ID_LEN..];
-
-    // Determine password
-    let password = match format {
-        ProfileFormat::V2N => PASSWORD_IF_EMPTY.to_string(),
-        ProfileFormat::V2S => {
-            keyring_read(&id)?
-                .context("keyring entry not found for this profile; cannot decrypt V2S profile")?
-        }
-        ProfileFormat::V2P => password_provider()?,
-    };
-
-    // Decrypt
-    let decrypted = profile_decrypt(encrypted, &password)
-        .context("profile decryption failed — wrong password or corrupt data")?;
-
-    Ok((format, id, decrypted))
+    load_profile_with_keyring(path, password_provider, keyring_read)
 }
 
 /// Load profile using a custom keyring reader (for Eddie profile import).
