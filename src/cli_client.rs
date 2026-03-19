@@ -335,30 +335,10 @@ pub fn send_status() -> Result<()> {
     }
 
     // Print lock status
-    println!("Lock status:");
-    println!(
-        "  Session lock:    {}",
-        if resp.lock.session_active {
-            "active"
-        } else {
-            "inactive"
-        }
-    );
-    println!(
-        "  Persistent lock: {}",
-        if resp.lock.persistent_active {
-            "active"
-        } else {
-            "inactive"
-        }
-    );
-    println!(
-        "  Installed:       {}",
-        if resp.lock.persistent_installed {
-            "yes"
-        } else {
-            "no"
-        }
+    print_lock_status(
+        resp.lock.session_active,
+        resp.lock.persistent_active,
+        resp.lock.persistent_installed,
     );
 
     // Print pinger status
@@ -525,6 +505,23 @@ fn render_event(event: &HelperEvent) -> EventAction {
     }
 }
 
+/// Print lock status from individual booleans (shared by typed and JSON paths).
+fn print_lock_status(session: bool, persistent: bool, installed: bool) {
+    println!("Lock status:");
+    println!(
+        "  Session lock:    {}",
+        if session { "active" } else { "inactive" }
+    );
+    println!(
+        "  Persistent lock: {}",
+        if persistent { "active" } else { "inactive" }
+    );
+    println!(
+        "  Installed:       {}",
+        if installed { "yes" } else { "no" }
+    );
+}
+
 /// Render lock status from a JSON value.
 fn render_lock_status(val: &serde_json::Value) {
     let session = val
@@ -539,20 +536,7 @@ fn render_lock_status(val: &serde_json::Value) {
         .get("persistent_installed")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-
-    println!("Lock status:");
-    println!(
-        "  Session lock:    {}",
-        if session { "active" } else { "inactive" }
-    );
-    println!(
-        "  Persistent lock: {}",
-        if persistent { "active" } else { "inactive" }
-    );
-    println!(
-        "  Installed:       {}",
-        if installed { "yes" } else { "no" }
-    );
+    print_lock_status(session, persistent, installed);
 }
 
 // ---------------------------------------------------------------------------
