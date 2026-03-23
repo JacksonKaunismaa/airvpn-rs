@@ -268,6 +268,7 @@ build_filter() {
     cat <<EOF
 (ip or ip6) and not (
 ${allowlist_clause}    host 127.0.0.1 or
+    net 169.254.0.0/16 or
     net 224.0.0.0/4 or
     net 255.255.255.255/32 or
     (net 192.168.0.0/16 and dst net 192.168.0.0/16) or
@@ -401,6 +402,14 @@ handle_leak() {
     echo "[$(date -Iseconds)] $line" >> "$LEAK_TXT"
 }
 
+# ARP probes for public DNS IPs — not an active leak (L2 only, no IP packet sent)
+# but evidence of a process trying to reach public DNS outside the tunnel.
+handle_arp_probe() {
+    local line="$1"
+    echo -e "${YELLOW}[ARP-PROBE] $line${NC}"
+    echo "[$(date -Iseconds)] [ARP-PROBE] $line" >> "$LEAK_TXT"
+}
+
 run_timed_probe() {
     local timeout_s="$1"
     shift
@@ -412,42 +421,41 @@ run_timed_probe() {
 }
 
 probe_iface() {
-    local iface="$1"
-    local src4
-    src4="$(ip -4 -o addr show dev "$iface" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
+    # Active probes generate traffic WITHOUT binding to a physical interface.
+    # This lets the VPN routing (table 51820) handle them normally.
+    # If the kill switch is working, traffic routes through avpn0 and tcpdump
+    # on the physical interface sees nothing. If it's broken, traffic escapes
+    # to the physical interface and tcpdump catches a real leak.
+    #
+    # We intentionally do NOT use --interface/SO_BINDTODEVICE/source-bind here:
+    # that bypasses VPN routing by design, creating fake "leaks" that the
+    # monitor's own tcpdump then detects — a self-fulfilling false positive.
 
-    # DNS leak attempts
+    # DNS leak attempts (no @server = uses system resolver, no source bind)
     if command -v dig &>/dev/null; then
         run_timed_probe 3 dig +time=1 +tries=1 @8.8.8.8 example.com A
         run_timed_probe 3 dig +time=1 +tries=1 @1.1.1.1 example.com A
     fi
 
-    # TCP + UDP egress attempts
+    # TCP + UDP egress attempts (no source bind)
     if command -v nc &>/dev/null; then
-        if [[ -n "$src4" ]]; then
-            run_timed_probe 3 nc -z -w1 -s "$src4" 1.1.1.1 443
-            printf "x" | run_timed_probe 3 nc -u -w1 -s "$src4" 8.8.8.8 53
-        else
-            run_timed_probe 3 nc -z -w1 1.1.1.1 443
-            printf "x" | run_timed_probe 3 nc -u -w1 8.8.8.8 53
-        fi
+        run_timed_probe 3 nc -z -w1 1.1.1.1 443
+        printf "x" | run_timed_probe 3 nc -u -w1 8.8.8.8 53
     else
         run_timed_probe 3 bash -c 'echo > /dev/tcp/1.1.1.1/443'
         run_timed_probe 3 bash -c 'echo x > /dev/udp/8.8.8.8/53'
     fi
 
-    # HTTP egress attempts pinned to physical interface
+    # HTTP egress attempts (no --interface, normal routing)
     if command -v curl &>/dev/null; then
-        run_timed_probe 4 curl -4 --interface "$iface" --connect-timeout 2 --max-time 3 -fsS "http://1.1.1.1"
-        run_timed_probe 4 curl -4 --interface "$iface" --connect-timeout 2 --max-time 3 -fsS "http://8.8.8.8"
+        run_timed_probe 4 curl -4 --connect-timeout 2 --max-time 3 -fsS "http://1.1.1.1"
+        run_timed_probe 4 curl -4 --connect-timeout 2 --max-time 3 -fsS "http://8.8.8.8"
     fi
 }
 
 active_probe_loop() {
     while true; do
-        for iface in "${IFACES[@]}"; do
-            probe_iface "$iface"
-        done
+        probe_iface
         sleep "$PROBE_INTERVAL"
     done
 }
@@ -494,7 +502,11 @@ for iface in "${IFACES[@]}"; do
     tcpdump -i "$iface" -l -n $PUBLIC_DNS_FILTER 2>/dev/null | (
         while read -r line; do
             [[ -z "$line" ]] && continue
-            handle_leak "[PUBLIC-DNS $iface] $line"
+            if [[ "$line" == *" ARP, "* ]]; then
+                handle_arp_probe "[$iface] $line"
+            else
+                handle_leak "[PUBLIC-DNS $iface] $line"
+            fi
         done
     ) &
     TCPDUMP_PIDS+=($!)
