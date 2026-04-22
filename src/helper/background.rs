@@ -188,6 +188,10 @@ pub(super) fn background_manifest_loop(state: State, shutdown: Arc<AtomicBool>) 
                             Ok(new_manifest) => {
                                 info!("Background manifest refresh: {} servers", new_manifest.servers.len());
 
+                                if let Err(e) = manifest::save_manifest(&new_manifest, manifest::MANIFEST_CACHE_PATH) {
+                                    warn!("Failed to persist manifest cache: {e}");
+                                }
+
                                 // Extract (name, preferred_entry_ip) pairs,
                                 // respecting ip_layer preference with fallback.
                                 let prefer_ipv6 = ip_layer == "ipv6";
@@ -266,6 +270,12 @@ pub(super) fn background_manifest_loop(state: State, shutdown: Arc<AtomicBool>) 
             Err(e) => warn!("Failed to load provider config: {:#}", e),
         }
 
-        interruptible_sleep_secs(&shutdown, refresh_interval_secs);
+        let has_manifest = lock_state(&state).manifest.is_some();
+        if has_manifest {
+            interruptible_sleep_secs(&shutdown, refresh_interval_secs);
+        } else {
+            warn!("Manifest not yet loaded, retrying in 15s");
+            interruptible_sleep_secs(&shutdown, 15);
+        }
     }
 }

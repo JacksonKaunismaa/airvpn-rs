@@ -125,12 +125,16 @@ impl SharedState {
                 log::warn!("Failed to populate ping_allow from cached IPs: {e}");
             }
         }
+        let cached_manifest = manifest::load_manifest(manifest::MANIFEST_CACHE_PATH);
+        if let Some(ref m) = cached_manifest {
+            log::info!("Loaded cached manifest from disk ({} servers)", m.servers.len());
+        }
         let ready = latency.has_data(); // warm start = ready immediately
         Self {
             conn: ConnState::new(),
             subscribers: Vec::new(),
             latency,
-            manifest: None,
+            manifest: cached_manifest,
             ready,
             key_names: Vec::new(),
         }
