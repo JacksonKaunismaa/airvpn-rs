@@ -289,6 +289,59 @@ pub(super) async fn handle_connect_async(
         .unwrap()
 }
 
+/// Signal disconnect and spawn async cleanup. Returns immediately.
+/// Returns true if a connection was active and signalled.
+fn signal_disconnect(state: &State) -> bool {
+    let is_connected = state.0.lock().unwrap().conn.is_connected();
+    if !is_connected {
+        return false;
+    }
+
+    state.0.lock().unwrap().conn.disconnect_flag.store(true, Ordering::SeqCst);
+
+    {
+        let mut st = state.0.lock().unwrap();
+        st.broadcast(&ipc::HelperEvent::StateChanged {
+            state: ipc::ConnectionState::Disconnecting,
+        });
+    }
+
+    // Take handles — cleanup thread will join them
+    let (connect_handle, stats_handle) = {
+        let mut st = state.0.lock().unwrap();
+        let ch = st.conn.connect_handle.take();
+        st.conn.stats_stop.store(true, Ordering::SeqCst);
+        let sh = st.conn.stats_handle.take();
+        (ch, sh)
+    };
+
+    // Spawn detached thread for blocking cleanup
+    let cleanup_state = Arc::clone(state);
+    thread::spawn(move || {
+        if let Some(h) = connect_handle {
+            let _ = h.join();
+        }
+        if let Some(h) = stats_handle {
+            let _ = h.join();
+        }
+
+        if let Err(e) = recovery::force_recover() {
+            warn!("force_recover after disconnect: {}", e);
+        }
+
+        // Clear server info and broadcast disconnected
+        let mut st = cleanup_state.0.lock().unwrap();
+        if let Ok(mut info) = st.conn.server_info.lock() {
+            *info = Default::default();
+        }
+        st.broadcast(&ipc::HelperEvent::StateChanged {
+            state: ipc::ConnectionState::Disconnected,
+        });
+    });
+
+    true
+}
+
 /// Disconnect the active VPN connection (blocking: joins threads).
 /// Returns true if a connection was active and torn down.
 fn perform_disconnect(state: &State) -> bool {
@@ -579,7 +632,7 @@ pub(super) fn handle_disconnect(state: &State) -> Response<HyperBody> {
     }
 
     if is_connected {
-        perform_disconnect(state);
+        signal_disconnect(state);
         json_response(StatusCode::OK, &json!({"disconnected": true}))
     } else if has_orphan {
         // Orphaned connection: no connect thread but WireGuard interface is still up.
@@ -635,7 +688,13 @@ pub(super) fn handle_disconnect(state: &State) -> Response<HyperBody> {
 
         json_response(StatusCode::OK, &json!({"disconnected": true}))
     } else {
-        error_response(StatusCode::BAD_REQUEST, "no active connection")
+        let was_stuck = state.0.lock().unwrap().conn.connect_in_progress.swap(false, Ordering::SeqCst);
+        if was_stuck {
+            info!("cleared stale connect_in_progress flag");
+            json_response(StatusCode::OK, &json!({"disconnected": true}))
+        } else {
+            error_response(StatusCode::BAD_REQUEST, "no active connection")
+        }
     }
 }
 
@@ -863,6 +922,8 @@ pub(super) fn handle_lock_status() -> Response<HyperBody> {
 /// Runs force_recover (DNS, locks, WireGuard) and also cleans up stale
 /// server host routes that force_recover can't handle (needs manifest IPs).
 pub(super) fn handle_recover(state: &State) -> Response<HyperBody> {
+    state.0.lock().unwrap().conn.connect_in_progress.store(false, Ordering::SeqCst);
+
     if let Err(e) = recovery::force_recover() {
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("recovery failed: {}", e));
     }
