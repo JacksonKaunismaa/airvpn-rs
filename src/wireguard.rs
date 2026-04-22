@@ -879,13 +879,21 @@ pub fn latest_handshake(iface: &str) -> Option<u64> {
 /// Eddie uses handshake_timeout_first=50 seconds. If no handshake arrives
 /// within the timeout, the tunnel is likely misconfigured (wrong key,
 /// blocked port, unreachable server).
-pub fn wait_for_handshake(iface: &str, timeout_secs: u64) -> Result<()> {
+pub fn wait_for_handshake(
+    iface: &str,
+    timeout_secs: u64,
+    shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
     validate_interface_name(iface)?;
 
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(timeout_secs);
 
     loop {
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            anyhow::bail!("handshake wait interrupted by disconnect");
+        }
+
         if start.elapsed() > timeout {
             anyhow::bail!(
                 "no WireGuard handshake within {}s — server may be unreachable or key may be wrong",
@@ -941,6 +949,7 @@ pub fn get_transfer_stats(iface: &str) -> Result<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     // Valid 44-character base64 strings (WireGuard keys are 32 bytes = 44 base64 chars)
     const TEST_PRIVATE_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
@@ -1452,6 +1461,22 @@ mod tests {
         assert!(
             result.unwrap_err().to_string().contains("invalid characters"),
             "should reject IP with newline injection"
+        );
+    }
+
+    #[test]
+    fn test_wait_for_handshake_respects_shutdown() {
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        // "lo" is always a valid interface but will never have a WG handshake.
+        // With shutdown=true, should bail immediately instead of blocking 10s.
+        let start = std::time::Instant::now();
+        let result = wait_for_handshake("lo", 10, &shutdown);
+        let elapsed = start.elapsed();
+        assert!(result.is_err());
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "wait_for_handshake took {:?} with shutdown=true, expected <2s",
+            elapsed
         );
     }
 

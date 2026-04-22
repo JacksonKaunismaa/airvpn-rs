@@ -1575,9 +1575,12 @@ fn wait_and_verify_connection(
         message: "Waiting for WireGuard handshake...".into(),
     });
     let handshake_timeout_first = options::get_u64(&config.resolved, options::WG_HANDSHAKE_FIRST);
-    if let Err(e) = wireguard::wait_for_handshake(iface, handshake_timeout_first) {
+    if let Err(e) = wireguard::wait_for_handshake(iface, handshake_timeout_first, &params.shutdown) {
         error!("Handshake failed: {:#}", e);
         let _ = wireguard::disconnect(config_path, endpoint_ip, iface);
+        if params.shutdown.load(Ordering::Relaxed) {
+            return LoopAction::Break;
+        }
         if config.no_reconnect {
             let _ = wireguard::remove_server_host_routes(&state.all_entry_ips, original_gw);
             cleanup_and_bail(config.no_lock, &params.blocked_ipv6_ifaces);
