@@ -5,16 +5,17 @@ use anyhow::{bail, Context};
 use log::{debug, warn};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
+use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub kind: String,
     pub text: String,
     pub url: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
     pub servers: Vec<Server>,
     pub modes: Vec<Mode>,
@@ -35,7 +36,7 @@ pub struct Manifest {
     pub rsa_exponent: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Server {
     pub name: String,
     pub group: String,
@@ -54,7 +55,7 @@ pub struct Server {
     pub warning_closed: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mode {
     pub title: String,
     pub protocol: String,
@@ -320,6 +321,43 @@ fn resolve_server(raw: RawServerAttrs, groups: &HashMap<String, ServerGroupAttrs
         support_ipv6: parse_bool(&support_ipv6),
         warning_open,
         warning_closed,
+    }
+}
+
+/// Filesystem path for the persisted manifest cache.
+pub const MANIFEST_CACHE_PATH: &str = "/var/lib/airvpn-rs/manifest.json";
+
+/// Persist the manifest to a JSON file (0600 root:root).
+pub fn save_manifest(manifest: &Manifest, path: &str) -> anyhow::Result<()> {
+    let parent = std::path::Path::new(path).parent();
+    if let Some(dir) = parent {
+        std::fs::create_dir_all(dir)?;
+    }
+    let json = serde_json::to_string_pretty(manifest)?;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(json.as_bytes())?;
+    Ok(())
+}
+
+/// Load the manifest from a JSON file. Returns `None` on any error
+/// (missing file, corrupt JSON) — stale cache is optional, not critical.
+pub fn load_manifest(path: &str) -> Option<Manifest> {
+    match std::fs::read_to_string(path) {
+        Ok(json) => match serde_json::from_str(&json) {
+            Ok(manifest) => Some(manifest),
+            Err(e) => {
+                warn!("Corrupt manifest cache at {path}: {e}");
+                None
+            }
+        },
+        Err(_) => None,
     }
 }
 
@@ -758,5 +796,39 @@ mod tests {
   <keys><key name="d" wg_private_key="P" wg_ipv4="10.0.0.1/32" wg_ipv6="fd00::1/128" wg_dns_ipv4="10.0.0.1" wg_dns_ipv6="fd00::53" wg_preshared="" /></keys>
 </user>"#;
         assert!(parse_user(xml).is_ok());
+    }
+
+    #[test]
+    fn test_manifest_persistence_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        let path_str = path.to_str().unwrap();
+
+        let manifest = parse_manifest(FULL_MANIFEST).unwrap();
+        save_manifest(&manifest, path_str).unwrap();
+
+        let loaded = load_manifest(path_str).unwrap();
+        assert_eq!(loaded.servers.len(), 1);
+        assert_eq!(loaded.servers[0].name, "Alchiba");
+        assert_eq!(loaded.servers[0].ips_entry, vec!["185.32.12.1", "185.32.12.2"]);
+        assert_eq!(loaded.servers[0].country_code, "IT");
+        assert_eq!(loaded.modes.len(), 1);
+        assert_eq!(loaded.modes[0].title, "WireGuard UDP 1637");
+        assert_eq!(loaded.check_domain, "airvpn.org");
+        assert_eq!(loaded.check_dns_query, "{hash}.airvpn.org");
+        assert_eq!(loaded.bootstrap_urls, vec!["https://api.airvpn.org/api/"]);
+    }
+
+    #[test]
+    fn test_load_manifest_missing_file() {
+        assert!(load_manifest("/nonexistent/manifest.json").is_none());
+    }
+
+    #[test]
+    fn test_load_manifest_corrupt_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        std::fs::write(&path, "not json").unwrap();
+        assert!(load_manifest(path.to_str().unwrap()).is_none());
     }
 }
