@@ -314,28 +314,30 @@ pub(super) async fn handle_connect_async(
 }
 
 /// Signal disconnect and spawn async cleanup. Returns immediately.
-/// Returns true if a connection was active and signalled.
+///
+/// Idempotent: if the disconnect flag is already set, returns false without
+/// spawning a duplicate cleanup thread. Returns true only for the caller
+/// that successfully flipped the flag.
 fn signal_disconnect(state: &State) -> bool {
-    let is_connected = state.0.lock().unwrap().conn.is_connected();
-    if !is_connected {
-        return false;
-    }
-
-    state.0.lock().unwrap().conn.disconnect_flag.store(true, Ordering::SeqCst);
-
-    {
+    // Single critical section: check, claim, capture handles, broadcast.
+    // Using swap on disconnect_flag makes this idempotent under concurrent
+    // /disconnect calls — only the first caller (which sees the old value
+    // false) proceeds to spawn cleanup.
+    let (connect_handle, stats_handle) = {
         let mut st = state.0.lock().unwrap();
+        if !st.conn.is_connected() {
+            return false;
+        }
+        if st.conn.disconnect_flag.swap(true, Ordering::SeqCst) {
+            // Another caller already signalled — they own cleanup.
+            return false;
+        }
+        st.conn.stats_stop.store(true, Ordering::SeqCst);
+        let ch = st.conn.connect_handle.take();
+        let sh = st.conn.stats_handle.take();
         st.broadcast(&ipc::HelperEvent::StateChanged {
             state: ipc::ConnectionState::Disconnecting,
         });
-    }
-
-    // Take handles — cleanup thread will join them
-    let (connect_handle, stats_handle) = {
-        let mut st = state.0.lock().unwrap();
-        let ch = st.conn.connect_handle.take();
-        st.conn.stats_stop.store(true, Ordering::SeqCst);
-        let sh = st.conn.stats_handle.take();
         (ch, sh)
     };
 
@@ -355,7 +357,7 @@ fn signal_disconnect(state: &State) -> bool {
 
         // Clear server info. The connect thread's ConnectGuard broadcasts
         // Disconnected on its way out — don't duplicate it here.
-        let mut st = cleanup_state.0.lock().unwrap();
+        let st = cleanup_state.0.lock().unwrap();
         if let Ok(mut info) = st.conn.server_info.lock() {
             *info = Default::default();
         };
