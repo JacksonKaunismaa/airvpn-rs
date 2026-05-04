@@ -106,12 +106,33 @@ fn build_pinger_info(st: &SharedState) -> ipc::PingerInfo {
     }
 }
 
-/// RAII guard that clears `connect_in_progress` on drop.
-/// Defused via `forget()` when the connect thread takes ownership of the flag.
-struct ConnectGuard(Arc<AtomicBool>);
+/// RAII guard for the connect thread. On drop (including panic unwind), clears
+/// the `connect_in_progress` flag and broadcasts the final `Disconnected` event.
+///
+/// Used at two call sites:
+/// - `handle_connect_async`: created before warmup, defused via `mem::forget()`
+///   once we're committed to spawning the connect thread. The connect thread
+///   creates its own guard and takes over responsibility.
+/// - The connect thread closure: created at the top, runs on every exit path
+///   (Ok, Err, panic).
+struct ConnectGuard {
+    in_progress: Arc<AtomicBool>,
+    /// `None` when used as the early-exit guard in `handle_connect_async`
+    /// (no broadcast needed — connection never started). `Some` inside the
+    /// connect thread.
+    state: Option<State>,
+}
+
 impl Drop for ConnectGuard {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+        self.in_progress.store(false, Ordering::SeqCst);
+        if let Some(state) = &self.state {
+            if let Ok(mut st) = state.0.lock() {
+                st.broadcast(&ipc::HelperEvent::StateChanged {
+                    state: ipc::ConnectionState::Disconnected,
+                });
+            }
+        }
     }
 }
 
@@ -187,7 +208,10 @@ pub(super) async fn handle_connect_async(
         st.conn.connect_in_progress.store(true, Ordering::SeqCst);
         // RAII guard: clears the flag if we return early (credential errors,
         // warmup timeout, etc.). The connect thread clears it on normal exit.
-        ConnectGuard(st.conn.connect_in_progress.clone())
+        ConnectGuard {
+            in_progress: st.conn.connect_in_progress.clone(),
+            state: None,
+        }
     };
 
     let (resolved_username, resolved_password) = match resolve_credentials(peer_uid) {
@@ -329,14 +353,12 @@ fn signal_disconnect(state: &State) -> bool {
             warn!("force_recover after disconnect: {}", e);
         }
 
-        // Clear server info and broadcast disconnected
+        // Clear server info. The connect thread's ConnectGuard broadcasts
+        // Disconnected on its way out — don't duplicate it here.
         let mut st = cleanup_state.0.lock().unwrap();
         if let Ok(mut info) = st.conn.server_info.lock() {
             *info = Default::default();
-        }
-        st.broadcast(&ipc::HelperEvent::StateChanged {
-            state: ipc::ConnectionState::Disconnected,
-        });
+        };
     });
 
     true
@@ -387,15 +409,13 @@ fn perform_disconnect(state: &State) -> bool {
         warn!("force_recover after disconnect: {}", e);
     }
 
-    // Clear server info and broadcast disconnected
+    // Clear server info. The connect thread's ConnectGuard broadcasts
+    // Disconnected on its way out — don't duplicate it here.
     {
         let mut st = state.0.lock().unwrap();
         if let Ok(mut info) = st.conn.server_info.lock() {
             *info = Default::default();
-        }
-        st.broadcast(&ipc::HelperEvent::StateChanged {
-            state: ipc::ConnectionState::Disconnected,
-        });
+        };
     }
 
     true
@@ -568,7 +588,18 @@ fn start_connect(state: State, connect_req: ipc::ConnectRequest, username: Zeroi
         disconnect_flag,
     );
 
+    let connect_in_progress_for_guard = {
+        let st = state.0.lock().unwrap();
+        st.conn.connect_in_progress.clone()
+    };
     let conn_handle = thread::spawn(move || {
+        // Guard fires on every exit path (Ok, Err, panic) — clears
+        // connect_in_progress and broadcasts Disconnected exactly once.
+        let _guard = ConnectGuard {
+            in_progress: connect_in_progress_for_guard,
+            state: Some(Arc::clone(&connect_broadcast_state)),
+        };
+
         let result = (|| -> Result<()> {
             let mut provider_config = api::load_provider_config()?;
             api::verify_rsa_key_integrity(&provider_config);
@@ -591,14 +622,7 @@ fn start_connect(state: State, connect_req: ipc::ConnectRequest, username: Zeroi
                 });
             }
         }
-
-        // Signal disconnected and clear the connect_in_progress guard
-        if let Ok(mut st) = connect_broadcast_state.0.lock() {
-            st.conn.connect_in_progress.store(false, Ordering::SeqCst);
-            st.broadcast(&ipc::HelperEvent::StateChanged {
-                state: ipc::ConnectionState::Disconnected,
-            });
-        }
+        // No manual store/broadcast — guard handles both on drop.
     });
 
     let (stats_handle, stats_stop) = spawn_stats_poller(&state);
