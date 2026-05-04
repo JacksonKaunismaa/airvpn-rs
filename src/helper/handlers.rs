@@ -319,11 +319,9 @@ pub(super) async fn handle_connect_async(
 /// spawning a duplicate cleanup thread. Returns true only for the caller
 /// that successfully flipped the flag.
 fn signal_disconnect(state: &State) -> bool {
-    // Single critical section: check, claim, capture handles, broadcast.
-    // Using swap on disconnect_flag makes this idempotent under concurrent
-    // /disconnect calls — only the first caller (which sees the old value
-    // false) proceeds to spawn cleanup.
-    let (connect_handle, stats_handle) = {
+    // Single critical section: check, claim, capture handles, snapshot
+    // manifest IPs, broadcast.
+    let (connect_handle, stats_handle, route_ips) = {
         let mut st = state.0.lock().unwrap();
         if !st.conn.is_connected() {
             return false;
@@ -335,10 +333,15 @@ fn signal_disconnect(state: &State) -> bool {
         st.conn.stats_stop.store(true, Ordering::SeqCst);
         let ch = st.conn.connect_handle.take();
         let sh = st.conn.stats_handle.take();
+        // Snapshot manifest IPs so the cleanup thread can remove host routes
+        // after force_recover (which doesn't know server IPs).
+        let ips: Vec<String> = st.manifest.as_ref()
+            .map(|m| m.servers.iter().flat_map(|s| s.ips_entry.iter().cloned()).collect())
+            .unwrap_or_default();
         st.broadcast(&ipc::HelperEvent::StateChanged {
             state: ipc::ConnectionState::Disconnecting,
         });
-        (ch, sh)
+        (ch, sh, ips)
     };
 
     // Spawn detached thread for blocking cleanup
@@ -353,6 +356,14 @@ fn signal_disconnect(state: &State) -> bool {
 
         if let Err(e) = recovery::force_recover() {
             warn!("force_recover after disconnect: {}", e);
+        }
+
+        // Remove stale /32 server host routes left by the pinger.
+        // force_recover doesn't handle these (it doesn't know server IPs).
+        if !route_ips.is_empty() {
+            if let Ok(gw) = wireguard::get_default_gateway_pub() {
+                let _ = wireguard::remove_server_host_routes(&route_ips, &gw);
+            }
         }
 
         // Clear server info. The connect thread's ConnectGuard broadcasts
@@ -411,10 +422,24 @@ fn perform_disconnect(state: &State) -> bool {
         warn!("force_recover after disconnect: {}", e);
     }
 
+    // Remove stale /32 server host routes left by the pinger.
+    // force_recover doesn't handle these (it doesn't know server IPs).
+    let route_ips: Vec<String> = {
+        let st = state.0.lock().unwrap();
+        st.manifest.as_ref()
+            .map(|m| m.servers.iter().flat_map(|s| s.ips_entry.iter().cloned()).collect())
+            .unwrap_or_default()
+    };
+    if !route_ips.is_empty() {
+        if let Ok(gw) = wireguard::get_default_gateway_pub() {
+            let _ = wireguard::remove_server_host_routes(&route_ips, &gw);
+        }
+    }
+
     // Clear server info. The connect thread's ConnectGuard broadcasts
     // Disconnected on its way out — don't duplicate it here.
     {
-        let mut st = state.0.lock().unwrap();
+        let st = state.0.lock().unwrap();
         if let Ok(mut info) = st.conn.server_info.lock() {
             *info = Default::default();
         };
