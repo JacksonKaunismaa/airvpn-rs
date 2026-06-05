@@ -46,11 +46,6 @@ pub struct State {
     /// belongs to the same process instance.
     #[serde(default)]
     pub nonce: u64,
-    /// Whether /etc/resolv.conf had the immutable flag before we modified it.
-    /// Persisted so the flag can be restored on reconnection or crash recovery
-    /// (the AtomicBool in dns.rs is lost on process restart).
-    #[serde(default)]
-    pub resolv_was_immutable: bool,
 }
 
 /// Validate deserialized state content to reject tampered/corrupted state files.
@@ -141,7 +136,7 @@ fn find_state_file() -> Option<PathBuf> {
 /// Save current connection state.
 pub fn save(state: &State) -> Result<()> {
     debug!(
-        "Saving recovery state: lock={}, iface={}, dns={}/{}, pid={}, ipv6_blocked={}, endpoint={}, nonce={}, resolv_immutable={}",
+        "Saving recovery state: lock={}, iface={}, dns={}/{}, pid={}, ipv6_blocked={}, endpoint={}, nonce={}",
         state.lock_active,
         state.wg_interface,
         state.dns_ipv4,
@@ -150,7 +145,6 @@ pub fn save(state: &State) -> Result<()> {
         state.blocked_ipv6_ifaces.len(),
         state.endpoint_ip,
         state.nonce,
-        state.resolv_was_immutable,
     );
     ensure_state_dir()?;
     let path = state_path();
@@ -343,28 +337,23 @@ fn cleanup_routing_rules(endpoint_ip: Option<&str>) {
     }
 }
 
-/// Run the recovery cleanup sequence (matches normal disconnect order):
+/// Run the recovery cleanup sequence:
 /// 1. wireguard::disconnect(config_path) (ip link delete)
-/// 2. ipv6::restore() (re-enable IPv6 on blocked interfaces)
-/// 3. dns::deactivate() (restore resolv.conf)
-/// 4. netlock::deactivate() (delete nft table — removed last to prevent leaks)
+/// 2. netlock::deactivate() (remove session lock — unblocks DNS for step 4)
+/// 3. ipv6::restore() (re-enable IPv6 on blocked interfaces)
+/// 4. dns::deactivate() (restore resolv.conf)
 /// 5. Remove state file
 fn recover_from_state(state: &State) -> Result<()> {
     let mut cleanup_failed = false;
 
     // 1. Disconnect WireGuard
     if !state.wg_config_path.is_empty() {
-        // Recovery doesn't know the endpoint IP — pass empty for best-effort cleanup.
-        // The policy rules and routes in table 51820 are still cleaned up; only the
-        // endpoint host route removal is skipped (it'll be removed when the interface
-        // goes down anyway since the route's nexthop becomes unreachable).
         let iface = if state.wg_interface.is_empty() { wireguard::VPN_INTERFACE } else { &state.wg_interface };
         if let Err(e) = wireguard::disconnect(&state.wg_config_path, &state.endpoint_ip, iface) {
             warn!("failed to disconnect WireGuard: {}", e);
             cleanup_failed = true;
         }
     } else if !state.wg_interface.is_empty() {
-        // Config path unknown (crash before state update) — delete interface directly
         if let Err(e) = std::process::Command::new("ip")
             .args(["link", "delete", &state.wg_interface])
             .output()
@@ -380,30 +369,28 @@ fn recover_from_state(state: &State) -> Result<()> {
     // 1b. Clean up any orphaned WireGuard config files (contain private keys)
     cleanup_wg_configs();
 
-    // 2. Restore IPv6 on previously blocked interfaces
-    if !state.blocked_ipv6_ifaces.is_empty() {
-        ipv6::restore(&state.blocked_ipv6_ifaces);
-        info!("restored IPv6 on {} interfaces", state.blocked_ipv6_ifaces.len());
-    }
-
-    // 3. Restore DNS (restore immutable flag knowledge from persisted state first)
-    dns::set_was_immutable(state.resolv_was_immutable);
-    if let Err(e) = dns::deactivate() {
-        warn!("failed to restore DNS: {}", e);
-        cleanup_failed = true;
-    }
-
-    // 3b. Clean up routing policy rules (table 51820) that setup_routing adds.
-    // wireguard::disconnect calls teardown_routing, but if disconnect failed
-    // (e.g., config_path was empty or interface already gone), rules may linger.
+    // 1c. Clean up routing policy rules (table 51820) that setup_routing adds.
     cleanup_routing_rules(Some(&state.endpoint_ip));
 
-    // 4. Deactivate network lock if it was active (last — prevents traffic leaks)
+    // 2. Deactivate session lock BEFORE DNS restore — the lock's policy drop
+    //    blocks DNS to restored nameservers during the slow dns::deactivate() cleanup.
     if state.lock_active {
         if let Err(e) = netlock::deactivate() {
             warn!("failed to deactivate network lock: {}", e);
             cleanup_failed = true;
         }
+    }
+
+    // 3. Restore IPv6 on previously blocked interfaces
+    if !state.blocked_ipv6_ifaces.is_empty() {
+        ipv6::restore(&state.blocked_ipv6_ifaces);
+        info!("restored IPv6 on {} interfaces", state.blocked_ipv6_ifaces.len());
+    }
+
+    // 4. Restore DNS (delete our resolv.conf, ask NM/resolved to regenerate)
+    if let Err(e) = dns::deactivate() {
+        warn!("failed to restore DNS: {}", e);
+        cleanup_failed = true;
     }
 
     // 5. Only remove state file if all cleanup steps succeeded.
@@ -457,11 +444,25 @@ pub fn force_recover() -> Result<()> {
     // Even without state.json, clean up anything that might be stuck.
     let mut found_orphans = false;
 
-    // Orphaned DNS backup
-    let dns_backup = std::path::Path::new("/etc/resolv.conf.airvpn-rs");
-    if dns_backup.exists() {
-        warn!("restoring orphaned DNS backup");
-        let _ = dns::deactivate();
+    // Orphaned resolv.conf with our header (left behind by an unclean shutdown
+    // before the previous session could ask NM to regenerate it).
+    let resolv = std::path::Path::new("/etc/resolv.conf");
+    if resolv.exists() {
+        let is_ours = std::fs::read_to_string(resolv)
+            .map(|c| c.contains("Created by airvpn-rs"))
+            .unwrap_or(false);
+        if is_ours {
+            warn!("restoring orphaned VPN resolv.conf");
+            let _ = dns::deactivate();
+            found_orphans = true;
+        }
+    }
+
+    // Best-effort cleanup of any old-format DNS backup file from prior versions.
+    let legacy_backup = std::path::Path::new("/etc/resolv.conf.airvpn-rs");
+    if legacy_backup.exists() {
+        warn!("removing stale DNS backup file from prior version");
+        let _ = std::fs::remove_file(legacy_backup);
         found_orphans = true;
     }
 
@@ -608,7 +609,6 @@ mod tests {
             blocked_ipv6_ifaces: vec!["eth0".to_string(), "wlan0".to_string()],
             endpoint_ip: String::new(),
             nonce: 42424242,
-            resolv_was_immutable: true,
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -622,7 +622,6 @@ mod tests {
         assert_eq!(parsed.pid, state.pid);
         assert_eq!(parsed.blocked_ipv6_ifaces, state.blocked_ipv6_ifaces);
         assert_eq!(parsed.nonce, state.nonce);
-        assert_eq!(parsed.resolv_was_immutable, state.resolv_was_immutable);
     }
 
     #[test]
@@ -639,7 +638,6 @@ mod tests {
         let state: State = serde_json::from_str(json).unwrap();
         assert!(state.blocked_ipv6_ifaces.is_empty());
         assert_eq!(state.nonce, 0, "old format without nonce should default to 0");
-        assert!(!state.resolv_was_immutable, "old format without resolv_was_immutable should default to false");
     }
 
     #[test]
@@ -671,7 +669,6 @@ mod tests {
             blocked_ipv6_ifaces: vec!["eth0".to_string()],
             endpoint_ip: "1.2.3.4".to_string(),
             nonce: 42,
-            resolv_was_immutable: false,
         };
         assert!(validate_state(&state));
     }
@@ -688,7 +685,6 @@ mod tests {
             blocked_ipv6_ifaces: vec![],
             endpoint_ip: String::new(),
             nonce: 0,
-            resolv_was_immutable: false,
         };
         assert!(!validate_state(&state));
     }
@@ -705,7 +701,6 @@ mod tests {
             blocked_ipv6_ifaces: vec![],
             endpoint_ip: String::new(),
             nonce: 0,
-            resolv_was_immutable: false,
         };
         assert!(!validate_state(&state));
     }
@@ -722,7 +717,6 @@ mod tests {
             blocked_ipv6_ifaces: vec!["../../../etc".to_string()],
             endpoint_ip: String::new(),
             nonce: 0,
-            resolv_was_immutable: false,
         };
         assert!(!validate_state(&state));
     }
@@ -740,7 +734,6 @@ mod tests {
             blocked_ipv6_ifaces: vec![],
             endpoint_ip: String::new(),
             nonce: 0,
-            resolv_was_immutable: false,
         };
         assert!(validate_state(&state));
     }
@@ -757,7 +750,6 @@ mod tests {
             blocked_ipv6_ifaces: vec![],
             endpoint_ip: String::new(),
             nonce: 0,
-            resolv_was_immutable: false,
         };
         assert!(!validate_state(&state));
     }
@@ -774,7 +766,6 @@ mod tests {
             blocked_ipv6_ifaces: vec![],
             endpoint_ip: String::new(),
             nonce: 0,
-            resolv_was_immutable: false,
         };
         assert!(!validate_state(&state));
     }

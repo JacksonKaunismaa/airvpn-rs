@@ -1,96 +1,37 @@
-//! DNS manager -- resolv.conf swap + systemd-resolved support.
+//! DNS manager — write VPN DNS on connect, defer to NetworkManager / systemd-resolved on disconnect.
 //!
-//! Matches Eddie's DnsManager approach (Platform.Linux.cs + elevated impl.cpp):
-//! 1. Backup /etc/resolv.conf to /etc/resolv.conf.airvpn-rs
-//! 2. Write VPN DNS nameservers to /etc/resolv.conf
-//! 3. If systemd-resolved is active, also configure via resolvectl
-//! 4. Periodically check for DNS drift (NetworkManager can revert resolv.conf)
+//! On connect, we forcibly write `/etc/resolv.conf` with the VPN's DNS servers
+//! (and configure systemd-resolved per-interface if active) so all DNS queries
+//! traverse the tunnel.
 //!
-//! Reference: Eddie src/App.CLI.Linux.Elevated/src/impl.cpp (dns-switch-do, dns-switch-restore)
+//! On disconnect, instead of restoring a snapshotted backup (Eddie's pattern,
+//! which goes stale across network changes and unclean shutdowns), we ask the
+//! system's source of truth to regenerate DNS state:
+//! - NetworkManager: `nmcli dev reapply <default-route-iface>` rewrites
+//!   resolv.conf with the current correct DNS for the active connection.
+//! - systemd-resolved: `resolvectl revert <iface>` drops manual DNS overrides
+//!   and lets DHCP / NM-pushed values reassert.
+//!
+//! See `docs/known_divergences.md` for the rationale for diverging from Eddie.
 
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use log::{info, warn};
 
-static RESOLV_WAS_IMMUTABLE: AtomicBool = AtomicBool::new(false);
-
-/// Return whether resolv.conf was immutable before we modified it.
-/// Used by main.rs to persist this flag in recovery state.
-pub fn was_immutable() -> bool {
-    RESOLV_WAS_IMMUTABLE.load(Ordering::Relaxed)
-}
-
-/// Restore the RESOLV_WAS_IMMUTABLE flag from persisted recovery state.
-/// Called on recovery/reconnection so deactivate() knows to restore the flag.
-pub fn set_was_immutable(val: bool) {
-    RESOLV_WAS_IMMUTABLE.store(val, Ordering::Relaxed);
-}
-
-const BACKUP_PATH: &str = "/etc/resolv.conf.airvpn-rs";
-
-/// Clear the immutable flag on a file (if set).
-/// Eddie: impl.cpp uses FS_IOC_SETFLAGS ioctl. We use chattr for simplicity.
-fn clear_immutable(path: &Path) {
-    let _ = Command::new("chattr")
-        .args(["-i", &path.to_string_lossy()])
-        .output();
-}
-
-/// Check if a file has the immutable flag set.
-fn is_immutable(path: &Path) -> bool {
-    Command::new("lsattr")
-        .arg(path.to_string_lossy().to_string())
-        .output()
-        .map(|o| {
-            if !o.status.success() {
-                return false;
-            }
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            // lsattr output: "----i---------e-- /etc/resolv.conf"
-            // Only check the attribute flags field (first column before space)
-            // to avoid false positives from 'i' in the filename (e.g. "resolv").
-            stdout.lines().any(|line| {
-                line.split_whitespace()
-                    .next()
-                    .map(|attrs| attrs.contains('i'))
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false)
-}
-
-/// Restore the immutable flag on a file.
-///
-/// Only used in deactivate() to restore the original immutable state. We NEVER
-/// proactively set immutable on resolv.conf — Eddie explicitly considers that a
-/// bug (Platform.cs:591-599 CompatibilityAfterProfile).
-fn restore_immutable(path: &Path) {
-    let _ = Command::new("chattr")
-        .args(["+i", &path.to_string_lossy()])
-        .output();
-}
-
 /// Build the expected resolv.conf content for VPN DNS.
-///
-/// Matches Eddie's format: header comment block + nameserver lines.
 fn build_resolv_conf(dns_ipv4: &str, dns_ipv6: &str) -> String {
-    let mut content = format!(
+    let mut content = String::from(
         "\
 #
 # Created by airvpn-rs. Do not edit.
 #
-# Your resolv.conf file is temporarily backed up in {}
-# To restore your resolv.conf file you need to log in as root
-# and execute the below command from the shell:
-#
-# mv {} /etc/resolv.conf
+# This file is overwritten on VPN connect. On disconnect, NetworkManager
+# (or systemd-resolved) regenerates /etc/resolv.conf from its own current state.
 #
 ",
-        BACKUP_PATH, BACKUP_PATH,
     );
 
     if !dns_ipv4.is_empty() {
@@ -104,14 +45,103 @@ fn build_resolv_conf(dns_ipv4: &str, dns_ipv6: &str) -> String {
 }
 
 /// Check if systemd-resolved is active.
-///
-/// Eddie: `systemctl is-active --quiet systemd-resolved`
 fn is_systemd_resolved_active() -> bool {
     Command::new("systemctl")
         .args(["is-active", "--quiet", "systemd-resolved"])
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Check if NetworkManager is active.
+fn is_network_manager_active() -> bool {
+    Command::new("systemctl")
+        .args(["is-active", "--quiet", "NetworkManager"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Find the interface that owns the IPv4 default route.
+///
+/// Used at disconnect time as the source of DNS info when NetworkManager's
+/// resolv.conf-rewrite mechanism doesn't fire (e.g. `rc-manager=unmanaged`).
+/// Returns None if no default route exists or the `ip route` output can't be
+/// parsed.
+fn find_default_route_iface() -> Option<String> {
+    let output = Command::new("ip")
+        .args(["route", "show", "default"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Format: "default via <gw> dev <iface> proto ..."
+    let line = stdout.lines().next()?;
+    let mut parts = line.split_whitespace();
+    while let Some(w) = parts.next() {
+        if w == "dev" {
+            return parts.next().map(|s| s.to_string());
+        }
+    }
+    None
+}
+
+/// Write `/etc/resolv.conf` directly from NetworkManager's live DNS state for
+/// the given interface.
+///
+/// Used as a fallback when `nmcli general reload dns-rc` doesn't actually
+/// regenerate resolv.conf — for instance when NM is configured with
+/// `rc-manager=unmanaged` or `dns=none`. NM still tracks the correct
+/// per-connection DNS internally; we just have to write it ourselves.
+fn write_resolv_conf_from_nm(iface: &str) -> Result<()> {
+    if !crate::common::validate_interface_name(iface) {
+        anyhow::bail!("invalid interface name: {:?}", iface);
+    }
+    let output = Command::new("nmcli")
+        .args(["-t", "-f", "IP4.DNS,IP6.DNS", "dev", "show", iface])
+        .output()
+        .context("failed to query nmcli for DNS state")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "nmcli dev show {} failed: {}",
+            iface,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let mut content = String::from("# Regenerated by airvpn-rs from NetworkManager DNS state on disconnect.\n");
+    let mut found_any = false;
+    // Output format (terse mode): "IP4.DNS[1]:192.168.2.1" — one per line.
+    for line in stdout.lines() {
+        let Some((key, val)) = line.split_once(':') else { continue };
+        let val = val.trim();
+        if val.is_empty() {
+            continue;
+        }
+        if key.starts_with("IP4.DNS") || key.starts_with("IP6.DNS") {
+            content.push_str(&format!("nameserver {}\n", val));
+            found_any = true;
+        }
+    }
+
+    if !found_any {
+        anyhow::bail!("NetworkManager has no DNS configured for {}", iface);
+    }
+
+    let resolv_path = Path::new("/etc/resolv.conf");
+    fs::write(resolv_path, &content).context("failed to write /etc/resolv.conf")?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(resolv_path, fs::Permissions::from_mode(0o644))
+            .context("failed to set /etc/resolv.conf permissions")?;
+    }
+
+    Ok(())
 }
 
 /// DNS resolution mode: which method to use for DNS configuration.
@@ -149,20 +179,15 @@ impl DnsMode {
 ///
 /// Restarts the given DNS cache services and flushes systemd-resolved.
 /// Eddie default: "nscd;dnsmasq;named;bind9"
-///
-/// `services` is the list from the `linux.dns.services` option.
 pub fn flush_with_services(services: &[String]) {
-    // Restart common DNS cache services (best-effort, most won't be running).
-    // Must happen BEFORE the resolvectl flush — Eddie does services first,
-    // then flush.  A restart re-populates the service's cache, so flushing
-    // before the restart is wasted work.
+    // Service restarts repopulate the service's own cache, so they must run
+    // BEFORE the resolvectl flush — flushing first would be wasted work.
     for service in services {
         let _ = Command::new("systemctl")
             .args(["try-restart", service.as_str()])
             .output();
     }
 
-    // Flush systemd-resolved cache (after service restarts)
     if is_systemd_resolved_active() {
         let _ = Command::new("resolvectl")
             .arg("flush-caches")
@@ -171,9 +196,6 @@ pub fn flush_with_services(services: &[String]) {
 }
 
 /// Flush DNS caches using the hardcoded default service list.
-///
-/// Convenience wrapper for callers that don't have access to resolved options
-/// (e.g. deactivate, which runs during cleanup without options context).
 pub fn flush() {
     let defaults: Vec<String> = ["nscd", "dnsmasq", "named", "bind9"]
         .iter()
@@ -182,30 +204,7 @@ pub fn flush() {
     flush_with_services(&defaults);
 }
 
-/// Read current DNS servers for an interface via resolvectl.
-///
-/// Returns the raw `resolvectl dns <iface>` output line, e.g.
-/// "Link 2 (eth0): 8.8.8.8 8.8.4.4" — the caller parses IPs from this.
-fn get_interface_dns(iface: &str) -> Option<String> {
-    if !crate::common::validate_interface_name(iface) {
-        warn!("get_interface_dns: invalid interface name {:?}", iface);
-        return None;
-    }
-    let output = Command::new("resolvectl")
-        .args(["dns", iface])
-        .output()
-        .ok()?;
-    if output.status.success() {
-        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        None
-    }
-}
-
 /// Get all network interface names from /sys/class/net/, excluding loopback.
-///
-/// Eddie uses if_nameindex() to enumerate interfaces. We read /sys/class/net/
-/// which is the sysfs equivalent and avoids needing libc bindings.
 fn list_interfaces() -> Vec<String> {
     let mut ifaces = Vec::new();
     if let Ok(entries) = fs::read_dir("/sys/class/net") {
@@ -224,128 +223,61 @@ fn list_interfaces() -> Vec<String> {
     ifaces
 }
 
-/// Configure systemd-resolved for all interfaces: set VPN DNS on VPN interface,
-/// disable default-route on all others to prevent DNS leaks.
+/// Configure systemd-resolved on connect: VPN iface gets DNS + default-route=true,
+/// every non-VPN interface gets default-route=false plus the VPN's DNS servers
+/// (so apps that query a specific link directly don't leak to that link's DNS).
 ///
-/// Eddie iterates ALL network interfaces and sets default-route=false on every
-/// non-VPN interface so systemd-resolved doesn't route DNS through them.
-/// Only the VPN interface gets DNS servers + default-route=true.
-///
-/// Reference: Eddie impl.cpp dns-switch-do (lines ~228-321)
-fn configure_systemd_resolved_all(dns_ipv4: &str, dns_ipv6: &str, vpn_iface: &str) -> Result<()> {
+/// We deliberately do NOT save per-interface state for restoration. `deactivate()`
+/// uses `resolvectl revert <iface>` which discards manual settings entirely and
+/// lets DHCP / NetworkManager-pushed values reassert. That's resilient against
+/// network changes and unclean shutdowns; the snapshot+replay pattern is not.
+fn configure_systemd_resolved_for_connect(dns_ipv4: &str, dns_ipv6: &str, vpn_iface: &str) -> Result<()> {
     if !crate::common::validate_interface_name(vpn_iface) {
         anyhow::bail!("invalid VPN interface name: {:?}", vpn_iface);
     }
     let ifaces = list_interfaces();
 
     for iface in &ifaces {
-        if iface == vpn_iface {
-            // VPN interface: set DNS servers and default-route=true
-            let mut dns_args = vec!["dns", iface.as_str()];
-            if !dns_ipv4.is_empty() {
-                dns_args.push(dns_ipv4);
-            }
-            if !dns_ipv6.is_empty() {
-                dns_args.push(dns_ipv6);
-            }
+        let is_vpn = iface == vpn_iface;
+        let dr_value = if is_vpn { "true" } else { "false" };
 
-            let output = Command::new("resolvectl")
-                .args(&dns_args)
-                .output()
-                .context("failed to execute resolvectl dns")?;
+        let mut dns_args = vec!["dns", iface.as_str()];
+        if !dns_ipv4.is_empty() {
+            dns_args.push(dns_ipv4);
+        }
+        if !dns_ipv6.is_empty() {
+            dns_args.push(dns_ipv6);
+        }
 
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                anyhow::bail!("resolvectl dns on {} failed: {}", iface, stderr);
+        let dns_output = Command::new("resolvectl")
+            .args(&dns_args)
+            .output()
+            .with_context(|| format!("failed to execute resolvectl dns {}", iface))?;
+        if !dns_output.status.success() {
+            let stderr = String::from_utf8_lossy(&dns_output.stderr);
+            if is_vpn {
+                anyhow::bail!("resolvectl dns on VPN iface {} failed: {}", iface, stderr);
             }
+            warn!("resolvectl dns on {} failed (non-fatal): {}", iface, stderr);
+        }
 
-            let output = Command::new("resolvectl")
-                .args(["default-route", iface.as_str(), "true"])
-                .output()
-                .context("failed to execute resolvectl default-route")?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                anyhow::bail!("resolvectl default-route on {} failed: {}", iface, stderr);
+        let dr_output = Command::new("resolvectl")
+            .args(["default-route", iface.as_str(), dr_value])
+            .output()
+            .with_context(|| format!("failed to execute resolvectl default-route {}", iface))?;
+        if !dr_output.status.success() {
+            let stderr = String::from_utf8_lossy(&dr_output.stderr);
+            if is_vpn {
+                anyhow::bail!("resolvectl default-route on VPN iface {} failed: {}", iface, stderr);
             }
-        } else {
-            // Non-VPN interface: back up current DNS servers + default-route state.
-            // Eddie: backs up /run/systemd/resolve/netif/<index> to
-            // /etc/systemd_resolve_netif_<iface>.eddievpn before modifying.
-            // We back up both values so we can fully restore on disconnect,
-            // rather than factory-resetting the interface with `resolvectl revert`.
-            let backup_path = Path::new("/etc").join(format!("systemd_resolve_{}.airvpn-rs", iface));
-            if !backup_path.exists() {
-                let dns_state = get_interface_dns(iface).unwrap_or_default();
-                let dr_output = Command::new("resolvectl")
-                    .args(["default-route", iface.as_str()])
-                    .output();
-                let dr_state = dr_output
-                    .ok()
-                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                    .unwrap_or_default();
-                let backup_content = format!("dns={}\ndefault_route={}", dns_state, dr_state);
-                // Write with restricted permissions (0o600) — these files contain
-                // DNS server IPs and live in /etc/, so avoid world-readable default.
-                #[cfg(unix)]
-                {
-                    use std::io::Write;
-                    use std::os::unix::fs::OpenOptionsExt;
-                    let result = fs::OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .mode(0o600)
-                        .open(&backup_path)
-                        .and_then(|mut f| f.write_all(backup_content.as_bytes()));
-                    if let Err(e) = result {
-                        warn!("failed to write systemd-resolved backup {}: {}", backup_path.display(), e);
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = fs::write(&backup_path, &backup_content);
-                }
-            }
-
-            // Non-VPN interface: set VPN DNS + default-route=false.
-            // Eddie sets VPN DNS on EVERY interface (impl.cpp lines 270-288),
-            // not just the VPN one. If an app queries a specific non-VPN interface
-            // directly, it would use that interface's original DNS → leak.
-            // Setting VPN DNS here prevents that.
-            let mut dns_args = vec!["dns", iface.as_str()];
-            if !dns_ipv4.is_empty() {
-                dns_args.push(dns_ipv4);
-            }
-            if !dns_ipv6.is_empty() {
-                dns_args.push(dns_ipv6);
-            }
-            let _ = Command::new("resolvectl").args(&dns_args).output();
-
-            // Set default-route=false to prevent DNS leak.
-            // Non-fatal — interface may not support it (e.g. virtual bridges).
-            let output = Command::new("resolvectl")
-                .args(["default-route", iface.as_str(), "false"])
-                .output();
-            if let Ok(o) = &output {
-                if !o.status.success() {
-                    let stderr = String::from_utf8_lossy(&o.stderr);
-                    warn!(
-                        "resolvectl default-route false on {} failed (non-fatal): {}",
-                        iface, stderr
-                    );
-                }
-            }
+            warn!("resolvectl default-route on {} failed (non-fatal): {}", iface, stderr);
         }
     }
 
     Ok(())
 }
 
-/// Activate DNS: backup resolv.conf, write VPN DNS, handle systemd-resolved.
-///
-/// Eddie always writes resolv.conf AND configures systemd-resolved if active.
-/// The resolv.conf swap is the universal fallback; systemd-resolved is layered on top.
+/// Activate DNS: write VPN DNS to /etc/resolv.conf, optionally configure systemd-resolved.
 ///
 /// `mode` controls whether to auto-detect, force resolvconf, or force systemd-resolved.
 /// `dns_services` is the list of DNS cache services to restart during flush.
@@ -357,39 +289,22 @@ pub fn activate(dns_ipv4: &str, dns_ipv6: &str, iface: &str, mode: DnsMode, dns_
         anyhow::bail!("no DNS servers provided (both IPv4 and IPv6 are empty)");
     }
 
-    // Configure systemd-resolved if the mode says so:
-    // VPN interface gets DNS + default-route=true, all others get default-route=false.
     if mode.use_systemd_resolved() {
-        configure_systemd_resolved_all(dns_ipv4, dns_ipv6, iface)?;
+        configure_systemd_resolved_for_connect(dns_ipv4, dns_ipv6, iface)?;
     }
 
-    // Always do the resolv.conf swap (Eddie does both regardless)
     let resolv_path = Path::new("/etc/resolv.conf");
-    let backup_path = Path::new(BACKUP_PATH);
-
-    // Save whether resolv.conf was immutable before we clear it, so we can
-    // restore the flag on deactivate.
-    RESOLV_WAS_IMMUTABLE.store(is_immutable(resolv_path), Ordering::Relaxed);
-
-    // Clear immutable flag before modifying (Fedora/RHEL set this on resolv.conf)
-    clear_immutable(resolv_path);
-
-    if resolv_path.exists() && !backup_path.exists() {
-        fs::rename(resolv_path, backup_path).context("failed to backup /etc/resolv.conf")?;
-    }
-
     let expected = build_resolv_conf(dns_ipv4, dns_ipv6);
 
-    // If resolv.conf became a symlink (e.g., NetworkManager recreated it),
-    // remove the symlink before writing to avoid corrupting the target
+    // If resolv.conf is a symlink (e.g., systemd-resolved's stub), remove it
+    // so we write a regular file rather than corrupting the symlink target.
     if resolv_path.is_symlink() {
         let _ = fs::remove_file(resolv_path);
     }
 
     fs::write(resolv_path, &expected).context("failed to write /etc/resolv.conf")?;
 
-    // Eddie sets 0644 explicitly (S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH)
-    // so non-root processes can read resolv.conf for DNS resolution
+    // 0644 so non-root processes can read it (Eddie does the same).
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -402,193 +317,92 @@ pub fn activate(dns_ipv4: &str, dns_ipv6: &str, iface: &str, mode: DnsMode, dns_
     Ok(())
 }
 
-/// Phase 1 of deactivate: restore /etc/resolv.conf from backup.
+/// Deactivate DNS: delete our /etc/resolv.conf and ask NetworkManager (or
+/// systemd-resolved) to regenerate state from its own current view.
 ///
-/// If the backup file exists, atomically renames it back. If not, removes
-/// resolv.conf only if it contains our header marker (prevents data loss on
-/// double-deactivate). Restores the immutable flag if it was set before activation.
-fn restore_resolv_conf() -> Result<()> {
+/// NetworkManager already holds the correct DNS for the active connection
+/// (DHCP, RA, or static profile). `nmcli dev reapply` rewrites resolv.conf
+/// from that current state — no snapshot, no staleness, no per-network drift.
+/// `resolvectl revert` does the equivalent for systemd-resolved per-link
+/// manual settings.
+pub fn deactivate() -> Result<()> {
     let resolv_path = Path::new("/etc/resolv.conf");
-    let backup_path = Path::new(BACKUP_PATH);
 
-    if backup_path.exists() {
-        // Clear immutable flag before modifying (Fedora/RHEL set this on resolv.conf)
-        clear_immutable(resolv_path);
-
-        // Remove symlink before rename to avoid EXDEV (cross-filesystem rename)
-        if resolv_path.is_symlink() {
+    // Delete our resolv.conf so the system's DNS manager can regenerate it.
+    // Only delete if it carries our header, to avoid touching a user-restored
+    // or system-managed file.
+    if resolv_path.exists() {
+        let is_ours = fs::read_to_string(resolv_path)
+            .map(|c| c.contains("Created by airvpn-rs"))
+            .unwrap_or(false);
+        if is_ours {
             let _ = fs::remove_file(resolv_path);
         }
-
-        // Atomic rename replaces dest on Linux — no gap where resolv.conf is missing
-        fs::rename(backup_path, resolv_path).context("failed to restore resolv.conf from backup")?;
-    } else {
-        // No backup file. Only delete resolv.conf if it's actually ours (contains
-        // our header marker). This prevents data loss when deactivate() is called
-        // twice: the first call consumes the backup, and a second call would
-        // otherwise delete the correctly-restored original resolv.conf.
-        if resolv_path.exists() {
-            let is_ours = fs::read_to_string(resolv_path)
-                .map(|c| c.contains("Created by airvpn-rs"))
-                .unwrap_or(false);
-            if is_ours {
-                clear_immutable(resolv_path);
-                let _ = fs::remove_file(resolv_path);
-            } else {
-                info!("resolv.conf exists but is not ours — leaving it intact");
-            }
-        }
     }
 
-    // Restore immutable flag if it was set before we activated
-    if RESOLV_WAS_IMMUTABLE.load(Ordering::Relaxed) {
-        restore_immutable(resolv_path);
-    }
-
-    Ok(())
-}
-
-/// Phase 2 of deactivate: restore per-interface systemd-resolved settings from backups.
-///
-/// Eddie: reads /etc/systemd_resolve_netif_<iface>.eddievpn, restores DNS servers
-/// and default_route via resolvectl, then deletes the backup file.
-///
-/// Returns the list of interface names that were successfully restored from backups.
-/// Phase 3 needs this to know which interfaces to skip (avoid double-revert).
-fn restore_systemd_per_interface() -> Result<Vec<String>> {
-    let mut restored_ifaces: Vec<String> = Vec::new();
-    if let Ok(entries) = fs::read_dir("/etc") {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("systemd_resolve_") && name.ends_with(".airvpn-rs") {
-                let iface = name
-                    .strip_prefix("systemd_resolve_")
-                    .and_then(|s| s.strip_suffix(".airvpn-rs"))
-                    .unwrap_or("");
-                if iface.is_empty() || !crate::common::validate_interface_name(iface) {
-                    if !iface.is_empty() {
-                        warn!("skipping invalid interface name from backup file: {:?}", iface);
-                    }
-                    // Still clean up the invalid backup file
-                    let _ = fs::remove_file(entry.path());
-                    continue;
-                }
-                if let Ok(content) = fs::read_to_string(entry.path()) {
-                    let mut dns_line = String::new();
-                    let mut dr_line = String::new();
-                    for line in content.lines() {
-                        if let Some(v) = line.strip_prefix("dns=") {
-                            dns_line = v.to_string();
-                        }
-                        if let Some(v) = line.strip_prefix("default_route=") {
-                            dr_line = v.to_string();
-                        }
-                    }
-
-                    // Restore DNS servers.
-                    // resolvectl dns output format: "Link 2 (eth0): 8.8.8.8 8.8.4.4"
-                    // Extract just the IP addresses from the saved line.
-                    let mut dns_restored = false;
-                    if !dns_line.is_empty() {
-                        let servers: Vec<&str> = dns_line
-                            .split_whitespace()
-                            .filter(|s| s.parse::<std::net::IpAddr>().is_ok())
-                            .collect();
-                        if !servers.is_empty() {
-                            let mut args = vec!["dns", iface];
-                            args.extend(servers);
-                            let result = Command::new("resolvectl").args(&args).output();
-                            if result.map(|o| o.status.success()).unwrap_or(false) {
-                                dns_restored = true;
-                            }
-                        }
-                    }
-
-                    // If the interface had no original DNS servers, revert it
-                    // instead of leaving VPN DNS in place.
-                    if !dns_restored {
-                        let _ = Command::new("resolvectl")
-                            .args(["revert", iface])
-                            .output();
-                    }
-
-                    // Restore default-route.
-                    // An unset default-route is different from explicitly false.
-                    // Only restore if the backup contains an explicit "yes" or "no";
-                    // otherwise let `resolvectl revert` (above) handle it.
-                    if dr_line.contains("yes") {
-                        let _ = Command::new("resolvectl")
-                            .args(["default-route", iface, "true"])
-                            .output();
-                    } else if dr_line.contains("no") {
-                        let _ = Command::new("resolvectl")
-                            .args(["default-route", iface, "false"])
-                            .output();
-                    }
-                    // else: was unset — resolvectl revert will handle it
-
-                    // Only mark as restored if DNS was actually put back.
-                    if dns_restored {
-                        restored_ifaces.push(iface.to_string());
-                    }
-                }
-                let _ = fs::remove_file(entry.path());
-            }
-        }
-    }
-    Ok(restored_ifaces)
-}
-
-/// Phase 3 of deactivate: revert DNS on interfaces that did NOT have backup files.
-///
-/// This is a best-effort fallback — `resolvectl revert` factory-resets
-/// the interface, but it's better than leaving VPN DNS on an interface
-/// we have no saved state for.
-fn revert_remaining_interfaces(restored: &[String]) -> Result<()> {
-    let ifaces = list_interfaces();
-    for iface in &ifaces {
-        if !restored.contains(iface) {
+    // systemd-resolved: revert per-link manual settings on every interface.
+    // `revert` is idempotent — a no-op for interfaces with no manual config.
+    if is_systemd_resolved_active() {
+        for iface in list_interfaces() {
             let _ = Command::new("resolvectl")
-                .args(["revert", iface.as_str()])
+                .args(["revert", &iface])
                 .output();
         }
     }
-    Ok(())
-}
 
-/// Phase 4 of deactivate: restart systemd-resolved if active, flush DNS caches.
-///
-/// Eddie: `service systemd-resolved restart` + flush all DNS cache services.
-fn restart_and_flush() -> Result<()> {
-    if is_systemd_resolved_active() {
-        let _ = Command::new("systemctl")
-            .args(["restart", "systemd-resolved"])
+    // NetworkManager: ask it to regenerate /etc/resolv.conf from current DNS
+    // state. `dev reapply` does not trigger this — it re-applies IP config but
+    // skips the resolv.conf write hook if nothing changed. `general reload
+    // dns-rc` is the documented "rewrite resolv.conf now" entry point.
+    //
+    // If that doesn't end up writing the file (NM in `rc-manager=unmanaged` or
+    // `dns=none` mode), fall back to writing resolv.conf ourselves from NM's
+    // per-device DNS state via `nmcli dev show`.
+    if is_network_manager_active() {
+        let reload = Command::new("nmcli")
+            .args(["general", "reload", "dns-rc"])
             .output();
+        match reload {
+            Ok(o) if o.status.success() => {
+                info!("nmcli general reload dns-rc: requested resolv.conf regeneration");
+            }
+            Ok(o) => {
+                warn!(
+                    "nmcli general reload dns-rc failed: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+            }
+            Err(e) => warn!("nmcli general reload error: {}", e),
+        }
+
+        // Verify NM actually wrote resolv.conf. If not, fall back to a
+        // direct write from NM's known DNS state for the default-route iface.
+        if !resolv_path.exists() {
+            match find_default_route_iface() {
+                Some(iface) => {
+                    info!("resolv.conf still missing after NM reload; writing it directly from nmcli state on {}", iface);
+                    if let Err(e) = write_resolv_conf_from_nm(&iface) {
+                        warn!("fallback write of resolv.conf failed: {}", e);
+                    }
+                }
+                None => warn!("resolv.conf missing and no default-route iface found"),
+            }
+        }
+    } else if !resolv_path.exists() {
+        warn!("/etc/resolv.conf removed but no DNS manager (NM/systemd-resolved) detected — DNS will not work until manually configured");
     }
 
     flush();
-    Ok(())
-}
 
-/// Deactivate: restore resolv.conf from backup.
-///
-/// Eddie: move backup back, then restart systemd-resolved if active.
-pub fn deactivate() -> Result<()> {
-    restore_resolv_conf()?;
-    let restored = restore_systemd_per_interface()?;
-    revert_remaining_interfaces(&restored)?;
-    restart_and_flush()?;
     Ok(())
 }
 
 /// Check if current resolv.conf matches our expected content, re-apply if drifted.
 /// Also checks systemd-resolved per-interface settings for drift.
 ///
-/// Eddie's DnsSwitchCheck pattern: NetworkManager and other services can revert
-/// resolv.conf behind our back, and can also revert per-interface systemd-resolved
-/// settings. This function is called periodically to detect and fix both kinds of drift.
-///
-/// `mode` and `dns_services` control DNS mode and which services to restart (from options).
+/// NetworkManager and other services can revert resolv.conf behind our back
+/// during a session (e.g. during Wi-Fi reassociation). This function is called
+/// periodically to detect and fix that.
 ///
 /// Returns Ok(true) if any DNS settings were re-applied, Ok(false) if no drift detected.
 pub fn check_and_reapply(dns_ipv4: &str, dns_ipv6: &str, vpn_iface: &str, mode: DnsMode, dns_services: &[String]) -> Result<bool> {
@@ -597,7 +411,6 @@ pub fn check_and_reapply(dns_ipv4: &str, dns_ipv6: &str, vpn_iface: &str, mode: 
     }
     let mut reapplied = false;
 
-    // Check resolv.conf drift
     let resolv_path = Path::new("/etc/resolv.conf");
 
     if resolv_path.exists() {
@@ -612,11 +425,7 @@ pub fn check_and_reapply(dns_ipv4: &str, dns_ipv6: &str, vpn_iface: &str, mode: 
 
         if current != expected {
             info!("DNS drift detected in /etc/resolv.conf, re-applying VPN DNS");
-            // Clear immutable flag before modifying (Fedora/RHEL set this on resolv.conf)
-            clear_immutable(resolv_path);
 
-            // If resolv.conf became a symlink (e.g., NetworkManager recreated it),
-            // remove the symlink before writing to avoid corrupting the target
             if resolv_path.is_symlink() {
                 let _ = fs::remove_file(resolv_path);
             }
@@ -640,27 +449,22 @@ pub fn check_and_reapply(dns_ipv4: &str, dns_ipv6: &str, vpn_iface: &str, mode: 
         }
     }
 
-    // Also re-check systemd-resolved settings (NetworkManager can revert per-interface DNS).
-    // Eddie checks ALL interfaces on every DnsSwitchCheck cycle (impl.cpp uses the same
-    // code path for both initial setup and periodic checking via the `check` parameter).
+    // Re-check systemd-resolved per-interface state (NM can revert
+    // default-route on Wi-Fi reassociation etc).
     if mode.use_systemd_resolved() {
         let ifaces = list_interfaces();
         for iface in &ifaces {
-            // Skip the VPN interface — it must keep default-route=true so DNS
-            // routes through the tunnel. Only enforce default-route=false on
-            // non-VPN interfaces.
+            // VPN interface must keep default-route=true.
             if iface == vpn_iface {
                 continue;
             }
-            // Check if default-route was reverted to true on a non-VPN interface
             let output = Command::new("resolvectl")
                 .args(["default-route", iface.as_str()])
                 .output();
             if let Ok(o) = output {
                 let state = String::from_utf8_lossy(&o.stdout);
-                // If a non-VPN interface has default-route=yes, it was reverted
+                // If a non-VPN interface has default-route=yes, it was reverted.
                 if state.contains("yes") {
-                    // Re-apply DNS and default-route=false
                     let mut dns_args = vec!["dns", iface.as_str()];
                     if !dns_ipv4.is_empty() {
                         dns_args.push(dns_ipv4);
@@ -682,10 +486,9 @@ pub fn check_and_reapply(dns_ipv4: &str, dns_ipv6: &str, vpn_iface: &str, mode: 
 }
 
 /// Verify that /etc/resolv.conf contains only the expected VPN DNS servers.
-/// Returns true if all nameserver entries match the expected VPN DNS IPs.
-/// This catches DNS drift that the server-side check cannot detect
-/// (the server-side check passes even when DNS leaks to upstream, because
-/// the query still reaches AirVPN's authoritative nameserver).
+/// Catches DNS drift that a server-side check cannot detect (the server-side
+/// check passes even when DNS leaks to an upstream resolver, because the query
+/// still reaches AirVPN's authoritative nameserver eventually).
 pub fn verify_resolv_conf(expected_ipv4: &str, expected_ipv6: &str, resolv_path: &Path) -> bool {
     let content = match std::fs::read_to_string(resolv_path) {
         Ok(c) => c,
@@ -713,15 +516,11 @@ mod tests {
     fn test_build_resolv_conf_format() {
         let content = build_resolv_conf("10.128.0.1", "fd7d:76ee:3c49:9950::1");
 
-        // Header comment
         assert!(content.contains("Created by airvpn-rs"));
-        assert!(content.contains(BACKUP_PATH));
-
-        // Nameserver lines
         assert!(content.contains("nameserver 10.128.0.1"));
         assert!(content.contains("nameserver fd7d:76ee:3c49:9950::1"));
 
-        // Nameservers should come after the comment block
+        // Nameservers come after the comment block.
         let comment_end = content.rfind('#').expect("comment end");
         let ns_start = content.find("nameserver").expect("nameserver");
         assert!(ns_start > comment_end, "nameservers should come after comments");
@@ -731,8 +530,7 @@ mod tests {
     fn test_build_resolv_conf_ipv4_only() {
         let content = build_resolv_conf("10.0.0.1", "");
         assert!(content.contains("nameserver 10.0.0.1"));
-        assert!(!content.contains("nameserver \n")); // No empty nameserver line
-        // Should not have a second nameserver line
+        assert!(!content.contains("nameserver \n"));
         assert_eq!(content.matches("nameserver").count(), 1);
     }
 
@@ -752,9 +550,6 @@ mod tests {
     #[test]
     fn test_list_interfaces_returns_some() {
         let ifaces = list_interfaces();
-        // Every Linux system has at least one non-loopback interface
-        // (e.g. eth0, ens3, wlan0, docker0). On a bare container this
-        // may be empty if /sys/class/net is missing, which is fine.
         if Path::new("/sys/class/net").exists() {
             assert!(
                 !ifaces.is_empty(),

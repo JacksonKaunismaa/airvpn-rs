@@ -173,15 +173,16 @@ pub fn cmd_disconnect_internal(config_path: &str, iface: &str, lock_active: bool
     }
     // 2. Tear down WireGuard (also tears down routing + endpoint host route)
     let _ = wireguard::disconnect(config_path, endpoint_ip, iface);
-    // 3. Restore DNS
-    let _ = dns::deactivate();
-    dns::flush();
-    // 4. Remove netlock
+    // 3. Remove netlock BEFORE restoring DNS — the session lock's policy drop
+    //    blocks DNS to restored nameservers while dns::deactivate() runs slow
+    //    cleanup (resolvectl/systemctl calls that fail when resolved is inactive).
     if lock_active {
         let _ = netlock::deactivate();
     }
-    // 5. Restore IPv6 (AFTER netlock is gone — avoids window where IPv6 is live
-    //    but firewall rules have stale state)
+    // 4. Restore DNS (resolv.conf, systemd-resolved if active, flush caches)
+    let _ = dns::deactivate();
+    dns::flush();
+    // 5. Restore IPv6
     ipv6::restore(blocked_ipv6);
     // 6. Remove state
     let _ = recovery::remove();
@@ -921,7 +922,6 @@ fn activate_netlock(
         blocked_ipv6_ifaces: params.blocked_ipv6_ifaces.clone(),
         endpoint_ip: String::new(),
         nonce: params.nonce,
-        resolv_was_immutable: dns::was_immutable(),
     })?;
     Ok(())
 }
@@ -1195,7 +1195,6 @@ fn save_recovery(
         blocked_ipv6_ifaces: params.blocked_ipv6_ifaces.clone(),
         endpoint_ip: endpoint_ip.to_string(),
         nonce: params.nonce,
-        resolv_was_immutable: dns::was_immutable(),
     })
 }
 

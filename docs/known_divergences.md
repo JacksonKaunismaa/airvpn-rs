@@ -373,3 +373,57 @@ privilege escalation through the IPC socket is real.
 
 **Eddie ref:** `Engine.cs` `RunEventCommand()`, `ProfileOptions.cs`
 `EnsureDefaultsEvent()`
+
+## 14. DNS restore via NetworkManager / systemd-resolved, not snapshot+replay
+
+**Eddie:** On connect, snapshots `/etc/resolv.conf` to
+`/etc/resolv.conf.eddievpn`. Per non-VPN interface, snapshots DNS servers and
+default-route flag to `/etc/systemd_resolve_netif_<iface>.eddievpn`. On
+disconnect, replays those snapshots verbatim — `mv` the resolv.conf backup
+back, and `resolvectl dns/default-route` with the saved values.
+
+**airvpn-rs:** No backup files. On connect, write VPN DNS to
+`/etc/resolv.conf` directly; configure systemd-resolved per-link if active.
+On disconnect, delete our resolv.conf, run `nmcli dev reapply <default-route-iface>`
+to make NetworkManager regenerate resolv.conf from its current connection
+state, and run `resolvectl revert <iface>` on every interface to drop our
+manual systemd-resolved overrides.
+
+**Why:** The snapshot+replay pattern assumes the snapshot is still correct at
+disconnect time. That assumption breaks in at least four ways:
+
+1. The user changes networks while the VPN is up. The backup is from the
+   wrong subnet; restoring it gives DNS servers that aren't reachable on the
+   current network.
+2. A previous session ended uncleanly (helper killed, system suspend mid-
+   disconnect, reboot during cleanup). `restore_resolv_conf` never ran, so
+   resolv.conf still carries our header. Next connect sees the existing
+   stale backup and the `&& !backup_path.exists()` guard refuses to refresh
+   it. The stale backup persists indefinitely across many connect/disconnect
+   cycles.
+3. DHCP renews mid-session with different upstream DNS, or IPv6 RA changes
+   the prefix; the snapshot is from before that change.
+4. Per-interface systemd-resolved overrides set via `resolvectl dns/default-route`
+   are sticky manual settings — replaying the saved values locks in stale
+   data and overrides whatever DHCP/NM is currently pushing.
+
+The proper fix is to defer to the system's source of truth. NetworkManager
+already holds the correct current DNS for the active connection (DHCP, RA,
+static profile); `nmcli dev reapply` rewrites resolv.conf from that current
+state. systemd-resolved's `revert` discards manual settings and lets DHCP/NM-
+pushed values reassert. Both eliminate the snapshot — and eliminate the
+staleness window with it.
+
+**Trade-off:** This assumes the user runs NetworkManager (or systemd-resolved)
+as their DNS manager. On a system with neither — pure static `/etc/resolv.conf`
+hand-edited by the user — `dns::deactivate()` deletes our file and logs a
+warning; the user is responsible for restoring DNS manually. Acceptable for
+a personal-use Linux client; not appropriate for a portable distribution.
+
+**Files:** `src/dns.rs` (rewritten), `src/recovery.rs` (dropped
+`resolv_was_immutable` field and its plumbing through state.json),
+`src/connect.rs` (dropped `dns::was_immutable()` call sites)
+
+**Eddie ref:** `App.CLI.Linux.Elevated/src/impl.cpp` `dns-switch-do` (line
+~213) and `dns-switch-restore` (line ~375)
+
