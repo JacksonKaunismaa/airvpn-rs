@@ -77,20 +77,31 @@ pub(super) fn background_pinger_loop(state: State, shutdown: Arc<AtomicBool>) {
         debug!("Starting ping cycle ({} servers, max {} concurrent)", ips.len(), pinger_jobs);
 
         // Ping all servers via host routes (direct, not through tunnel).
-        // All servers are treated equally — no special-casing for the
-        // connected server. This gives consistent raw network latency.
-        let results = pinger::measure_all_from_ips(&ips, ping_timeout_secs, pinger_jobs);
-
-        // Merge results back into shared state (quick lock)
-        {
-            let mut st = lock_state(&state);
-            for (name, latency) in &results {
-                if *latency >= 0 {
-                    st.latency.update(name, *latency);
+        // Each result merges under a brief per-result lock so /servers
+        // reflects fresh values as they arrive, not in one bulk swap at
+        // the end of the cycle.
+        let total = ips.len();
+        let mut measured: usize = 0;
+        let mut failed: usize = 0;
+        pinger::measure_all_from_ips(
+            &ips,
+            ping_timeout_secs,
+            pinger_jobs,
+            |name, latency| {
+                let mut st = lock_state(&state);
+                if latency >= 0 {
+                    st.latency.update(name, latency);
+                    measured += 1;
                 } else {
                     st.latency.update_failed(name);
+                    failed += 1;
                 }
-            }
+            },
+        );
+
+        // Flip ready (if first cycle) and persist to disk once per cycle.
+        {
+            let mut st = lock_state(&state);
             if !st.ready {
                 st.ready = true;
                 state.1.ready_cv.notify_all();
@@ -100,25 +111,23 @@ pub(super) fn background_pinger_loop(state: State, shutdown: Arc<AtomicBool>) {
             }
         }
 
-        let measured = results.iter().filter(|(_, l)| *l >= 0).count();
-        let failed = results.len() - measured;
         // One line per cycle: concise summary. Warn only if significant failures.
         {
             let st = lock_state(&state);
             if let Some((_count, min, avg, max)) = st.latency.summary() {
-                if failed > results.len() / 4 {
+                if failed > total / 4 {
                     warn!(
                         "Ping: {}/{} measured ({} failed) — {}ms/{}ms/{}ms min/avg/max",
-                        measured, results.len(), failed, min, avg, max,
+                        measured, total, failed, min, avg, max,
                     );
                 } else {
                     info!(
                         "Ping: {}/{} — {}ms/{}ms/{}ms min/avg/max",
-                        measured, results.len(), min, avg, max,
+                        measured, total, min, avg, max,
                     );
                 }
             } else {
-                info!("Ping: {}/{} measured — no latency data yet", measured, results.len());
+                info!("Ping: {}/{} measured — no latency data yet", measured, total);
             }
         }
 

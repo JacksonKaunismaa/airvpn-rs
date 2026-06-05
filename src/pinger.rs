@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::process::Command;
 
-use log::{debug, info, warn};
+use log::{debug, warn};
 use serde::{Deserialize, Serialize};
 
 /// EWMA smoothing factor. Higher values weight new samples more heavily.
@@ -289,63 +289,71 @@ mod tests {
     }
 }
 
-/// Measure latency for a list of (name, ip) pairs.
+/// Measure latency for a list of (name, ip) pairs via a rolling thread pool.
 ///
-/// Used by the background pinger which already has extracted IPs from the
-/// LatencyCache. Returns `Vec<(name, latency_ms)>` where latency is -1 on
-/// failure. Servers are pinged in parallel (up to `max_jobs` concurrent
-/// threads) via host routes (physical NIC). EWMA smoothing handles outliers
-/// across cycles.
-pub fn measure_all_from_ips(
+/// `max_jobs` worker threads pull from the input slice via an atomic counter
+/// — as soon as one ping returns (success or timeout), that slot picks up the
+/// next server. No batch barrier: a single slow ping no longer holds back
+/// the threads next to it.
+///
+/// `on_result` is invoked from the calling thread for each completed ping,
+/// in arrival order. `latency_ms` is `-1` on failure. Calling it from a
+/// single thread keeps the callback `FnMut` (no Send/Sync needed) and lets
+/// the caller take a short lock per result rather than one big lock at the
+/// end of the cycle — so `/servers` reflects each ping within milliseconds
+/// instead of waiting for the whole cycle.
+pub fn measure_all_from_ips<F>(
     pairs: &[(String, String)],
     ping_timeout_secs: u64,
     max_jobs: usize,
-) -> Vec<(String, i64)> {
+    mut on_result: F,
+) where
+    F: FnMut(&str, i64),
+{
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::mpsc;
     use std::thread;
 
     let total = pairs.len();
     if total == 0 {
-        return Vec::new();
+        return;
     }
+    let workers = max_jobs.max(1).min(total);
+    let next = AtomicUsize::new(0);
+    let completed = AtomicUsize::new(0);
+    let (tx, rx) = mpsc::channel::<(String, i64)>();
 
-    let completed = Arc::new(AtomicUsize::new(0));
-    let max_jobs = max_jobs.max(1); // at least 1
-
-    // Process in batches of max_jobs to limit concurrent threads
-    let mut results = Vec::with_capacity(total);
-    for batch in pairs.chunks(max_jobs) {
-        let handles: Vec<_> = batch
-            .iter()
-            .map(|(name, ip)| {
-                let name = name.clone();
-                let ip = ip.clone();
-                let completed = Arc::clone(&completed);
-
-                let timeout = ping_timeout_secs;
-                thread::spawn(move || {
-                    let latency = match ping_ip(&ip, timeout) {
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            let tx = tx.clone();
+            let next = &next;
+            let completed = &completed;
+            scope.spawn(move || {
+                loop {
+                    let idx = next.fetch_add(1, Ordering::Relaxed);
+                    if idx >= total {
+                        break;
+                    }
+                    let (name, ip) = &pairs[idx];
+                    let latency = match ping_ip(ip, ping_timeout_secs) {
                         Some(ms) => ms as i64,
                         None => -1,
                     };
-
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                     if done % 50 == 0 || done == total {
                         debug!("Ping cycle progress: {}/{}", done, total);
                     }
-
-                    (name, latency)
-                })
-            })
-            .collect();
-
-        for handle in handles {
-            if let Ok(pair) = handle.join() {
-                results.push(pair);
-            }
+                    let _ = tx.send((name.clone(), latency));
+                }
+            });
         }
-    }
-    results
+        // Close the original sender so rx.recv() returns Err once all worker
+        // clones are dropped (i.e., all workers have exited).
+        drop(tx);
+
+        while let Ok((name, latency)) = rx.recv() {
+            on_result(&name, latency);
+        }
+    });
 }
 
