@@ -215,7 +215,7 @@ pub(super) async fn handle_connect_async(
     // (below) handles the disconnect→reconnect sequence. Without this, the
     // connect_in_progress flag (set while the connect thread is running) would
     // block every server-switch attempt with a silent 409.
-    let connect_guard = {
+    let (connect_guard, claimed_exclusive) = {
         let st = state.0.lock().unwrap();
         // A server-switch in flight owns the whole disconnect→reconnect; reject
         // anything else for its full duration (connect_in_progress alone is
@@ -226,13 +226,21 @@ pub(super) async fn handle_connect_async(
         if st.conn.connect_in_progress.load(Ordering::SeqCst) && !st.conn.is_connected() {
             return error_response(StatusCode::CONFLICT, "connect already in progress");
         }
-        st.conn.connect_in_progress.store(true, Ordering::SeqCst);
+        // Claim the flag with a swap so we know whether WE took it (false→true)
+        // or it was already held by a running connect thread (the
+        // already-connected exception above). The distinction matters twice:
+        // only an exclusive claimant may take the fresh-connect fall-through
+        // after the switch block below, and only an exclusive claimant gets an
+        // early-exit guard — clearing a flag owned by a still-running connect
+        // thread would let a concurrent request slip past this gate.
+        let claimed_exclusive = !st.conn.connect_in_progress.swap(true, Ordering::SeqCst);
         // RAII guard: clears the flag if we return early (credential errors,
         // warmup timeout, etc.). The connect thread clears it on normal exit.
-        ConnectGuard {
+        let guard = claimed_exclusive.then(|| ConnectGuard {
             in_progress: st.conn.connect_in_progress.clone(),
             state: None,
-        }
+        });
+        (guard, claimed_exclusive)
     };
 
     let (resolved_username, resolved_password) = match resolve_credentials(peer_uid) {
@@ -293,14 +301,28 @@ pub(super) async fn handle_connect_async(
                 }
                 Err(e) => {
                     // Thread couldn't be created — undo the switch claim so the
-                    // helper isn't permanently wedged. connect_guard is still
-                    // live and clears connect_in_progress when it drops on return.
+                    // helper isn't permanently wedged. If we claimed
+                    // connect_in_progress ourselves, connect_guard clears it on
+                    // drop; if we entered via the already-connected exception,
+                    // there is no guard and the flag correctly stays with the
+                    // still-running connect thread.
                     state.0.lock().unwrap_or_else(|p| p.into_inner())
                         .conn.switch_in_progress.store(false, Ordering::SeqCst);
                     return error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("failed to start server switch: {e}"));
                 }
             }
         }
+    }
+
+    // Falling through to a fresh connect is only safe for the request that
+    // claimed `connect_in_progress` itself (false→true). A request that entered
+    // through the already-connected exception holds no claim of its own — if
+    // the connection dropped while it sat in resolve_credentials/warmup,
+    // another request may have since claimed a fresh connect, and proceeding
+    // here would spawn a duplicate connect thread (and the stale-state
+    // force_recover below could tear down that request's half-built session).
+    if !claimed_exclusive {
+        return error_response(StatusCode::CONFLICT, "connection dropped during connect request, retry");
     }
 
     // Clean up stale state from a previous connect session that crashed/failed
@@ -731,6 +753,18 @@ pub(super) fn handle_disconnect(state: &State) -> Response<HyperBody> {
 
     {
         let st = state.0.lock().unwrap();
+        // A server-switch owns the whole disconnect→reconnect window; check it
+        // FIRST, before is_connected/has_orphan are computed. Mid-switch,
+        // is_connected() reads false while the WG interface may still be up, so
+        // this request would otherwise take the orphan path and run
+        // force_recover() concurrently with the switch thread's own teardown
+        // (racing on nft tables, routes, and state.json) — or take the signal
+        // path and report success while the switch reconnects anyway. The
+        // switch thread owns its teardown/flag via SwitchGuard; report it and
+        // let the caller retry once the switch settles.
+        if st.conn.switch_in_progress.load(Ordering::SeqCst) {
+            return error_response(StatusCode::CONFLICT, "server switch in progress, try again shortly");
+        }
         is_connected = st.conn.is_connected();
         has_orphan = !is_connected && matches!(
             recovery::load(),
@@ -795,15 +829,12 @@ pub(super) fn handle_disconnect(state: &State) -> Response<HyperBody> {
 
         json_response(StatusCode::OK, &json!({"disconnected": true}))
     } else {
-        // A server-switch makes is_connected() read false for its whole
-        // disconnect→reconnect window. Don't treat that as "nothing to do" and
-        // don't clear switch_in_progress here — doing so would both reopen the
-        // duplicate-connect race and lie (the switch thread reconnects anyway).
-        // The switch thread owns its own teardown/flag via SwitchGuard; report
-        // it and let the caller retry once the switch settles.
-        if state.0.lock().unwrap().conn.switch_in_progress.load(Ordering::SeqCst) {
-            return error_response(StatusCode::CONFLICT, "server switch in progress, try again shortly");
-        }
+        // Known narrow race: this stale-flag clear can't distinguish a genuinely
+        // stuck flag from a connect request still in its pre-thread window
+        // (resolving credentials/warming up). A disconnect landing in that
+        // window "succeeds" while the pending connect proceeds anyway. Fixing
+        // it needs a way to cancel an in-flight pre-thread connect, which the
+        // flag alone can't express.
         let was_stuck = state.0.lock().unwrap().conn.connect_in_progress.swap(false, Ordering::SeqCst);
         if was_stuck {
             info!("cleared stale connect_in_progress flag");
