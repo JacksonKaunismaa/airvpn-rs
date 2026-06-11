@@ -258,7 +258,13 @@ pub fn connect(params: &WgConnectParams, ipv6_enabled: bool, ipv4_enabled: bool,
     debug!("WireGuard connect: endpoint_ip={}, config_len={} bytes",
            params.endpoint_ip, params.wg_config.len());
 
-    // Ensure secure config directory exists with mode 0o700
+    // Ensure the config directory exists at 0o755. WG_CONFIG_DIR is
+    // /run/airvpn-rs — the SAME directory that holds the 0660 root:wheel helper
+    // socket, so it MUST stay world-traversable or non-root clients can no
+    // longer reach the socket (and the socket unit declares DirectoryMode=0755).
+    // Do NOT force 0700 here: that locked out the GUI/CLI whenever connect()
+    // failed after this point. Secrecy of the WG config comes from the config
+    // file's own 0600 mode (created below), not from the shared directory.
     let config_dir = Path::new(WG_CONFIG_DIR);
     if !config_dir.exists() {
         std::fs::create_dir_all(config_dir)
@@ -267,7 +273,7 @@ pub fn connect(params: &WgConnectParams, ipv6_enabled: bool, ipv4_enabled: bool,
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(config_dir, std::fs::Permissions::from_mode(0o700))
+        std::fs::set_permissions(config_dir, std::fs::Permissions::from_mode(0o755))
             .with_context(|| format!("failed to set permissions on {}", WG_CONFIG_DIR))?;
     }
 
