@@ -225,7 +225,7 @@ fn init_logging(file_logging_enabled: bool, profile_log_path: &str, debug_level:
 
     rotate_log(&log_path);
 
-    let file_level = if debug_level { LevelFilter::Debug } else { LevelFilter::Debug };
+    let file_level = if debug_level { LevelFilter::Debug } else { LevelFilter::Info };
     match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
