@@ -15,7 +15,6 @@ RestartSec=1
 # keyring, toggles IPv6 sysctls), so full sandboxing isn't viable. These are
 # the directives that are safe given those operations — none of them block
 # anything the helper actually does.
-NoNewPrivileges=yes
 ProtectControlGroups=yes
 ProtectKernelLogs=yes
 ProtectClock=yes
@@ -25,6 +24,13 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 
 # Deliberately NOT enabled (would break documented behaviour):
+#   NoNewPrivileges=      -> the Eddie keyring import drops to the user's uid via
+#                            `sudo -u <user> secret-tool ...` (profile.rs), and
+#                            sudo REFUSES to run under no_new_privs ("the 'no new
+#                            privileges' flag is set, which prevents sudo from
+#                            running as root"). Enable this ONLY after switching
+#                            that drop to `runuser -u`/`setpriv` (which don't use
+#                            the setuid model), then test Eddie import + connect.
 #   ProtectSystem=        -> helper writes /etc/airvpn-rs, /etc/systemd/system,
 #                            /etc/resolv.conf
 #   ProtectHome=          -> Eddie-profile import reads the user's ~/.config
