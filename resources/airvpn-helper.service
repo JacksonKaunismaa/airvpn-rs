@@ -9,44 +9,5 @@ ExecStart=/usr/bin/airvpn helper
 Restart=on-failure
 RestartSec=1
 
-# --- Hardening -------------------------------------------------------------
-# The helper genuinely needs broad power (nft/ip/wg, writes /etc + /run +
-# /var/lib + /etc/resolv.conf, drops to the user's uid to read the D-Bus
-# keyring, toggles IPv6 sysctls), so full sandboxing isn't viable. These are
-# the directives that are safe given those operations — none of them block
-# anything the helper actually does.
-ProtectControlGroups=yes
-ProtectKernelLogs=yes
-ProtectClock=yes
-ProtectHostname=yes
-RestrictRealtime=yes
-RestrictSUIDSGID=yes
-LockPersonality=yes
-
-# Deliberately NOT enabled (would break documented behaviour):
-#   NoNewPrivileges=      -> the Eddie keyring import drops to the user's uid via
-#                            `sudo -u <user> secret-tool ...` (profile.rs), and
-#                            sudo REFUSES to run under no_new_privs ("the 'no new
-#                            privileges' flag is set, which prevents sudo from
-#                            running as root"). Enable this ONLY after switching
-#                            that drop to `runuser -u`/`setpriv` (which don't use
-#                            the setuid model), then test Eddie import + connect.
-#   ProtectSystem=        -> helper writes /etc/airvpn-rs, /etc/systemd/system,
-#                            /etc/resolv.conf
-#   ProtectHome=          -> Eddie-profile import reads the user's ~/.config
-#   ProtectKernelTunables -> helper writes /proc/sys/net/ipv6/.../disable_ipv6
-#   ProtectKernelModules  -> `ip link add type wireguard` autoloads the module
-#
-# To actually drop capabilities (the daemon is otherwise full root), the set
-# below is the candidate. It is commented out because it MUST be verified on a
-# real system against three paths that need specific caps:
-#   - keyring privilege-drop (CAP_SETUID/CAP_SETGID),
-#   - reading the user-owned Eddie profile as root (CAP_DAC_*),
-#   - the background pinger (CAP_NET_RAW if it uses raw ICMP sockets).
-# Enable it, then test: connect, Eddie import, lock install, pinger latency,
-# and recover. If any fails, widen the set rather than removing this line.
-#CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_CHOWN CAP_KILL
-#AmbientCapabilities=
-
 [Install]
 WantedBy=multi-user.target
