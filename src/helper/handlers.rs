@@ -1013,7 +1013,7 @@ pub(super) fn handle_save_profile(body_bytes: &Bytes, _state: &State) -> Respons
         if !iface.is_empty() && !crate::common::validate_interface_name(iface) {
             return error_response(
                 StatusCode::BAD_REQUEST,
-                &format!("invalid {}: must be alphanumeric/-/_ and ≤15 chars", options::NETWORK_IFACE_NAME),
+                &format!("invalid {}: must be alphanumeric/-/_/. and ≤15 chars", options::NETWORK_IFACE_NAME),
             );
         }
     }
@@ -1022,7 +1022,7 @@ pub(super) fn handle_save_profile(body_bytes: &Bytes, _state: &State) -> Respons
             if !crate::common::validate_interface_name(entry) {
                 return error_response(
                     StatusCode::BAD_REQUEST,
-                    &format!("invalid interface {entry:?} in {}: must be alphanumeric/-/_ and ≤15 chars", options::NETLOCK_LOCAL_FORWARD_IFACES),
+                    &format!("invalid interface {entry:?} in {}: must be alphanumeric/-/_/. and ≤15 chars", options::NETLOCK_LOCAL_FORWARD_IFACES),
                 );
             }
         }
