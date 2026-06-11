@@ -1247,12 +1247,22 @@ fn refresh_and_rebuild_lock(
             .iter()
             .flat_map(|s| s.ips_entry.iter().cloned())
             .collect();
-        if new_entry_ips != state.all_entry_ips {
+        let ips_changed = new_entry_ips != state.all_entry_ips;
+        if ips_changed {
             state.all_entry_ips = new_entry_ips;
-            if !config.no_lock {
-                if let Err(e) = activate_netlock(params, config, provider_config, &data.manifest.bootstrap_urls, &state.all_entry_ips) {
-                    warn!("Failed to reload netlock with updated server IPs: {}", e);
-                }
+        }
+        // Rebuild the lock if the server set changed OR the kill-switch table is
+        // missing. The !is_active() case is load-bearing: when the monitor
+        // detects an externally-deleted lock (run_monitor_loop, "deleted
+        // externally") it reconnects, but a same-server reconnect leaves the
+        // entry IPs unchanged — so without this the lock would never be rebuilt.
+        // The reconnect tears the tunnel down, and policy routing then re-exposes
+        // the physical default route, so a missing lock here is an IPv4 leak, not
+        // just lost protection. Rebuilding at the top of the loop puts the lock
+        // back before the pre-connection auth call and tunnel re-establishment.
+        if !config.no_lock && (ips_changed || !netlock::is_active()) {
+            if let Err(e) = activate_netlock(params, config, provider_config, &data.manifest.bootstrap_urls, &state.all_entry_ips) {
+                warn!("Failed to (re)activate netlock on reconnect: {}", e);
             }
         }
     }
