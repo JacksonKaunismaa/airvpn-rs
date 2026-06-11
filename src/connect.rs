@@ -1262,7 +1262,26 @@ fn refresh_and_rebuild_lock(
         // back before the pre-connection auth call and tunnel re-establishment.
         if !config.no_lock && (ips_changed || !netlock::is_active()) {
             if let Err(e) = activate_netlock(params, config, provider_config, &data.manifest.bootstrap_urls, &state.all_entry_ips) {
-                warn!("Failed to (re)activate netlock on reconnect: {}", e);
+                if netlock::is_active() || netlock::is_persist_active() {
+                    // No leak: activate() replaces the table atomically, so a
+                    // failed reload leaves the previous session table in place
+                    // (stale allowlist at worst, which fails closed) — or the
+                    // persistent lock is blocking the physical route anyway.
+                    warn!("Failed to (re)activate netlock on reconnect: {}", e);
+                } else {
+                    // No session table AND no persistent lock: the kill switch
+                    // is down while we reconnect. Reconnection still proceeds —
+                    // the tunnel itself is what stops the leak fastest, and the
+                    // monitor loop re-triggers this rebuild on the next cycle —
+                    // but the user must hear about it, not just the helper log:
+                    // a kill-switch user whose lock is silently gone believes
+                    // they have protection they don't.
+                    error!("Kill switch could not be restored on reconnect: {} — traffic may bypass the VPN until the tunnel is up", e);
+                    emit(config, crate::ipc::EngineEvent::Log {
+                        level: "error".into(),
+                        message: format!("Kill switch could not be restored: {} — traffic may bypass the VPN until reconnection completes", e),
+                    });
+                }
             }
         }
     }
