@@ -369,7 +369,12 @@ fn fetch_encrypted(
                 // without a bound, a multi-GB response would OOM the root helper.
                 // Reject an oversized Content-Length early, then read with a hard
                 // ceiling so a missing or lying length can't bypass the check.
-                const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024; // manifests are well under this
+                // Derived from the manifest parser's own limit (the response is
+                // raw AES-CBC ciphertext ≈ same size as the decrypted XML) plus a
+                // 1 MiB margin for padding/the smaller user XML, so this can never
+                // reject a manifest the parser would accept. Real manifests are
+                // ~200 KB; this is purely the DoS ceiling.
+                const MAX_RESPONSE_BYTES: u64 = (crate::manifest::MAX_MANIFEST_SIZE + 1024 * 1024) as u64;
                 if let Some(len) = response.content_length() {
                     if len > MAX_RESPONSE_BYTES {
                         last_error = Some(anyhow::anyhow!("{}: response Content-Length {} exceeds {} byte cap", base_url, len, MAX_RESPONSE_BYTES));

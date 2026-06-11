@@ -132,7 +132,10 @@ struct RawServerAttrs {
 }
 
 const MAX_ERROR_MSG_LEN: usize = 200;
-const MAX_MANIFEST_SIZE: usize = 50 * 1024 * 1024;
+/// Upper bound on a decrypted manifest. The API client's response read cap
+/// (api.rs) is derived from this so the two limits can't drift — a response
+/// small enough to decrypt must be large enough to hold any manifest we'd parse.
+pub(crate) const MAX_MANIFEST_SIZE: usize = 50 * 1024 * 1024;
 const MAX_SERVERS: usize = 10_000;
 const MAX_MODES: usize = 100;
 const MAX_BOOTSTRAP_URLS: usize = 50;
