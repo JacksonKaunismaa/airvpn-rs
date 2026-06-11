@@ -144,9 +144,10 @@ struct SwitchGuard(State);
 
 impl Drop for SwitchGuard {
     fn drop(&mut self) {
-        // Recover from a poisoned mutex so the flag is ALWAYS cleared — a stuck
-        // `switch_in_progress` would permanently reject every future connect.
-        let st = self.0 .0.lock().unwrap_or_else(|e| e.into_inner());
+        // lock_state recovers from a poisoned mutex so the flag is ALWAYS
+        // cleared — a stuck `switch_in_progress` would permanently reject
+        // every future connect.
+        let st = lock_state(&self.0);
         st.conn.switch_in_progress.store(false, Ordering::SeqCst);
     }
 }
@@ -288,8 +289,12 @@ pub(super) async fn handle_connect_async(
                     let _switch_guard = SwitchGuard(Arc::clone(&switch_state));
                     perform_disconnect(&switch_state);
                     // Re-arm the flag: the old connect thread cleared it on exit
-                    // (during the join inside perform_disconnect).
-                    switch_state.0.lock().unwrap().conn.connect_in_progress.store(true, Ordering::SeqCst);
+                    // (during the join inside perform_disconnect). lock_state
+                    // (poison-tolerant) like the rest of this background path —
+                    // panicking here would skip start_connect after the client
+                    // was already told "server_switch": true.
+                    lock_state(&switch_state)
+                        .conn.connect_in_progress.store(true, Ordering::SeqCst);
                     start_connect(switch_state, connect_req, resolved_username, resolved_password);
                 });
             match spawn_result {
@@ -655,7 +660,7 @@ fn start_connect(state: State, connect_req: ipc::ConnectRequest, username: Zeroi
     let (event_tx, event_rx) = mpsc::channel::<ipc::EngineEvent>();
 
     let server_info = {
-        let st = state.0.lock().unwrap();
+        let st = lock_state(&state);
         st.conn.server_info.clone()
     };
 
@@ -663,7 +668,7 @@ fn start_connect(state: State, connect_req: ipc::ConnectRequest, username: Zeroi
 
     // Stop any previous stats poller
     {
-        let mut st = state.0.lock().unwrap();
+        let mut st = lock_state(&state);
         st.conn.stats_stop.store(true, Ordering::SeqCst);
         let prev_stats = st.conn.stats_handle.take();
         drop(st);
@@ -683,7 +688,7 @@ fn start_connect(state: State, connect_req: ipc::ConnectRequest, username: Zeroi
     // without touching the global shutdown flag (which would kill the accept loop).
     let disconnect_flag = Arc::new(AtomicBool::new(false));
     {
-        let mut st = state.0.lock().unwrap();
+        let mut st = lock_state(&state);
         st.conn.disconnect_flag = disconnect_flag.clone();
     }
 
@@ -694,7 +699,7 @@ fn start_connect(state: State, connect_req: ipc::ConnectRequest, username: Zeroi
     );
 
     let connect_in_progress_for_guard = {
-        let st = state.0.lock().unwrap();
+        let st = lock_state(&state);
         st.conn.connect_in_progress.clone()
     };
     let conn_handle = thread::spawn(move || {
@@ -1094,7 +1099,26 @@ pub(super) fn handle_lock_status() -> Response<HyperBody> {
 /// Runs force_recover (DNS, locks, WireGuard) and also cleans up stale
 /// server host routes that force_recover can't handle (needs manifest IPs).
 pub(super) fn handle_recover(state: &State) -> Response<HyperBody> {
-    state.0.lock().unwrap().conn.connect_in_progress.store(false, Ordering::SeqCst);
+    {
+        // lock_state (poison-tolerant): /recover is the break-glass endpoint,
+        // so it must keep working even after another thread panicked while
+        // holding the state mutex.
+        let st = lock_state(state);
+        // Same gate as handle_disconnect: a server-switch owns the whole
+        // disconnect→reconnect window. Running force_recover() here would race
+        // the switch thread's own teardown (nft tables, routes, state.json),
+        // and the flag-clear below would stomp the connect_in_progress the
+        // switch thread re-arms for its new connect thread.
+        if st.conn.switch_in_progress.load(Ordering::SeqCst) {
+            return error_response(StatusCode::CONFLICT, "server switch in progress, try again shortly");
+        }
+        st.conn.connect_in_progress.store(false, Ordering::SeqCst);
+    }
+    // Known narrow race: the gate above serializes the flag handoff, not the
+    // teardown below. Once the lock drops, a /connect can claim a fresh connect
+    // (connect_in_progress was just cleared) and race the still-running
+    // force_recover on nft tables and routes. Closing it would need a
+    // recover_in_progress gate checked in /connect's claim section.
 
     if let Err(e) = recovery::force_recover() {
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("recovery failed: {}", e));
@@ -1103,7 +1127,7 @@ pub(super) fn handle_recover(state: &State) -> Response<HyperBody> {
     // Best-effort cleanup of server host routes (the ~1000 /32 routes to server IPs).
     // force_recover can't do this because it doesn't know the server IPs.
     // We get them from the cached manifest in SharedState.
-    let st = state.0.lock().unwrap();
+    let st = lock_state(state);
     if let Some(ref manifest) = st.manifest {
         let server_ips: Vec<String> = manifest.servers
             .iter()
