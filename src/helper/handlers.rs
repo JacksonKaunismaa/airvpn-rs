@@ -136,6 +136,21 @@ impl Drop for ConnectGuard {
     }
 }
 
+/// RAII guard that clears `switch_in_progress` on every exit path of the
+/// server-switch thread (normal return or panic unwind). Without this, a panic
+/// in `perform_disconnect`/`start_connect` would leave the flag stuck `true` and
+/// permanently reject all future connect requests.
+struct SwitchGuard(State);
+
+impl Drop for SwitchGuard {
+    fn drop(&mut self) {
+        // Recover from a poisoned mutex so the flag is ALWAYS cleared — a stuck
+        // `switch_in_progress` would permanently reject every future connect.
+        let st = self.0 .0.lock().unwrap_or_else(|e| e.into_inner());
+        st.conn.switch_in_progress.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Resolve credentials from the saved profile, returning 409 if Eddie import
 /// is needed. Returns `Ok((username, password))` on success, or `Err(response)`
 /// with the appropriate HTTP error/conflict response on failure.
@@ -202,6 +217,12 @@ pub(super) async fn handle_connect_async(
     // block every server-switch attempt with a silent 409.
     let connect_guard = {
         let st = state.0.lock().unwrap();
+        // A server-switch in flight owns the whole disconnect→reconnect; reject
+        // anything else for its full duration (connect_in_progress alone is
+        // insufficient — it flaps to false mid-switch).
+        if st.conn.switch_in_progress.load(Ordering::SeqCst) {
+            return error_response(StatusCode::CONFLICT, "connect already in progress (server switch)");
+        }
         if st.conn.connect_in_progress.load(Ordering::SeqCst) && !st.conn.is_connected() {
             return error_response(StatusCode::CONFLICT, "connect already in progress");
         }
@@ -228,22 +249,57 @@ pub(super) async fn handle_connect_async(
     // (cancelling this handler), so we must not await the disconnect.
     // Events flow through the /events stream.
     {
-        let is_connected = state.0.lock().unwrap().conn.is_connected();
-        if is_connected {
-            // Defuse — the server_switch thread's start_connect will spawn a
-            // connect thread that owns clearing connect_in_progress.
-            std::mem::forget(connect_guard);
+        let st = state.0.lock().unwrap();
+        // Decide switch-vs-fresh and claim the switch under ONE critical section.
+        // Checking `switch_in_progress` here — before the `is_connected()`
+        // branch AND before the fall-through to a fresh connect — is what
+        // actually closes the duplicate-spawn race: `is_connected()` reads false
+        // during the switch's perform_disconnect window, so a request that
+        // parked in wait_for_warmup and resumes mid-switch would otherwise fall
+        // straight through to start_connect and spawn a second connect thread.
+        // Because the check and the set below both happen under this lock, no
+        // swap/CAS is needed — the mutex serializes the decision.
+        if st.conn.switch_in_progress.load(Ordering::SeqCst) {
+            drop(st);
+            return error_response(StatusCode::CONFLICT, "connect already in progress (server switch)");
+        }
+        if st.conn.is_connected() {
+            st.conn.switch_in_progress.store(true, Ordering::SeqCst);
+            drop(st);
             let switch_state = Arc::clone(&state);
-            thread::spawn(move || {
-                perform_disconnect(&switch_state);
-                // Re-arm the flag: the old connect thread cleared it on exit
-                // (during the join inside perform_disconnect). Without this,
-                // a racing request could sneak through between disconnect and
-                // the new connect thread starting.
-                switch_state.0.lock().unwrap().conn.connect_in_progress.store(true, Ordering::SeqCst);
-                start_connect(switch_state, connect_req, resolved_username, resolved_password);
-            });
-            return json_response(StatusCode::OK, &json!({"server_switch": true}));
+            // Use Builder::spawn (returns Result) rather than thread::spawn
+            // (panics on failure): the SwitchGuard that clears the flag lives
+            // INSIDE the closure, so if thread creation fails we must clear
+            // switch_in_progress here or every future connect is rejected.
+            let spawn_result = thread::Builder::new()
+                .name("airvpn-switch".into())
+                .spawn(move || {
+                    // Clears switch_in_progress on every exit path (incl. panic),
+                    // at which point the new connect thread is running and
+                    // is_connected() is true again, so releasing the gate is safe.
+                    let _switch_guard = SwitchGuard(Arc::clone(&switch_state));
+                    perform_disconnect(&switch_state);
+                    // Re-arm the flag: the old connect thread cleared it on exit
+                    // (during the join inside perform_disconnect).
+                    switch_state.0.lock().unwrap().conn.connect_in_progress.store(true, Ordering::SeqCst);
+                    start_connect(switch_state, connect_req, resolved_username, resolved_password);
+                });
+            match spawn_result {
+                Ok(_) => {
+                    // Committed: the switch thread now owns both flags. Defuse the
+                    // early-exit guard so it doesn't clear connect_in_progress.
+                    std::mem::forget(connect_guard);
+                    return json_response(StatusCode::OK, &json!({"server_switch": true}));
+                }
+                Err(e) => {
+                    // Thread couldn't be created — undo the switch claim so the
+                    // helper isn't permanently wedged. connect_guard is still
+                    // live and clears connect_in_progress when it drops on return.
+                    state.0.lock().unwrap_or_else(|p| p.into_inner())
+                        .conn.switch_in_progress.store(false, Ordering::SeqCst);
+                    return error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("failed to start server switch: {e}"));
+                }
+            }
         }
     }
 
@@ -739,6 +795,15 @@ pub(super) fn handle_disconnect(state: &State) -> Response<HyperBody> {
 
         json_response(StatusCode::OK, &json!({"disconnected": true}))
     } else {
+        // A server-switch makes is_connected() read false for its whole
+        // disconnect→reconnect window. Don't treat that as "nothing to do" and
+        // don't clear switch_in_progress here — doing so would both reopen the
+        // duplicate-connect race and lie (the switch thread reconnects anyway).
+        // The switch thread owns its own teardown/flag via SwitchGuard; report
+        // it and let the caller retry once the switch settles.
+        if state.0.lock().unwrap().conn.switch_in_progress.load(Ordering::SeqCst) {
+            return error_response(StatusCode::CONFLICT, "server switch in progress, try again shortly");
+        }
         let was_stuck = state.0.lock().unwrap().conn.connect_in_progress.swap(false, Ordering::SeqCst);
         if was_stuck {
             info!("cleared stale connect_in_progress flag");

@@ -79,6 +79,15 @@ pub(super) struct ConnState {
     /// or when perform_disconnect completes. Checked at the top of
     /// handle_connect_async to reject rapid-fire requests.
     pub(super) connect_in_progress: Arc<AtomicBool>,
+    /// Held for the FULL duration of a server-switch (disconnect → reconnect).
+    /// `connect_in_progress` is transiently cleared mid-switch when the old
+    /// connect thread's ConnectGuard drops during the join inside
+    /// perform_disconnect, leaving a multi-second window (force_recover, route
+    /// cleanup) where both flags read false and a second /connect could spawn a
+    /// duplicate connect thread. This flag closes that window: it's set before
+    /// the switch thread starts and cleared only after the new connect thread
+    /// is running.
+    pub(super) switch_in_progress: Arc<AtomicBool>,
 }
 
 impl ConnState {
@@ -90,6 +99,7 @@ impl ConnState {
             disconnect_flag: Arc::new(AtomicBool::new(false)),
             server_info: Arc::new(Mutex::new((String::new(), String::new(), String::new()))),
             connect_in_progress: Arc::new(AtomicBool::new(false)),
+            switch_in_progress: Arc::new(AtomicBool::new(false)),
         }
     }
 
