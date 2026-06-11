@@ -337,10 +337,13 @@ async fn router(req: Request<hyper::body::Incoming>, state: State, peer_uid: Opt
     let path = req.uri().path().to_string();
     debug!("HTTP {} {}", method, path);
 
-    // Read body for all requests (no-op for GET with empty body)
-    let body_bytes = match req.collect().await {
+    // Read body for all requests (no-op for GET with empty body), bounded so a
+    // client can't OOM the root daemon with a huge body. Every real request is
+    // small JSON; 1 MiB is generous.
+    const MAX_BODY_BYTES: usize = 1024 * 1024;
+    let body_bytes = match http_body_util::Limited::new(req.into_body(), MAX_BODY_BYTES).collect().await {
         Ok(collected) => collected.to_bytes(),
-        Err(_) => return error_response(StatusCode::BAD_REQUEST, "failed to read body"),
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "request body too large or unreadable"),
     };
 
     // Dispatch to handlers — streaming handlers (events, connect) are async,

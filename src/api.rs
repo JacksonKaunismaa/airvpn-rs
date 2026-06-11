@@ -358,19 +358,36 @@ fn fetch_encrypted(
         debug!("Trying bootstrap URL: {}", base_url);
         let req_start = std::time::Instant::now();
         match client.post(&url).form(&[("s", &s_b64), ("d", &d_b64)]).send() {
-            Ok(response) => {
+            Ok(mut response) => {
                 let status = response.status();
                 if !status.is_success() {
                     last_error = Some(anyhow::anyhow!("{}: HTTP {}", base_url, status));
                     continue;
                 }
-                let body = match response.bytes() {
-                    Ok(b) => b,
-                    Err(e) => {
-                        last_error = Some(anyhow::Error::new(e).context(format!("{}: failed to read response body", base_url)));
+                // Cap the response size. The bootstrap endpoints are plaintext
+                // HTTP (see note above), so a network MITM controls this body;
+                // without a bound, a multi-GB response would OOM the root helper.
+                // Reject an oversized Content-Length early, then read with a hard
+                // ceiling so a missing or lying length can't bypass the check.
+                const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024; // manifests are well under this
+                if let Some(len) = response.content_length() {
+                    if len > MAX_RESPONSE_BYTES {
+                        last_error = Some(anyhow::anyhow!("{}: response Content-Length {} exceeds {} byte cap", base_url, len, MAX_RESPONSE_BYTES));
                         continue;
                     }
-                };
+                }
+                let mut body: Vec<u8> = Vec::new();
+                if let Err(e) = std::io::Read::read_to_end(
+                    &mut std::io::Read::take(&mut response, MAX_RESPONSE_BYTES + 1),
+                    &mut body,
+                ) {
+                    last_error = Some(anyhow::Error::new(e).context(format!("{}: failed to read response body", base_url)));
+                    continue;
+                }
+                if body.len() as u64 > MAX_RESPONSE_BYTES {
+                    last_error = Some(anyhow::anyhow!("{}: response exceeded {} byte cap", base_url, MAX_RESPONSE_BYTES));
+                    continue;
+                }
                 let xml = match crypto::decrypt_response(&body, &session_key.key, &session_key.iv) {
                     Ok(xml) => xml,
                     Err(e) => {
