@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
 
 use anyhow::{bail, Context};
 use log::{debug, warn};
@@ -184,14 +183,16 @@ fn split_ips(s: &str) -> Vec<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .filter(|ip_str| {
-            // Strip CIDR prefix if present (e.g. "10.0.0.1/24" -> "10.0.0.1")
-            let bare = ip_str.split('/').next().unwrap_or(ip_str);
-            match bare.parse::<IpAddr>() {
-                Ok(_) => true,
-                Err(_) => {
-                    warn!("Skipping invalid IP '{}' in server entry/exit list", ip_str);
-                    false
-                }
+            // Validate the FULL string, not just the part before '/'. These IPs
+            // are written verbatim into the `ip -batch` route stream
+            // (wireguard::add_server_host_routes), so a value like
+            // `1.2.3.4/0\nroute add ...` must be rejected outright, not have only
+            // its address portion validated.
+            if crate::common::is_valid_ip_or_cidr(ip_str) {
+                true
+            } else {
+                warn!("Skipping invalid IP '{}' in server entry/exit list", ip_str);
+                false
             }
         })
         .map(String::from)
@@ -255,9 +256,13 @@ fn validate_server_name(name: &str) -> anyhow::Result<()> {
 // approach.
 
 fn validate_ip(s: &str, context: &str) -> anyhow::Result<()> {
-    let ip_str = s.split('/').next().unwrap_or(s);
-    ip_str.parse::<IpAddr>()
-        .with_context(|| format!("invalid IP address '{}' in {}", s, context))?;
+    // Validate the whole string (incl. any CIDR prefix), not just the address.
+    // These values flow into `/etc/resolv.conf` (`nameserver {dns}`) and
+    // `resolvectl` args, so a value smuggling a newline or extra tokens past the
+    // prefix must be rejected.
+    if !crate::common::is_valid_ip_or_cidr(s) {
+        anyhow::bail!("invalid IP address '{}' in {}", s, context);
+    }
     Ok(())
 }
 
@@ -661,6 +666,19 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_ip_rejects_cidr_suffix_injection() {
+        // Address parses, but the "prefix" smuggles a newline + extra resolv.conf
+        // line. Must be rejected — `validate_ip` feeds wg_dns -> /etc/resolv.conf.
+        assert!(validate_ip("10.0.0.1/0\nnameserver 8.8.8.8", "wg_dns_ipv4").is_err());
+        assert!(validate_ip("10.0.0.1/24 ; extra", "wg_ipv4").is_err());
+        assert!(validate_ip("10.0.0.1/33", "wg_ipv4").is_err()); // prefix out of range
+        // Clean bare IP and in-range CIDR still accepted.
+        assert!(validate_ip("10.0.0.1", "wg_ipv4").is_ok());
+        assert!(validate_ip("10.0.0.1/32", "wg_ipv4").is_ok());
+        assert!(validate_ip("fd00::1/64", "wg_ipv6").is_ok());
+    }
+
+    #[test]
     fn test_parse_user_invalid_dns_ip() {
         let xml = r#"<?xml version="1.0" encoding="utf-8"?>
 <user login="t" wg_public_key="P">
@@ -690,6 +708,22 @@ mod tests {
         assert!(split_ips("garbage,also-bad").is_empty());
         // IPv6 works
         assert_eq!(split_ips("fd00::1,1.2.3.4"), vec!["fd00::1", "1.2.3.4"]);
+    }
+
+    #[test]
+    fn test_split_ips_rejects_cidr_suffix_injection() {
+        // Address parses but the "prefix" carries an injected `ip -batch` command
+        // (split_ips feeds wireguard::add_server_host_routes). Single entry: no
+        // ',' or ';' so it isn't split apart — must be dropped on its own merit.
+        assert!(split_ips("1.2.3.4/0\nroute add 0.0.0.0/0 via 10.0.0.1").is_empty());
+        assert!(split_ips("1.2.3.4/24 via 10.0.0.1").is_empty());
+        // Clean entry alongside a malicious one: only the clean one survives.
+        assert_eq!(
+            split_ips("1.2.3.4,5.6.7.8/0\nroute add x"),
+            vec!["1.2.3.4"]
+        );
+        // In-range CIDR is still preserved verbatim.
+        assert_eq!(split_ips("fd00::1/64"), vec!["fd00::1/64"]);
     }
 
     #[test]

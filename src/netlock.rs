@@ -74,10 +74,15 @@ fn sha256_hex(input: &str) -> String {
 
 /// Classify an IP/CIDR string as v4 or v6.
 fn classify_ip(ip_str: &str) -> Option<IpVersion> {
-    // Strip CIDR prefix if present
-    let addr_part = ip_str.split('/').next()?;
-    let addr: IpAddr = addr_part.parse().ok()?;
-    match addr {
+    // Reject anything that isn't a clean IP or IP/prefix CIDR. Validating the
+    // FULL string (not just the part before '/') is what stops a value like
+    // `1.2.3.4/32 ; <nft statements>` from being interpolated raw into an
+    // `nft -f` ruleset: returning None here makes every caller skip the entry.
+    if !crate::common::is_valid_ip_or_cidr(ip_str) {
+        return None;
+    }
+    let addr_part = ip_str.split('/').next().unwrap_or(ip_str);
+    match addr_part.parse::<IpAddr>().ok()? {
         IpAddr::V4(_) => Some(IpVersion::V4),
         IpAddr::V6(_) => Some(IpVersion::V6),
     }
@@ -1208,6 +1213,43 @@ mod tests {
         assert!(
             validate_config_ifaces(&config).is_err(),
             "malicious local_forward_iface must be rejected before reaching nft -f"
+        );
+    }
+
+    #[test]
+    fn test_classify_ip_rejects_cidr_suffix_injection() {
+        // The pre-fix bug: classify_ip validated only the segment before '/', so
+        // a value whose address parses but whose "prefix" carries nft statements
+        // was interpolated raw into the ruleset. Both `"`-free `;` payloads and
+        // newline payloads must now classify as None (and thus be skipped).
+        assert!(classify_ip("1.2.3.4/32 ; ip daddr 0.0.0.0/0 counter accept #").is_none());
+        assert!(classify_ip("1.2.3.4/0\nip daddr 0.0.0.0/0 accept").is_none());
+        assert!(classify_ip("fd00::1/64 ; drop").is_none());
+        // Out-of-range prefixes are rejected too.
+        assert!(classify_ip("1.2.3.4/33").is_none());
+        assert!(classify_ip("fd00::1/129").is_none());
+        // Legit values still classify correctly.
+        assert_eq!(classify_ip("1.2.3.4"), Some(IpVersion::V4));
+        assert_eq!(classify_ip("1.2.3.4/32"), Some(IpVersion::V4));
+        assert_eq!(classify_ip("fd00::1"), Some(IpVersion::V6));
+        assert_eq!(classify_ip("fd00::1/64"), Some(IpVersion::V6));
+    }
+
+    #[test]
+    fn test_allowlist_cidr_injection_absent_from_ruleset() {
+        // End-to-end: a malicious allowlist entry must not appear in the emitted
+        // `nft -f` ruleset (the injected accept-all in particular).
+        let mut config = default_config();
+        config.allowlist_out_cidrs =
+            vec!["1.2.3.4/32 ; ip daddr 0.0.0.0/0 counter accept #".to_string()];
+        let ruleset = generate_ruleset(&config);
+        assert!(
+            !ruleset.contains("0.0.0.0/0 counter accept"),
+            "injected accept-all must not survive into the ruleset:\n{ruleset}"
+        );
+        assert!(
+            !ruleset.contains("1.2.3.4/32 ;"),
+            "malicious allowlist entry must be skipped entirely"
         );
     }
 

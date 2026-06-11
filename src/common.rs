@@ -1,6 +1,7 @@
 //! Shared utilities used across multiple modules.
 
 use anyhow::Result;
+use std::net::IpAddr;
 use zeroize::Zeroizing;
 
 /// Maximum routing rule deletions per teardown pass.
@@ -21,6 +22,28 @@ pub fn validate_interface_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Validate that `s` is a bare IP address or an `IP/prefix` CIDR whose prefix
+/// length is in range for its address family.
+///
+/// Crucially, this validates the ENTIRE string. A `split('/').next()`-style
+/// check validates only the address and silently keeps any trailing bytes after
+/// the prefix — which is dangerous because these strings are interpolated into
+/// `nft -f` rulesets and `ip -batch` command streams. A value like
+/// `1.2.3.4/32 ; <nft statements>` or `1.2.3.4/0\n<ip command>` would otherwise
+/// pass (its address parses) and inject rules/commands that run as root. Every
+/// IP/CIDR that reaches such a sink MUST pass through this check (or be skipped
+/// when it returns false).
+pub fn is_valid_ip_or_cidr(s: &str) -> bool {
+    match s.split_once('/') {
+        None => s.parse::<IpAddr>().is_ok(),
+        Some((addr, prefix)) => match addr.parse::<IpAddr>() {
+            Ok(IpAddr::V4(_)) => matches!(prefix.parse::<u8>(), Ok(p) if p <= 32),
+            Ok(IpAddr::V6(_)) => matches!(prefix.parse::<u8>(), Ok(p) if p <= 128),
+            Err(_) => false,
+        },
+    }
 }
 
 /// Read password from stdin when `--password-stdin` is set.
@@ -80,6 +103,30 @@ mod tests {
         assert!(!validate_interface_name("wg 0")); // space
         assert!(!validate_interface_name("../etc/passwd")); // path traversal
         assert!(!validate_interface_name("wg\0")); // null byte
+    }
+
+    #[test]
+    fn test_is_valid_ip_or_cidr() {
+        // Bare IPs
+        assert!(is_valid_ip_or_cidr("1.2.3.4"));
+        assert!(is_valid_ip_or_cidr("fd00::1"));
+        // In-range CIDRs
+        assert!(is_valid_ip_or_cidr("10.0.0.0/8"));
+        assert!(is_valid_ip_or_cidr("1.2.3.4/32"));
+        assert!(is_valid_ip_or_cidr("fd00::/64"));
+        assert!(is_valid_ip_or_cidr("::/0"));
+        // Out-of-range prefixes
+        assert!(!is_valid_ip_or_cidr("1.2.3.4/33"));
+        assert!(!is_valid_ip_or_cidr("fd00::1/129"));
+        // Garbage / non-IP
+        assert!(!is_valid_ip_or_cidr("not-an-ip"));
+        assert!(!is_valid_ip_or_cidr(""));
+        // Injection: address parses, but trailing bytes after the prefix must
+        // make the WHOLE string invalid (this is the core guarantee).
+        assert!(!is_valid_ip_or_cidr("1.2.3.4/32 ; ip daddr 0.0.0.0/0 counter accept #"));
+        assert!(!is_valid_ip_or_cidr("1.2.3.4/0\nroute add 0.0.0.0/0 via 10.0.0.1"));
+        assert!(!is_valid_ip_or_cidr("1.2.3.4/")); // empty prefix
+        assert!(!is_valid_ip_or_cidr("1.2.3.4/32/8")); // double prefix
     }
 
     #[test]
