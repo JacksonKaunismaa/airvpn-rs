@@ -13,15 +13,30 @@ pub const MAX_RULE_DELETIONS: usize = 100;
 
 /// Validate a network interface name.
 ///
-/// Linux interface names: max 15 chars, ASCII alphanumeric + '-' + '_'.
-/// Used for defense-in-depth against command/path injection in nft commands,
-/// sysctl paths, and WireGuard config.
+/// Allows the characters the Linux kernel permits that are also safe in every
+/// context we interpolate the name into: ASCII alphanumerics, '-', '_', and '.'
+/// ('.' is needed for VLAN sub-interfaces like "eth0.100"). This is safe because
+/// every nft interpolation quotes the name (`oifname "{}"`), so '.' can't break
+/// out of the string, and the IPv6 sysctl paths are built with path joins
+/// (`/proc/sys/net/ipv6/conf/{iface}/...`), not dotted sysctl names, so '.' is a
+/// normal path component there too.
+///
+/// Rejects (defense-in-depth against command/path injection in nft, `ip`/
+/// `resolvectl` argv, sysctl paths, and WireGuard config):
+/// - empty, or longer than the 15-char kernel limit (IFNAMSIZ - 1)
+/// - the special names "." and ".." (path traversal in the /proc/sys joins;
+///   the kernel rejects them anyway)
+/// - a leading '-', which `ip`/`resolvectl` would parse as a flag (argv
+///   option-injection)
 pub fn validate_interface_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 15
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    if name.is_empty() || name.len() > 15 || name == "." || name == ".." {
+        return false;
+    }
+    if name.starts_with('-') {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
 /// Validate that `s` is a bare IP address or an `IP/prefix` CIDR whose prefix
@@ -93,6 +108,8 @@ mod tests {
         assert!(validate_interface_name("eth_0"));
         assert!(validate_interface_name("a")); // single char
         assert!(validate_interface_name("123456789012345")); // exactly 15 chars
+        assert!(validate_interface_name("eth0.100")); // VLAN sub-interface
+        assert!(validate_interface_name("br0.10")); // VLAN on a bridge
     }
 
     #[test]
@@ -101,8 +118,12 @@ mod tests {
         assert!(!validate_interface_name("1234567890123456")); // 16 chars
         assert!(!validate_interface_name("a-very-long-interface-name")); // way too long
         assert!(!validate_interface_name("wg 0")); // space
-        assert!(!validate_interface_name("../etc/passwd")); // path traversal
+        assert!(!validate_interface_name("../etc/passwd")); // path traversal ('/')
         assert!(!validate_interface_name("wg\0")); // null byte
+        assert!(!validate_interface_name("-foo")); // leading '-' -> argv option injection
+        assert!(!validate_interface_name(".")); // current dir
+        assert!(!validate_interface_name("..")); // parent dir (traversal)
+        assert!(!validate_interface_name("eth0\"; drop")); // nft quote break-out
     }
 
     #[test]
