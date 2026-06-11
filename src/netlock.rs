@@ -694,6 +694,29 @@ pub fn generate_persistent_ruleset(bootstrap_ips: &[String], iface_name: &str, a
     r
 }
 
+/// Validate every interface name that will be interpolated into the nft ruleset.
+///
+/// Interface names are written into `nft -f` rule strings unquoted-escaped, e.g.
+/// `oifname "{iface}" counter accept`. A value containing `"` and `;` (both of
+/// which survive the XML profile round-trip) could close the string and inject
+/// arbitrary nftables statements that load as root — including an accept-all that
+/// silently defeats the kill switch. These names come from profile options
+/// (`network.iface.name`, `netlock.local_forward_ifaces`) that any socket client
+/// can set, so validation here — at the privileged `nft -f` boundary — is
+/// mandatory. The generators are pure string builders and trust their inputs;
+/// every path that reaches `nft -f` MUST pass through this check first.
+pub fn validate_config_ifaces(config: &NetlockConfig) -> Result<()> {
+    if !crate::common::validate_interface_name(&config.iface_name) {
+        anyhow::bail!("invalid VPN interface name: {:?}", config.iface_name);
+    }
+    for iface in &config.local_forward_ifaces {
+        if !crate::common::validate_interface_name(iface) {
+            anyhow::bail!("invalid local-forward interface name: {:?}", iface);
+        }
+    }
+    Ok(())
+}
+
 /// Activate the network lock: write ruleset to tmpfile and load via `nft -f`.
 ///
 /// If the table already exists (e.g., reconnection), performs an atomic
@@ -701,6 +724,7 @@ pub fn generate_persistent_ruleset(bootstrap_ips: &[String], iface_name: &str, a
 /// and loading both in a single `nft -f` call. This avoids the leak window
 /// that would occur if we deleted the table first and then created a new one.
 pub fn activate(config: &NetlockConfig) -> Result<()> {
+    validate_config_ifaces(config)?;
     let ruleset = generate_ruleset(config);
 
     // If the table already exists, prepend a flush command so the kernel
@@ -1153,6 +1177,38 @@ mod tests {
             allowlist_out_cidrs: vec![],
             local_forward_ifaces: vec![],
         }
+    }
+
+    #[test]
+    fn test_validate_config_ifaces_accepts_valid() {
+        let mut config = default_config();
+        assert!(validate_config_ifaces(&config).is_ok());
+        config.iface_name = "avpn0".to_string();
+        config.local_forward_ifaces = vec!["eth0".to_string(), "wlan0".to_string()];
+        assert!(validate_config_ifaces(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_config_ifaces_rejects_nft_injection() {
+        // A quote-balanced, ';'-separated value that — without this guard —
+        // injects an accept-all rule into the OUTPUT chain, defeating the kill
+        // switch. Both `"` and `;` survive the XML profile round-trip.
+        let mut config = default_config();
+        config.iface_name =
+            "avpn0\" counter accept; ip daddr 0.0.0.0/0 counter accept; iifname \"avpn0".to_string();
+        assert!(
+            validate_config_ifaces(&config).is_err(),
+            "malicious iface_name must be rejected before reaching nft -f"
+        );
+
+        // Same attack via the (previously entirely unvalidated) forward-iface list.
+        let mut config = default_config();
+        config.local_forward_ifaces =
+            vec!["eth0\"; ip daddr 0.0.0.0/0 accept #".to_string()];
+        assert!(
+            validate_config_ifaces(&config).is_err(),
+            "malicious local_forward_iface must be rejected before reaching nft -f"
+        );
     }
 
     #[test]

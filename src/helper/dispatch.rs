@@ -58,6 +58,20 @@ pub(super) fn dispatch_lock_install() -> Result<String> {
         let v = options::get_str(&resolved, options::NETLOCK_LOCAL_FORWARD_IFACES);
         if v.is_empty() { vec![] } else { v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect() }
     };
+
+    // Validate interface names before they are interpolated into the persistent
+    // lock.nft (loaded by `nft -f` as root, and again at every boot). An
+    // unvalidated name containing `"`/`;` could inject arbitrary nftables rules.
+    // Same guard as the session lock's activate() — see validate_config_ifaces.
+    if !crate::common::validate_interface_name(iface_name) {
+        anyhow::bail!("invalid VPN interface name: {iface_name:?}");
+    }
+    for iface in &local_forward_ifaces {
+        if !crate::common::validate_interface_name(iface) {
+            anyhow::bail!("invalid local-forward interface name: {iface:?}");
+        }
+    }
+
     let ruleset = netlock::generate_persistent_ruleset(&bootstrap_ips, iface_name, &allowlist_ips, &local_forward_ifaces);
 
     // Write rules file

@@ -907,6 +907,31 @@ pub(super) fn handle_save_profile(body_bytes: &Bytes, _state: &State) -> Respons
         );
     }
 
+    // Reject interface names that would be unsafe to interpolate into the nft
+    // kill-switch ruleset. These options flow into `nft -f` (run as root), so a
+    // value containing `"`/`;` could inject arbitrary rules. Validate at write
+    // time too — not just at the activate()/lock-install boundary — so bad
+    // values can't persist and silently break (or subvert) lock activation
+    // later. Empty is allowed: it means "use the default interface".
+    if let Some(iface) = save_req.options.get(options::NETWORK_IFACE_NAME) {
+        if !iface.is_empty() && !crate::common::validate_interface_name(iface) {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid {}: must be alphanumeric/-/_ and ≤15 chars", options::NETWORK_IFACE_NAME),
+            );
+        }
+    }
+    if let Some(list) = save_req.options.get(options::NETLOCK_LOCAL_FORWARD_IFACES) {
+        for entry in list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if !crate::common::validate_interface_name(entry) {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("invalid interface {entry:?} in {}: must be alphanumeric/-/_ and ≤15 chars", options::NETLOCK_LOCAL_FORWARD_IFACES),
+                );
+            }
+        }
+    }
+
     match dispatch::dispatch_save_profile(&save_req.options) {
         Ok(()) => {
             // Apply log level changes at runtime (no helper restart needed).
