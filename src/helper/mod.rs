@@ -402,4 +402,50 @@ pub(super) fn lock_state(state: &State) -> std::sync::MutexGuard<'_, SharedState
 mod tests {
     use super::*;
 
+    /// Build a State with no I/O or `nft` side effects, for handler-gating
+    /// tests. Unlike `SharedState::new()` (which populates the persistent
+    /// lock's ping_allow via `nft` and reads the on-disk caches), this loads an
+    /// empty latency cache from a missing path (-> `Default`, no writes) and no
+    /// manifest, so it's safe to run under `cargo test` on a live machine.
+    fn test_state() -> State {
+        let shared = SharedState {
+            conn: ConnState::new(),
+            subscribers: Vec::new(),
+            latency: pinger::LatencyCache::load("/nonexistent/airvpn-test-latency.json"),
+            manifest: None,
+            ready: false,
+            key_names: Vec::new(),
+        };
+        Arc::new((
+            Mutex::new(shared),
+            Notify {
+                manifest_cv: Condvar::new(),
+                pinger_cv: Condvar::new(),
+                ready_cv: Condvar::new(),
+            },
+        ))
+    }
+
+    // A server switch owns the whole disconnect->reconnect window. While
+    // `switch_in_progress` is set, /disconnect and /recover must reject with 409
+    // *before* running any teardown (force_recover / flag clears) that would
+    // otherwise race the switch thread on nft tables, routes, and state.json.
+    // Regression tests for the gates added in fae121b (/disconnect) and
+    // ace7660 (/recover) — the concurrency fixes that had no coverage.
+
+    #[test]
+    fn disconnect_rejects_with_409_during_switch() {
+        let state = test_state();
+        state.0.lock().unwrap().conn.switch_in_progress.store(true, Ordering::SeqCst);
+        let resp = handlers::handle_disconnect(&state);
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn recover_rejects_with_409_during_switch() {
+        let state = test_state();
+        state.0.lock().unwrap().conn.switch_in_progress.store(true, Ordering::SeqCst);
+        let resp = handlers::handle_recover(&state);
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
 }
