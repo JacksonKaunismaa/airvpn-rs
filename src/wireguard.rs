@@ -479,6 +479,45 @@ pub fn get_default_gateway_pub() -> Result<String> {
     get_default_gateway()
 }
 
+/// Parse the egress interface (`dev <iface>`) from `ip route show default`
+/// output. Pure helper, split out for testability.
+fn parse_default_iface(stdout: &str) -> Option<String> {
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.first() != Some(&"default") {
+            continue;
+        }
+        if let Some(pos) = parts.iter().position(|&p| p == "dev") {
+            if let Some(iface) = parts.get(pos + 1) {
+                return Some((*iface).to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Get the physical egress interface from the main-table default route.
+///
+/// When the VPN is up, the main-table default route still points at the
+/// physical NIC (the tunnel default lives in table 51820), so this returns the
+/// interface the background pinger binds its ICMP sockets to in order to reach
+/// servers *outside* the tunnel. Re-derived each cycle, so it tracks the
+/// current interface across WiFi roams / DHCP renews — unlike the old `/32`
+/// host routes, which NetworkManager flushed on every such event.
+pub fn default_route_iface() -> Result<String> {
+    let output = Command::new("ip")
+        .args(["-4", "route", "show", "default"])
+        .output()
+        .context("failed to execute: ip -4 route show default")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let iface = parse_default_iface(&stdout)
+        .context("no IPv4 default route interface found (is the network up?)")?;
+    if !crate::common::validate_interface_name(&iface) {
+        anyhow::bail!("default route interface name failed validation: {:?}", iface);
+    }
+    Ok(iface)
+}
+
 /// Get the current IPv6 default gateway from the main routing table.
 ///
 /// Parses `ip -6 route show default` output which looks like:
@@ -956,6 +995,25 @@ pub fn get_transfer_stats(iface: &str) -> Result<(u64, u64)> {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn test_parse_default_iface_basic() {
+        let out = "default via 10.100.1.1 dev wlo1 proto dhcp src 10.100.7.120 metric 20600\n";
+        assert_eq!(parse_default_iface(out).as_deref(), Some("wlo1"));
+    }
+
+    #[test]
+    fn test_parse_default_iface_first_default_wins() {
+        let out = "default via 192.168.1.1 dev eth0 proto static\n\
+                   default via 10.0.0.1 dev wlan0 metric 600\n";
+        assert_eq!(parse_default_iface(out).as_deref(), Some("eth0"));
+    }
+
+    #[test]
+    fn test_parse_default_iface_none_when_no_default_route() {
+        let out = "10.100.0.0/20 dev wlo1 proto kernel scope link src 10.100.7.120\n";
+        assert_eq!(parse_default_iface(out), None);
+    }
 
     // Valid 44-character base64 strings (WireGuard keys are 32 bytes = 44 base64 chars)
     const TEST_PRIVATE_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";

@@ -8,7 +8,7 @@ use std::time::Duration;
 use log::{debug, info, warn};
 use zeroize::Zeroizing;
 
-use crate::{api, config, manifest, netlock, options, pinger};
+use crate::{api, config, manifest, netlock, options, pinger, wireguard};
 use super::{lock_state, State};
 
 /// Background pinger loop — runs every 3 minutes, measures all server latencies.
@@ -76,7 +76,20 @@ pub(super) fn background_pinger_loop(state: State, shutdown: Arc<AtomicBool>) {
 
         debug!("Starting ping cycle ({} servers, max {} concurrent)", ips.len(), pinger_jobs);
 
-        // Ping all servers via host routes (direct, not through tunnel).
+        // Bind each ping to the physical egress interface so it leaves the
+        // physical NIC instead of following the routing table into the tunnel.
+        // Re-derived every cycle, so it tracks the current interface across
+        // WiFi roams / DHCP renews — the exact events that used to flush the
+        // old /32 host routes and silently make the pinger measure through the
+        // tunnel.
+        let ping_iface = match wireguard::default_route_iface() {
+            Ok(iface) => Some(iface),
+            Err(e) => {
+                warn!("Pinger: no physical egress interface ({e}); measuring via default route");
+                None
+            }
+        };
+
         // Each result merges under a brief per-result lock so /servers
         // reflects fresh values as they arrive, not in one bulk swap at
         // the end of the cycle.
@@ -85,6 +98,7 @@ pub(super) fn background_pinger_loop(state: State, shutdown: Arc<AtomicBool>) {
         let mut failed: usize = 0;
         pinger::measure_all_from_ips(
             &ips,
+            ping_iface.as_deref(),
             ping_timeout_secs,
             pinger_jobs,
             |name, latency| {

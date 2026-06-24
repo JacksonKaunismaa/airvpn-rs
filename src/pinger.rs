@@ -148,11 +148,20 @@ impl LatencyCache {
     }
 }
 
-/// Ping an IP via the default route (host routes send it through physical NIC).
-fn ping_ip(ip: &str, timeout_secs: u64) -> Option<u64> {
+/// Ping an IP and return the average RTT in ms, or `None` on failure.
+///
+/// `iface`, when set, binds the ICMP socket to that interface (`ping -I`, i.e.
+/// `SO_BINDTODEVICE`) so the packet egresses the physical NIC instead of
+/// following the routing table into the VPN tunnel. Without it, pings to
+/// servers traverse the tunnel and measure "latency to the exit POP + distance
+/// from the POP" rather than true latency from this host.
+fn ping_ip(ip: &str, iface: Option<&str>, timeout_secs: u64) -> Option<u64> {
     let timeout_str = timeout_secs.to_string();
     let mut cmd = Command::new("ping");
     cmd.args(["-c", "1", "-W", &timeout_str, "-q"]);
+    if let Some(iface) = iface {
+        cmd.args(["-I", iface]);
+    }
     cmd.arg(ip);
     let output = cmd.output().ok()?;
 
@@ -304,6 +313,7 @@ mod tests {
 /// instead of waiting for the whole cycle.
 pub fn measure_all_from_ips<F>(
     pairs: &[(String, String)],
+    iface: Option<&str>,
     ping_timeout_secs: u64,
     max_jobs: usize,
     mut on_result: F,
@@ -335,7 +345,7 @@ pub fn measure_all_from_ips<F>(
                         break;
                     }
                     let (name, ip) = &pairs[idx];
-                    let latency = match ping_ip(ip, ping_timeout_secs) {
+                    let latency = match ping_ip(ip, iface, ping_timeout_secs) {
                         Some(ms) => ms as i64,
                         None => -1,
                     };
