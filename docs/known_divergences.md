@@ -237,10 +237,14 @@ reconnection readiness, not pinging).
 parallel every 3 minutes, one ping per server per cycle. Uses EWMA (α=0.3)
 instead of simple running average — EWMA smoothing across cycles makes
 multi-round median unnecessary. **Continues pinging while connected** — all
-servers are pinged equally via host routes (`/32` via physical gateway) through
-the physical NIC for consistent raw network latency. No special-casing for the
-connected server. Results are persisted to `/var/lib/airvpn-rs/latency.json`
-(survive restarts).
+servers are pinged equally by binding each ICMP socket to the physical egress
+interface (`ping -I <iface>`, SO_BINDTODEVICE) so pings leave the physical NIC
+instead of the tunnel, for consistent raw network latency. No special-casing
+for the connected server. (Earlier builds steered these pings with ~1020 `/32`
+host routes via the physical gateway, but NetworkManager flushed them on every
+WiFi roam / DHCP renew / resume, silently sending pings through the tunnel;
+per-socket binding has no such global state to lose.) Results are persisted to
+`/var/lib/airvpn-rs/latency.json` (survive restarts).
 
 Matches Eddie's all-server allowlist: session lock allowlists all server entry
 IPs (not just the selected server), activated once before the reconnection loop
@@ -254,10 +258,10 @@ background pinger's ICMP access.
 - Parallel pinging is faster (~30s for all servers vs Eddie's sequential approach).
 - Persistence means data is available immediately after restart.
 
-**Files:** `src/pinger.rs` (`LatencyCache`, `measure_all_from_ips`),
-`src/helper.rs` (`background_pinger_loop`), `src/wireguard.rs`
-(`add_server_host_routes`), `src/netlock.rs` (`populate_ping_allow`),
-`src/connect.rs` (cached latency, all-server allowlist)
+**Files:** `src/pinger.rs` (`LatencyCache`, `measure_all_from_ips`, `ping_ip`),
+`src/helper/background.rs` (`background_pinger_loop`), `src/wireguard.rs`
+(`default_route_iface` / `parse_default_iface`), `src/netlock.rs`
+(`populate_ping_allow`), `src/connect.rs` (cached latency, all-server allowlist)
 
 **Eddie ref:** `src/Lib.Core/Jobs/Latency.cs`, `src/Lib.Core/NetworkLockPlugin.cs`
 (`GetIpsAllowlistOutgoing`)

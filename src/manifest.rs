@@ -184,8 +184,8 @@ fn split_ips(s: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .filter(|ip_str| {
             // Validate the FULL string, not just the part before '/'. These IPs
-            // are written verbatim into the `ip -batch` route stream
-            // (wireguard::add_server_host_routes), so a value like
+            // are written verbatim into the nftables allowlist (`nft -f` via
+            // netlock) and `ip route` commands, so a value like
             // `1.2.3.4/0\nroute add ...` must be rejected outright, not have only
             // its address portion validated.
             if crate::common::is_valid_ip_or_cidr(ip_str) {
@@ -712,8 +712,8 @@ mod tests {
 
     #[test]
     fn test_split_ips_rejects_cidr_suffix_injection() {
-        // Address parses but the "prefix" carries an injected `ip -batch` command
-        // (split_ips feeds wireguard::add_server_host_routes). Single entry: no
+        // Address parses but the "prefix" carries an injected command (split_ips
+        // feeds the nftables allowlist and `ip route` commands). Single entry: no
         // ',' or ';' so it isn't split apart — must be dropped on its own merit.
         assert!(split_ips("1.2.3.4/0\nroute add 0.0.0.0/0 via 10.0.0.1").is_empty());
         assert!(split_ips("1.2.3.4/24 via 10.0.0.1").is_empty());

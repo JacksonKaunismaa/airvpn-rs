@@ -402,9 +402,8 @@ pub(super) async fn handle_connect_async(
 /// spawning a duplicate cleanup thread. Returns true only for the caller
 /// that successfully flipped the flag.
 fn signal_disconnect(state: &State) -> bool {
-    // Single critical section: check, claim, capture handles, snapshot
-    // manifest IPs, broadcast.
-    let (connect_handle, stats_handle, route_ips) = {
+    // Single critical section: check, claim, capture handles, broadcast.
+    let (connect_handle, stats_handle) = {
         let mut st = state.0.lock().unwrap();
         if !st.conn.is_connected() {
             return false;
@@ -416,15 +415,10 @@ fn signal_disconnect(state: &State) -> bool {
         st.conn.stats_stop.store(true, Ordering::SeqCst);
         let ch = st.conn.connect_handle.take();
         let sh = st.conn.stats_handle.take();
-        // Snapshot manifest IPs so the cleanup thread can remove host routes
-        // after force_recover (which doesn't know server IPs).
-        let ips: Vec<String> = st.manifest.as_ref()
-            .map(|m| m.servers.iter().flat_map(|s| s.ips_entry.iter().cloned()).collect())
-            .unwrap_or_default();
         st.broadcast(&ipc::HelperEvent::StateChanged {
             state: ipc::ConnectionState::Disconnecting,
         });
-        (ch, sh, ips)
+        (ch, sh)
     };
 
     // Spawn detached thread for blocking cleanup
@@ -439,14 +433,6 @@ fn signal_disconnect(state: &State) -> bool {
 
         if let Err(e) = recovery::force_recover() {
             warn!("force_recover after disconnect: {}", e);
-        }
-
-        // Remove stale /32 server host routes left by the pinger.
-        // force_recover doesn't handle these (it doesn't know server IPs).
-        if !route_ips.is_empty() {
-            if let Ok(gw) = wireguard::get_default_gateway_pub() {
-                let _ = wireguard::remove_server_host_routes(&route_ips, &gw);
-            }
         }
 
         // Clear server info. The connect thread's ConnectGuard broadcasts
@@ -503,20 +489,6 @@ fn perform_disconnect(state: &State) -> bool {
     // file and is a no-op.
     if let Err(e) = recovery::force_recover() {
         warn!("force_recover after disconnect: {}", e);
-    }
-
-    // Remove stale /32 server host routes left by the pinger.
-    // force_recover doesn't handle these (it doesn't know server IPs).
-    let route_ips: Vec<String> = {
-        let st = state.0.lock().unwrap();
-        st.manifest.as_ref()
-            .map(|m| m.servers.iter().flat_map(|s| s.ips_entry.iter().cloned()).collect())
-            .unwrap_or_default()
-    };
-    if !route_ips.is_empty() {
-        if let Ok(gw) = wireguard::get_default_gateway_pub() {
-            let _ = wireguard::remove_server_host_routes(&route_ips, &gw);
-        }
     }
 
     // Clear server info. The connect thread's ConnectGuard broadcasts
@@ -794,21 +766,6 @@ pub(super) fn handle_disconnect(state: &State) -> Response<HyperBody> {
         if let Err(e) = recovery::force_recover() {
             error!("orphaned disconnect recovery failed: {}", e);
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("orphaned disconnect failed: {}", e));
-        }
-
-        // Clean up server host routes (force_recover doesn't know server IPs)
-        {
-            let st = state.0.lock().unwrap();
-            if let Some(ref manifest) = st.manifest {
-                let server_ips: Vec<String> = manifest.servers
-                    .iter()
-                    .flat_map(|s| s.ips_entry.iter().cloned())
-                    .collect();
-                drop(st);
-                if let Ok(gw) = wireguard::get_default_gateway_pub() {
-                    let _ = wireguard::remove_server_host_routes(&server_ips, &gw);
-                }
-            }
         }
 
         // Stop stats poller and clear server info
@@ -1096,8 +1053,7 @@ pub(super) fn handle_lock_status() -> Response<HyperBody> {
 
 /// POST /recover — clean up orphaned VPN state.
 ///
-/// Runs force_recover (DNS, locks, WireGuard) and also cleans up stale
-/// server host routes that force_recover can't handle (needs manifest IPs).
+/// Runs force_recover (DNS, locks, WireGuard).
 pub(super) fn handle_recover(state: &State) -> Response<HyperBody> {
     {
         // lock_state (poison-tolerant): /recover is the break-glass endpoint,
@@ -1122,21 +1078,6 @@ pub(super) fn handle_recover(state: &State) -> Response<HyperBody> {
 
     if let Err(e) = recovery::force_recover() {
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("recovery failed: {}", e));
-    }
-
-    // Best-effort cleanup of server host routes (the ~1000 /32 routes to server IPs).
-    // force_recover can't do this because it doesn't know the server IPs.
-    // We get them from the cached manifest in SharedState.
-    let st = lock_state(state);
-    if let Some(ref manifest) = st.manifest {
-        let server_ips: Vec<String> = manifest.servers
-            .iter()
-            .flat_map(|s| s.ips_entry.iter().cloned())
-            .collect();
-        drop(st);
-        if let Ok(gw) = wireguard::get_default_gateway_pub() {
-            let _ = wireguard::remove_server_host_routes(&server_ips, &gw);
-        }
     }
 
     json_response(StatusCode::OK, &json!({"recovered": true}))

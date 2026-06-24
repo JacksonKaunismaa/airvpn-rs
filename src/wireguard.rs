@@ -8,7 +8,7 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use log::{debug, error, info, warn};
+use log::{debug, error, warn};
 
 use crate::manifest::{Mode, Server, UserInfo, WireGuardKey};
 
@@ -732,91 +732,6 @@ fn teardown_routing(_iface: &str, endpoint_ip: &str) {
             .args([ip_version, "route", "delete", &endpoint_route])
             .output();
     }
-}
-
-/// Add host routes for all server entry IPs through the physical gateway.
-///
-/// Uses `ip -batch` for performance (tested: 1024 routes in 18ms).
-/// Errors are non-fatal — some routes may already exist (e.g., the connected
-/// endpoint already has a route from `setup_routing`).
-pub fn add_server_host_routes(server_ips: &[String], gateway: &str) -> Result<()> {
-    if server_ips.is_empty() {
-        return Ok(());
-    }
-    let gw_is_v6 = gateway.contains(':');
-    let ip_ver = if gw_is_v6 { "-6" } else { "-4" };
-
-    let mut batch = String::new();
-    for ip in server_ips {
-        // Only add routes whose IP version matches the gateway
-        if ip.contains(':') == gw_is_v6 {
-            let prefix = if ip.contains(':') { "/128" } else { "/32" };
-            batch.push_str(&format!("route add {}{} via {}\n", ip, prefix, gateway));
-        }
-    }
-    if batch.is_empty() {
-        return Ok(());
-    }
-
-    let mut child = Command::new("ip")
-        .args([ip_ver, "-force", "-batch", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("failed to spawn ip -batch for server routes")?;
-    if let Some(ref mut stdin) = child.stdin {
-        stdin.write_all(batch.as_bytes())
-            .context("failed to write server route batch")?;
-    }
-    let output = child.wait_with_output()
-        .context("failed to wait on ip -batch for server routes")?;
-
-    // Non-fatal: some routes may already exist (e.g., the connected endpoint).
-    // -force ensures ip continues past errors instead of terminating on first failure.
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!("Some server host routes failed (non-fatal): {}", stderr.trim());
-    }
-
-    let count = batch.lines().count();
-    info!("Added {} server host routes via physical gateway", count);
-    Ok(())
-}
-
-/// Remove host routes for server entry IPs. Best-effort cleanup.
-pub fn remove_server_host_routes(server_ips: &[String], gateway: &str) -> Result<()> {
-    if server_ips.is_empty() {
-        return Ok(());
-    }
-    let gw_is_v6 = gateway.contains(':');
-    let ip_ver = if gw_is_v6 { "-6" } else { "-4" };
-
-    let mut batch = String::new();
-    for ip in server_ips {
-        if ip.contains(':') == gw_is_v6 {
-            let prefix = if ip.contains(':') { "/128" } else { "/32" };
-            batch.push_str(&format!("route del {}{} via {}\n", ip, prefix, gateway));
-        }
-    }
-    if batch.is_empty() {
-        return Ok(());
-    }
-
-    let mut child = Command::new("ip")
-        .args([ip_ver, "-force", "-batch", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("failed to spawn ip -batch for route removal")?;
-    if let Some(ref mut stdin) = child.stdin {
-        stdin.write_all(batch.as_bytes())?;
-    }
-    let _ = child.wait_with_output();
-
-    info!("Removed server host routes");
-    Ok(())
 }
 
 /// Disconnect the WireGuard tunnel using direct `ip` commands (no wg-quick).
