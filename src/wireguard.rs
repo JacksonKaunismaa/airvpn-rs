@@ -518,6 +518,29 @@ pub fn default_route_iface() -> Result<String> {
     Ok(iface)
 }
 
+/// Parse the contents of `/sys/class/net/<iface>/carrier`.
+///
+/// "1" -> link up, "0" -> link down, anything else -> None (carrier file is
+/// transiently unreadable / EINVAL when the iface is admin-down). Pure helper.
+fn parse_carrier(s: &str) -> Option<bool> {
+    match s.trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// Read the physical-link carrier state of `iface` from sysfs.
+///
+/// Some(true)/Some(false) for link up/down; None on read error (iface gone,
+/// admin-down, or transient EINVAL). Used to detect a WiFi/ethernet flap that
+/// happened *during* a connection, which should be treated as network-down
+/// rather than a server failure.
+pub fn iface_carrier_up(iface: &str) -> Option<bool> {
+    let path = format!("/sys/class/net/{}/carrier", iface);
+    std::fs::read_to_string(path).ok().and_then(|s| parse_carrier(&s))
+}
+
 /// Get the current IPv6 default gateway from the main routing table.
 ///
 /// Parses `ip -6 route show default` output which looks like:
@@ -928,6 +951,17 @@ mod tests {
     fn test_parse_default_iface_none_when_no_default_route() {
         let out = "10.100.0.0/20 dev wlo1 proto kernel scope link src 10.100.7.120\n";
         assert_eq!(parse_default_iface(out), None);
+    }
+
+    #[test]
+    fn test_parse_carrier() {
+        assert_eq!(parse_carrier("1"), Some(true));
+        assert_eq!(parse_carrier("1\n"), Some(true));
+        assert_eq!(parse_carrier("0"), Some(false));
+        assert_eq!(parse_carrier(" 0 \n"), Some(false));
+        assert_eq!(parse_carrier(""), None);
+        assert_eq!(parse_carrier("\n"), None);
+        assert_eq!(parse_carrier("garbage"), None);
     }
 
     // Valid 44-character base64 strings (WireGuard keys are 32 bytes = 44 base64 chars)

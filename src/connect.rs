@@ -756,7 +756,10 @@ fn refresh_manifest_if_needed(
 
 /// Monitor loop: checks interface, handshake, DNS, kill switch every 1s.
 ///
-/// Returns the ResetLevel when the connection ends or a problem is detected.
+/// Returns `(ResetLevel, net_flapped)` when the connection ends. `net_flapped`
+/// is true if the physical egress link lost carrier or the default gateway
+/// disappeared at any point during the connection — used to distinguish a
+/// transient WiFi blip from a genuine server failure.
 fn run_monitor_loop(
     shutdown: &std::sync::atomic::AtomicBool,
     iface: &str,
@@ -766,27 +769,38 @@ fn run_monitor_loop(
     handshake_timeout_connected: u64,
     dns_mode: dns::DnsMode,
     dns_services: &[String],
-) -> ResetLevel {
+) -> (ResetLevel, bool) {
+    // Physical NIC while connected (main-table default route still points at it).
+    let phys_iface = wireguard::default_route_iface().ok();
+    let mut net_flapped = false;
     let mut dns_fail_count: u32 = 0;
     loop {
         if shutdown.load(Ordering::Relaxed) {
             info!("Disconnecting...");
-            break ResetLevel::None;
+            break (ResetLevel::None, net_flapped);
+        }
+
+        // Carrier down on the egress NIC, or no default gateway, means the
+        // underlying network blipped during this connection.
+        if (phys_iface.as_deref().and_then(wireguard::iface_carrier_up) == Some(false))
+            || !wireguard::has_default_gateway()
+        {
+            net_flapped = true;
         }
 
         if !wireguard::is_connected(iface) {
             error!("WireGuard interface {} disappeared!", iface);
-            break ResetLevel::Error;
+            break (ResetLevel::Error, net_flapped);
         }
 
         if wireguard::is_handshake_stale(iface, handshake_timeout_connected) {
             error!("WireGuard handshake stale (>{}s) -- tunnel may be dead", handshake_timeout_connected);
-            break ResetLevel::Error;
+            break (ResetLevel::Error, net_flapped);
         }
 
         if !no_lock && !netlock::is_active() {
             error!("Kill switch nftables table deleted externally! Triggering reconnection to restore it.");
-            break ResetLevel::Error;
+            break (ResetLevel::Error, net_flapped);
         }
 
         match dns::check_and_reapply(dns_ipv4, dns_ipv6, iface, dns_mode, dns_services) {
@@ -799,7 +813,7 @@ fn run_monitor_loop(
                         "DNS re-apply failed {} consecutive times, triggering reconnection",
                         dns_fail_count,
                     );
-                    break ResetLevel::Error;
+                    break (ResetLevel::Error, net_flapped);
                 }
             }
         }
@@ -969,6 +983,17 @@ fn post_connect_setup(
     Ok(())
 }
 
+/// Decide whether a failure should be attributed to the network rather than the
+/// server. Pure helper so the classification can be unit-tested without the
+/// side effects of `handle_connection_failure`.
+fn is_network_down(check_network: bool, net_flapped: bool, has_gw: bool) -> bool {
+    // Flap-during-connection: a physical-link carrier drop or missing gateway
+    // *while connected* means the WiFi/ethernet blipped, not the server. The
+    // gateway is often back by the time we check (WiFi reassociated), so the
+    // carrier-flap signal is what catches the transient case.
+    check_network && (net_flapped || !has_gw)
+}
+
 /// Penalize server and compute backoff, with network-down and lock_last awareness.
 ///
 /// Returns whether the server was penalized (and forced_server cleared). When
@@ -978,16 +1003,17 @@ fn handle_connection_failure(
     server_name: &str,
     lock_last: bool,
     check_network: bool,
+    net_flapped: bool,
     penalties: &mut server::ServerPenalties,
     forced_server: &mut Option<String>,
     consecutive_failures: &mut u32,
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     penality_on_error: i64,
 ) {
-    let network_down = check_network && !wireguard::has_default_gateway();
+    let network_down = is_network_down(check_network, net_flapped, wireguard::has_default_gateway());
     if network_down || lock_last {
         if network_down {
-            warn!("Network appears down (no default gateway). Will retry same server.");
+            warn!("Network blipped during connection (carrier flap or no gateway), not a server fault. Will retry same server.");
         }
         // Don't penalize, don't clear forced_server (retry same server)
     } else {
@@ -1112,6 +1138,7 @@ fn resolve_effective_dns(
 #[allow(clippy::too_many_arguments)]
 fn handle_reset_level(
     reset_level: ResetLevel,
+    net_flapped: bool,
     config: &ConnectConfig,
     params: &SessionParams,
     config_path: &str,
@@ -1139,7 +1166,7 @@ fn handle_reset_level(
             let _ = partial_disconnect(config_path, iface, !config.no_lock, endpoint_ip);
             let penality_on_error = options::get_i64(&config.resolved, options::PENALITY_ON_ERROR);
             handle_connection_failure(
-                server_name, lock_last, true,
+                server_name, lock_last, true, net_flapped,
                 penalties, forced_server, consecutive_failures,
                 &params.shutdown, penality_on_error,
             );
@@ -1537,8 +1564,10 @@ fn establish_wireguard_tunnel(
                 return Err(LoopAction::Bail(e.context("WireGuard connection failed")));
             }
             let penality_on_error = options::get_i64(&config.resolved, options::PENALITY_ON_ERROR);
+            // Setup-time failure (no monitor loop yet): no tracked flap, so
+            // net_flapped=false keeps the original gateway-only classification.
             handle_connection_failure(
-                &server_ref.name, data.lock_last, true,
+                &server_ref.name, data.lock_last, true, false,
                 &mut state.penalties, &mut state.forced_server, &mut state.consecutive_failures,
                 &params.shutdown, penality_on_error,
             );
@@ -1603,8 +1632,9 @@ fn wait_and_verify_connection(
             return LoopAction::Bail(e);
         }
         let penality_on_error = options::get_i64(&config.resolved, options::PENALITY_ON_ERROR);
+        // No monitor loop ran yet (check_network=false), so net_flapped is moot.
         handle_connection_failure(
-            &server_ref.name, data.lock_last, false,
+            &server_ref.name, data.lock_last, false, false,
             &mut state.penalties, &mut state.forced_server, &mut state.consecutive_failures,
             &params.shutdown, penality_on_error,
         );
@@ -1656,8 +1686,9 @@ fn wait_and_verify_connection(
                 return LoopAction::Bail(anyhow::anyhow!("Verification failed (--no-reconnect)"));
             }
             let penality_on_error = options::get_i64(&config.resolved, options::PENALITY_ON_ERROR);
+            // No monitor loop ran yet (check_network=false), so net_flapped is moot.
             handle_connection_failure(
-                &server_ref.name, data.lock_last, false,
+                &server_ref.name, data.lock_last, false, false,
                 &mut state.penalties, &mut state.forced_server, &mut state.consecutive_failures,
                 &params.shutdown, penality_on_error,
             );
@@ -1808,7 +1839,7 @@ pub fn run(
 
         // Monitor loop — determines ResetLevel when connection ends
         let handshake_timeout_connected = options::get_u64(&config.resolved, options::WG_HANDSHAKE_CONNECTED);
-        let reset_level = run_monitor_loop(
+        let (reset_level, net_flapped) = run_monitor_loop(
             &params.shutdown,
             &iface,
             config.no_lock,
@@ -1821,7 +1852,7 @@ pub fn run(
 
         // Handle reset level (Eddie: Session.cs phase 6 cleanup + wait)
         let should_break = handle_reset_level(
-            reset_level, config, &params,
+            reset_level, net_flapped, config, &params,
             &config_path, &iface, &endpoint_ip,
             &server_ref.name, data.lock_last,
             &mut state.penalties, &mut state.forced_server, &mut state.consecutive_failures,
@@ -1842,6 +1873,49 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_network_down_flap_is_network() {
+        // A carrier flap during the connection => network-down (retry same server).
+        assert!(is_network_down(true, true, true));
+        assert!(is_network_down(true, true, false));
+    }
+
+    #[test]
+    fn test_is_network_down_no_gateway_is_network() {
+        assert!(is_network_down(true, false, false));
+    }
+
+    #[test]
+    fn test_is_network_down_genuine_server_failure() {
+        // No flap, gateway present => server failure (penalize + clear forced_server).
+        assert!(!is_network_down(true, false, true));
+    }
+
+    #[test]
+    fn test_is_network_down_check_disabled() {
+        // check_network=false short-circuits to server failure regardless.
+        assert!(!is_network_down(false, true, false));
+    }
+
+    #[test]
+    fn test_handle_connection_failure_flap_retries_same_server() {
+        // net_flapped=true is treated as network-down even if a gateway is
+        // present, so the server is NOT penalized and forced_server is retained.
+        // Pre-set shutdown so interruptible_sleep returns immediately.
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut penalties = server::ServerPenalties::new();
+        let mut forced_server = Some("us-server-1".to_string());
+        let mut consecutive_failures = 0u32;
+        handle_connection_failure(
+            "us-server-1", false, true, /* net_flapped */ true,
+            &mut penalties, &mut forced_server, &mut consecutive_failures,
+            &shutdown, 30,
+        );
+        assert_eq!(forced_server.as_deref(), Some("us-server-1"), "should retry same server");
+        assert_eq!(penalties.get("us-server-1"), 0, "should not penalize on a network flap");
+        assert_eq!(consecutive_failures, 1);
+    }
 
     #[test]
     fn test_extract_ip_from_url_http() {
