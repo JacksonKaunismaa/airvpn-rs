@@ -67,6 +67,9 @@ pub const SERVERS_CAPACITY_FACTOR: &str = "servers.capacity_factor";
 pub const DNS_MODE: &str = "dns.mode";
 pub const LINUX_DNS_SERVICES: &str = "linux.dns.services";
 
+// AirDNS self-heal
+pub const DDNS_HOSTNAME: &str = "ddns.hostname";
+
 // UI
 pub const UI_UNIT: &str = "ui.unit";
 pub const UI_IEC: &str = "ui.iec";
@@ -146,6 +149,8 @@ pub static REGISTRY: &[OptionDef] = &[
     // DNS
     OptionDef { name: DNS_MODE, default: "auto", description: "DNS resolution mode: auto, resolvconf, or systemd-resolved" },
     OptionDef { name: LINUX_DNS_SERVICES, default: "nscd,dnsmasq,named,bind9", description: "DNS cache services to restart on flush (comma-separated)" },
+    // AirDNS self-heal
+    OptionDef { name: DDNS_HOSTNAME, default: "", description: "AirDNS DDNS hostname (e.g. host.airdns.org). When set, after connect the authoritative record is checked against the server's exit IP and a corrective reconnect is triggered on drift. Empty = disabled" },
     // UI
     OptionDef { name: UI_UNIT, default: "bytes", description: "Display unit for speeds: bytes or bits" },
     OptionDef { name: UI_IEC, default: "false", description: "Use binary IEC units (KiB/MiB) instead of decimal SI (KB/MB)" },

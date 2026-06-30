@@ -1,3 +1,4 @@
+pub mod airdns;
 pub mod api;
 pub mod cli_client;
 pub mod common;
