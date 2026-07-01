@@ -141,8 +141,6 @@ pub fn view<'a>(
     lock_persistent: bool,
     sub_tab: SettingsSubTab,
     // WireGuard settings
-    wg_key: &'a str,
-    available_keys: &'a [String],
     wg_mtu: &'a str,
     wg_keepalive: &'a str,
     wg_handshake_first: &'a str,
@@ -202,9 +200,6 @@ pub fn view<'a>(
         ),
         SettingsSubTab::Network => view_network(ipv6_mode, ipv4_mode, entry_iface, dns, dns_mode, dns_services, routes_custom, areas_allowlist, areas_denylist),
         SettingsSubTab::WireGuard => view_wireguard(
-            wg_key,
-            available_keys,
-            credentials_configured,
             wg_mtu,
             wg_keepalive,
             wg_handshake_first,
@@ -430,37 +425,15 @@ fn view_network<'a>(
 // ── WireGuard sub-tab ──────────────────────────────────────────────────
 
 fn view_wireguard<'a>(
-    wg_key: &'a str,
-    available_keys: &'a [String],
-    credentials_configured: bool,
     wg_mtu: &'a str,
     wg_keepalive: &'a str,
     wg_handshake_first: &'a str,
     wg_handshake_connected: &'a str,
 ) -> Element<'a, Message> {
-    // Device/key dropdown — populated from API, hidden when only 1 key (like Eddie).
-    let key_widget: Element<'a, Message> = if available_keys.len() > 1 {
-        let key_options: Vec<&str> = available_keys.iter().map(|s| s.as_str()).collect();
-        let selected: Option<&str> = key_options.iter().find(|&&k| k == wg_key).copied()
-            .or_else(|| key_options.first().copied());
-        dropdown_field("Device / Key", key_options, selected, |selected: &str| {
-            Message::SettingsWgKeyChanged(selected.to_string())
-        })
-    } else if available_keys.len() == 1 {
-        text(format!("Device / Key: {}", available_keys[0]))
-            .size(13).color(theme::TEXT_SECONDARY).into()
-    } else if !credentials_configured {
-        text("Device / Key: credentials not configured")
-            .size(13).color(theme::WARNING).into()
-    } else {
-        text("Device / Key: loading...")
-            .size(13).color(theme::TEXT_SECONDARY).into()
-    };
-
+    // Device/key selection now lives on the Overview, not here.
     section_card(
         column![
             section_header("WireGuard"),
-            key_widget,
             text_field("Interface MTU", "1320", wg_mtu, Message::SettingsWgMtuChanged),
             text_field(
                 "Persistent Keepalive (s)",

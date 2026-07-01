@@ -118,6 +118,9 @@ pub enum Message {
     Connect,
     ConnectToServer(String),
     Disconnect,
+    Recover,
+    /// Device/key picked from the Overview dropdown (persisted immediately).
+    OverviewKeyChanged(String),
     Tick,
     HelperConnected,
     FetchServers,
@@ -142,7 +145,6 @@ pub enum Message {
     SettingsSubTabChanged(views::settings::SettingsSubTab),
     FetchKeys,
     // WireGuard settings
-    SettingsWgKeyChanged(String),
     SettingsWgMtuChanged(String),
     SettingsWgKeepaliveChanged(String),
     SettingsWgHandshakeFirstChanged(String),

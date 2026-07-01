@@ -19,15 +19,11 @@ impl App {
                 if tab == views::Tab::Servers && self.servers.is_empty() && !self.servers_loading {
                     return Task::done(Message::FetchServers);
                 }
-                if tab == views::Tab::Settings {
-                    if !self.settings.loaded {
-                        return Task::batch([
-                            Task::done(Message::FetchProfile),
-                            Task::done(Message::FetchKeys),
-                        ]);
-                    }
-                    // Re-fetch keys each time (may have been empty on first try)
-                    return Task::done(Message::FetchKeys);
+                if tab == views::Tab::Settings && !self.settings.loaded {
+                    // Profile normally loads eagerly on HelperConnected; this is a
+                    // fallback if that initial fetch failed. The device/key list now
+                    // lives on the Overview, so Settings no longer fetches keys.
+                    return Task::done(Message::FetchProfile);
                 }
                 Task::none()
             }
@@ -57,6 +53,59 @@ impl App {
                 }
                 Task::none()
             }
+            Message::Recover => {
+                // Break-glass cleanup of orphaned VPN state (kill switch, DNS,
+                // tunnel). Resulting state/lock changes arrive via the /events
+                // stream. Feedback goes through `activity` (always visible) since
+                // the error banner is gated behind show_errors and a silent
+                // outcome defeats the whole point of a recover button.
+                self.error_overview = None;
+                if let Some(ref helper) = self.helper {
+                    match helper.send_command("POST", "/recover", None) {
+                        Ok((status, body)) => {
+                            if status == 200 {
+                                self.activity = "Recovery complete".into();
+                            } else {
+                                self.activity = format!("Recover failed (HTTP {})", status);
+                                self.error_overview = Some(format!("Recover failed: {}", body));
+                            }
+                        }
+                        Err(_) => self.enter_reconnection(),
+                    }
+                }
+                Task::none()
+            }
+            Message::OverviewKeyChanged(key) => {
+                // Device picked on the Overview. Persist immediately (focused
+                // profile save merges, so other options are untouched) so the
+                // choice is remembered and used on the next connect. wg_key is
+                // only updated on a confirmed save — otherwise the dropdown would
+                // show a device the next connect wouldn't actually use.
+                self.error_overview = None;
+                if let Some(ref helper) = self.helper {
+                    let mut options = std::collections::HashMap::new();
+                    options.insert(options::KEY.into(), key.clone());
+                    let req = SaveProfileRequest { options };
+                    match serde_json::to_vec(&req) {
+                        Ok(body) => match helper.send_command("POST", "/profile", Some(&body)) {
+                            Ok((status, _body)) => {
+                                if status == 200 {
+                                    self.settings.wg_key = key;
+                                } else {
+                                    self.error_overview =
+                                        Some(format!("Failed to save device (HTTP {})", status));
+                                }
+                            }
+                            Err(_) => self.enter_reconnection(),
+                        },
+                        Err(e) => {
+                            self.error_overview =
+                                Some(format!("Failed to serialize device selection: {}", e));
+                        }
+                    }
+                }
+                Task::none()
+            }
             Message::Tick => {
                 // Attempt reconnection if helper died
                 if self.helper_reconnecting && Instant::now() >= self.helper_reconnect_at {
@@ -68,10 +117,14 @@ impl App {
                             self.helper_reconnecting = false;
                             self.activity.clear();
                             self.error_overview = None;
-                            // Re-fetch state from the new helper instance
-                            // (event stream delivers initial StatusResponse + LockStatus,
-                            // but we also need servers/profile if they were loaded)
-                            return Task::none();
+                            // Re-fetch state from the new helper instance. The event
+                            // stream delivers the initial StatusResponse + LockStatus,
+                            // but profile (connect flags + selected device) and the
+                            // device/key list must be pulled explicitly.
+                            return Task::batch([
+                                Task::done(Message::FetchProfile),
+                                Task::done(Message::FetchKeys),
+                            ]);
                         }
                         Err(e) => {
                             eprintln!("[GUI] Helper reconnection failed: {}", e);
@@ -103,6 +156,19 @@ impl App {
                     self.last_server_fetch = Instant::now();
                     return Task::done(Message::FetchServers);
                 }
+                // Retry the device/key list while empty — the helper's background
+                // loop populates it a few seconds after startup, so the initial
+                // FetchKeys on connect often comes back empty. Gated on
+                // credentials_configured so a credential-less profile (which can
+                // never have keys) doesn't poll forever.
+                if self.helper.is_some()
+                    && self.settings.credentials_configured
+                    && self.available_keys.is_empty()
+                    && self.last_keys_fetch.elapsed() > Duration::from_secs(5)
+                {
+                    self.last_keys_fetch = Instant::now();
+                    return Task::done(Message::FetchKeys);
+                }
                 Task::none()
             }
             Message::HelperConnected => {
@@ -112,7 +178,13 @@ impl App {
                         self.helper_reconnecting = false;
                         self.error_overview = None;
                         self.activity.clear();
-                        Task::none()
+                        // Eagerly load profile (connect flags + selected device)
+                        // and the device/key list so the Overview is fully
+                        // populated without first visiting Settings.
+                        Task::batch([
+                            Task::done(Message::FetchProfile),
+                            Task::done(Message::FetchKeys),
+                        ])
                     }
                     Err(e) => {
                         eprintln!("[GUI] HelperClient::connect() failed: {}", e);
@@ -353,11 +425,6 @@ impl App {
             }
             Message::SettingsSubTabChanged(tab) => {
                 self.settings.sub_tab = tab;
-                Task::none()
-            }
-            Message::SettingsWgKeyChanged(val) => {
-                self.settings.wg_key = val;
-                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsWgMtuChanged(val) => {

@@ -43,6 +43,8 @@ impl App {
                 &self.activity,
                 &self.eddie_import_pending,
                 views::overview::UnitConfig::from_options(&self.settings.ui_unit, &self.settings.ui_iec.to_string()),
+                &self.available_keys,
+                &self.settings.wg_key,
             ),
             views::Tab::Servers => views::servers::view(
                 &self.servers,
@@ -80,8 +82,6 @@ impl App {
                 self.lock_persistent,
                 self.settings.sub_tab,
                 // WireGuard
-                &self.settings.wg_key,
-                &self.available_keys,
                 &self.settings.wg_mtu,
                 &self.settings.wg_keepalive,
                 &self.settings.wg_handshake_first,

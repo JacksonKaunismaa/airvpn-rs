@@ -1,6 +1,6 @@
 //! Overview tab: connection status, connect/disconnect, stats, lock status.
 
-use iced::widget::{button, column, container, row, text, Space};
+use iced::widget::{button, column, container, pick_list, row, text, Space};
 use iced::{Alignment, Element, Fill};
 
 use airvpn::ipc::ConnectionState;
@@ -50,6 +50,8 @@ pub fn view<'a>(
     activity: &'a str,
     eddie_import_pending: &'a Option<String>,
     unit_config: UnitConfig,
+    available_keys: &'a [String],
+    wg_key: &'a str,
 ) -> Element<'a, Message> {
     // If Eddie import confirmation is pending, show that dialog instead
     if let Some(path) = eddie_import_pending {
@@ -109,6 +111,29 @@ pub fn view<'a>(
         .style(theme::card);
 
         content = content.push(server_card);
+    }
+
+    // ── Device / key selector (pre-connect) ──────────────────────────
+    // Shown only when disconnected and more than one device key exists
+    // (hidden for a single key, like Eddie's ComboBox). Picking a device
+    // persists it immediately and applies on the next connect.
+    if matches!(connection_state, ConnectionState::Disconnected) && available_keys.len() > 1 {
+        let key_options: Vec<&str> = available_keys.iter().map(|s| s.as_str()).collect();
+        let selected: Option<&str> = key_options
+            .iter()
+            .find(|&&k| k == wg_key)
+            .copied()
+            .or_else(|| key_options.first().copied());
+        content = content.push(
+            column![
+                text("Device / Key").size(13).color(theme::TEXT_SECONDARY),
+                pick_list(key_options, selected, |selected: &str| {
+                    Message::OverviewKeyChanged(selected.to_string())
+                })
+                .width(Fill),
+            ]
+            .spacing(4.0),
+        );
     }
 
     // ── Connect / Disconnect button ──────────────────────────────────
@@ -261,6 +286,38 @@ pub fn view<'a>(
     footer = footer.push(text(lock_label).size(13).color(lock_color));
 
     content = content.push(footer.align_y(Alignment::Center));
+
+    // ── Troubleshooting: recover ──────────────────────────────────────
+    // Subtle break-glass control: clears orphaned VPN state. Always enabled
+    // (when the helper is reachable) so it can unstick a frozen
+    // Connecting/Reconnecting state, not just a clean disconnected one.
+    let divider = container(Space::new().height(1.0).width(Fill)).style(
+        |_theme: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(theme::BORDER)),
+            ..Default::default()
+        },
+    );
+
+    let recover_btn = button(text("Recover").size(14))
+        .padding([8, 20])
+        .style(theme::secondary_button)
+        .on_press(Message::Recover);
+
+    let recover_section = column![
+        container(recover_btn).width(Fill).center_x(Fill),
+        container(
+            text("Clean up stuck VPN state (kill switch, DNS, tunnel)")
+                .size(12)
+                .color(theme::TEXT_SECONDARY),
+        )
+        .width(Fill)
+        .center_x(Fill),
+    ]
+    .spacing(theme::SPACE_SM);
+
+    content = content.push(Space::new().height(theme::SPACE_MD));
+    content = content.push(divider);
+    content = content.push(recover_section);
 
     content.into()
 }

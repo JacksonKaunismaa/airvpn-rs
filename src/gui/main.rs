@@ -80,6 +80,10 @@ struct App {
     // Auto-refresh timer for server list
     last_server_fetch: Instant,
 
+    // Throttle for re-fetching the device/key list while it's still empty
+    // (the helper's background loop populates it a few seconds after startup).
+    last_keys_fetch: Instant,
+
     // Tick counter for loading animation (wraps on overflow)
     loading_tick: u32,
 
@@ -135,6 +139,7 @@ impl App {
             available_keys: Vec::new(),
 
             last_server_fetch: Instant::now(),
+            last_keys_fetch: Instant::now(),
 
             loading_tick: 0,
 
