@@ -17,6 +17,7 @@ use std::collections::HashMap;
 pub const NETLOCK: &str = "netlock";
 pub const NETLOCK_ALLOW_PRIVATE: &str = "netlock.allow_private";
 pub const RECONNECT: &str = "reconnect";
+pub const CONNECT: &str = "connect";
 pub const VERIFY: &str = "verify";
 pub const CONNECTIONS_ALLOW_ANYWAY: &str = "connections.allow_anyway";
 
@@ -107,6 +108,7 @@ pub static REGISTRY: &[OptionDef] = &[
     OptionDef { name: NETLOCK, default: "true", description: "Enable network lock (kill switch)" },
     OptionDef { name: NETLOCK_ALLOW_PRIVATE, default: "true", description: "Allow LAN traffic through lock" },
     OptionDef { name: RECONNECT, default: "true", description: "Auto-reconnect on disconnect" },
+    OptionDef { name: CONNECT, default: "false", description: "Connect automatically at boot via airvpn-autoconnect.service (Eddie: connect)" },
     OptionDef { name: VERIFY, default: "true", description: "Verify tunnel and DNS after connect" },
     OptionDef { name: CONNECTIONS_ALLOW_ANYWAY, default: "false", description: "Allow connection even when account has warnings (e.g. expired)" },
     // Server selection

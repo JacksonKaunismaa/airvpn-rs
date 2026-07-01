@@ -431,3 +431,47 @@ a personal-use Linux client; not appropriate for a portable distribution.
 **Eddie ref:** `App.CLI.Linux.Elevated/src/impl.cpp` `dns-switch-do` (line
 ~213) and `dns-switch-restore` (line ~375)
 
+## 15. Connect-at-boot via systemd unit, not app autostart
+
+**Eddie:** Is a desktop application. "Connect at startup" is the `connect`
+profile bool (default false), honored inside `Engine` when the *app launches*.
+A separate `start_os` bool launches the Eddie app itself with the OS. So
+"connect automatically on boot" = `start_os=true` (autostart the GUI app at
+login) + `connect=true` (connect once the app is up). Both are tied to the app
+process running.
+
+**airvpn-rs:** Split architecture — a socket-activated root helper daemon plus
+thin CLI/GUI clients. There is no long-lived app process to autostart, and the
+helper only starts when a client touches its socket, so there is no "app
+launch" moment to hang a connect off. Instead, connect-at-boot is a dedicated
+oneshot systemd unit, `airvpn-autoconnect.service`, ordered
+`After=network-online.target` (so it fires only once the network is usable).
+It runs `airvpn autoconnect`, which reads the profile's `connect` flag and, if
+set, issues a best-scored-server connect (with a short retry loop for helper
+warmup / post-boot network flux). We reuse Eddie's `connect` option key for
+parity, so an imported Eddie profile with `connect=true` carries over.
+
+**Why:** Eddie's model can't be mirrored — there's no resident process to
+autostart. A systemd unit is the idiomatic Linux equivalent and, unlike an app
+autostart, works headlessly before any desktop login. This is feasible only
+because our profile is V2N (see #10): root can decrypt credentials standalone,
+with no access to the user's D-Bus keyring, which at boot is typically still
+locked. The unit is enabled unconditionally by `install.sh` and self-gates on
+the `connect` flag (no-op when false), so the GUI's "Connect at startup"
+checkbox toggles behavior purely by writing the profile flag — the thin client
+never needs to run `systemctl`.
+
+**Trade-off:** The unit always runs at boot and exits immediately when the flag
+is off (negligible cost) rather than being enabled/disabled in lockstep with
+the flag. Best-server selection at boot relies on the persisted latency cache
+(`/var/lib/airvpn-rs/latency.json`) plus a fresh manifest, since the background
+pinger has not yet run.
+
+**Files:** `resources/airvpn-autoconnect.service` (new unit), `src/main.rs`
+(`autoconnect` subcommand + `run_autoconnect`), `src/options.rs` (`connect`
+option), `scripts/install.sh` (install + enable unit), GUI settings
+("Connect at startup" checkbox)
+
+**Eddie ref:** `Lib.Core/ProfileOptions.cs` `SetDefaultBool("connect", ...)`
+and `SetDefaultBool("start_os", ...)`; `Lib.Core/Engine.cs` startup connect check
+

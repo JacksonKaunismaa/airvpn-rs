@@ -1,0 +1,17 @@
+[Unit]
+Description=AirVPN connect at boot (if enabled in profile)
+# Wait until the network is actually usable before attempting to connect.
+After=network-online.target airvpn-helper.socket
+Wants=network-online.target
+Requires=airvpn-helper.socket
+
+[Service]
+Type=oneshot
+# The command reads the profile's `connect` flag and exits 0 if disabled, so this
+# unit can be enabled unconditionally; the GUI checkbox just toggles the flag.
+ExecStart=/usr/bin/airvpn autoconnect
+# Bound: 5 connect retries x 5s, plus the connect/verify itself.
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

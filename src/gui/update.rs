@@ -321,6 +321,7 @@ impl App {
             Message::SaveSettings => {
                 if let Some(ref helper) = self.helper {
                     let mut options = std::collections::HashMap::new();
+                    options.insert(options::CONNECT.into(), self.settings.connect.to_string());
                     options.insert(options::SERVERS_STARTLAST.into(), self.settings.startlast.to_string());
                     options.insert(options::SERVERS_LOCKLAST.into(), self.settings.locklast.to_string());
                     options.insert(options::NETWORK_IPV6_MODE.into(), self.settings.ipv6_mode.clone());
@@ -388,6 +389,11 @@ impl App {
                         }
                     }
                 }
+                Task::none()
+            }
+            Message::SettingsConnectToggle(val) => {
+                self.settings.connect = val;
+                self.settings.dirty = true;
                 Task::none()
             }
             Message::SettingsStartlastToggle(val) => {
@@ -708,6 +714,8 @@ impl App {
             }
             HelperEvent::Profile { options, credentials_configured } => {
                 self.settings.credentials_configured = credentials_configured;
+                self.settings.connect = options.get(options::CONNECT)
+                    .map(|v| v.eq_ignore_ascii_case("true")).unwrap_or(false);
                 self.settings.startlast = options.get(options::SERVERS_STARTLAST)
                     .map(|v| v.eq_ignore_ascii_case("true")).unwrap_or(false);
                 self.settings.locklast = options.get(options::SERVERS_LOCKLAST)

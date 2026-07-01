@@ -66,6 +66,8 @@ enum Commands {
     },
     /// Disconnect from AirVPN
     Disconnect,
+    /// Connect at boot if enabled in the profile (used by airvpn-autoconnect.service)
+    Autoconnect,
     /// Show connection status
     Status,
     /// List available servers
@@ -309,6 +311,7 @@ fn main() -> anyhow::Result<()> {
             cli_client::send_connect(&req)
         }
         Commands::Disconnect => cli_client::send_simple("POST", "/disconnect", None),
+        Commands::Autoconnect => run_autoconnect(),
         Commands::Status => cli_client::send_status(),
         Commands::Servers => cli_client::send_list_servers(),
         Commands::Recover => cli_client::send_simple("POST", "/recover", None),
@@ -333,6 +336,46 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+/// Boot-time auto-connect entry point, invoked by `airvpn-autoconnect.service`.
+///
+/// Reads the `connect` profile option (our profile is V2N — decryptable as root
+/// without a desktop keyring, so this works before any user logs in). If the
+/// option is disabled, exits successfully without contacting the helper. If
+/// enabled, issues a best-scored-server connect (no server override), retrying a
+/// few times to ride out the socket-activated helper's warmup and any brief
+/// post-boot network flux.
+fn run_autoconnect() -> anyhow::Result<()> {
+    use airvpn::config;
+
+    let options = config::load_profile_options();
+    if !options::get_bool(&options, options::CONNECT) {
+        println!("autoconnect: disabled in profile (connect=false), nothing to do");
+        return Ok(());
+    }
+
+    println!("autoconnect: enabled — connecting to best-scored server...");
+    let req = ipc::ConnectRequest { server: None, overrides: HashMap::new() };
+
+    const MAX_ATTEMPTS: u32 = 5;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+    let mut last_err = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match cli_client::send_connect(&req) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                eprintln!("autoconnect: attempt {attempt}/{MAX_ATTEMPTS} failed: {e}");
+                last_err = Some(e);
+                if attempt < MAX_ATTEMPTS {
+                    std::thread::sleep(RETRY_DELAY);
+                }
+            }
+        }
+    }
+    Err(last_err
+        .expect("loop runs at least once so last_err is set on failure")
+        .context("autoconnect: giving up after retries"))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -340,6 +383,13 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_autoconnect_subcommand_parse() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["airvpn", "autoconnect"]);
+        assert!(cli.is_ok(), "autoconnect should parse: {:?}", cli.err());
+    }
 
     #[test]
     fn test_lock_subcommand_parse() {

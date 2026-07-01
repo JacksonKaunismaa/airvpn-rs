@@ -65,6 +65,7 @@ impl App {
             ),
             views::Tab::Settings => views::settings::view(
                 self.settings.credentials_configured,
+                self.settings.connect,
                 self.settings.startlast,
                 self.settings.locklast,
                 &self.settings.ipv6_mode,

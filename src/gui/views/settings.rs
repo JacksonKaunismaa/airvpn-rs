@@ -124,6 +124,7 @@ fn save_button(dirty: bool, loaded: bool) -> Element<'static, Message> {
 #[allow(clippy::too_many_arguments)]
 pub fn view<'a>(
     credentials_configured: bool,
+    connect: bool,
     startlast: bool,
     locklast: bool,
     ipv6_mode: &'a str,
@@ -193,6 +194,7 @@ pub fn view<'a>(
     let tab_content: Element<'a, Message> = match sub_tab {
         SettingsSubTab::General => view_general(
             credentials_configured,
+            connect,
             startlast,
             locklast,
             show_errors,
@@ -250,6 +252,7 @@ pub fn view<'a>(
 
 fn view_general<'a>(
     credentials_configured: bool,
+    connect: bool,
     startlast: bool,
     locklast: bool,
     show_errors: bool,
@@ -276,6 +279,10 @@ fn view_general<'a>(
     sections = sections.push(section_card(
         column![
             section_header("Server Preferences"),
+            checkbox(connect)
+                .label("Connect at startup")
+                .on_toggle(Message::SettingsConnectToggle),
+            hint("Automatically connect to the best server at boot (via airvpn-autoconnect.service)."),
             checkbox(startlast)
                 .label("Start with last server")
                 .on_toggle(Message::SettingsStartlastToggle),

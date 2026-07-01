@@ -10,6 +10,7 @@ pub struct LogEntry {
 /// All profile-backed settings fields, extracted from App for clarity.
 pub(crate) struct SettingsState {
     pub(crate) credentials_configured: bool,
+    pub(crate) connect: bool,
     pub(crate) startlast: bool,
     pub(crate) locklast: bool,
     pub(crate) ipv6_mode: String,
@@ -74,6 +75,7 @@ impl Default for SettingsState {
     fn default() -> Self {
         Self {
             credentials_configured: false,
+            connect: false,
             startlast: false,
             locklast: false,
             ipv6_mode: String::new(),
@@ -134,6 +136,7 @@ pub enum Message {
     LogClear,
     FetchProfile,
     SaveSettings,
+    SettingsConnectToggle(bool),
     SettingsStartlastToggle(bool),
     SettingsLocklastToggle(bool),
     SettingsIpv6ModeChanged(String),

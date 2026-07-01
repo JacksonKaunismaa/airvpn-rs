@@ -13,6 +13,19 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
+# Capture the current connection (if any) so we can restore it after the helper
+# restart below — reinstalling shouldn't silently drop your VPN. Empty string
+# means "not connected" (or curl/jq unavailable), in which case we do nothing.
+PREV_SERVER=""
+if command -v curl >/dev/null && command -v jq >/dev/null; then
+    PREV_SERVER="$(curl -s --unix-socket /run/airvpn-rs/helper.sock \
+        http://localhost/status 2>/dev/null \
+        | jq -r '.state | objects | .Connected.server_name // empty' 2>/dev/null || true)"
+fi
+if [[ -n "$PREV_SERVER" ]]; then
+    echo "Currently connected to '$PREV_SERVER' — will reconnect after install."
+fi
+
 # Build release binaries
 echo "Building release binaries..."
 sudo -u "${SUDO_USER:-$(logname)}" bash -c "cd '$SCRIPT_DIR' && cargo build --release"
@@ -35,6 +48,7 @@ install -Dm644 "$SCRIPT_DIR/resources/airvpn.svg" /usr/share/icons/hicolor/scala
 echo "Installing systemd units..."
 install -Dm644 "$SCRIPT_DIR/resources/airvpn-helper.socket" /etc/systemd/system/airvpn-helper.socket
 install -Dm644 "$SCRIPT_DIR/resources/airvpn-helper.service" /etc/systemd/system/airvpn-helper.service
+install -Dm644 "$SCRIPT_DIR/resources/airvpn-autoconnect.service" /etc/systemd/system/airvpn-autoconnect.service
 
 # Reload units first (so stop uses the current unit file)
 systemctl daemon-reload
@@ -58,6 +72,11 @@ install -dm755 /var/lib/airvpn-rs
 # Enable socket activation
 systemctl enable --now airvpn-helper.socket
 
+# Enable boot auto-connect unit. It self-gates on the profile `connect` flag
+# (no-op when disabled), so enabling it unconditionally is safe — the GUI's
+# "Connect at startup" checkbox is what actually turns the behavior on/off.
+systemctl enable airvpn-autoconnect.service
+
 echo ""
 echo "Installed:"
 echo "  /usr/bin/airvpn"
@@ -69,7 +88,28 @@ echo "  /usr/share/fish/vendor_completions.d/airvpn.fish"
 echo "  /usr/share/bash-completion/completions/airvpn"
 echo "  /etc/systemd/system/airvpn-helper.socket (enabled)"
 echo "  /etc/systemd/system/airvpn-helper.service"
+echo "  /etc/systemd/system/airvpn-autoconnect.service (enabled; connects at boot when 'Connect at startup' is on)"
 echo "  /var/lib/airvpn-rs/ (latency cache)"
 echo ""
 echo "Socket status:"
 systemctl status --no-pager airvpn-helper.socket || true
+
+# Restore the pre-install connection, if there was one. The helper is
+# socket-activated and this first connect may land while it's still warming up
+# (background manifest fetch), which returns an error — retry briefly.
+if [[ -n "$PREV_SERVER" ]]; then
+    echo ""
+    echo "Reconnecting to '$PREV_SERVER'..."
+    reconnected=false
+    for attempt in 1 2 3 4 5; do
+        if /usr/bin/airvpn connect --server "$PREV_SERVER"; then
+            reconnected=true
+            break
+        fi
+        echo "  connect attempt $attempt failed (helper may be warming up), retrying in 3s..."
+        sleep 3
+    done
+    if [[ "$reconnected" != true ]]; then
+        echo "  warning: could not auto-reconnect to '$PREV_SERVER' — run 'sudo airvpn connect' manually." >&2
+    fi
+fi
