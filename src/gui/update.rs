@@ -346,6 +346,7 @@ impl App {
                     options.insert(options::NETLOCK_ALLOW_PING.into(), self.settings.netlock_allow_ping.to_string());
                     options.insert(options::NETLOCK_ALLOWLIST_IPS.into(), self.settings.netlock_allowlist_ips.clone());
                     options.insert(options::NETLOCK_LOCAL_FORWARD_IFACES.into(), self.settings.netlock_local_forward_ifaces.clone());
+                    options.insert(options::DDNS_HOSTNAME.into(), self.settings.ddns_hostname.clone());
                     // Routes
                     options.insert(options::ROUTES_CUSTOM.into(), self.settings.routes_custom.clone());
                     // DNS settings
@@ -474,6 +475,11 @@ impl App {
             }
             Message::SettingsNetlockLocalForwardIfacesChanged(val) => {
                 self.settings.netlock_local_forward_ifaces = val;
+                self.settings.dirty = true;
+                Task::none()
+            }
+            Message::SettingsDdnsHostnameChanged(val) => {
+                self.settings.ddns_hostname = val;
                 self.settings.dirty = true;
                 Task::none()
             }
@@ -755,6 +761,8 @@ impl App {
                 self.settings.netlock_allowlist_ips = options.get(options::NETLOCK_ALLOWLIST_IPS)
                     .cloned().unwrap_or_default();
                 self.settings.netlock_local_forward_ifaces = options.get(options::NETLOCK_LOCAL_FORWARD_IFACES)
+                    .cloned().unwrap_or_default();
+                self.settings.ddns_hostname = options.get(options::DDNS_HOSTNAME)
                     .cloned().unwrap_or_default();
 
                 // Routes

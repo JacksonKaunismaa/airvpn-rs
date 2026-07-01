@@ -91,6 +91,7 @@ impl App {
                 self.settings.netlock_allow_ping,
                 &self.settings.netlock_allowlist_ips,
                 &self.settings.netlock_local_forward_ifaces,
+                &self.settings.ddns_hostname,
                 // Routes
                 &self.settings.routes_custom,
                 // Area filters

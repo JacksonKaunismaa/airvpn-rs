@@ -150,6 +150,7 @@ pub fn view<'a>(
     netlock_allow_ping: bool,
     netlock_allowlist_ips: &'a str,
     netlock_local_forward_ifaces: &'a str,
+    ddns_hostname: &'a str,
     // Routes
     routes_custom: &'a str,
     // Area filters
@@ -216,6 +217,7 @@ pub fn view<'a>(
             netlock_allow_ping,
             netlock_allowlist_ips,
             netlock_local_forward_ifaces,
+            ddns_hostname,
         ),
         SettingsSubTab::Advanced => view_advanced(
             pinger_timeout,
@@ -471,6 +473,7 @@ fn view_network_lock<'a>(
     netlock_allow_ping: bool,
     netlock_allowlist_ips: &'a str,
     netlock_local_forward_ifaces: &'a str,
+    ddns_hostname: &'a str,
 ) -> Element<'a, Message> {
     let mut sections = column![].spacing(theme::SPACE_MD);
 
@@ -525,6 +528,22 @@ fn view_network_lock<'a>(
                 netlock_allowlist_ips,
                 Message::SettingsNetlockAllowlistIpsChanged,
             ),
+        ]
+        .spacing(theme::SPACE_SM),
+    ));
+
+    // AirDNS self-heal
+    sections = sections.push(section_card(
+        column![
+            section_header("AirDNS Self-Heal"),
+            hint("Your AirVPN DDNS hostname (Client Area > Forwarded Ports). The client re-points this record at the current server after a hop."),
+            text_field(
+                "AirDNS Hostname",
+                "host.airdns.org",
+                ddns_hostname,
+                Message::SettingsDdnsHostnameChanged,
+            ),
+            hint("Leave empty to disable. Takes effect on the next connect."),
         ]
         .spacing(theme::SPACE_SM),
     ));
