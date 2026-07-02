@@ -35,8 +35,6 @@ pub(crate) struct SettingsState {
     pub(crate) netlock_allow_ping: bool,
     pub(crate) netlock_allowlist_ips: String,
     pub(crate) netlock_local_forward_ifaces: String,
-    /// AirDNS DDNS hostname for the in-client self-heal (empty = disabled).
-    pub(crate) ddns_hostname: String,
 
     // Routes
     pub(crate) routes_custom: String,
@@ -94,7 +92,6 @@ impl Default for SettingsState {
             netlock_allow_ping: true,
             netlock_allowlist_ips: String::new(),
             netlock_local_forward_ifaces: String::new(),
-            ddns_hostname: String::new(),
             routes_custom: String::new(),
             areas_allowlist: String::new(),
             areas_denylist: String::new(),
@@ -163,7 +160,6 @@ pub enum Message {
     SettingsNetlockAllowPingToggle(bool),
     SettingsNetlockAllowlistIpsChanged(String),
     SettingsNetlockLocalForwardIfacesChanged(String),
-    SettingsDdnsHostnameChanged(String),
     // Routes
     SettingsRoutesCustomChanged(String),
     // DNS settings

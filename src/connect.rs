@@ -4,7 +4,7 @@
 //! along with disconnect helpers and supporting types that were previously
 //! in main.rs.
 
-use crate::{airdns, api, common, config, dns, ipv6, manifest, netlock, options, pinger, recovery, server, verify, wireguard};
+use crate::{api, common, config, dns, ipv6, manifest, netlock, options, pinger, recovery, server, verify, wireguard};
 
 use std::sync::atomic::Ordering;
 
@@ -1236,9 +1236,6 @@ struct LoopState {
     all_entry_ips: Vec<String>,
     /// Custom "out" route CIDRs (session-constant, parsed once before the loop).
     custom_route_out_cidrs: Vec<String>,
-    /// Corrective AirDNS reconnects triggered for the current drift episode.
-    /// Reset to 0 whenever the authoritative record matches (see airdns).
-    ddns_corrective_attempts: u32,
 }
 
 /// Control flow signal from phase functions back to the main loop.
@@ -1760,7 +1757,6 @@ pub fn run(
             .flat_map(|s| s.ips_entry.iter().cloned())
             .collect(),
         custom_route_out_cidrs,
-        ddns_corrective_attempts: 0,
     };
 
     // Activate network lock once before the loop with all server IPs.
@@ -1840,57 +1836,6 @@ pub fn run(
                 server_location: server_ref.location.clone(),
             },
         ));
-
-        // AirDNS self-heal: verify the authoritative DDNS record points at this
-        // server's exit IP. The record is only rewritten on a *fresh* full
-        // connect, so an in-loop reconnect can leave it stale. On drift, trigger
-        // a corrective full reconnect (full teardown, then re-establish from the
-        // top — exactly what rewrites the record). Off unless ddns.hostname set.
-        let ddns_hostname = options::get_str(&config.resolved, options::DDNS_HOSTNAME).to_string();
-        if !ddns_hostname.is_empty() && !config.no_reconnect {
-            // Brief grace period so AirVPN's backend can publish the new record.
-            interruptible_sleep(&params.shutdown, 5);
-            if !params.shutdown.load(Ordering::Relaxed) {
-                let exit_ip = server_ref.ips_exit.first().and_then(|s| s.parse().ok());
-                let looked_up = airdns::lookup_authoritative(&ddns_hostname);
-                match airdns::decide_heal(
-                    looked_up, exit_ip, state.ddns_corrective_attempts, airdns::CORRECTIVE_CAP,
-                ) {
-                    airdns::HealAction::Proceed => {
-                        // Match (or inconclusive) — clear the per-episode budget.
-                        state.ddns_corrective_attempts = 0;
-                    }
-                    airdns::HealAction::Correct { attempt } => {
-                        warn!(
-                            "AirDNS record for {} is stale (authoritative={:?}, expected exit {:?}); corrective reconnect {}/{} to {}",
-                            ddns_hostname, looked_up, exit_ip, attempt, airdns::CORRECTIVE_CAP, server_ref.name,
-                        );
-                        state.ddns_corrective_attempts = attempt;
-                        // Re-target the same server so the rewritten record lands
-                        // on the exit IP we want.
-                        state.forced_server = Some(server_ref.name.clone());
-                        // FULL teardown (session lock airvpn_lock only; the
-                        // persistent airvpn_persist lock is untouched, so no leak
-                        // window), then re-establish from scratch.
-                        cmd_disconnect_internal(
-                            &config_path, &iface, !config.no_lock,
-                            &params.blocked_ipv6_ifaces, &endpoint_ip, &original_gw,
-                            &state.custom_route_out_cidrs,
-                        )?;
-                        continue;
-                    }
-                    airdns::HealAction::GiveUp => {
-                        error!(
-                            "AirDNS record for {} still stale after {} corrective reconnects; giving up (leaving connection up)",
-                            ddns_hostname, airdns::CORRECTIVE_CAP,
-                        );
-                        // Leave the connection up and proceed into the monitor
-                        // loop. Keep the counter pinned so a later, *unrelated*
-                        // drift gets a fresh budget only after a clean match.
-                    }
-                }
-            }
-        }
 
         // Monitor loop — determines ResetLevel when connection ends
         let handshake_timeout_connected = options::get_u64(&config.resolved, options::WG_HANDSHAKE_CONNECTED);
