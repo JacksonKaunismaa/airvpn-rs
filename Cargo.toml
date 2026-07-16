@@ -20,8 +20,11 @@ path = "src/gui/main.rs"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 
-# HTTP
-reqwest = { version = "0.12", features = ["blocking"] }
+# HTTP — rustls instead of OpenSSL/native-tls (pure-Rust TLS, no OpenSSL C
+# dependency → eliminates the recurring rust-openssl CVE class). native-roots
+# keeps using the system CA trust store, matching native-tls's prior behavior
+# (the only cert-verified request is the https://airvpn.org bootstrap fallback).
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "http2", "charset", "rustls-tls-native-roots"] }
 
 # HTTP server (helper daemon)
 hyper = { version = "1", features = ["http1", "server", "client"] }
