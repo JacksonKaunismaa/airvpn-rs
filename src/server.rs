@@ -29,12 +29,20 @@ use crate::pinger::LatencyCache;
 // Unmeasured ping (Ping==-1) contributes 0 instead of Eddie's 99995 sentinel,
 // so that load/users/scorebase/penalties still differentiate servers.
 // Result is truncated to i64 to match Eddie's `(int)(sum)` cast.
+//
+// Divergence #16 (2026-08-10, see docs/known_divergences.md): by default Speed
+// mode drops the users% term (scoring.speed_users_factor=1000) and both modes
+// add a superlinear congestion penalty (load% - knee)^2 above scoring.congestion_knee.
+// Eddie parity: `airvpn config set scoring.speed_users_factor 1` +
+// `airvpn config set scoring.congestion_factor 0`.
 // ---------------------------------------------------------------------------
 
 /// Scoring mode (Eddie: `servers.scoretype`).
 ///
-/// Speed (default): balanced — load, users, scorebase, and ping all contribute equally.
+/// Speed (default): load, scorebase, and ping contribute equally; users% is dropped
+/// by default (divergence #16, `scoring.speed_users_factor`).
 /// Latency: ping dominates — load and users divided by 10, scorebase divided by 500.
+/// Both modes add the congestion penalty (divergence #16) on raw load%.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum ScoreType {
     #[default]
@@ -54,7 +62,8 @@ impl ScoreType {
 
 /// Bundles all configurable scoring factors into one struct.
 ///
-/// In Speed mode, divisors default to 1 (no adjustment).
+/// In Speed mode, latency/load divisors default to 1; the users divisor comes from
+/// `scoring.speed_users_factor` (default 1000 — term dropped, divergence #16).
 /// In Latency mode, divisors default to 500/10/10 so ping dominates.
 /// The profile options `scoring.*` override these defaults.
 ///
@@ -66,7 +75,7 @@ pub struct ScoringConfig {
     pub latency_factor: i64,
     /// Divides load in Latency mode (default 10; Speed: 1).
     pub load_factor: i64,
-    /// Divides users in Latency mode (default 10; Speed: 1).
+    /// Divides users (Latency default 10; Speed default 1000 = term dropped, divergence #16).
     pub users_factor: i64,
     /// Multiplies ping contribution (default 1).
     pub ping_factor: i64,
@@ -74,13 +83,17 @@ pub struct ScoringConfig {
     pub penality_factor: i64,
     /// Capacity bonus factor (default 0 = disabled).
     pub capacity_factor: i64,
+    /// Load% where the superlinear congestion penalty starts (default 60).
+    pub congestion_knee: i64,
+    /// Multiplies the (load% - knee)^2 congestion penalty (default 1; 0 = Eddie parity).
+    pub congestion_factor: i64,
 }
 
 impl ScoringConfig {
     /// Build from resolved options map.
     ///
-    /// In Speed mode, latency/load/users divisors are forced to 1
-    /// (matching Eddie's behavior where Speed mode has no division).
+    /// In Speed mode, latency/load divisors are forced to 1 (matching Eddie); the users
+    /// divisor is read from `scoring.speed_users_factor` (divergence #16, default 1000).
     /// In Latency mode, the profile values are used (defaults: 500/10/10).
     pub fn from_options(options: &std::collections::HashMap<String, String>) -> Self {
         let score_type = ScoreType::from_profile(
@@ -88,7 +101,16 @@ impl ScoringConfig {
         );
 
         let (latency_factor, load_factor, users_factor) = match score_type {
-            ScoreType::Speed => (1, 1, 1),
+            // Speed mode divergence #16: users% divisor comes from scoring.speed_users_factor
+            // (default 1000 ⇒ term contributes 0). User count tracks server SIZE — AirVPN
+            // packs ~2x the users onto 20 Gbps boxes — so charging it as a congestion signal
+            // cancels the bandwidth-load term exactly on the servers with the most headroom
+            // (measured 2026-08-10: 20G fleet averaged 25% load, 1-2G fleet 67%).
+            ScoreType::Speed => (
+                1,
+                1,
+                crate::options::get_i64(options, crate::options::SCORING_SPEED_USERS_FACTOR),
+            ),
             ScoreType::Latency => (
                 crate::options::get_i64(options, crate::options::SCORING_LATENCY_FACTOR),
                 crate::options::get_i64(options, crate::options::SCORING_LOAD_FACTOR),
@@ -104,6 +126,8 @@ impl ScoringConfig {
             ping_factor: crate::options::get_i64(options, crate::options::SCORING_PING_FACTOR),
             penality_factor: crate::options::get_i64(options, crate::options::SCORING_PENALITY_FACTOR),
             capacity_factor: crate::options::get_i64(options, crate::options::SERVERS_CAPACITY_FACTOR),
+            congestion_knee: crate::options::get_i64(options, crate::options::SCORING_CONGESTION_KNEE),
+            congestion_factor: crate::options::get_i64(options, crate::options::SCORING_CONGESTION_FACTOR),
         }
     }
 }
@@ -201,10 +225,11 @@ fn users_perc(server: &Server) -> i64 {
 ///
 /// Normal computation (no ping):
 /// ```text
-/// Score = PenalityB + PingB + LoadB + ScoreB + UsersB
+/// Score = PenalityB + PingB + LoadB + ScoreB + UsersB + CongestionB
 /// ```
-/// Speed mode (all 1.0): LoadB = LoadPerc, ScoreB = ScoreBase, UsersB = UsersPerc
+/// Speed mode: LoadB = LoadPerc, ScoreB = ScoreBase, UsersB = UsersPerc/1000 (≈0, divergence #16)
 /// Latency mode: ScoreB /= 500, LoadB /= 10, UsersB /= 10 (ping dominates)
+/// Both modes: CongestionB = (LoadPerc − knee)² above scoring.congestion_knee (divergence #16)
 ///
 /// Result is truncated to i64 to match Eddie's `(int)(sum)` cast.
 ///
@@ -222,8 +247,9 @@ pub fn score(server: &Server, scoring: &ScoringConfig) -> i64 {
 /// - Otherwise: `PingB = ping_ms * ping_factor(1)` added to score sum
 ///
 /// Score type determines factor divisors (Eddie: `servers.scoretype`):
-/// - Speed (default): all factors 1.0
+/// - Speed (default): latency/load factors 1.0; UsersB /= speed_users_factor(1000) — divergence #16
 /// - Latency: ScoreB /= latency_factor(500), LoadB /= load_factor(10), UsersB /= users_factor(10)
+/// - Both modes then add the congestion penalty on raw load% — divergence #16
 ///
 /// NOTE: Eddie returns 99995 sentinel for unmeasured ping, which makes all
 /// unmeasured servers score identically and breaks penalty-based rotation
@@ -248,12 +274,14 @@ pub fn score_with_ping(server: &Server, ping_ms: i64, scoring: &ScoringConfig) -
 
     let penality_b = 0; // Base score excludes penalty; use score_with_penalty() for penalty-aware scoring
 
-    let mut load_b = load_perc(server);
+    let load_raw = load_perc(server);
+    let mut load_b = load_raw;
     let mut score_b = server.scorebase;
     let mut users_b = users_perc(server);
 
     // Apply score type divisors (Eddie: ConnectionInfo.cs lines 233-244).
-    // In Speed mode, factors are forced to 1 by ScoringConfig::from_options().
+    // In Speed mode, latency/load factors are forced to 1 by from_options(); the users
+    // divisor defaults to 1000 (term dropped, divergence #16).
     // In Latency mode, factors come from profile (defaults: 500/10/10).
     // .max(1) prevents division by zero from misconfiguration.
     score_b /= scoring.latency_factor.max(1);
@@ -261,6 +289,24 @@ pub fn score_with_ping(server: &Server, ping_ms: i64, scoring: &ScoringConfig) -
     users_b /= scoring.users_factor.max(1);
 
     let mut total = penality_b + ping_b + load_b + score_b + users_b;
+
+    // Congestion penalty (divergence #16, not in Eddie): packet loss is nonlinear in
+    // bandwidth utilization — ~0 below the knee, queue collapse above ~80% (measured
+    // 2026-08-10: a 77-85%-loaded exit dropped 30-47% of tunneled packets while its
+    // endpoint pinged clean). The linear LoadB term prices 85% vs 15% at only 70 points
+    // (= 70ms of ping), so saturated-but-near beats idle-but-far. Square the excess over
+    // the knee so saturation dominates: 85% at knee 60 ⇒ +625. Applied on raw load in
+    // BOTH modes (physics is mode-independent); congestion_factor 0 restores Eddie.
+    // Clamp + saturate: knee/factor are user-settable i64s and load_raw can reach ~9.2e14
+    // on corrupt manifests (load_perc saturates instead of dividing by zero). A negative
+    // knee could push healthy servers past the 99997+ warning sentinels (a maintenance
+    // server would win selection); a negative factor would REWARD saturation; unclamped
+    // squaring overflows. Same defensive posture as the .max(1) divisor guards above.
+    let over = (load_raw - scoring.congestion_knee.max(0)).clamp(0, 1000);
+    total = total.saturating_add(
+        over.saturating_mul(over)
+            .saturating_mul(scoring.congestion_factor.max(0)),
+    );
 
     // Capacity bonus: prefer high-bandwidth servers (not in Eddie).
     // Subtracts (bandwidth_max / 1000) * capacity_factor from the score,
@@ -440,7 +486,8 @@ mod tests {
         }
     }
 
-    /// Build a ScoringConfig for Speed mode with default factors.
+    /// Build a ScoringConfig for Speed mode with Eddie-parity factors
+    /// (users term active, congestion penalty off — divergence #16 disabled).
     fn speed_scoring() -> ScoringConfig {
         ScoringConfig {
             score_type: ScoreType::Speed,
@@ -450,10 +497,12 @@ mod tests {
             ping_factor: 1,
             penality_factor: 1000,
             capacity_factor: 0,
+            congestion_knee: 60,
+            congestion_factor: 0,
         }
     }
 
-    /// Build a ScoringConfig for Latency mode with default factors.
+    /// Build a ScoringConfig for Latency mode with Eddie-parity factors.
     fn latency_scoring() -> ScoringConfig {
         ScoringConfig {
             score_type: ScoreType::Latency,
@@ -463,7 +512,15 @@ mod tests {
             ping_factor: 1,
             penality_factor: 1000,
             capacity_factor: 0,
+            congestion_knee: 60,
+            congestion_factor: 0,
         }
+    }
+
+    /// Build a Speed-mode ScoringConfig with the new defaults (divergence #16 active),
+    /// as `from_options` produces them on a default profile.
+    fn new_default_scoring() -> ScoringConfig {
+        ScoringConfig::from_options(&crate::options::defaults())
     }
 
     #[test]
@@ -506,6 +563,117 @@ mod tests {
         let s = make_server("Bravo", 50_000_000, 1000, 200, 250, 0, "", "");
         let sc = score(&s, &speed_scoring());
         assert_eq!(sc, 160);
+    }
+
+    // -----------------------------------------------------------------------
+    // Divergence #16 fixtures: the 2026-08-10 peak-load incident.
+    // Ginan: 2 Gbps at 85% load, ping 31ms, users% 34 — dropping
+    // 30-47% of tunneled packets. Xamidimura: 20 Gbps at 15% load, ping
+    // 18ms, users% 78. scorebase values are the residuals reconstructed from
+    // the live `airvpn servers` scores that night (283 vs 295).
+    // -----------------------------------------------------------------------
+
+    /// load_perc = 85 needs bw such that 2*(bw*8)/1e6 * 100 / 2000 = 85 -> bw = 106_250_000.
+    fn ginan_like() -> Server {
+        make_server("Ginan", 106_250_000, 2000, 170, 500, 133, "", "")
+    }
+
+    /// load_perc = 15 on 20 Gbps -> bw = 187_500_000; users% = 78.
+    fn xamidimura_like() -> Server {
+        make_server("Xamidimura", 187_500_000, 20000, 390, 500, 184, "", "")
+    }
+
+    #[test]
+    fn test_eddie_parity_reproduces_the_bad_pick() {
+        // Documents the failure mode this divergence fixes: with Eddie's formula the
+        // saturated small box outranks the idle big one (283 < 295, matching the real
+        // scores from the incident).
+        let g = score_with_ping(&ginan_like(), 31, &speed_scoring());
+        let x = score_with_ping(&xamidimura_like(), 18, &speed_scoring());
+        assert_eq!(g, 283);
+        assert_eq!(x, 295);
+        assert!(g < x, "Eddie parity must reproduce the inversion");
+    }
+
+    #[test]
+    fn test_new_defaults_invert_the_bad_pick() {
+        // users term dropped (34 and 78 -> 0), congestion penalty added:
+        // Ginan: 31 + 85 + 133 + (85-60)^2 = 874. Xamidimura: 18 + 15 + 184 + 0 = 217.
+        let scoring = new_default_scoring();
+        let g = score_with_ping(&ginan_like(), 31, &scoring);
+        let x = score_with_ping(&xamidimura_like(), 18, &scoring);
+        assert_eq!(g, 874);
+        assert_eq!(x, 217);
+        assert!(x < g, "idle 20G box must beat the saturated 2G box");
+    }
+
+    #[test]
+    fn test_congestion_penalty_zero_at_or_below_knee() {
+        // load_perc = 60 on bw_max 1000 -> bw = 37_500_000.
+        let at_knee = make_server("AtKnee", 37_500_000, 1000, 0, 500, 0, "", "");
+        let scoring = new_default_scoring();
+        assert_eq!(score(&at_knee, &scoring), 60); // load only, no penalty
+        // One point over the knee costs exactly +1.
+        let over = make_server("Over", 38_125_000, 1000, 0, 500, 0, "", "");
+        assert_eq!(score(&over, &scoring), 61 + 1);
+    }
+
+    #[test]
+    fn test_speed_mode_users_term_dropped_by_default() {
+        // Identical servers except users count: same score under new defaults.
+        let empty = make_server("Empty", 500_000, 1000, 0, 500, 10, "", "");
+        let packed = make_server("Packed", 500_000, 1000, 495, 500, 10, "", "");
+        let scoring = new_default_scoring();
+        assert_eq!(score(&empty, &scoring), score(&packed, &scoring));
+        // Eddie parity (speed_users_factor=1) still differentiates them.
+        assert!(score(&empty, &speed_scoring()) < score(&packed, &speed_scoring()));
+    }
+
+    #[test]
+    fn test_from_options_eddie_parity_restorable() {
+        let mut opts = crate::options::defaults();
+        opts.insert("scoring.speed_users_factor".to_string(), "1".to_string());
+        opts.insert("scoring.congestion_factor".to_string(), "0".to_string());
+        let scoring = ScoringConfig::from_options(&opts);
+        let g = score_with_ping(&ginan_like(), 31, &scoring);
+        let x = score_with_ping(&xamidimura_like(), 18, &scoring);
+        assert_eq!((g, x), (283, 295), "parity config must reproduce Eddie scores");
+    }
+
+    #[test]
+    fn test_congestion_hostile_values_clamped() {
+        // Negative factor must not REWARD saturation; negative knee must not push
+        // healthy servers past the 99997+ warning sentinels; huge factors must not
+        // overflow into a negative (i.e. "best") score.
+        let mut scoring = new_default_scoring();
+        scoring.congestion_factor = -5;
+        assert_eq!(
+            score(&ginan_like(), &scoring),
+            85 + 133, // load + scorebase only: penalty clamped to 0, users dropped
+            "negative factor must behave as 0"
+        );
+        scoring.congestion_factor = 1;
+        scoring.congestion_knee = -1_000_000;
+        let s = score(&ginan_like(), &scoring);
+        assert!(s < 99995, "negative knee must not reach sentinel range: {s}");
+        assert_eq!(s, 85 + 133 + 85 * 85, "negative knee clamps to 0");
+        scoring.congestion_knee = 60;
+        scoring.congestion_factor = i64::MAX;
+        assert!(
+            score(&ginan_like(), &scoring) > 0,
+            "saturating math must not wrap negative"
+        );
+    }
+
+    #[test]
+    fn test_latency_mode_congestion_applies_on_raw_load() {
+        // Latency mode divides LoadB by 10, but the congestion penalty uses RAW load:
+        // load 85 -> LoadB 8 + penalty 625. With congestion off: just LoadB 8.
+        let mut scoring = latency_scoring();
+        let base = score_with_ping(&ginan_like(), 0, &scoring);
+        scoring.congestion_factor = 1;
+        let with_penalty = score_with_ping(&ginan_like(), 0, &scoring);
+        assert_eq!(with_penalty - base, 625);
     }
 
     #[test]
@@ -1093,13 +1261,17 @@ mod tests {
         // defaults() has servers.scoretype = "Speed"
         let cfg = ScoringConfig::from_options(&opts);
         assert_eq!(cfg.score_type, ScoreType::Speed);
-        // Speed mode forces divisors to 1
+        // Speed mode forces latency/load divisors to 1; users comes from
+        // scoring.speed_users_factor (divergence #16 — default 1000 drops the term).
         assert_eq!(cfg.latency_factor, 1);
         assert_eq!(cfg.load_factor, 1);
-        assert_eq!(cfg.users_factor, 1);
+        assert_eq!(cfg.users_factor, 1000);
         assert_eq!(cfg.ping_factor, 1);
         assert_eq!(cfg.penality_factor, 1000);
         assert_eq!(cfg.capacity_factor, 0);
+        // Congestion penalty defaults (divergence #16).
+        assert_eq!(cfg.congestion_knee, 60);
+        assert_eq!(cfg.congestion_factor, 1);
     }
 
     #[test]

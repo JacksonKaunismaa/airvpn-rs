@@ -263,6 +263,14 @@ fn load_or_create_options(path: &Path) -> HashMap<String, String> {
 // Public API
 // ---------------------------------------------------------------------------
 
+/// Whether the profile file exists and is readable by this process (it's
+/// root-only 0600, so this is effectively an are-we-root check when the
+/// profile exists). Lets CLI paths distinguish "no overrides" from "can't see
+/// the overrides" instead of silently showing defaults.
+pub fn profile_readable() -> bool {
+    std::fs::File::open(profile_path()).is_ok()
+}
+
 /// Load all profile options from our profile, falling back to Eddie's profile.
 ///
 /// Returns an empty HashMap if no profile exists (caller uses defaults).

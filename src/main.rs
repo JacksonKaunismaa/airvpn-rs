@@ -81,12 +81,53 @@ enum Commands {
     },
     /// Run as root helper daemon for GUI IPC
     Helper,
+    /// Get or set profile options (root; changes take effect on next connect)
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+    /// Dynamic-DNS utilities (DuckDNS record writer + pager)
+    Ddns {
+        #[command(subcommand)]
+        action: DdnsAction,
+    },
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
         #[arg(value_enum)]
         shell: Shell,
     },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Print an option's effective value (profile override or default)
+    Get {
+        key: String,
+        /// Print secret options (passwords, credentialed URLs) unredacted
+        #[arg(long)]
+        reveal: bool,
+    },
+    /// Set a profile option (key must exist in the options registry)
+    Set {
+        key: String,
+        /// Value; omit together with --stdin to read it from stdin instead
+        value: Option<String>,
+        /// Read the value from stdin (keeps secrets out of argv/process lists)
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// List all options with their effective values
+    List,
+}
+
+#[derive(Subcommand)]
+enum DdnsAction {
+    /// Send a test page through the exact DDNS pager path
+    TestNotify,
+    /// One live DuckDNS record write through the real path (empty ip= =
+    /// source-detect: the VPN exit when connected, the raw WAN IP when not)
+    TestDuckdns,
 }
 
 #[derive(Subcommand)]
@@ -329,9 +370,181 @@ fn main() -> anyhow::Result<()> {
             use airvpn::helper;
             helper::run()
         }
+        Commands::Config { action } => run_config(action),
+        Commands::Ddns { action } => run_ddns(action),
         Commands::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "airvpn", &mut std::io::stdout());
             Ok(())
+        }
+    }
+}
+
+/// `airvpn config` entry point: read/write profile options directly (the
+/// profile is V2N, root-decryptable). Keys are validated against the options
+/// registry so a typo can't plant a dead entry. Writes take effect on the next
+/// connect — the running session resolved its options at connect time.
+fn run_config(action: ConfigAction) -> anyhow::Result<()> {
+    use airvpn::config;
+
+    if !matches!(action, ConfigAction::Set { .. }) && !config::profile_readable() {
+        eprintln!("warning: profile not readable (run as root to see actual values); showing defaults");
+    }
+
+    match action {
+        ConfigAction::Get { key, reveal } => {
+            let def = options::REGISTRY
+                .iter()
+                .find(|d| d.name == key)
+                .ok_or_else(|| anyhow::anyhow!("unknown option '{}' (see `airvpn config list`)", key))?;
+            let profile = config::load_profile_options();
+            match profile.get(key.as_str()) {
+                Some(v) if is_secret_option(&key) && !reveal => {
+                    println!("<set — redacted; use --reveal>  (profile)")
+                }
+                Some(v) => println!("{}  (profile)", v),
+                None => println!("{}  (default)", def.default),
+            }
+            Ok(())
+        }
+        ConfigAction::Set { key, value, stdin } => {
+            let value = match (value, stdin) {
+                (Some(v), false) => v,
+                (None, true) => {
+                    use std::io::Read;
+                    let mut v = String::new();
+                    std::io::stdin().read_to_string(&mut v)?;
+                    // Strip the trailing newline a shell pipe or heredoc adds;
+                    // anything else in the value is intentional.
+                    v.trim_end_matches(['\r', '\n']).to_string()
+                }
+                (Some(_), true) => anyhow::bail!("pass either a value or --stdin, not both"),
+                (None, false) => anyhow::bail!("missing value (or pass --stdin to read it from stdin)"),
+            };
+            let def = options::REGISTRY
+                .iter()
+                .find(|d| d.name == key)
+                .ok_or_else(|| anyhow::anyhow!("unknown option '{}' (see `airvpn config list`)", key))?;
+            // Boolean-typed options (default "true"/"false"): reject typos —
+            // a stored "ture" would silently parse as false forever.
+            if matches!(def.default, "true" | "false")
+                && !matches!(value.to_ascii_lowercase().as_str(), "true" | "false")
+            {
+                anyhow::bail!("option '{}' is boolean — value must be 'true' or 'false'", key);
+            }
+            // Integer-typed options (default parses as i64): same hazard — get_i64
+            // turns an unparseable stored value into 0, which e.g. silently disables
+            // the congestion penalty or re-enables the Speed-mode users term at full
+            // strength (0 -> .max(1) -> divisor 1).
+            if def.default.parse::<i64>().is_ok() && value.parse::<i64>().is_err() {
+                anyhow::bail!("option '{}' is an integer — '{}' does not parse", key, value);
+            }
+            config::save_profile_option(&key, &value)?;
+            // Never echo secret values back — a config set of the notify
+            // password printed to a terminal/transcript is a credential leak
+            // and transcripts outlive terminals.
+            if is_secret_option(&key) {
+                println!("{} = <set — redacted>  (takes effect on next connect)", key);
+            } else {
+                println!("{} = {}  (takes effect on next connect)", key, value);
+            }
+            Ok(())
+        }
+        ConfigAction::List => {
+            let profile = config::load_profile_options();
+            for def in options::REGISTRY {
+                match profile.get(def.name) {
+                    Some(v) if v != def.default && is_secret_option(def.name) => {
+                        println!("{} = <set — redacted>", def.name)
+                    }
+                    Some(v) if v != def.default => {
+                        println!("{} = {}  (default: {})", def.name, v, def.default)
+                    }
+                    _ => println!("{} = {}", def.name, def.default),
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Options whose values must never be echoed by config get/set/list.
+/// Single source of truth lives in the options registry (shared with the
+/// helper's GET /profile redaction).
+fn is_secret_option(key: &str) -> bool {
+    options::is_secret(key)
+}
+
+/// `airvpn ddns` entry point.
+fn run_ddns(action: DdnsAction) -> anyhow::Result<()> {
+    use airvpn::{config, ddns};
+    match action {
+        DdnsAction::TestNotify => {
+            if !config::profile_readable() {
+                anyhow::bail!("profile not readable — run as root (sudo airvpn ddns test-notify)");
+            }
+            // notify() reports failures through log::warn! — give this thin
+            // CLI path a stderr logger so they're visible.
+            let _ = simplelog::TermLogger::init(
+                simplelog::LevelFilter::Info,
+                simplelog::Config::default(),
+                simplelog::TerminalMode::Stderr,
+                simplelog::ColorChoice::Auto,
+            );
+            let profile = config::load_profile_options();
+            let url = options::get_str(&profile, options::DDNS_NOTIFY_URL).to_string();
+            let user = options::get_str(&profile, options::DDNS_NOTIFY_USER).to_string();
+            let password = options::get_str(&profile, options::DDNS_NOTIFY_PASSWORD).to_string();
+            if url.is_empty() {
+                anyhow::bail!("ddns.notify_url is empty — pager disabled, nothing to test");
+            }
+            ddns::validate_notify_url(&url)
+                .map_err(|e| anyhow::anyhow!("ddns.notify_url does not parse: {}", e))?;
+            println!("sending test page through the DDNS pager path...");
+            if ddns::notify(
+                &url,
+                &user,
+                &password,
+                "DDNS pager test",
+                "Manual test via `airvpn ddns test-notify` — if this reached the phone, the pager works.",
+            ) {
+                println!("server accepted the page (2xx) — check the phone.");
+                Ok(())
+            } else {
+                anyhow::bail!("page NOT delivered — see the warning above for the cause");
+            }
+        }
+        DdnsAction::TestDuckdns => {
+            use airvpn::duckdns;
+            if !config::profile_readable() {
+                anyhow::bail!("profile not readable — run as root (sudo airvpn ddns test-duckdns)");
+            }
+            let profile = config::load_profile_options();
+            let domain = options::get_str(&profile, options::DDNS_DUCKDNS_DOMAIN).to_string();
+            let token = zeroize::Zeroizing::new(
+                options::get_str(&profile, options::DDNS_DUCKDNS_TOKEN).to_string(),
+            );
+            duckdns::validate_config(&domain, &token).map_err(|e| anyhow::anyhow!(e))?;
+            if domain.is_empty() {
+                anyhow::bail!("ddns.duckdns_domain is empty — record writer disabled, nothing to test");
+            }
+            let name = duckdns::record_name(&domain);
+            println!("writing {} via the DuckDNS API (source-detected IP)...", name);
+            match duckdns::update(&domain, &token, None) {
+                duckdns::WriteOutcome::Accepted => {
+                    println!(
+                        "DuckDNS acked the write (OK) — {} now points at this machine's egress IP \
+                         (the VPN exit if connected). Propagation TTL is 60s.",
+                        name,
+                    );
+                    Ok(())
+                }
+                duckdns::WriteOutcome::Rejected => anyhow::bail!(
+                    "DuckDNS returned KO — the token is wrong or {} is not in that account", name,
+                ),
+                duckdns::WriteOutcome::Failed(cause) => {
+                    anyhow::bail!("write failed: {}", cause)
+                }
+            }
         }
     }
 }

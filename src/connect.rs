@@ -4,7 +4,7 @@
 //! along with disconnect helpers and supporting types that were previously
 //! in main.rs.
 
-use crate::{api, common, config, dns, ipv6, manifest, netlock, options, pinger, recovery, server, verify, wireguard};
+use crate::{api, common, config, ddns, dns, duckdns, ipv6, manifest, netlock, options, pinger, recovery, server, verify, wireguard};
 
 use std::sync::atomic::Ordering;
 
@@ -754,12 +754,55 @@ fn refresh_manifest_if_needed(
     }
 }
 
+/// Per-connection context for the DuckDNS record writer. Unlike the removed
+/// AirDNS self-heal there is no cross-reconnect state to carry: every write
+/// is acked (OK/KO), the interval loop is the retry policy, and pager dedup
+/// resets per connection.
+struct DuckdnsCtx {
+    domain: String,
+    token: Zeroizing<String>,
+    /// Exit IP written to the record — the port forward listens on the exit;
+    /// an entry IP would point the record at the wrong side of the tunnel.
+    write_ip: std::net::Ipv4Addr,
+    notify_url: String,
+    notify_user: String,
+    notify_password: String,
+    consecutive_failures: u32,
+    /// One transport-failure page per failure streak (re-armed on success).
+    failure_paged: bool,
+    /// One KO page per connection — KO is permanent until config changes.
+    rejected_paged: bool,
+}
+
+/// Resolve the ntfy pager options, disabling loudly on a rejected URL — the
+/// pager must fail at connect time, not silently when a page is needed
+/// Returns (url, user, password); empty url =
+/// pager disabled.
+fn resolve_pager_options(
+    resolved: &std::collections::HashMap<String, String>,
+) -> (String, String, String) {
+    let mut url = options::get_str(resolved, options::DDNS_NOTIFY_URL).to_string();
+    let user = options::get_str(resolved, options::DDNS_NOTIFY_USER).to_string();
+    let password = options::get_str(resolved, options::DDNS_NOTIFY_PASSWORD).to_string();
+    if let Err(e) = ddns::validate_notify_url(&url) {
+        error!(
+            "ddns.notify_url rejected ({}) — pager DISABLED, DuckDNS failure pages will NOT send. \
+             Fix: credential-free URL + ddns.notify_user/notify_password \
+             via `airvpn config set`.",
+            e,
+        );
+        url.clear();
+    }
+    (url, user, password)
+}
+
 /// Monitor loop: checks interface, handshake, DNS, kill switch every 1s.
 ///
 /// Returns `(ResetLevel, net_flapped)` when the connection ends. `net_flapped`
 /// is true if the physical egress link lost carrier or the default gateway
 /// disappeared at any point during the connection — used to distinguish a
 /// transient WiFi blip from a genuine server failure.
+#[allow(clippy::too_many_arguments)]
 fn run_monitor_loop(
     shutdown: &std::sync::atomic::AtomicBool,
     iface: &str,
@@ -769,11 +812,14 @@ fn run_monitor_loop(
     handshake_timeout_connected: u64,
     dns_mode: dns::DnsMode,
     dns_services: &[String],
+    mut duckdns_ctx: Option<DuckdnsCtx>,
 ) -> (ResetLevel, bool) {
     // Physical NIC while connected (main-table default route still points at it).
     let phys_iface = wireguard::default_route_iface().ok();
     let mut net_flapped = false;
     let mut dns_fail_count: u32 = 0;
+    let connected_at = std::time::Instant::now();
+    let mut tick: u64 = 0;
     loop {
         if shutdown.load(Ordering::Relaxed) {
             info!("Disconnecting...");
@@ -820,6 +866,97 @@ fn run_monitor_loop(
 
         if !dns::verify_resolv_conf(dns_ipv4, dns_ipv6, std::path::Path::new("/etc/resolv.conf")) {
             warn!("resolv.conf contains non-VPN nameservers — potential DNS leak (check_and_reapply should fix on next cycle)");
+        }
+
+        tick += 1;
+
+        // DuckDNS record writer: unconditional idempotent rewrite right after
+        // connect (tick 1, tunnel already verified) and every
+        // WRITE_INTERVAL_SECS. Every write is acked, so there is no drift
+        // detection — the interval loop IS the retry policy and the pager
+        // covers sustained failure. The blocking GET (10s cap, includes DNS)
+        // can stall this loop's 1s cadence; at one write per 300s against a
+        // 200s handshake-staleness threshold that's harmless.
+        if let Some(ctx) = duckdns_ctx.as_mut() {
+            if tick == 1 || tick.is_multiple_of(duckdns::WRITE_INTERVAL_SECS) {
+                let name = duckdns::record_name(&ctx.domain);
+                let outcome = duckdns::update(&ctx.domain, &ctx.token, Some(ctx.write_ip));
+                let verdict = match &outcome {
+                    duckdns::WriteOutcome::Accepted => "duckdns_ok",
+                    duckdns::WriteOutcome::Rejected => "duckdns_ko",
+                    duckdns::WriteOutcome::Failed(_) => "duckdns_err",
+                };
+                ddns::log_observation(
+                    &name, None, &[ctx.write_ip], connected_at.elapsed().as_secs(), verdict,
+                );
+                match outcome {
+                    duckdns::WriteOutcome::Accepted => {
+                        if ctx.consecutive_failures > 0 {
+                            info!(
+                                "duckdns: write recovered after {} failures — {} -> {}",
+                                ctx.consecutive_failures, name, ctx.write_ip,
+                            );
+                        } else if tick == 1 {
+                            info!("duckdns: {} -> {} (acked)", name, ctx.write_ip);
+                        } else {
+                            debug!("duckdns: {} -> {} (acked)", name, ctx.write_ip);
+                        }
+                        ctx.consecutive_failures = 0;
+                        ctx.failure_paged = false;
+                        // KO can heal server-side (token regenerated, domain
+                        // re-added) without a reconnect — re-arm so a later
+                        // regression pages again.
+                        ctx.rejected_paged = false;
+                    }
+                    duckdns::WriteOutcome::Rejected => {
+                        // A KO reached DuckDNS and back — transport worked,
+                        // so it must not count toward the transport streak.
+                        ctx.consecutive_failures = 0;
+                        error!(
+                            "duckdns: write REJECTED (KO) — token wrong or domain not in the \
+                             account; {} is NOT updating",
+                            name,
+                        );
+                        if !ctx.rejected_paged {
+                            ctx.rejected_paged = true;
+                            ddns::notify(
+                                &ctx.notify_url, &ctx.notify_user, &ctx.notify_password,
+                                "DuckDNS write rejected",
+                                &format!(
+                                    "DuckDNS returned KO for {} — token or domain misconfigured; \
+                                     the record is NOT updating. Fix ddns.duckdns_domain/_token, \
+                                     then verify with `sudo airvpn ddns test-duckdns`.",
+                                    name,
+                                ),
+                            );
+                        }
+                    }
+                    duckdns::WriteOutcome::Failed(cause) => {
+                        ctx.consecutive_failures += 1;
+                        warn!(
+                            "duckdns: write failed ({} consecutive): {}",
+                            ctx.consecutive_failures, cause,
+                        );
+                        if ctx.consecutive_failures >= duckdns::FAILURES_BEFORE_PAGE
+                            && !ctx.failure_paged
+                        {
+                            ctx.failure_paged = true;
+                            ddns::notify(
+                                &ctx.notify_url, &ctx.notify_user, &ctx.notify_password,
+                                "DuckDNS writes failing",
+                                &format!(
+                                    "{} consecutive DuckDNS write failures (~{} min) — {} may be \
+                                     stale (current exit {}). Latest error: {}",
+                                    ctx.consecutive_failures,
+                                    ctx.consecutive_failures as u64 * duckdns::WRITE_INTERVAL_SECS
+                                        / 60,
+                                    name, ctx.write_ip, cause,
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -1782,7 +1919,10 @@ pub fn run(
 
         // Phase 3: Select server and resolve IPv6/DNS
         let (server_ref, ipv6_enabled, effective_dns_ipv4, effective_dns_ipv6) =
-            select_and_resolve_server(&state, &params, &data, config, wg_key)?;
+            match select_and_resolve_server(&state, &params, &data, config, wg_key) {
+                Ok(sel) => sel,
+                Err(e) => return Err(e),
+            };
 
         // Phase 4: Pre-connection authorization
         match perform_pre_connection_auth(&mut state, provider_config, &params, &data, config, &server_ref.name) {
@@ -1837,6 +1977,48 @@ pub fn run(
             },
         ));
 
+        // DuckDNS record writer for this connection (None = disabled). Not
+        // gated on no_reconnect: it writes a DNS record, never reconnects.
+        let duckdns_ctx = {
+            let domain =
+                options::get_str(&config.resolved, options::DDNS_DUCKDNS_DOMAIN).to_string();
+            let token = Zeroizing::new(
+                options::get_str(&config.resolved, options::DDNS_DUCKDNS_TOKEN).to_string(),
+            );
+            match duckdns::validate_config(&domain, &token) {
+                Err(e) => {
+                    error!("duckdns record writer DISABLED: {}", e);
+                    None
+                }
+                Ok(()) if domain.is_empty() => None,
+                Ok(()) => match duckdns::exit_ips(server_ref).first() {
+                    None => {
+                        warn!(
+                            "duckdns: server {} has no parseable exit IPs — record writer \
+                             inactive for this connection",
+                            server_ref.name,
+                        );
+                        None
+                    }
+                    Some(&ip) => {
+                        let (notify_url, notify_user, notify_password) =
+                            resolve_pager_options(&config.resolved);
+                        Some(DuckdnsCtx {
+                            domain,
+                            token,
+                            write_ip: ip,
+                            notify_url,
+                            notify_user,
+                            notify_password,
+                            consecutive_failures: 0,
+                            failure_paged: false,
+                            rejected_paged: false,
+                        })
+                    }
+                },
+            }
+        };
+
         // Monitor loop — determines ResetLevel when connection ends
         let handshake_timeout_connected = options::get_u64(&config.resolved, options::WG_HANDSHAKE_CONNECTED);
         let (reset_level, net_flapped) = run_monitor_loop(
@@ -1848,6 +2030,7 @@ pub fn run(
             handshake_timeout_connected,
             params.dns_mode,
             &params.dns_services,
+            duckdns_ctx,
         );
 
         // Handle reset level (Eddie: Session.cs phase 6 cleanup + wait)

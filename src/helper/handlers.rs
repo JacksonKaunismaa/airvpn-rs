@@ -931,7 +931,7 @@ pub(super) fn handle_get_keys(state: &State) -> Response<HyperBody> {
     json_response(StatusCode::OK, &json!({"keys": names}))
 }
 
-/// GET /profile — return profile options (credentials stripped).
+/// GET /profile — return profile options (credentials and secrets stripped).
 pub(super) fn handle_get_profile() -> Response<HyperBody> {
     match dispatch::dispatch_get_profile() {
         Ok(mut options) => {
@@ -939,6 +939,11 @@ pub(super) fn handle_get_profile() -> Response<HyperBody> {
                 && options.get("password").map_or(false, |v| !v.is_empty());
             options.remove("login");
             options.remove("password");
+            // Secret options (ntfy password, DuckDNS token, legacy
+            // credentialed notify_url) never cross the wheel-readable
+            // socket. Removal (not a redaction sentinel) is safe because
+            // save_profile_options merges: absent keys are never touched.
+            options.retain(|k, _| !crate::options::is_secret(k));
             json_response(StatusCode::OK, &json!({
                 "options": options,
                 "credentials_configured": credentials_configured,
@@ -962,6 +967,15 @@ pub(super) fn handle_save_profile(body_bytes: &Bytes, _state: &State) -> Respons
             StatusCode::FORBIDDEN,
             "credential writes not allowed via SaveProfile \
              — use sudo airvpn connect or Eddie import",
+        );
+    }
+    // Secret options are never served by GET /profile, so accepting writes
+    // for them here would let any wheel process overwrite (or plant) a
+    // secret it cannot read. Writes go through `sudo airvpn config set`.
+    if let Some(key) = save_req.options.keys().find(|k| crate::options::is_secret(k)) {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            &format!("secret option '{}' not writable via SaveProfile — use sudo airvpn config set", key),
         );
     }
 

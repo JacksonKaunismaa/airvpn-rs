@@ -475,3 +475,76 @@ option), `scripts/install.sh` (install + enable unit), GUI settings
 **Eddie ref:** `Lib.Core/ProfileOptions.cs` `SetDefaultBool("connect", ...)`
 and `SetDefaultBool("start_os", ...)`; `Lib.Core/Engine.cs` startup connect check
 
+
+## 16. Speed-mode scoring: users% term dropped, superlinear congestion penalty added
+
+**Eddie behavior:** `ConnectionInfo.Score()` in Speed mode (the default) sums
+`ping_ms + load% + users% + scorebase` with equal weights, computed once at
+selection time.
+
+**airvpn-rs behavior:** two changes to the same sum, both profile-tunable:
+
+1. **users% contributes 0 by default** (`scoring.speed_users_factor`, default
+   1000 as a divisor). User count tracks server *size*, not congestion: AirVPN
+   packs roughly 2× the users onto its 20 Gbps boxes, so the term charges the
+   servers with the most headroom ~45-60 extra points and steers selection
+   toward small, hot boxes. Bandwidth load already measures real utilization.
+2. **Both modes add `(load% − knee)² × factor` above a knee**
+   (`scoring.congestion_knee` default 60, `scoring.congestion_factor` default
+   1, computed on raw load% before mode divisors). Packet loss is nonlinear in
+   utilization: ~0 below the knee, queue collapse above ~80%. Eddie's linear
+   term prices 85% vs 15% load at 70 points — the same as 70 ms of ping — so
+   a saturated small box beats an idle big one.
+
+**Why:** 2026-08-10 incident: Eddie's formula kept selecting congested 2 Gbps
+boxes at 77–85% load (30–47% measured in-tunnel packet loss, evening-long
+upstream-timeout storm against a latency-sensitive API) while 20 Gbps LA boxes sat
+at 13–22% load with *lower* measured ping. Fleet-wide that night: the 212
+small (1–2G) servers averaged 67% load with 105 above 70%; the 43 big (20G)
+servers averaged 25% with none above 70%. With the new defaults the incident
+servers score 874 (Ginan) vs 217 (Xamidimura); Eddie parity
+scored them 283 vs 295. Unit fixtures pin both rankings.
+
+**Eddie parity:** `airvpn config set scoring.speed_users_factor 1` and
+`airvpn config set scoring.congestion_factor 0`.
+
+**Files:** `src/server.rs` (`ScoringConfig`, `score_with_ping`),
+`src/options.rs` (three new options)
+
+**Eddie ref:** `Lib.Core/ConnectionInfo.cs` `Score()`, `LoadPerc()`, `UsersPerc()`
+
+## 17. DuckDNS record writer; AirDNS self-heal removed
+
+**airvpn-rs behavior:** if `ddns.duckdns_domain` + `ddns.duckdns_token` are
+set, the monitor loop writes `<domain>.duckdns.org → current exit IP` through
+DuckDNS's acked update API right after connect and every 300s while connected
+(unconditional idempotent rewrite; every result lands in the flight recorder
+as `duckdns_ok`/`duckdns_ko`/`duckdns_err`; ntfy page immediately on `KO`
+= bad token/domain, and after 3 consecutive transport failures ≈ 15 min).
+`airvpn ddns test-duckdns` performs one live source-detect write. The AirDNS
+self-heal v2 (authoritative-record watcher + same-server corrective
+reconnects, options `ddns.hostname`/`ddns.selfheal`) is **removed**.
+
+**Why:** the AirDNS record is written by AirVPN's backend as an unacked side
+effect of session lifecycle; there is no client-callable update path.
+Observed wedges: 3h38m (2026-07-01), 9h36m (2026-08-03), 7h32m+ (2026-08-20,
+hop off a hard-dead origin server). v2's design premise — "the write is a
+probabilistic race and patient same-server retries converge" (2026-08-03
+postmortem) — was falsified on 2026-08-20: same-server corrective reconnects
+went 0-for-6 lifetime (3× on 08-15, 3× on 08-20), while the only connects
+ever observed to rewrite the record were hops to a *different, live* server
+(the two observed successful rewrites) — and even those fail when the origin died
+uncleanly (the 08-20 initial hop). Owning the record client-side (acked write — we
+hold the pen) eliminates the wedge class instead of steering an opaque
+backend with reconnects. The AirVPN port forward is bound to the session,
+not the DNS name, so any hostname resolving to the current exit works.
+
+**Eddie parity:** Eddie contains no DDNS code at all (AirDNS is purely
+server-side), so both the removed self-heal and the DuckDNS writer are
+airvpn-rs extensions. Leave `ddns.duckdns_domain` unset to disable.
+
+**Files:** `src/duckdns.rs` (API client + policy constants), `src/ddns.rs`
+(shared pager + flight recorder, formerly `airdns.rs`), `src/connect.rs`
+(monitor-loop writer), `src/options.rs`
+
+**Eddie ref:** none (no DDNS in Eddie)

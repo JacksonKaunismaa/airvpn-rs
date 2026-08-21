@@ -62,11 +62,21 @@ pub const SCORING_LATENCY_FACTOR: &str = "scoring.latency_factor";
 pub const SCORING_LOAD_FACTOR: &str = "scoring.load_factor";
 pub const SCORING_USERS_FACTOR: &str = "scoring.users_factor";
 pub const SCORING_PING_FACTOR: &str = "scoring.ping_factor";
+pub const SCORING_SPEED_USERS_FACTOR: &str = "scoring.speed_users_factor";
+pub const SCORING_CONGESTION_KNEE: &str = "scoring.congestion_knee";
+pub const SCORING_CONGESTION_FACTOR: &str = "scoring.congestion_factor";
 pub const SERVERS_CAPACITY_FACTOR: &str = "servers.capacity_factor";
 
 // DNS
 pub const DNS_MODE: &str = "dns.mode";
 pub const LINUX_DNS_SERVICES: &str = "linux.dns.services";
+
+// DDNS (pager + DuckDNS record writer)
+pub const DDNS_NOTIFY_URL: &str = "ddns.notify_url";
+pub const DDNS_NOTIFY_USER: &str = "ddns.notify_user";
+pub const DDNS_NOTIFY_PASSWORD: &str = "ddns.notify_password";
+pub const DDNS_DUCKDNS_DOMAIN: &str = "ddns.duckdns_domain";
+pub const DDNS_DUCKDNS_TOKEN: &str = "ddns.duckdns_token";
 
 // UI
 pub const UI_UNIT: &str = "ui.unit";
@@ -98,6 +108,15 @@ pub struct OptionDef {
     pub name: &'static str,
     pub default: &'static str,
     pub description: &'static str,
+}
+
+/// Options whose values must never leave the process un-redacted — CLI
+/// output (`config get/set/list`) AND the helper's wheel-readable
+/// `GET /profile`. notify_url counts: it may embed user:pass@ userinfo
+/// (legacy form). Single source of truth — CLI-only redaction is
+/// insufficient; the helper socket must strip these too.
+pub fn is_secret(name: &str) -> bool {
+    name == DDNS_NOTIFY_PASSWORD || name == DDNS_NOTIFY_URL || name == DDNS_DUCKDNS_TOKEN
 }
 
 pub static REGISTRY: &[OptionDef] = &[
@@ -144,10 +163,19 @@ pub static REGISTRY: &[OptionDef] = &[
     OptionDef { name: SCORING_LOAD_FACTOR, default: "10", description: "Divisor for load in Latency mode (Speed mode: 1)" },
     OptionDef { name: SCORING_USERS_FACTOR, default: "10", description: "Divisor for users in Latency mode (Speed mode: 1)" },
     OptionDef { name: SCORING_PING_FACTOR, default: "1", description: "Multiplier for ping latency in scoring" },
+    OptionDef { name: SCORING_SPEED_USERS_FACTOR, default: "1000", description: "Divisor for users% in Speed mode (divergence #16). Default 1000 drops the term: user count tracks server size, not congestion, and steers away from big idle boxes. Eddie parity: 1. Note: 0 behaves as 1 (divisors are clamped to >=1), NOT as off" },
+    OptionDef { name: SCORING_CONGESTION_KNEE, default: "60", description: "Load% where the congestion penalty starts (divergence #16). Below the knee load is fine; above it packet loss grows nonlinearly" },
+    OptionDef { name: SCORING_CONGESTION_FACTOR, default: "1", description: "Multiplier for the (load% - knee)^2 congestion penalty (divergence #16). 0 = Eddie parity (off). At default 1, an 85%-loaded server takes +625 — effectively never chosen while alternatives exist" },
     OptionDef { name: SERVERS_CAPACITY_FACTOR, default: "0", description: "Capacity weighting factor (0 = disabled). Higher values prefer high-bandwidth servers" },
     // DNS
     OptionDef { name: DNS_MODE, default: "auto", description: "DNS resolution mode: auto, resolvconf, or systemd-resolved" },
     OptionDef { name: LINUX_DNS_SERVICES, default: "nscd,dnsmasq,named,bind9", description: "DNS cache services to restart on flush (comma-separated)" },
+    // DDNS (pager + DuckDNS record writer)
+    OptionDef { name: DDNS_NOTIFY_URL, default: "", description: "Credential-free URL POSTed (ntfy-style) on DuckDNS write failures (KO, or 3 consecutive transport errors). Empty = no notifications. user:pass@ userinfo is REJECTED (pager disabled at connect) — credentials go in ddns.notify_user/notify_password (an unencoded \\ / ? # in a URL-embedded password breaks URL parsing)" },
+    OptionDef { name: DDNS_NOTIFY_USER, default: "", description: "Basic-auth username for ddns.notify_url. Empty = no explicit auth (URL userinfo, if any, still applies)" },
+    OptionDef { name: DDNS_NOTIFY_PASSWORD, default: "", description: "Basic-auth password for ddns.notify_url, used verbatim — any characters are safe here. Set via `airvpn config set --stdin ddns.notify_password` to keep it out of argv" },
+    OptionDef { name: DDNS_DUCKDNS_DOMAIN, default: "", description: "DuckDNS subdomain kept pointed at the current exit IP while connected (e.g. myhost or myhost.duckdns.org). Written via DuckDNS's acked API every 300s — replaces AirDNS record tracking. Requires ddns.duckdns_token" },
+    OptionDef { name: DDNS_DUCKDNS_TOKEN, default: "", description: "DuckDNS account token for ddns.duckdns_domain. Set via `airvpn config set ddns.duckdns_token --stdin` to keep it out of argv" },
     // UI
     OptionDef { name: UI_UNIT, default: "bytes", description: "Display unit for speeds: bytes or bits" },
     OptionDef { name: UI_IEC, default: "false", description: "Use binary IEC units (KiB/MiB) instead of decimal SI (KB/MB)" },
