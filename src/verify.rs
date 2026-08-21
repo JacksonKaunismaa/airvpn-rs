@@ -35,6 +35,43 @@ fn strip_cidr(ip: &str) -> &str {
     ip.split('/').next().unwrap_or(ip)
 }
 
+/// True if `ip route show` output contains a default route whose `dev` is
+/// exactly `iface`.
+///
+/// A plain `output.contains("default")` (or `"0.0.0.0/0"`) passes as long as
+/// *some* default route exists anywhere in the table — including a stale
+/// physical-interface route that would leak traffic outside the tunnel. This
+/// requires the default route to actually egress the VPN interface.
+fn has_default_route_via_dev(route_output: &str, iface: &str) -> bool {
+    for line in route_output.lines() {
+        let line = line.trim();
+        if !(line.starts_with("default") || line.starts_with("0.0.0.0/0")) {
+            continue;
+        }
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.windows(2).any(|w| w[0] == "dev" && w[1] == iface) {
+            return true;
+        }
+    }
+    false
+}
+
+/// True if `ip addr show` output assigns exactly `ip` to the interface.
+///
+/// Matches the whole address token (`inet <ip>/<prefix>`), so `10.1.2.3` does
+/// not spuriously match `10.1.2.30` the way a substring `contains` would.
+fn iface_has_exact_addr(addr_output: &str, ip: &str) -> bool {
+    for line in addr_output.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        for w in tokens.windows(2) {
+            if (w[0] == "inet" || w[0] == "inet6") && strip_cidr(w[1]) == ip {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Split a check_domain that may contain a port (e.g. "airservers.org:89")
 /// into (domain, port). Returns (domain, 443) if no port is specified.
 fn split_domain_port(check_domain: &str) -> (&str, u16) {
@@ -354,7 +391,7 @@ pub fn check_route(iface: &str, expected_ipv4: &str) -> Result<()> {
         .context("failed to execute: ip addr show")?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let expected_ip = strip_cidr(expected_ipv4);
-    if !stdout.contains(expected_ip) {
+    if !iface_has_exact_addr(&stdout, expected_ip) {
         anyhow::bail!(
             "interface {} does not have expected IP {} (got: {})",
             iface, expected_ip, stdout.trim()
@@ -368,13 +405,13 @@ pub fn check_route(iface: &str, expected_ipv4: &str) -> Result<()> {
         .output()
         .context("failed to execute: ip route show table 51820")?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    if !stdout.contains("0.0.0.0/0") && !stdout.contains("default") {
+    if !has_default_route_via_dev(&stdout, iface) {
         anyhow::bail!(
-            "no default route in table 51820 (routes: {})",
-            stdout.trim()
+            "table 51820 has no default route via {} — traffic could leave outside the tunnel (routes: {})",
+            iface, stdout.trim()
         );
     }
-    debug!("Route check: table 51820 has default route");
+    debug!("Route check: table 51820 has default route via {}", iface);
 
     // 3. Check fwmark policy rule exists
     let output = std::process::Command::new("ip")
@@ -411,6 +448,32 @@ mod tests {
     #[test]
     fn test_strip_cidr_ipv6() {
         assert_eq!(strip_cidr("fd7d:76ee:e68f:a993::1196/128"), "fd7d:76ee:e68f:a993::1196");
+    }
+
+    #[test]
+    fn test_default_route_requires_correct_dev() {
+        // Default route via the VPN interface: accepted.
+        let via_vpn = "default dev avpn0 scope link\n10.0.0.0/8 dev avpn0";
+        assert!(has_default_route_via_dev(via_vpn, "avpn0"));
+        // A default route that exists but egresses the PHYSICAL interface must
+        // NOT pass — this is the leak the substring check missed.
+        let via_phys = "default via 192.168.1.1 dev wlan0\nlocal 10.1.2.3 dev avpn0";
+        assert!(!has_default_route_via_dev(via_phys, "avpn0"));
+        // 0.0.0.0/0 spelling, correct dev.
+        assert!(has_default_route_via_dev("0.0.0.0/0 dev avpn0", "avpn0"));
+        // No default route at all.
+        assert!(!has_default_route_via_dev("10.0.0.0/8 dev avpn0", "avpn0"));
+    }
+
+    #[test]
+    fn test_iface_addr_is_whole_token_not_substring() {
+        let out = "    inet 10.1.2.30/24 scope global avpn0";
+        // Exact address present.
+        assert!(iface_has_exact_addr(out, "10.1.2.30"));
+        // A prefix of a real address must NOT match (substring bug).
+        assert!(!iface_has_exact_addr(out, "10.1.2.3"));
+        // Absent address.
+        assert!(!iface_has_exact_addr(out, "10.9.9.9"));
     }
 
     #[test]

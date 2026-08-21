@@ -9,11 +9,18 @@
 use std::fs;
 use std::path::Path;
 
+use anyhow::{bail, Context, Result};
 use log::warn;
 
 /// Disable IPv6 on all non-loopback interfaces, including `default`.
 ///
-/// Returns the list of interfaces that were blocked (for restore on disconnect).
+/// Returns the list of interfaces that were blocked (for restore on disconnect),
+/// or an error if IPv6 could **not** be confirmed disabled on some live
+/// interface. This is deliberately fail-closed: a silently-ignored write
+/// failure would leave IPv6 enabled on a physical interface — exactly the leak
+/// this function exists to prevent — so the caller must be able to see it and
+/// refuse to connect (see `resolve_session`). This diverges from Eddie, which
+/// best-efforts each interface and ignores failures (see known_divergences.md).
 ///
 /// Setting `default` to `disable_ipv6=1` means newly created interfaces
 /// (including the WireGuard tunnel) inherit disabled IPv6 automatically.
@@ -24,14 +31,12 @@ use log::warn;
 /// The WireGuard interface is set up via direct `ip`/`wg` commands with IPv4 only.
 ///
 /// Reference: Eddie src/App.CLI.Linux.Elevated/src/impl.cpp lines 478-510
-pub fn block_all() -> Vec<String> {
+pub fn block_all() -> Result<Vec<String>> {
     let mut blocked = Vec::new();
     let conf_dir = Path::new("/proc/sys/net/ipv6/conf");
 
-    let entries = match fs::read_dir(conf_dir) {
-        Ok(e) => e,
-        Err(_) => return blocked,
-    };
+    let entries = fs::read_dir(conf_dir)
+        .with_context(|| format!("failed to enumerate {}", conf_dir.display()))?;
 
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
@@ -54,20 +59,48 @@ pub fn block_all() -> Vec<String> {
 
         let disable_path = conf_dir.join(&name).join("disable_ipv6");
 
-        // Check current state — only block if currently enabled
-        let current = fs::read_to_string(&disable_path)
-            .unwrap_or_default()
-            .trim()
-            .to_string();
+        // Read the current state. If the knob vanished (interface removed between
+        // the readdir and now), skip it — a gone interface can't leak. Any other
+        // read error is fatal: we cannot confirm IPv6 is off, and treating an
+        // unknown state as "already handled" is precisely the silent gap we're
+        // removing.
+        let current = match fs::read_to_string(&disable_path) {
+            Ok(s) => s.trim().to_string(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => bail!(
+                "cannot read {} to confirm IPv6 state: {}",
+                disable_path.display(),
+                e
+            ),
+        };
 
-        if current == "0"
-            && fs::write(&disable_path, "1").is_ok()
-        {
-            blocked.push(name);
+        // Already disabled (or otherwise not "0") — nothing to do, and we don't
+        // track it for restore since we didn't change it.
+        if current != "0" {
+            continue;
+        }
+
+        // Disable, then read back to CONFIRM. A write that "succeeded" but left
+        // IPv6 enabled (or a write that failed) must not be hidden.
+        if let Err(e) = fs::write(&disable_path, "1") {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                continue; // interface disappeared mid-write; can't leak
+            }
+            bail!("failed to disable IPv6 on {}: {}", name, e);
+        }
+        match fs::read_to_string(&disable_path) {
+            Ok(s) if s.trim() == "1" => blocked.push(name),
+            Ok(s) => bail!(
+                "IPv6 still enabled on {} after write (state={:?})",
+                name,
+                s.trim()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => bail!("cannot confirm IPv6 disabled on {}: {}", name, e),
         }
     }
 
-    blocked
+    Ok(blocked)
 }
 
 /// Restore IPv6 on previously blocked interfaces.

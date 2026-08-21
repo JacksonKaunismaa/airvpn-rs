@@ -464,7 +464,26 @@ fn resolve_session(config: &ConnectConfig) -> anyhow::Result<SessionParams> {
     // an empty list when interfaces are already blocked. Calling it again on
     // reconnection would overwrite the recovery state with an empty list,
     // losing the original blocked interfaces needed for crash recovery.
-    let blocked_ipv6_ifaces = ipv6::block_all();
+    let blocked_ipv6_ifaces = match ipv6::block_all() {
+        Ok(ifaces) => ifaces,
+        Err(e) => {
+            // IPv6 could not be confirmed disabled on every interface. With the
+            // kill switch on, nftables drops non-tunnel IPv6 egress, so this is a
+            // degraded-but-backstopped state — warn and continue. With no kill
+            // switch there is nothing to stop an IPv6 leak, so fail closed:
+            // refuse to connect rather than come up while leaking.
+            if config.no_lock {
+                return Err(e.context(
+                    "refusing to connect: IPv6 could not be blocked and the kill switch is disabled (would risk an IPv6 leak)",
+                ));
+            }
+            warn!(
+                "IPv6 block incomplete ({:#}) — relying on the nftables kill switch to drop non-tunnel IPv6",
+                e
+            );
+            Vec::new()
+        }
+    };
     if !blocked_ipv6_ifaces.is_empty() {
         info!("IPv6 disabled on {} interfaces", blocked_ipv6_ifaces.len());
     }
@@ -1357,6 +1376,41 @@ fn save_recovery(
     })
 }
 
+/// Bring up a minimal, DNS-free "drop everything except the server entry IPs"
+/// kill switch. Used as a fail-closed fallback during reconnect when the full
+/// `activate_netlock` could not install a lock and nothing else is protecting
+/// the physical route.
+///
+/// Uses only the numeric server entry IPs — no bootstrap-hostname resolution,
+/// which would block ~30s while VPN DNS is unreachable mid-reconnect — so it can
+/// go up fast. The next successful `activate_netlock` atomically replaces it.
+/// Worst case it over-blocks (LAN/custom routes) for the brief reconnect window,
+/// which is the safe direction for a kill switch.
+fn activate_emergency_lock(config: &ConnectConfig, entry_ips: &[String]) -> anyhow::Result<()> {
+    let iface_name = {
+        let v = options::get_str(&config.resolved, options::NETWORK_IFACE_NAME);
+        if v.is_empty() { wireguard::VPN_INTERFACE } else { v }
+    };
+    let lock_config = netlock::NetlockConfig {
+        allow_lan: config.allow_lan,
+        allow_dhcp: true,
+        allow_ping: false,
+        allow_ipv4ipv6translation: true,
+        allowed_ips_incoming: vec![],
+        allowed_ips_outgoing: entry_ips
+            .iter()
+            .filter(|ip| ip.parse::<std::net::IpAddr>().is_ok())
+            .cloned()
+            .collect(),
+        incoming_policy_accept: false,
+        iface_name: iface_name.to_string(),
+        custom_route_out_cidrs: vec![],
+        allowlist_out_cidrs: vec![],
+        local_forward_ifaces: vec![],
+    };
+    netlock::activate(&lock_config)
+}
+
 // ---------------------------------------------------------------------------
 // LoopState — mutable per-loop state for the reconnection loop
 // ---------------------------------------------------------------------------
@@ -1428,18 +1482,27 @@ fn refresh_and_rebuild_lock(
                     // persistent lock is blocking the physical route anyway.
                     warn!("Failed to (re)activate netlock on reconnect: {}", e);
                 } else {
-                    // No session table AND no persistent lock: the kill switch
-                    // is down while we reconnect. Reconnection still proceeds —
-                    // the tunnel itself is what stops the leak fastest, and the
-                    // monitor loop re-triggers this rebuild on the next cycle —
-                    // but the user must hear about it, not just the helper log:
-                    // a kill-switch user whose lock is silently gone believes
-                    // they have protection they don't.
-                    error!("Kill switch could not be restored on reconnect: {} — traffic may bypass the VPN until the tunnel is up", e);
-                    emit(config, crate::ipc::EngineEvent::Log {
-                        level: "error".into(),
-                        message: format!("Kill switch could not be restored: {} — traffic may bypass the VPN until reconnection completes", e),
-                    });
+                    // No session table AND no persistent lock: nothing is blocking
+                    // the physical route right now. Fail closed by installing a
+                    // minimal DNS-free drop-all-except-server lock BEFORE we go on
+                    // to rebuild the tunnel, instead of proceeding exposed. (The
+                    // full activate_netlock just failed and may block on bootstrap
+                    // DNS mid-reconnect, so we don't simply retry it here.)
+                    match activate_emergency_lock(config, &state.all_entry_ips) {
+                        Ok(()) => info!(
+                            "Emergency kill switch installed on reconnect — blocking all but server IPs until the tunnel is up"
+                        ),
+                        Err(emerg_err) => {
+                            // nft itself appears broken. Proceeding still stops the
+                            // leak fastest (the tunnel is the next thing to come
+                            // up), but the user must hear they were unprotected.
+                            error!("Kill switch could not be restored on reconnect: {} (emergency lock also failed: {}) — traffic may bypass the VPN until the tunnel is up", e, emerg_err);
+                            emit(config, crate::ipc::EngineEvent::Log {
+                                level: "error".into(),
+                                message: format!("Kill switch could not be restored: {} — traffic may bypass the VPN until reconnection completes", e),
+                            });
+                        }
+                    }
                 }
             }
         }
