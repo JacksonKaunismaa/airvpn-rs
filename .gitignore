@@ -2,6 +2,7 @@
 .worktrees
 CLAUDE.md
 .claude
+docs/known_divergences.md
 servers.xml
 servers.xml
 tmp/
