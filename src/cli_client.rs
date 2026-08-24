@@ -590,6 +590,13 @@ fn prompt_eddie_import(path: &str) -> bool {
     let _ = std::io::stderr().flush();
     let mut answer = String::new();
     match std::io::stdin().read_line(&mut answer) {
+        // EOF — no terminal attached (systemd stdin is /dev/null, piped use).
+        // Importing credentials must be an explicit yes from a person, not
+        // the [Y/n] default applied to an absent one: decline.
+        Ok(0) => {
+            eprintln!("no (EOF on stdin — declining Eddie import)");
+            false
+        }
         Ok(_) => {
             let trimmed = answer.trim().to_lowercase();
             trimmed.is_empty() || trimmed == "y" || trimmed == "yes"
