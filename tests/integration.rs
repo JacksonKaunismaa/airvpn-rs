@@ -556,8 +556,8 @@ fn test_ipv6_block_restore() {
         }
     }
 
-    // Block all IPv6
-    let blocked = ipv6::block_all();
+    // Block all IPv6 (fail-closed Result since the netlock hardening)
+    let blocked = ipv6::block_all().expect("ipv6::block_all failed");
     let _guard = Ipv6Guard {
         blocked: blocked.clone(),
     };
