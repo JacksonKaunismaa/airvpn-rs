@@ -450,6 +450,11 @@ It runs `airvpn autoconnect`, which reads the profile's `connect` flag and, if
 set, issues a best-scored-server connect (with a short retry loop for helper
 warmup / post-boot network flux). We reuse Eddie's `connect` option key for
 parity, so an imported Eddie profile with `connect=true` carries over.
+Unlike interactive `connect` (which stays attached to the helper's event
+stream for stats/reconnection), `autoconnect` detaches as soon as `Connected`
+arrives (`send_connect_detached`) — a oneshot must exit, and staying attached
+start-timed-out the unit on every boot until fixed 2026-08-23. Other units
+can therefore order `After=airvpn-autoconnect.service` to wait for the VPN.
 
 **Why:** Eddie's model can't be mirrored — there's no resident process to
 autostart. A systemd unit is the idiomatic Linux equivalent and, unlike an app

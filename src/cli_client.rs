@@ -264,9 +264,25 @@ fn http_stream(
 /// - 409 + already connected → error
 /// - 200 chunked → stream events until Disconnected
 pub fn send_connect(req: &ipc::ConnectRequest) -> Result<()> {
+    send_connect_impl(req, render_event)
+}
+
+/// `send_connect`, but `Connected` is terminal: returns as soon as the tunnel
+/// is up instead of staying attached for stats/reconnection events. For
+/// `autoconnect`, whose systemd oneshot must exit — attached to the stream it
+/// hit TimeoutStartSec and landed `failed` on every boot (the helper owns the
+/// connection, so detaching loses nothing).
+pub fn send_connect_detached(req: &ipc::ConnectRequest) -> Result<()> {
+    send_connect_impl(req, render_event_until_connected)
+}
+
+fn send_connect_impl(
+    req: &ipc::ConnectRequest,
+    on_event: fn(&HelperEvent) -> EventAction,
+) -> Result<()> {
     let body = serde_json::to_string(req).context("serialize ConnectRequest")?;
 
-    let (status, resp_body) = http_stream("POST", "/connect", Some(&body), render_event)?;
+    let (status, resp_body) = http_stream("POST", "/connect", Some(&body), on_event)?;
 
     match status {
         200 => Ok(()),
@@ -287,7 +303,7 @@ pub fn send_connect(req: &ipc::ConnectRequest) -> Result<()> {
 
                 // Retry connect after successful import
                 let (status2, resp_body2) =
-                    http_stream("POST", "/connect", Some(&body), render_event)?;
+                    http_stream("POST", "/connect", Some(&body), on_event)?;
                 match status2 {
                     200 => Ok(()),
                     _ => anyhow::bail!("connect failed after Eddie import: {}", resp_body2),
@@ -502,6 +518,30 @@ fn render_event(event: &HelperEvent) -> EventAction {
         | HelperEvent::EddieProfileFound { .. }
         | HelperEvent::Profile { .. }
         | HelperEvent::ProfileSaved => EventAction::Continue,
+    }
+}
+
+/// `render_event`, except `Connected` ends the stream (see
+/// `send_connect_detached`): prints the same ":: Connected …" line, then
+/// tells the reader loop to stop instead of staying attached for stats.
+fn render_event_until_connected(event: &HelperEvent) -> EventAction {
+    let action = render_event(event);
+    match event {
+        HelperEvent::StateChanged {
+            state: ConnectionState::Connected { .. },
+        } => EventAction::Done,
+        // A detached (oneshot) caller must treat "stream ended without
+        // reaching Connected" as FAILURE: render_event maps these to Done,
+        // which would bubble up as Ok(()) and let autoconnect exit SUCCESS
+        // with no tunnel — units ordered After= it would then run with
+        // egress still blackholed by the network lock.
+        HelperEvent::StateChanged {
+            state: ConnectionState::Disconnected,
+        } => EventAction::Error("connect ended in Disconnected before Connected".into()),
+        HelperEvent::Shutdown => {
+            EventAction::Error("helper shut down before Connected".into())
+        }
+        _ => action,
     }
 }
 

@@ -573,7 +573,7 @@ fn run_autoconnect() -> anyhow::Result<()> {
     const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
     let mut last_err = None;
     for attempt in 1..=MAX_ATTEMPTS {
-        match cli_client::send_connect(&req) {
+        match cli_client::send_connect_detached(&req) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 eprintln!("autoconnect: attempt {attempt}/{MAX_ATTEMPTS} failed: {e}");
