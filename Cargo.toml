@@ -75,3 +75,9 @@ sha1 = "0.10"
 iced = { version = "0.14", features = ["tokio"] }
 tokio = { version = "1", features = ["time", "rt-multi-thread", "net", "sync", "macros"] }
 tokio-stream = "0.1"
+
+[dev-dependencies]
+# Runs code before the integration test `main` to enter a namespace sandbox
+# (see tests/integration.rs::enter_sandbox), so the system tests run isolated
+# under a plain `cargo test`.
+ctor = "0.2"

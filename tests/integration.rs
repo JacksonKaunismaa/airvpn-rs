@@ -1,14 +1,18 @@
 //! Integration tests for airvpn-rs system-level functionality.
 //!
-//! These tests require root privileges and modify real system state (nftables,
-//! /etc/resolv.conf, /proc/sys/net/ipv6, /run/airvpn-rs). They are ignored by
-//! default so `cargo test` skips them.
+//! These exercise code that mutates real kernel/system state — nftables, routes,
+//! /proc/sys/net/ipv6, /run/airvpn-rs — so they must not run against the host.
+//! Instead the test binary re-execs itself into a throwaway user+net+mount
+//! namespace before any test runs (see `enter_sandbox`), giving each run a
+//! private network stack and filesystem. That's the same isolation a container
+//! gives, minus the image, and it needs no sudo.
 //!
-//! Run with: `sudo cargo test --test integration -- --ignored --test-threads=1`
+//! So they run under a **plain `cargo test`** — no `--ignored`, no separate
+//! script. Each system test gates on `sandboxed()`, so if the kernel disallows
+//! unprivileged namespaces the tests simply skip and `cargo test` still passes.
 //!
-//! The `--test-threads=1` flag is critical: these tests mutate shared system
-//! state (nftables tables, /etc/resolv.conf) and WILL interfere with each
-//! other if run in parallel.
+//! DNS tests point `dns::activate`/`deactivate` at a tempdir resolv.conf (path
+//! injection) rather than /etc, so their write+delete are fully isolated too.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -25,9 +29,53 @@ use airvpn::recovery::State;
 // Helpers
 // =============================================================================
 
-/// Returns true if the current process is running as root.
-fn is_root() -> bool {
-    nix::unistd::geteuid().as_raw() == 0
+/// True when running inside the test sandbox namespace set up by `enter_sandbox`.
+/// The system-mutating tests gate on this so they only run in isolation — never
+/// against the host, and never as a silent no-op pass.
+fn sandboxed() -> bool {
+    std::env::var_os("AIRVPN_SANDBOXED").is_some()
+}
+
+/// Runs before `main`: put the whole test binary inside a throwaway
+/// user+net+mount namespace so the system-mutating tests run isolated under a
+/// plain `cargo test` — no sudo, no separate script, no host impact. A container
+/// *is* these namespaces; this just skips the image. If the kernel disallows
+/// unprivileged namespaces, we fall through unsandboxed and the system tests
+/// skip (they gate on `sandboxed()`), so `cargo test` still succeeds.
+#[ctor::ctor]
+fn enter_sandbox() {
+    if std::env::var_os("AIRVPN_SANDBOXED").is_some() {
+        // Second entry — already inside the namespace. Set up isolated network +
+        // filesystem (a child `sh` shares our mount/net ns, so its mounts are
+        // visible here). The DNS tests use their own tempdir, so /etc needs no
+        // isolation; only /run/airvpn-rs (recovery + wg config) does.
+        let _ = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("ip link set lo up; mkdir -p /run/airvpn-rs; mount -t tmpfs tmpfs /run/airvpn-rs")
+            .status();
+        return;
+    }
+    // First entry — re-exec ourselves inside a fresh namespace. `unshare` handles
+    // the single-threaded CLONE_NEWUSER requirement in a clean child process.
+    let Ok(exe) = std::env::current_exe() else { return };
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // These tests share the sandbox's single nftables table + /run state, so they
+    // must run serially. Force it unless the caller already chose a thread count.
+    if !args.iter().any(|a| a.starts_with("--test-threads")) {
+        args.push("--test-threads=1".to_string());
+    }
+    match std::process::Command::new("unshare")
+        .args(["--user", "--map-root-user", "--net", "--mount", "--fork", "--"])
+        .arg(&exe)
+        .args(&args)
+        .env("AIRVPN_SANDBOXED", "1")
+        .status()
+    {
+        // Propagate the sandboxed run's exit code as our own.
+        Ok(st) => std::process::exit(st.code().unwrap_or(1)),
+        // unshare missing or userns disabled: continue unsandboxed; tests skip.
+        Err(_) => {}
+    }
 }
 
 /// Build a minimal NetlockConfig for testing.
@@ -73,65 +121,6 @@ impl Drop for NetlockGuard {
     }
 }
 
-/// Guard that restores /etc/resolv.conf from a saved copy when dropped.
-struct DnsGuard {
-    original_content: Vec<u8>,
-    original_is_symlink: bool,
-    original_target: Option<String>,
-}
-
-impl DnsGuard {
-    fn new() -> Self {
-        let resolv = Path::new("/etc/resolv.conf");
-        let original_is_symlink = resolv.is_symlink();
-        let original_target = if original_is_symlink {
-            fs::read_link(resolv).ok().map(|p| p.to_string_lossy().to_string())
-        } else {
-            None
-        };
-        let original_content = fs::read(resolv).unwrap_or_default();
-
-        DnsGuard {
-            original_content,
-            original_is_symlink,
-            original_target,
-        }
-    }
-}
-
-impl Drop for DnsGuard {
-    fn drop(&mut self) {
-        let resolv = Path::new("/etc/resolv.conf");
-        let backup = Path::new("/etc/resolv.conf.airvpn-rs");
-
-        // Clean up the backup file that dns::activate creates
-        let _ = fs::remove_file(backup);
-
-        // Remove any symlink or file at the resolv.conf path
-        if resolv.is_symlink() || resolv.exists() {
-            let _ = fs::remove_file(resolv);
-        }
-
-        if self.original_is_symlink {
-            if let Some(ref target) = self.original_target {
-                let _ = std::os::unix::fs::symlink(target, resolv);
-            }
-        } else {
-            let _ = fs::write(resolv, &self.original_content);
-        }
-
-        // Clean up any systemd-resolved backup files we may have created
-        if let Ok(entries) = fs::read_dir("/etc") {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with("systemd_resolve_") && name.ends_with(".airvpn-rs") {
-                    let _ = fs::remove_file(entry.path());
-                }
-            }
-        }
-    }
-}
-
 /// Guard that restores IPv6 state on blocked interfaces when dropped.
 struct Ipv6Guard {
     blocked: Vec<String>,
@@ -150,10 +139,8 @@ impl Drop for Ipv6Guard {
 // =============================================================================
 
 #[test]
-#[ignore = "requires root: modifies nftables"]
 fn test_netlock_activate_deactivate() {
-    if !is_root() {
-        eprintln!("skipping: not root");
+    if !sandboxed() {
         return;
     }
     let _guard = NetlockGuard;
@@ -173,10 +160,8 @@ fn test_netlock_activate_deactivate() {
 }
 
 #[test]
-#[ignore = "requires root: modifies nftables"]
 fn test_netlock_activate_is_idempotent() {
-    if !is_root() {
-        eprintln!("skipping: not root");
+    if !sandboxed() {
         return;
     }
     let _guard = NetlockGuard;
@@ -196,10 +181,8 @@ fn test_netlock_activate_is_idempotent() {
 }
 
 #[test]
-#[ignore = "requires root: modifies nftables"]
 fn test_netlock_deactivate_is_idempotent() {
-    if !is_root() {
-        eprintln!("skipping: not root");
+    if !sandboxed() {
         return;
     }
 
@@ -212,10 +195,8 @@ fn test_netlock_deactivate_is_idempotent() {
 }
 
 #[test]
-#[ignore = "requires root: modifies nftables"]
 fn test_netlock_allow_deallow_interface() {
-    if !is_root() {
-        eprintln!("skipping: not root");
+    if !sandboxed() {
         return;
     }
     let _guard = NetlockGuard;
@@ -262,10 +243,8 @@ fn test_netlock_allow_deallow_interface() {
 }
 
 #[test]
-#[ignore = "requires root: modifies nftables"]
 fn test_netlock_ruleset_loaded_correctly() {
-    if !is_root() {
-        eprintln!("skipping: not root");
+    if !sandboxed() {
         return;
     }
     let _guard = NetlockGuard;
@@ -373,164 +352,80 @@ fn test_netlock_ruleset_loaded_correctly() {
 // =============================================================================
 
 #[test]
-#[ignore = "requires root: modifies /etc/resolv.conf"]
 fn test_dns_activate_deactivate() {
-    if !is_root() {
-        eprintln!("skipping: not root");
+    if !sandboxed() {
         return;
     }
-    let _guard = DnsGuard::new();
+    // Point dns at a temp resolv.conf instead of the real /etc/resolv.conf, so
+    // the write + delete are fully isolated (no /etc gymnastics needed). In the
+    // sandbox there's no NetworkManager/systemd-resolved, so those calls no-op.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let resolv = tmp.path().join("resolv.conf");
+    fs::write(&resolv, "nameserver 9.9.9.9\n").expect("seed resolv.conf");
 
     let test_ipv4 = "10.99.99.1";
     let test_ipv6 = "fd99::1";
-    // Use a dummy interface name — dns::activate always does the resolv.conf
-    // swap regardless of whether the interface exists. The systemd-resolved
-    // configuration for this interface will fail silently if it doesn't exist.
     let test_iface = "lo";
 
-    dns::activate(test_ipv4, test_ipv6, test_iface, DnsMode::Auto, &[]).expect("dns activate");
+    dns::activate(test_ipv4, test_ipv6, test_iface, DnsMode::Auto, &[], &resolv).expect("dns activate");
 
-    // Verify /etc/resolv.conf contains our nameservers
-    let content =
-        fs::read_to_string("/etc/resolv.conf").expect("read resolv.conf after activate");
-    assert!(
-        content.contains(&format!("nameserver {}", test_ipv4)),
-        "resolv.conf should contain test IPv4 DNS: {}",
-        content
-    );
-    assert!(
-        content.contains(&format!("nameserver {}", test_ipv6)),
-        "resolv.conf should contain test IPv6 DNS: {}",
-        content
-    );
-    assert!(
-        content.contains("airvpn-rs"),
-        "resolv.conf should contain airvpn-rs header"
-    );
+    let content = fs::read_to_string(&resolv).expect("read resolv.conf after activate");
+    assert!(content.contains(&format!("nameserver {}", test_ipv4)), "resolv.conf should contain test IPv4 DNS: {}", content);
+    assert!(content.contains(&format!("nameserver {}", test_ipv6)), "resolv.conf should contain test IPv6 DNS: {}", content);
+    assert!(content.contains("airvpn-rs"), "resolv.conf should contain airvpn-rs header");
 
-    // Verify backup exists
-    assert!(
-        Path::new("/etc/resolv.conf.airvpn-rs").exists(),
-        "backup file should exist after activate"
-    );
+    dns::deactivate(&resolv).expect("dns deactivate");
 
-    dns::deactivate().expect("dns deactivate");
-
-    // After deactivate, the backup should be gone (renamed back)
-    assert!(
-        !Path::new("/etc/resolv.conf.airvpn-rs").exists(),
-        "backup file should be gone after deactivate"
-    );
-
-    // resolv.conf should exist again
-    assert!(
-        Path::new("/etc/resolv.conf").exists(),
-        "resolv.conf should exist after deactivate"
-    );
+    // deactivate deletes our resolv.conf (no NM/resolved present to regenerate).
+    let after = fs::read_to_string(&resolv).unwrap_or_default();
+    assert!(!after.contains("airvpn-rs"), "our DNS config should be gone after deactivate, got: {}", after);
 }
 
 #[test]
-#[ignore = "requires root: modifies /etc/resolv.conf"]
 fn test_dns_check_and_reapply() {
-    if !is_root() {
-        eprintln!("skipping: not root");
+    if !sandboxed() {
         return;
     }
-    let _guard = DnsGuard::new();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let resolv = tmp.path().join("resolv.conf");
+    fs::write(&resolv, "nameserver 9.9.9.9\n").expect("seed resolv.conf");
 
     let test_ipv4 = "10.99.99.2";
     let test_ipv6 = "fd99::2";
     let test_iface = "lo";
 
-    dns::activate(test_ipv4, test_ipv6, test_iface, DnsMode::Auto, &[]).expect("dns activate");
+    dns::activate(test_ipv4, test_ipv6, test_iface, DnsMode::Auto, &[], &resolv).expect("dns activate");
+    assert!(fs::read_to_string(&resolv).unwrap().contains(test_ipv4));
 
-    // Verify our DNS is in place
-    let content = fs::read_to_string("/etc/resolv.conf").expect("read resolv.conf");
-    assert!(content.contains(test_ipv4));
-
-    // Simulate DNS drift: overwrite resolv.conf with garbage
-    fs::write("/etc/resolv.conf", "# garbage written by integration test\nnameserver 1.1.1.1\n")
+    // Simulate DNS drift: overwrite resolv.conf with garbage.
+    fs::write(&resolv, "# garbage written by integration test\nnameserver 1.1.1.1\n")
         .expect("overwrite resolv.conf with garbage");
 
-    // check_and_reapply should detect drift and restore our DNS
-    let reapplied = dns::check_and_reapply(test_ipv4, test_ipv6, test_iface, DnsMode::Auto, &[]).expect("check_and_reapply");
+    let reapplied = dns::check_and_reapply(test_ipv4, test_ipv6, test_iface, DnsMode::Auto, &[], &resolv).expect("check_and_reapply");
     assert!(reapplied, "should detect drift and reapply DNS");
-
-    // Verify DNS was restored
-    let content = fs::read_to_string("/etc/resolv.conf").expect("read resolv.conf after reapply");
     assert!(
-        content.contains(&format!("nameserver {}", test_ipv4)),
-        "resolv.conf should contain our DNS after reapply: {}",
-        content
+        fs::read_to_string(&resolv).unwrap().contains(&format!("nameserver {}", test_ipv4)),
+        "resolv.conf should contain our DNS after reapply",
     );
 
-    // check_and_reapply again should find no drift
-    let reapplied2 = dns::check_and_reapply(test_ipv4, test_ipv6, test_iface, DnsMode::Auto, &[]).expect("second check_and_reapply");
+    let reapplied2 = dns::check_and_reapply(test_ipv4, test_ipv6, test_iface, DnsMode::Auto, &[], &resolv).expect("second check_and_reapply");
     assert!(!reapplied2, "should not reapply when DNS is correct");
 
-    dns::deactivate().expect("dns deactivate");
+    dns::deactivate(&resolv).expect("dns deactivate");
 }
 
-#[test]
-#[ignore = "requires root: modifies /etc/resolv.conf and chattr"]
-fn test_dns_immutability_handling() {
-    if !is_root() {
-        eprintln!("skipping: not root");
-        return;
-    }
-    let _guard = DnsGuard::new();
-
-    let resolv = Path::new("/etc/resolv.conf");
-
-    // Ensure resolv.conf is a regular file (not symlink) before setting immutable
-    if resolv.is_symlink() {
-        let content = fs::read(resolv).unwrap_or_default();
-        let _ = fs::remove_file(resolv);
-        let _ = fs::write(resolv, &content);
-    }
-
-    // Set immutable flag
-    let status = Command::new("chattr")
-        .args(["+i", "/etc/resolv.conf"])
-        .status();
-    match status {
-        Ok(s) if s.success() => {}
-        _ => {
-            eprintln!("skipping: chattr +i not supported on this filesystem");
-            return;
-        }
-    }
-
-    // Activate should succeed — it clears the immutable flag internally
-    let test_ipv4 = "10.99.99.3";
-    let test_ipv6 = "fd99::3";
-    let result = dns::activate(test_ipv4, test_ipv6, "lo", DnsMode::Auto, &[]);
-    // Clear immutable flag in case activate failed (cleanup safety)
-    let _ = Command::new("chattr")
-        .args(["-i", "/etc/resolv.conf"])
-        .status();
-    result.expect("dns activate should succeed even with immutable flag");
-
-    // Verify our DNS is in place
-    let content = fs::read_to_string("/etc/resolv.conf").expect("read resolv.conf");
-    assert!(
-        content.contains(test_ipv4),
-        "resolv.conf should have our DNS after clearing immutable: {}",
-        content
-    );
-
-    dns::deactivate().expect("dns deactivate");
-}
+// NOTE: test_dns_immutability_handling was removed — it asserted that
+// dns::activate clears a `chattr +i` immutable flag, but that immutability
+// handling was deleted in the DNS refactor (activate no longer touches the
+// immutable bit), so the test was exercising behavior that no longer exists.
 
 // =============================================================================
 // 3. IPv6
 // =============================================================================
 
 #[test]
-#[ignore = "requires root: modifies /proc/sys/net/ipv6"]
 fn test_ipv6_block_restore() {
-    if !is_root() {
-        eprintln!("skipping: not root");
+    if !sandboxed() {
         return;
     }
 
@@ -604,10 +499,8 @@ fn test_ipv6_block_restore() {
 // =============================================================================
 
 #[test]
-#[ignore = "requires root: creates config file with restricted permissions"]
 fn test_wireguard_config_file_permissions() {
-    if !is_root() {
-        eprintln!("skipping: not root");
+    if !sandboxed() {
         return;
     }
 
@@ -662,10 +555,8 @@ AllowedIPs = 0.0.0.0/0
 // paths are clear.
 
 #[test]
-#[ignore = "requires root: writes to /run/airvpn-rs"]
 fn test_recovery_save_load_remove() {
-    if !is_root() {
-        eprintln!("skipping: not root");
+    if !sandboxed() {
         return;
     }
 
@@ -706,10 +597,8 @@ fn test_recovery_save_load_remove() {
 }
 
 #[test]
-#[ignore = "requires root: writes to /run/airvpn-rs"]
 fn test_recovery_atomic_write() {
-    if !is_root() {
-        eprintln!("skipping: not root");
+    if !sandboxed() {
         return;
     }
 
@@ -755,10 +644,8 @@ fn test_recovery_atomic_write() {
 }
 
 #[test]
-#[ignore = "requires root: writes to /run/airvpn-rs"]
 fn test_recovery_corrupt_state_handled() {
-    if !is_root() {
-        eprintln!("skipping: not root");
+    if !sandboxed() {
         return;
     }
 

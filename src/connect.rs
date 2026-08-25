@@ -176,7 +176,7 @@ pub fn cmd_disconnect_internal(config_path: &str, iface: &str, lock_active: bool
         let _ = netlock::deactivate();
     }
     // 4. Restore DNS (resolv.conf, systemd-resolved if active, flush caches)
-    let _ = dns::deactivate();
+    let _ = dns::deactivate(std::path::Path::new(dns::RESOLV_CONF));
     dns::flush();
     // 5. Restore IPv6
     ipv6::restore(blocked_ipv6);
@@ -378,7 +378,7 @@ fn preflight_and_cleanup() -> anyhow::Result<()> {
         let dns_backup = std::path::Path::new("/etc/resolv.conf.airvpn-rs");
         if dns_backup.exists() {
             warn!("Restoring orphaned DNS backup...");
-            let _ = dns::deactivate();
+            let _ = dns::deactivate(std::path::Path::new(dns::RESOLV_CONF));
         }
 
         // Remove orphaned nftables table
@@ -868,7 +868,7 @@ fn run_monitor_loop(
             break (ResetLevel::Error, net_flapped);
         }
 
-        match dns::check_and_reapply(dns_ipv4, dns_ipv6, iface, dns_mode, dns_services) {
+        match dns::check_and_reapply(dns_ipv4, dns_ipv6, iface, dns_mode, dns_services, std::path::Path::new(dns::RESOLV_CONF)) {
             Ok(_) => { dns_fail_count = 0; }
             Err(e) => {
                 dns_fail_count += 1;
@@ -1120,7 +1120,7 @@ fn post_connect_setup(
         message: "Configuring DNS...".into(),
     });
     debug!("Activating DNS: ipv4={}, ipv6={}, iface={}", effective_dns_ipv4, effective_dns_ipv6, iface);
-    dns::activate(effective_dns_ipv4, effective_dns_ipv6, iface, params.dns_mode, &params.dns_services)?;
+    dns::activate(effective_dns_ipv4, effective_dns_ipv6, iface, params.dns_mode, &params.dns_services, std::path::Path::new(dns::RESOLV_CONF))?;
     info!("DNS configured: {}{}", effective_dns_ipv4,
           if effective_dns_ipv6.is_empty() { String::new() } else { format!(", {}", effective_dns_ipv6) });
     if !dns::verify_resolv_conf(effective_dns_ipv4, effective_dns_ipv6, std::path::Path::new("/etc/resolv.conf")) {

@@ -95,7 +95,7 @@ fn find_default_route_iface() -> Option<String> {
 /// regenerate resolv.conf — for instance when NM is configured with
 /// `rc-manager=unmanaged` or `dns=none`. NM still tracks the correct
 /// per-connection DNS internally; we just have to write it ourselves.
-fn write_resolv_conf_from_nm(iface: &str) -> Result<()> {
+fn write_resolv_conf_from_nm(iface: &str, resolv_path: &Path) -> Result<()> {
     if !crate::common::validate_interface_name(iface) {
         anyhow::bail!("invalid interface name: {:?}", iface);
     }
@@ -131,7 +131,6 @@ fn write_resolv_conf_from_nm(iface: &str) -> Result<()> {
         anyhow::bail!("NetworkManager has no DNS configured for {}", iface);
     }
 
-    let resolv_path = Path::new("/etc/resolv.conf");
     fs::write(resolv_path, &content).context("failed to write /etc/resolv.conf")?;
 
     #[cfg(unix)]
@@ -277,11 +276,16 @@ fn configure_systemd_resolved_for_connect(dns_ipv4: &str, dns_ipv6: &str, vpn_if
     Ok(())
 }
 
+/// The system resolver config path. A `const` so it's a single source of truth;
+/// passed explicitly into the resolv.conf functions (rather than hardcoded
+/// inside them) so tests can point them at a temp file instead of the real one.
+pub const RESOLV_CONF: &str = "/etc/resolv.conf";
+
 /// Activate DNS: write VPN DNS to /etc/resolv.conf, optionally configure systemd-resolved.
 ///
 /// `mode` controls whether to auto-detect, force resolvconf, or force systemd-resolved.
 /// `dns_services` is the list of DNS cache services to restart during flush.
-pub fn activate(dns_ipv4: &str, dns_ipv6: &str, iface: &str, mode: DnsMode, dns_services: &[String]) -> Result<()> {
+pub fn activate(dns_ipv4: &str, dns_ipv6: &str, iface: &str, mode: DnsMode, dns_services: &[String], resolv_path: &Path) -> Result<()> {
     if !crate::common::validate_interface_name(iface) {
         anyhow::bail!("invalid interface name: {:?}", iface);
     }
@@ -293,7 +297,6 @@ pub fn activate(dns_ipv4: &str, dns_ipv6: &str, iface: &str, mode: DnsMode, dns_
         configure_systemd_resolved_for_connect(dns_ipv4, dns_ipv6, iface)?;
     }
 
-    let resolv_path = Path::new("/etc/resolv.conf");
     let expected = build_resolv_conf(dns_ipv4, dns_ipv6);
 
     // If resolv.conf is a symlink (e.g., systemd-resolved's stub), remove it
@@ -325,9 +328,7 @@ pub fn activate(dns_ipv4: &str, dns_ipv6: &str, iface: &str, mode: DnsMode, dns_
 /// from that current state — no snapshot, no staleness, no per-network drift.
 /// `resolvectl revert` does the equivalent for systemd-resolved per-link
 /// manual settings.
-pub fn deactivate() -> Result<()> {
-    let resolv_path = Path::new("/etc/resolv.conf");
-
+pub fn deactivate(resolv_path: &Path) -> Result<()> {
     // Delete our resolv.conf so the system's DNS manager can regenerate it.
     // Only delete if it carries our header, to avoid touching a user-restored
     // or system-managed file.
@@ -381,7 +382,7 @@ pub fn deactivate() -> Result<()> {
             match find_default_route_iface() {
                 Some(iface) => {
                     info!("resolv.conf still missing after NM reload; writing it directly from nmcli state on {}", iface);
-                    if let Err(e) = write_resolv_conf_from_nm(&iface) {
+                    if let Err(e) = write_resolv_conf_from_nm(&iface, resolv_path) {
                         warn!("fallback write of resolv.conf failed: {}", e);
                     }
                 }
@@ -405,13 +406,11 @@ pub fn deactivate() -> Result<()> {
 /// periodically to detect and fix that.
 ///
 /// Returns Ok(true) if any DNS settings were re-applied, Ok(false) if no drift detected.
-pub fn check_and_reapply(dns_ipv4: &str, dns_ipv6: &str, vpn_iface: &str, mode: DnsMode, dns_services: &[String]) -> Result<bool> {
+pub fn check_and_reapply(dns_ipv4: &str, dns_ipv6: &str, vpn_iface: &str, mode: DnsMode, dns_services: &[String], resolv_path: &Path) -> Result<bool> {
     if !crate::common::validate_interface_name(vpn_iface) {
         anyhow::bail!("invalid VPN interface name: {:?}", vpn_iface);
     }
     let mut reapplied = false;
-
-    let resolv_path = Path::new("/etc/resolv.conf");
 
     if resolv_path.exists() {
         let expected = build_resolv_conf(dns_ipv4, dns_ipv6);

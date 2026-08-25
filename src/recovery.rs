@@ -7,7 +7,7 @@
 //! Recovery sequence matches normal disconnect order (WireGuard → IPv6 → DNS → netlock):
 //! 1. wireguard::disconnect(config_path) (ip link delete)
 //! 2. ipv6::restore() (re-enable IPv6 on blocked interfaces)
-//! 3. dns::deactivate() (restore resolv.conf)
+//! 3. dns::deactivate(std::path::Path::new(dns::RESOLV_CONF)) (restore resolv.conf)
 //! 4. netlock::deactivate() (delete nft table — removed last to prevent leaks)
 //! 5. Remove state file
 //!
@@ -341,7 +341,7 @@ fn cleanup_routing_rules(endpoint_ip: Option<&str>) {
 /// 1. wireguard::disconnect(config_path) (ip link delete)
 /// 2. netlock::deactivate() (remove session lock — unblocks DNS for step 4)
 /// 3. ipv6::restore() (re-enable IPv6 on blocked interfaces)
-/// 4. dns::deactivate() (restore resolv.conf)
+/// 4. dns::deactivate(std::path::Path::new(dns::RESOLV_CONF)) (restore resolv.conf)
 /// 5. Remove state file
 fn recover_from_state(state: &State) -> Result<()> {
     let mut cleanup_failed = false;
@@ -373,7 +373,7 @@ fn recover_from_state(state: &State) -> Result<()> {
     cleanup_routing_rules(Some(&state.endpoint_ip));
 
     // 2. Deactivate session lock BEFORE DNS restore — the lock's policy drop
-    //    blocks DNS to restored nameservers during the slow dns::deactivate() cleanup.
+    //    blocks DNS to restored nameservers during the slow dns::deactivate(std::path::Path::new(dns::RESOLV_CONF)) cleanup.
     if state.lock_active {
         if let Err(e) = netlock::deactivate() {
             warn!("failed to deactivate network lock: {}", e);
@@ -388,7 +388,7 @@ fn recover_from_state(state: &State) -> Result<()> {
     }
 
     // 4. Restore DNS (delete our resolv.conf, ask NM/resolved to regenerate)
-    if let Err(e) = dns::deactivate() {
+    if let Err(e) = dns::deactivate(std::path::Path::new(dns::RESOLV_CONF)) {
         warn!("failed to restore DNS: {}", e);
         cleanup_failed = true;
     }
@@ -453,7 +453,7 @@ pub fn force_recover() -> Result<()> {
             .unwrap_or(false);
         if is_ours {
             warn!("restoring orphaned VPN resolv.conf");
-            let _ = dns::deactivate();
+            let _ = dns::deactivate(std::path::Path::new(dns::RESOLV_CONF));
             found_orphans = true;
         }
     }
