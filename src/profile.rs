@@ -8,12 +8,17 @@
 //! - `v2p` = user-provided password
 //!
 //! The encrypted data uses Eddie's AESThenHMAC scheme:
-//! - PBKDF2-HMAC-SHA1 key derivation (10000 iterations, 8-byte salts)
+//! - PBKDF2 key derivation (10000 iterations, 8-byte salts): HMAC-SHA1 for
+//!   legacy blobs, HMAC-SHA256 for blobs written by Eddie 2.24+ (marked by a
+//!   `0x01` version byte before the salts). We still write legacy blobs.
 //! - AES-256-CBC encryption with PKCS7 padding
 //! - HMAC-SHA256 authentication (Encrypt-then-MAC)
 //!
 //! Wire format of encrypted blob:
 //! `[NotSecretPayload (40 bytes)][cryptSalt (8 bytes)][authSalt (8 bytes)][IV (16 bytes)][ciphertext][HMAC-SHA256 tag (32 bytes)]`
+//!
+//! Eddie 2.24+ wire format (PBKDF2-SHA256):
+//! `[NotSecretPayload (40 bytes)][0x01][cryptSalt (8 bytes)][authSalt (8 bytes)][IV (16 bytes)][ciphertext][HMAC-SHA256 tag (32 bytes)]`
 //!
 //! Reference: Eddie src/Lib.Core/Storage.cs, src/Lib.Core/Crypto/AESThenHMAC.cs,
 //!            src/Lib.Core/Crypto/Manager.cs, src/Lib.Core/Constants.cs
@@ -55,6 +60,10 @@ const KEY_BYTE_SIZE: usize = KEY_BIT_SIZE / 8; // 32
 const BLOCK_BYTE_SIZE: usize = BLOCK_BIT_SIZE / 8; // 16
 const SALT_BYTE_SIZE: usize = SALT_BIT_SIZE / 8; // 8
 const HMAC_TAG_SIZE: usize = 32; // SHA-256 output
+
+/// Eddie's `PayloadVersionSha256` — version byte after the external payload
+/// marking a blob whose keys are derived with PBKDF2-HMAC-SHA256.
+const PAYLOAD_VERSION_SHA256: u8 = 0x01;
 
 // ---------------------------------------------------------------------------
 // Profile format
@@ -101,6 +110,15 @@ impl ProfileFormat {
 fn pbkdf2_derive_key(password: &str, salt: &[u8]) -> Zeroizing<[u8; KEY_BYTE_SIZE]> {
     let mut key = Zeroizing::new([0u8; KEY_BYTE_SIZE]);
     pbkdf2::pbkdf2::<Hmac<Sha1>>(password.as_bytes(), salt, PBKDF2_ITERATIONS, &mut *key)
+        .expect("HMAC can be initialized with any key length");
+    key
+}
+
+/// Derive a key with PBKDF2-HMAC-SHA256, matching Eddie 2.24+'s
+/// `Pbkdf2Compat.DeriveKeySha256` (used for blobs with `PAYLOAD_VERSION_SHA256`).
+fn pbkdf2_derive_key_sha256(password: &str, salt: &[u8]) -> Zeroizing<[u8; KEY_BYTE_SIZE]> {
+    let mut key = Zeroizing::new([0u8; KEY_BYTE_SIZE]);
+    pbkdf2::pbkdf2::<Hmac<Sha256>>(password.as_bytes(), salt, PBKDF2_ITERATIONS, &mut *key)
         .expect("HMAC can be initialized with any key length");
     key
 }
@@ -225,34 +243,52 @@ fn encrypt_with_password(plaintext: &[u8], password: &str, external_payload: &[u
 
 /// Eddie's `SimpleDecryptWithPassword` — extract salts, derive keys, then decrypt.
 ///
-/// Returns `None` if decryption/authentication fails.
+/// Handles both Eddie 2.24+ blobs (`PAYLOAD_VERSION_SHA256` byte, PBKDF2-SHA256)
+/// and legacy blobs (PBKDF2-SHA1). Returns `None` if decryption/authentication fails.
 fn decrypt_with_password(
     encrypted: &[u8],
     password: &str,
     external_payload_length: usize,
 ) -> Option<Zeroizing<Vec<u8>>> {
-    if encrypted.len() < external_payload_length + SALT_BYTE_SIZE + SALT_BYTE_SIZE {
+    if encrypted.get(external_payload_length) == Some(&PAYLOAD_VERSION_SHA256) {
+        let decrypted = decrypt_with_salts_at(
+            encrypted,
+            password,
+            external_payload_length + 1,
+            pbkdf2_derive_key_sha256,
+        );
+        if decrypted.is_some() {
+            return decrypted;
+        }
+        // A legacy blob's random crypt salt can also start with 0x01, so fall
+        // through to legacy (the HMAC check makes the wrong guess harmless).
+    }
+    decrypt_with_salts_at(encrypted, password, external_payload_length, pbkdf2_derive_key)
+}
+
+/// Decrypt a blob whose `[cryptSalt][authSalt]` pair starts at `salts_offset`,
+/// deriving keys with `derive_key`.
+fn decrypt_with_salts_at(
+    encrypted: &[u8],
+    password: &str,
+    salts_offset: usize,
+    derive_key: fn(&str, &[u8]) -> Zeroizing<[u8; KEY_BYTE_SIZE]>,
+) -> Option<Zeroizing<Vec<u8>>> {
+    if encrypted.len() < salts_offset + SALT_BYTE_SIZE + SALT_BYTE_SIZE {
         return None;
     }
 
-    // Extract salts from after the external payload
-    let mut crypt_salt = [0u8; SALT_BYTE_SIZE];
-    crypt_salt.copy_from_slice(
-        &encrypted[external_payload_length..external_payload_length + SALT_BYTE_SIZE],
-    );
-
-    let mut auth_salt = [0u8; SALT_BYTE_SIZE];
-    auth_salt.copy_from_slice(
-        &encrypted[external_payload_length + SALT_BYTE_SIZE
-            ..external_payload_length + SALT_BYTE_SIZE + SALT_BYTE_SIZE],
-    );
+    // Extract salts
+    let crypt_salt = &encrypted[salts_offset..salts_offset + SALT_BYTE_SIZE];
+    let auth_salt =
+        &encrypted[salts_offset + SALT_BYTE_SIZE..salts_offset + SALT_BYTE_SIZE + SALT_BYTE_SIZE];
 
     // Derive keys
-    let crypt_key = pbkdf2_derive_key(password, &crypt_salt);
-    let auth_key = pbkdf2_derive_key(password, &auth_salt);
+    let crypt_key = derive_key(password, crypt_salt);
+    let auth_key = derive_key(password, auth_salt);
 
-    // Total non-secret payload length = external + both salts
-    let total_payload_len = external_payload_length + SALT_BYTE_SIZE + SALT_BYTE_SIZE;
+    // Total non-secret payload length = everything up to the end of the salts
+    let total_payload_len = salts_offset + SALT_BYTE_SIZE + SALT_BYTE_SIZE;
     simple_decrypt(encrypted, &crypt_key, &auth_key, total_payload_len)
 }
 
@@ -724,6 +760,58 @@ mod tests {
         let encrypted = encrypt_with_password(plaintext, password, NOT_SECRET_PAYLOAD);
         let decrypted = decrypt_with_password(&encrypted, password, NOT_SECRET_PAYLOAD.len());
 
+        assert_eq!(decrypted.as_deref().map(|d| d.as_slice()), Some(plaintext.as_slice()));
+    }
+
+    /// Build an Eddie 2.24+ blob: `[external][0x01][salts]`, PBKDF2-SHA256 keys.
+    fn encrypt_with_password_sha256(
+        plaintext: &[u8],
+        password: &str,
+        external_payload: &[u8],
+        crypt_salt: [u8; SALT_BYTE_SIZE],
+    ) -> Vec<u8> {
+        let auth_salt = [7u8; SALT_BYTE_SIZE];
+        let crypt_key = pbkdf2_derive_key_sha256(password, &crypt_salt);
+        let auth_key = pbkdf2_derive_key_sha256(password, &auth_salt);
+
+        let mut payload = external_payload.to_vec();
+        payload.push(PAYLOAD_VERSION_SHA256);
+        payload.extend_from_slice(&crypt_salt);
+        payload.extend_from_slice(&auth_salt);
+
+        simple_encrypt(plaintext, &crypt_key, &auth_key, &payload)
+    }
+
+    #[test]
+    fn test_decrypt_eddie_sha256_format() {
+        let plaintext = b"Eddie 2.24 profile";
+        let password = "keyring-password";
+
+        let encrypted =
+            encrypt_with_password_sha256(plaintext, password, NOT_SECRET_PAYLOAD, [3u8; SALT_BYTE_SIZE]);
+        let decrypted = decrypt_with_password(&encrypted, password, NOT_SECRET_PAYLOAD.len());
+
+        assert_eq!(decrypted.as_deref().map(|d| d.as_slice()), Some(plaintext.as_slice()));
+        assert!(decrypt_with_password(&encrypted, "wrong", NOT_SECRET_PAYLOAD.len()).is_none());
+    }
+
+    #[test]
+    fn test_decrypt_legacy_blob_with_salt_starting_0x01() {
+        // A legacy (SHA-1) blob whose crypt salt happens to begin with the
+        // SHA-256 version byte must still decrypt via the legacy fallback.
+        let plaintext = b"legacy profile";
+        let password = "test-password-12chars";
+        let crypt_salt = [PAYLOAD_VERSION_SHA256, 2, 3, 4, 5, 6, 7, 8];
+        let auth_salt = [9u8; SALT_BYTE_SIZE];
+
+        let crypt_key = pbkdf2_derive_key(password, &crypt_salt);
+        let auth_key = pbkdf2_derive_key(password, &auth_salt);
+        let mut payload = NOT_SECRET_PAYLOAD.to_vec();
+        payload.extend_from_slice(&crypt_salt);
+        payload.extend_from_slice(&auth_salt);
+        let encrypted = simple_encrypt(plaintext, &crypt_key, &auth_key, &payload);
+
+        let decrypted = decrypt_with_password(&encrypted, password, NOT_SECRET_PAYLOAD.len());
         assert_eq!(decrypted.as_deref().map(|d| d.as_slice()), Some(plaintext.as_slice()));
     }
 

@@ -608,9 +608,20 @@ impl App {
                 self.activity = "Importing Eddie profile...".into();
                 if let Some(ref helper) = self.helper {
                     let import_body = b"{\"accept\":true}";
-                    if helper.send_command("POST", "/import-eddie", Some(import_body)).is_err() {
-                        self.enter_reconnection();
-                        return Task::none();
+                    match helper.send_command("POST", "/import-eddie", Some(import_body)) {
+                        Ok((200, _)) => {}
+                        Ok((status, resp_body)) => {
+                            // Don't retry connect: it would 409 and re-show the dialog.
+                            self.error_overview = Some(format!(
+                                "Eddie import failed (HTTP {}): {}",
+                                status, resp_body
+                            ));
+                            return Task::none();
+                        }
+                        Err(_) => {
+                            self.enter_reconnection();
+                            return Task::none();
+                        }
                     }
                     // Retry connect after successful import
                     let server = self.selected_server.clone();
