@@ -38,9 +38,6 @@ impl UnitConfig {
 #[allow(clippy::too_many_arguments)]
 pub fn view<'a>(
     connection_state: &'a ConnectionState,
-    lock_session: bool,
-    lock_persistent: bool,
-    lock_installed: bool,
     rx_bytes: u64,
     tx_bytes: u64,
     rx_speed: f64,
@@ -250,29 +247,11 @@ pub fn view<'a>(
         );
     }
 
-    // ── Footer: lock, session count, recover ─────────────────────────
-    let lock_label = if lock_persistent {
-        "Network lock: persistent"
-    } else if lock_session {
-        "Network lock: this session"
-    } else if lock_installed {
-        "Network lock: installed, inactive"
-    } else {
-        "Network lock: off"
-    };
-    let lock_on = lock_persistent || lock_session;
-
-    let mut footer = row![
-        icon(if lock_on { Icon::Lock } else { Icon::LockOpen }, 14.0, if lock_on { Ink::Text } else { Ink::Muted }),
-        text(lock_label)
-            .size(theme::TEXT_SM)
-            .style(move |t: &iced::Theme| if lock_on { iced::widget::text::Style::default() } else { theme::text_muted(t) }),
-    ]
-    .spacing(theme::SPACE_SM)
-    .align_y(Alignment::Center);
+    // ── Footer: session count, recover ───────────────────────────────
+    // (Network lock status lives in the sidebar, visible from every tab.)
+    let mut footer = row![].spacing(theme::SPACE_SM).align_y(Alignment::Center);
 
     if connection_count > 0 {
-        footer = footer.push(text("\u{00B7}").size(theme::TEXT_SM).style(theme::text_faint));
         footer = footer.push(
             text(format!(
                 "{} connection{} this session",

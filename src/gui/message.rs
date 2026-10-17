@@ -119,6 +119,8 @@ pub enum Message {
     TabSelected(views::Tab),
     /// System light/dark preference reported or changed.
     ThemeChanged(iced::theme::Mode),
+    /// Sidebar lock status clicked: jump to Settings > Network Lock.
+    OpenLockSettings,
     Connect,
     ConnectToServer(String),
     Disconnect,

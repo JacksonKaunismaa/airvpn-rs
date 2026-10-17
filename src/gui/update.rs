@@ -21,6 +21,10 @@ impl App {
                 }
                 Task::none()
             }
+            Message::OpenLockSettings => {
+                self.settings.sub_tab = views::settings::SettingsSubTab::NetworkLock;
+                self.update(Message::TabSelected(views::Tab::Settings))
+            }
             Message::TabSelected(tab) => {
                 self.active_tab = tab;
                 if tab == views::Tab::Servers && self.servers.is_empty() && !self.servers_loading {

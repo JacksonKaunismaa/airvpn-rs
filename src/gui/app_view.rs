@@ -56,9 +56,6 @@ impl App {
         let content: Element<Message> = match self.active_tab {
             views::Tab::Overview => views::overview::view(
                 &self.connection_state,
-                self.lock_session,
-                self.lock_persistent,
-                self.lock_installed,
                 self.rx_bytes,
                 self.tx_bytes,
                 self.rx_speed,
@@ -204,26 +201,30 @@ impl App {
                 text(label).size(theme::TEXT_SM).font(theme::FONT_MEDIUM),
             ]
             .spacing(theme::SPACE_SM)
+            .padding(iced::Padding { left: 6.0, ..Default::default() })
             .align_y(Alignment::Center),
         ]
         .spacing(2.0);
         if let Some(name) = detail {
             lines = lines.push(
                 container(text(name).size(theme::TEXT_XS).style(theme::text_muted))
-                    .padding(iced::Padding { left: 16.0, ..Default::default() }),
+                    .padding(iced::Padding { left: 22.0, ..Default::default() }),
             );
         }
-        lines = lines.push(
+        let lock_link = button(
             row![
                 icon(if lock_on { Icon::Lock } else { Icon::LockOpen }, 12.0, Ink::Muted),
-                text(if lock_on { "Network lock on" } else { "Network lock off" })
-                    .size(theme::TEXT_XS)
-                    .style(theme::text_muted),
+                text(if lock_on { "Network lock on" } else { "Network lock off" }).size(theme::TEXT_XS),
+                icon(Icon::ChevronRight, 12.0, Ink::Muted),
             ]
             .spacing(theme::SPACE_XS + 2.0)
             .align_y(Alignment::Center),
-        );
+        )
+        .padding([4, 6])
+        .style(theme::ghost_button)
+        .on_press(Message::OpenLockSettings);
+        lines = lines.push(lock_link);
 
-        container(lines).padding([theme::SPACE_SM, 10.0]).width(Fill).into()
+        container(lines).padding([theme::SPACE_SM, 4.0]).width(Fill).into()
     }
 }
