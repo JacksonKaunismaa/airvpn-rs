@@ -71,6 +71,10 @@ pub struct Tokens {
     pub danger: Color,
     pub danger_soft: Color,
     pub warning: Color,
+    /// Server quality scale (load bars, ping): good / ok / bad.
+    pub good: Color,
+    pub ok: Color,
+    pub bad: Color,
 }
 
 pub const DARK: Tokens = Tokens {
@@ -92,6 +96,9 @@ pub const DARK: Tokens = Tokens {
     danger: rgb(0xFF, 0x5C, 0x5C),
     danger_soft: rgba(0xFF, 0x5C, 0x5C, 0.10),
     warning: rgb(0xF5, 0xA5, 0x24),
+    good: rgb(0x3F, 0xCF, 0x8E),
+    ok: rgb(0xF5, 0xC5, 0x18),
+    bad: rgb(0xFF, 0x5C, 0x5C),
 };
 
 pub const LIGHT: Tokens = Tokens {
@@ -113,6 +120,9 @@ pub const LIGHT: Tokens = Tokens {
     danger: rgb(0xD9, 0x2D, 0x20),
     danger_soft: rgba(0xD9, 0x2D, 0x20, 0.08),
     warning: rgb(0xB4, 0x53, 0x09),
+    good: rgb(0x16, 0xA3, 0x4A),
+    ok: rgb(0xCA, 0x8A, 0x04),
+    bad: rgb(0xDC, 0x26, 0x26),
 };
 
 /// Tokens for the active theme variant.
@@ -258,16 +268,43 @@ pub fn bar_track(theme: &Theme) -> container::Style {
     }
 }
 
-/// Load bar fill: neutral, turning to full-strength text color when hot.
-pub fn bar_fill(hot: bool) -> impl Fn(&Theme) -> container::Style {
-    move |theme| {
-        let t = tokens(theme);
-        container::Style {
-            background: Some(Background::Color(if hot { t.text } else { t.muted })),
-            border: Border { radius: 2.0.into(), ..Default::default() },
-            ..Default::default()
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Quality {
+    Good,
+    Ok,
+    Bad,
+}
+
+impl Quality {
+    pub fn from_load(pct: f64) -> Self {
+        if pct > 80.0 { Quality::Bad } else if pct > 50.0 { Quality::Ok } else { Quality::Good }
+    }
+
+    pub fn from_ping(ms: i64) -> Self {
+        if ms < 50 { Quality::Good } else if ms < 100 { Quality::Ok } else { Quality::Bad }
+    }
+
+    fn color(self, t: &Tokens) -> Color {
+        match self {
+            Quality::Good => t.good,
+            Quality::Ok => t.ok,
+            Quality::Bad => t.bad,
         }
     }
+}
+
+/// Load bar fill in the quality color.
+pub fn bar_fill(q: Quality) -> impl Fn(&Theme) -> container::Style {
+    move |theme| container::Style {
+        background: Some(Background::Color(q.color(tokens(theme)))),
+        border: Border { radius: 2.0.into(), ..Default::default() },
+        ..Default::default()
+    }
+}
+
+/// Text in the quality color (ping).
+pub fn text_quality(q: Quality) -> impl Fn(&Theme) -> text::Style {
+    move |theme| text::Style { color: Some(q.color(tokens(theme))) }
 }
 
 // ── Buttons ──────────────────────────────────────────────────────────────

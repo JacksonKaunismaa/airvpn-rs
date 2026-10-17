@@ -6,7 +6,7 @@ use iced::{Alignment, Element, Fill, FillPortion};
 use airvpn::ipc::{ConnectionState, ServerInfo};
 
 use crate::icons::{icon, Icon};
-use crate::theme::{self, DotKind, Ink};
+use crate::theme::{self, DotKind, Ink, Quality};
 use crate::Message;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -231,7 +231,7 @@ fn build_row<'a>(server: &ServerInfo, is_connected: bool, is_warning: bool) -> E
 
     let location = format!("{}, {}", server.location, server.country_code.to_uppercase());
 
-    // Load: neutral bar, full-strength above 80%
+    // Load: bar colored green / yellow / red
     let load_pct = server.load_percent;
     let bar_w = 56.0;
     let fill_w = (load_pct as f32 / 100.0 * bar_w).clamp(0.0, bar_w);
@@ -240,7 +240,7 @@ fn build_row<'a>(server: &ServerInfo, is_connected: bool, is_warning: bool) -> E
             container(Space::new())
                 .width(fill_w)
                 .height(4.0)
-                .style(theme::bar_fill(load_pct > 80.0)),
+                .style(theme::bar_fill(Quality::from_load(load_pct))),
         )
         .width(bar_w)
         .height(4.0)
@@ -255,7 +255,7 @@ fn build_row<'a>(server: &ServerInfo, is_connected: bool, is_warning: bool) -> E
             .size(theme::TEXT_SM)
             .font(theme::MONO)
             .style(move |t: &iced::Theme| {
-                if ms >= 150 || is_warning { theme::text_muted(t) } else { iced::widget::text::Style::default() }
+                if is_warning { theme::text_faint(t) } else { theme::text_quality(Quality::from_ping(ms))(t) }
             })
             .into(),
         None => text("\u{2014}").size(theme::TEXT_SM).style(theme::text_faint).into(),
