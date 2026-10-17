@@ -71,21 +71,38 @@ pub fn view<'a>(
         count += 1;
     }
 
-    if count == 0 {
-        log_col = log_col.push(
-            container(text("No log entries.").size(theme::TEXT_MD).style(theme::text_muted))
-                .padding([theme::SPACE_MD, 12.0]),
-        );
-    }
-
-    let log_area = container(
-        scrollable(container(log_col).padding([8.0, 0.0]))
-            .anchor_bottom()
-            .style(theme::scrollable_style)
-            .height(Fill),
-    )
-    .height(Fill)
-    .style(theme::panel);
+    let log_area: Element<'a, Message> = if count == 0 {
+        let any_hidden = !logs.is_empty();
+        container(
+            column![
+                text("No log entries").size(theme::TEXT_MD).font(theme::FONT_MEDIUM),
+                text(if any_hidden {
+                    "Entries exist but are hidden by the level filters."
+                } else {
+                    "Helper messages will appear here as they arrive."
+                })
+                .size(theme::TEXT_SM)
+                .style(theme::text_muted),
+            ]
+            .spacing(theme::SPACE_XS)
+            .align_x(Alignment::Center),
+        )
+        .center(Fill)
+        .style(theme::panel)
+        .into()
+    } else {
+        container(
+            scrollable(container(log_col).width(Fill).padding([8.0, 0.0]))
+                .anchor_bottom()
+                .style(theme::scrollable_style)
+                .width(Fill)
+                .height(Fill),
+        )
+        .width(Fill)
+        .height(Fill)
+        .style(theme::panel)
+        .into()
+    };
 
     column![top_bar, log_area].spacing(theme::SPACE_MD).into()
 }
