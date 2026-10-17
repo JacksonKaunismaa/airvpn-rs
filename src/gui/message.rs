@@ -117,6 +117,8 @@ impl Default for SettingsState {
 #[derive(Debug, Clone)]
 pub enum Message {
     TabSelected(views::Tab),
+    /// System light/dark preference reported or changed.
+    ThemeChanged(iced::theme::Mode),
     Connect,
     ConnectToServer(String),
     Disconnect,

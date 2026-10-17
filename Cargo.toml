@@ -72,7 +72,7 @@ pbkdf2 = "0.12"
 sha1 = "0.10"
 
 # GUI
-iced = { version = "0.14", features = ["tokio"] }
+iced = { version = "0.14", features = ["tokio", "svg"] }
 tokio = { version = "1", features = ["time", "rt-multi-thread", "net", "sync", "macros"] }
 tokio-stream = "0.1"
 

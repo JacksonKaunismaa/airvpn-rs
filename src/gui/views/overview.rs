@@ -1,11 +1,13 @@
 //! Overview tab: connection status, connect/disconnect, stats, lock status.
 
-use iced::widget::{button, column, container, pick_list, row, text, Space};
+use iced::widget::{button, column, container, pick_list, row, text, tooltip, Space};
 use iced::{Alignment, Element, Fill};
 
 use airvpn::ipc::ConnectionState;
 
-use crate::theme;
+use super::Tab;
+use crate::icons::{icon, Icon};
+use crate::theme::{self, DotKind, Ink};
 use crate::Message;
 
 /// Display unit configuration for speeds and transfer totals.
@@ -58,60 +60,81 @@ pub fn view<'a>(
         return eddie_import_dialog(path);
     }
 
-    let mut content = column![].spacing(theme::SPACE_MD).width(Fill);
-
-    // ── Status hero ──────────────────────────────────────────────────
-    let (status_text, status_color) = match connection_state {
-        ConnectionState::Disconnected => ("Disconnected", theme::DANGER),
-        ConnectionState::Connecting => ("Connecting...", theme::WARNING),
-        ConnectionState::Connected { .. } => ("Connected", theme::SUCCESS),
-        ConnectionState::Reconnecting => ("Reconnecting...", theme::WARNING),
-        ConnectionState::Disconnecting => ("Disconnecting...", theme::WARNING),
-    };
-
-    let status_label = text(status_text).size(32).color(status_color);
-
-    // Activity sub-status (e.g. "Fetching user info...")
-    let status_section = if !activity.is_empty() {
-        column![
-            status_label,
-            text(activity).size(14).color(theme::TEXT_SECONDARY),
-        ]
-        .spacing(4.0)
-        .align_x(Alignment::Center)
-    } else {
-        column![status_label].align_x(Alignment::Center)
-    };
-
-    content = content.push(
-        container(status_section)
-            .width(Fill)
-            .center_x(Fill)
-            .padding([theme::SPACE_LG, 0.0]),
+    let is_connected = matches!(connection_state, ConnectionState::Connected { .. });
+    let is_transitioning = matches!(
+        connection_state,
+        ConnectionState::Connecting | ConnectionState::Reconnecting | ConnectionState::Disconnecting
     );
 
-    // ── Server info card (when connected) ────────────────────────────
-    if let ConnectionState::Connected {
+    let mut content = column![Space::new().height(Fill)].spacing(theme::SPACE_LG).width(Fill);
+
+    // ── Status chip ──────────────────────────────────────────────────
+    let (chip_label, dot_kind) = match connection_state {
+        ConnectionState::Disconnected => ("Disconnected".to_string(), DotKind::Off),
+        ConnectionState::Connecting => ("Connecting\u{2026}".to_string(), DotKind::Busy),
+        ConnectionState::Reconnecting => ("Reconnecting\u{2026}".to_string(), DotKind::Busy),
+        ConnectionState::Disconnecting => ("Disconnecting\u{2026}".to_string(), DotKind::Busy),
+        ConnectionState::Connected { .. } => (
+            match connected_since {
+                Some(since) => format!("Connected \u{00B7} {}", format_uptime(since.elapsed().as_secs())),
+                None => "Connected".to_string(),
+            },
+            DotKind::On,
+        ),
+    };
+    let chip = container(
+        row![
+            container(Space::new()).width(8.0).height(8.0).style(theme::dot(dot_kind)),
+            text(chip_label).size(theme::TEXT_SM).font(theme::FONT_MEDIUM),
+        ]
+        .spacing(theme::SPACE_SM)
+        .align_y(Alignment::Center),
+    )
+    .padding([5, 12])
+    .style(theme::chip(is_connected));
+
+    // ── Headline: where traffic goes (or will go) ────────────────────
+    let headline: Element<'a, Message> = if let ConnectionState::Connected {
         server_name,
         server_country,
         server_location,
     } = connection_state
     {
-        let server_card = container(
-            column![
-                text(server_name.as_str()).size(18).color(theme::TEXT),
-                text(format!("{}, {}", server_location, server_country))
-                    .size(14)
-                    .color(theme::TEXT_SECONDARY),
+        column![
+            text(server_name.as_str()).size(theme::TEXT_DISPLAY).font(theme::FONT_SEMIBOLD),
+            text(format!("{}, {}", server_location, server_country))
+                .size(theme::TEXT_LG)
+                .style(theme::text_muted),
+        ]
+        .spacing(2.0)
+        .into()
+    } else {
+        let target = match selected_server {
+            Some(server) => server.clone(),
+            None if startlast => "Last server".to_string(),
+            None => "Best server".to_string(),
+        };
+        let choose = button(
+            row![
+                text(if selected_server.is_some() { "Change server" } else { "Choose a server" })
+                    .size(theme::TEXT_MD),
+                icon(Icon::ChevronRight, 14.0, Ink::Accent),
             ]
-            .spacing(4.0),
+            .spacing(2.0)
+            .align_y(Alignment::Center),
         )
-        .padding(theme::SPACE_MD)
-        .width(Fill)
-        .style(theme::card);
+        .padding(0)
+        .style(theme::link_button)
+        .on_press(Message::TabSelected(Tab::Servers));
+        column![
+            text(target).size(theme::TEXT_DISPLAY).font(theme::FONT_SEMIBOLD),
+            choose,
+        ]
+        .spacing(theme::SPACE_XS)
+        .into()
+    };
 
-        content = content.push(server_card);
-    }
+    content = content.push(column![chip, headline].spacing(theme::SPACE_MD));
 
     // ── Device / key selector (pre-connect) ──────────────────────────
     // Shown only when disconnected and more than one device key exists
@@ -125,242 +148,219 @@ pub fn view<'a>(
             .copied()
             .or_else(|| key_options.first().copied());
         content = content.push(
-            column![
-                text("Device / Key").size(13).color(theme::TEXT_SECONDARY),
+            row![
+                text("Device").size(theme::TEXT_MD).style(theme::text_muted),
+                Space::new().width(Fill),
                 pick_list(key_options, selected, |selected: &str| {
                     Message::OverviewKeyChanged(selected.to_string())
                 })
-                .width(Fill),
+                .width(220)
+                .padding([7, 10])
+                .text_size(theme::TEXT_MD)
+                .style(theme::pick_list_style)
+                .menu_style(theme::menu_style),
             ]
-            .spacing(4.0),
+            .align_y(Alignment::Center),
         );
     }
 
     // ── Connect / Disconnect button ──────────────────────────────────
-    let is_transitioning = matches!(
-        connection_state,
-        ConnectionState::Connecting | ConnectionState::Reconnecting | ConnectionState::Disconnecting
-    );
+    let action: Element<'a, Message> = if is_connected {
+        let mut btn = button(
+            container(text("Disconnect").size(theme::TEXT_LG).font(theme::FONT_MEDIUM))
+                .center_x(Fill),
+        )
+        .width(Fill)
+        .padding([13, 24])
+        .style(theme::secondary_button);
+        if !is_transitioning {
+            btn = btn.on_press(Message::Disconnect);
+        }
+        btn.into()
+    } else {
+        let label = match connection_state {
+            ConnectionState::Connecting => "Connecting\u{2026}",
+            ConnectionState::Reconnecting => "Reconnecting\u{2026}",
+            ConnectionState::Disconnecting => "Disconnecting\u{2026}",
+            _ => "Connect",
+        };
+        let mut btn = button(
+            container(
+                row![
+                    icon(Icon::Power, 18.0, Ink::OnAccent),
+                    text(label).size(theme::TEXT_LG).font(theme::FONT_SEMIBOLD),
+                ]
+                .spacing(10.0)
+                .align_y(Alignment::Center),
+            )
+            .center_x(Fill),
+        )
+        .width(Fill)
+        .padding([13, 24])
+        .style(theme::primary_button);
+        if !is_transitioning {
+            btn = btn.on_press(Message::Connect);
+        }
+        btn.into()
+    };
 
-    match connection_state {
-        ConnectionState::Connected { .. } => {
-            let mut btn = button(
-                container(text("Disconnect").size(16).color(iced::Color::WHITE))
-                    .width(Fill)
-                    .center_x(Fill),
-            )
-            .width(Fill)
-            .padding([12, 24])
-            .style(theme::danger_button);
-            if !is_transitioning {
-                btn = btn.on_press(Message::Disconnect);
-            }
-            content = content.push(btn);
-        }
-        _ => {
-            let connect_label = match selected_server {
-                Some(server) => format!("Connect to {}", server),
-                None if startlast => "Connect (last server)".to_string(),
-                None => "Connect (best server)".to_string(),
-            };
-            let mut btn = button(
-                container(text(connect_label).size(16).color(iced::Color::WHITE))
-                    .width(Fill)
-                    .center_x(Fill),
-            )
-            .width(Fill)
-            .padding([12, 24])
-            .style(theme::primary_button);
-            if !is_transitioning {
-                btn = btn.on_press(Message::Connect);
-            }
-            content = content.push(btn);
-        }
+    let mut action_block = column![action].spacing(theme::SPACE_SM);
+    if !activity.is_empty() {
+        action_block = action_block.push(
+            container(text(activity).size(theme::TEXT_SM).style(theme::text_muted)).center_x(Fill),
+        );
     }
+    content = content.push(action_block);
 
-    // ── Stats cards (when connected) ─────────────────────────────────
-    if matches!(connection_state, ConnectionState::Connected { .. }) {
-        let transfer_card = container(
+    // ── Live stats (when connected) ──────────────────────────────────
+    if is_connected {
+        let cell = |arrow: Icon, label: &'static str, value: String| -> Element<'a, Message> {
             column![
-                text("Transfer").size(12).color(theme::TEXT_SECONDARY),
                 row![
-                    column![
-                        text("\u{2193} RX").size(11).color(theme::TEXT_SECONDARY),
-                        text(format_transfer(rx_bytes, unit_config)).size(16).color(theme::TEXT),
-                    ]
-                    .spacing(2.0)
-                    .width(Fill),
-                    column![
-                        text("\u{2191} TX").size(11).color(theme::TEXT_SECONDARY),
-                        text(format_transfer(tx_bytes, unit_config)).size(16).color(theme::TEXT),
-                    ]
-                    .spacing(2.0)
-                    .width(Fill),
+                    icon(arrow, 12.0, Ink::Muted),
+                    text(label).size(theme::TEXT_XS).style(theme::text_muted),
                 ]
-                .spacing(theme::SPACE_MD),
+                .spacing(theme::SPACE_XS)
+                .align_y(Alignment::Center),
+                text(value).size(theme::TEXT_LG).font(theme::MONO),
             ]
-            .spacing(theme::SPACE_SM),
-        )
-        .padding(theme::SPACE_MD)
-        .width(Fill)
-        .style(theme::card);
-
-        let speed_card = container(
-            column![
-                text("Speed").size(12).color(theme::TEXT_SECONDARY),
-                row![
-                    column![
-                        text("\u{2193} Down").size(11).color(theme::TEXT_SECONDARY),
-                        text(format_speed_with_unit(rx_speed, unit_config)).size(16).color(theme::TEXT),
-                    ]
-                    .spacing(2.0)
-                    .width(Fill),
-                    column![
-                        text("\u{2191} Up").size(11).color(theme::TEXT_SECONDARY),
-                        text(format_speed_with_unit(tx_speed, unit_config)).size(16).color(theme::TEXT),
-                    ]
-                    .spacing(2.0)
-                    .width(Fill),
-                ]
-                .spacing(theme::SPACE_MD),
-            ]
-            .spacing(theme::SPACE_SM),
-        )
-        .padding(theme::SPACE_MD)
-        .width(Fill)
-        .style(theme::card);
+            .spacing(6.0)
+            .width(Fill)
+            .into()
+        };
+        let vrule = || container(Space::new()).width(1.0).height(36.0).style(theme::rule);
 
         content = content.push(
-            row![transfer_card, speed_card].spacing(theme::SPACE_MD),
+            container(
+                row![
+                    cell(Icon::ArrowDown, "Download", format_speed_with_unit(rx_speed, unit_config)),
+                    vrule(),
+                    cell(Icon::ArrowUp, "Upload", format_speed_with_unit(tx_speed, unit_config)),
+                    vrule(),
+                    cell(Icon::ArrowDown, "Received", format_transfer(rx_bytes, unit_config)),
+                    vrule(),
+                    cell(Icon::ArrowUp, "Sent", format_transfer(tx_bytes, unit_config)),
+                ]
+                .spacing(theme::SPACE_MD)
+                .align_y(Alignment::Center),
+            )
+            .padding([14, 16])
+            .width(Fill)
+            .style(theme::panel),
         );
     }
 
-    // ── Footer info ──────────────────────────────────────────────────
-    let mut footer = row![].spacing(theme::SPACE_MD);
-
-    // Uptime
-    if let Some(since) = connected_since {
-        let elapsed = since.elapsed();
-        let total_secs = elapsed.as_secs();
-        let hours = total_secs / 3600;
-        let minutes = (total_secs % 3600) / 60;
-        let seconds = total_secs % 60;
-        footer = footer.push(
-            text(format!("Uptime {:02}:{:02}:{:02}", hours, minutes, seconds))
-                .size(13)
-                .color(theme::TEXT_SECONDARY),
-        );
-    }
-
-    // Connection count
-    if connection_count > 0 {
-        footer = footer.push(
-            text(format!("Connections: {}", connection_count))
-                .size(13)
-                .color(theme::TEXT_SECONDARY),
-        );
-    }
-
-    // Network lock badge
+    // ── Footer: lock, session count, recover ─────────────────────────
     let lock_label = if lock_persistent {
-        if lock_installed {
-            "Lock: Persistent"
-        } else {
-            "Lock: Persistent"
-        }
+        "Network lock: persistent"
     } else if lock_session {
-        "Lock: Session"
+        "Network lock: this session"
     } else if lock_installed {
-        "Lock: Installed (inactive)"
+        "Network lock: installed, inactive"
     } else {
-        "Lock: Off"
+        "Network lock: off"
     };
+    let lock_on = lock_persistent || lock_session;
 
-    let lock_color = if lock_persistent || lock_session {
-        theme::SUCCESS
-    } else {
-        theme::TEXT_SECONDARY
-    };
+    let mut footer = row![
+        icon(if lock_on { Icon::Lock } else { Icon::LockOpen }, 14.0, if lock_on { Ink::Text } else { Ink::Muted }),
+        text(lock_label)
+            .size(theme::TEXT_SM)
+            .style(move |t: &iced::Theme| if lock_on { iced::widget::text::Style::default() } else { theme::text_muted(t) }),
+    ]
+    .spacing(theme::SPACE_SM)
+    .align_y(Alignment::Center);
 
-    footer = footer.push(Space::new().width(Fill));
-    footer = footer.push(text(lock_label).size(13).color(lock_color));
+    if connection_count > 0 {
+        footer = footer.push(text("\u{00B7}").size(theme::TEXT_SM).style(theme::text_faint));
+        footer = footer.push(
+            text(format!(
+                "{} connection{} this session",
+                connection_count,
+                if connection_count == 1 { "" } else { "s" }
+            ))
+            .size(theme::TEXT_SM)
+            .style(theme::text_muted),
+        );
+    }
 
-    content = content.push(footer.align_y(Alignment::Center));
-
-    // ── Troubleshooting: recover ──────────────────────────────────────
     // Subtle break-glass control: clears orphaned VPN state. Always enabled
     // (when the helper is reachable) so it can unstick a frozen
     // Connecting/Reconnecting state, not just a clean disconnected one.
-    let divider = container(Space::new().height(1.0).width(Fill)).style(
-        |_theme: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(theme::BORDER)),
-            ..Default::default()
-        },
+    let recover_btn = button(
+        row![icon(Icon::Wrench, 14.0, Ink::Muted), text("Recover").size(theme::TEXT_SM)]
+            .spacing(6.0)
+            .align_y(Alignment::Center),
+    )
+    .padding([6, 10])
+    .style(theme::ghost_button)
+    .on_press(Message::Recover);
+    let recover = tooltip(
+        recover_btn,
+        container(
+            text("Clean up stuck VPN state (kill switch, DNS, tunnel)").size(theme::TEXT_XS),
+        )
+        .padding([6, 10])
+        .style(theme::panel),
+        tooltip::Position::Top,
     );
 
-    let recover_btn = button(text("Recover").size(14))
-        .padding([8, 20])
-        .style(theme::secondary_button)
-        .on_press(Message::Recover);
+    footer = footer.push(Space::new().width(Fill));
+    footer = footer.push(recover);
 
-    let recover_section = column![
-        container(recover_btn).width(Fill).center_x(Fill),
-        container(
-            text("Clean up stuck VPN state (kill switch, DNS, tunnel)")
-                .size(12)
-                .color(theme::TEXT_SECONDARY),
-        )
-        .width(Fill)
-        .center_x(Fill),
-    ]
-    .spacing(theme::SPACE_SM);
+    content = content.push(Space::new().height(Fill));
+    content = content.push(container(Space::new()).width(Fill).height(1.0).style(theme::rule));
+    content = content.push(footer);
 
-    content = content.push(Space::new().height(theme::SPACE_MD));
-    content = content.push(divider);
-    content = content.push(recover_section);
+    container(content)
+        .max_width(theme::CONTENT_MAX_WIDTH)
+        .padding(iced::Padding { top: theme::SPACE_MD, ..Default::default() })
+        .height(Fill)
+        .center_x(Fill)
+        .into()
+}
 
-    content.into()
+fn format_uptime(total_secs: u64) -> String {
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
 }
 
 /// Confirmation dialog for Eddie profile import.
 fn eddie_import_dialog(path: &str) -> Element<'_, Message> {
     let content = container(
         column![
-            text("Import credentials from Eddie profile?").size(20).color(theme::TEXT),
-            text(path).size(14).color(theme::TEXT_SECONDARY),
-            Space::new().height(theme::SPACE_SM),
+            text("Import credentials from Eddie?").size(theme::TEXT_XL).font(theme::FONT_SEMIBOLD),
+            text("Found an Eddie profile. Its saved login will be copied into airvpn-rs.")
+                .size(theme::TEXT_MD)
+                .style(theme::text_muted),
+            text(path).size(theme::TEXT_SM).font(theme::MONO).style(theme::text_muted),
+            Space::new().height(theme::SPACE_XS),
             row![
+                button(container(text("Cancel").size(theme::TEXT_MD)).center_x(Fill))
+                    .width(Fill)
+                    .padding([10, 20])
+                    .style(theme::secondary_button)
+                    .on_press(Message::EddieImportCancel),
                 button(
-                    container(text("Import").size(15).color(iced::Color::WHITE))
+                    container(text("Import").size(theme::TEXT_MD).font(theme::FONT_MEDIUM))
                         .center_x(Fill)
                 )
                 .width(Fill)
                 .padding([10, 20])
                 .style(theme::primary_button)
                 .on_press(Message::EddieImportAccept),
-
-                button(
-                    container(text("Cancel").size(15))
-                        .center_x(Fill)
-                )
-                .width(Fill)
-                .padding([10, 20])
-                .style(theme::secondary_button)
-                .on_press(Message::EddieImportCancel),
             ]
-            .spacing(theme::SPACE_MD),
+            .spacing(theme::SPACE_SM),
         ]
-        .spacing(theme::SPACE_MD),
+        .spacing(theme::SPACE_SM),
     )
     .padding(theme::SPACE_LG)
-    .width(Fill)
-    .style(theme::card);
+    .max_width(theme::CONTENT_MAX_WIDTH)
+    .style(theme::panel);
 
-    container(content)
-        .width(Fill)
-        .center_y(Fill)
-        .padding(theme::SPACE_LG)
-        .into()
+    container(content).center(Fill).into()
 }
 
 /// Format a byte count for transfer totals, respecting unit and IEC settings.

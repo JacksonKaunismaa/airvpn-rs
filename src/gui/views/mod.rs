@@ -1,3 +1,5 @@
+use crate::icons::Icon;
+
 pub mod logs;
 pub mod overview;
 pub mod servers;
@@ -18,6 +20,15 @@ impl Tab {
             Tab::Servers => "Servers",
             Tab::Logs => "Logs",
             Tab::Settings => "Settings",
+        }
+    }
+
+    pub fn icon(&self) -> Icon {
+        match self {
+            Tab::Overview => Icon::Power,
+            Tab::Servers => Icon::Globe,
+            Tab::Logs => Icon::Logs,
+            Tab::Settings => Icon::Sliders,
         }
     }
 

@@ -1,4 +1,5 @@
 mod app_view;
+mod icons;
 mod ipc;
 mod message;
 mod theme;
@@ -18,17 +19,23 @@ use airvpn::ipc::{ConnectionState, ServerInfo};
 
 fn main() -> iced::Result {
     eprintln!("[GUI] Starting airvpn-gui (built {})", env!("CARGO_PKG_VERSION"));
-    iced::application(App::boot, App::update, App::view)
+    let mut app = iced::application(App::boot, App::update, App::view)
         .title("AirVPN")
-        .theme(theme::airvpn_theme())
+        .theme(App::theme)
         .subscription(App::subscription)
         .window_size(Size::new(900.0, 600.0))
-        .centered()
-        .run()
+        .centered();
+    for font in theme::FONT_FILES {
+        app = app.font(font);
+    }
+    app.default_font(theme::FONT).run()
 }
 
 struct App {
     active_tab: views::Tab,
+    /// Light/dark variant: follows the system unless `AIRVPN_THEME` pins it.
+    theme_mode: iced::theme::Mode,
+    theme_pinned: bool,
     connection_state: ConnectionState,
     lock_session: bool,
     lock_persistent: bool,
@@ -94,8 +101,11 @@ struct App {
 
 impl App {
     fn boot() -> (Self, Task<Message>) {
+        let pinned = theme::env_override();
         let app = Self {
             active_tab: views::Tab::Overview,
+            theme_mode: pinned.unwrap_or(iced::theme::Mode::Dark),
+            theme_pinned: pinned.is_some(),
             connection_state: ConnectionState::Disconnected,
             lock_session: false,
             lock_persistent: false,
@@ -149,16 +159,29 @@ impl App {
 
         // With systemd socket activation, the socket always exists.
         // Connecting triggers systemd to start the helper on demand.
-        let task = Task::done(Message::HelperConnected);
+        let mut task = Task::done(Message::HelperConnected);
+        if !app.theme_pinned {
+            task = Task::batch([task, iced::system::theme().map(Message::ThemeChanged)]);
+        }
 
         (app, task)
     }
 
+    fn theme(&self) -> iced::Theme {
+        theme::theme_for(self.theme_mode)
+    }
+
     fn subscription(&self) -> Subscription<Message> {
-        if self.helper.is_some() || self.helper_reconnecting {
+        let tick = if self.helper.is_some() || self.helper_reconnecting {
             time::every(Duration::from_millis(100)).map(|_| Message::Tick)
         } else {
             Subscription::none()
-        }
+        };
+        let system_theme = if self.theme_pinned {
+            Subscription::none()
+        } else {
+            iced::system::theme_changes().map(Message::ThemeChanged)
+        };
+        Subscription::batch([tick, system_theme])
     }
 }

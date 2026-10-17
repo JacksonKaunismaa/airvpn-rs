@@ -14,6 +14,13 @@ use super::message::LogEntry;
 impl App {
     pub(crate) fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::ThemeChanged(mode) => {
+                // Mode::None means the desktop has no preference; keep the current variant.
+                if mode != iced::theme::Mode::None {
+                    self.theme_mode = mode;
+                }
+                Task::none()
+            }
             Message::TabSelected(tab) => {
                 self.active_tab = tab;
                 if tab == views::Tab::Servers && self.servers.is_empty() && !self.servers_loading {

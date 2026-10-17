@@ -1,29 +1,56 @@
-use iced::widget::{button, column, container, row, text};
-use iced::{Element, Fill};
+use iced::widget::{button, column, container, row, text, Space};
+use iced::{Alignment, Element, Fill};
 
+use airvpn::ipc::ConnectionState;
+
+use super::icons::{icon, Icon};
+use super::theme::{self, DotKind, Ink};
 use super::views;
-use super::theme;
 use super::{App, Message};
 
 impl App {
     pub(crate) fn view(&self) -> Element<'_, Message> {
-        // Left sidebar: tab buttons with active accent
-        let mut sidebar = column![].spacing(theme::SPACE_SM).width(theme::SIDEBAR_WIDTH);
+        // Left sidebar: wordmark, tab buttons, connection status pinned to the bottom
+        let mut nav = column![].spacing(2.0);
         for tab in views::Tab::all() {
             let is_active = *tab == self.active_tab;
-            let label = text(tab.label()).size(15);
-            let mut btn = button(label).width(Fill).padding([10, 16]);
-            if is_active {
-                btn = btn.style(theme::sidebar_tab_active);
-            } else {
-                btn = btn.on_press(Message::TabSelected(*tab))
-                    .style(theme::sidebar_tab_inactive);
+            let label = row![
+                icon(tab.icon(), 16.0, if is_active { Ink::Text } else { Ink::Muted }),
+                text(tab.label()).size(theme::TEXT_MD).font(theme::FONT_MEDIUM),
+            ]
+            .spacing(10.0)
+            .align_y(Alignment::Center);
+            let mut btn = button(label)
+                .width(Fill)
+                .padding([8, 10])
+                .style(theme::nav_item(is_active));
+            if !is_active {
+                btn = btn.on_press(Message::TabSelected(*tab));
             }
-            sidebar = sidebar.push(btn);
+            nav = nav.push(btn);
         }
-        let sidebar = container(sidebar)
-            .padding([theme::SPACE_MD, theme::SPACE_SM + 4.0])
-            .style(theme::sidebar);
+
+        let wordmark = row![
+            text("airvpn").size(15).font(theme::FONT_SEMIBOLD),
+            text("-rs").size(15).font(theme::FONT_SEMIBOLD).style(theme::text_faint),
+        ];
+
+        let sidebar = container(
+            column![
+                container(wordmark).padding([4.0, 10.0]),
+                Space::new().height(theme::SPACE_MD),
+                nav,
+                Space::new().height(Fill),
+                self.sidebar_status(),
+            ]
+            .height(Fill),
+        )
+        .width(theme::SIDEBAR_WIDTH)
+        .height(Fill)
+        .padding([theme::SPACE_MD, theme::SPACE_SM + 2.0])
+        .style(theme::sidebar);
+
+        let divider = container(Space::new()).width(1.0).height(Fill).style(theme::rule);
 
         // Right content area
         let content: Element<Message> = match self.active_tab {
@@ -133,15 +160,16 @@ impl App {
 
         let content_with_error: Element<Message> = if let Some(err) = tab_error {
             let err_banner = container(
-                text(err).size(13).color(theme::DANGER)
+                row![
+                    icon(Icon::Alert, 16.0, Ink::Text),
+                    text(err).size(theme::TEXT_SM).style(theme::text_danger),
+                ]
+                .spacing(theme::SPACE_SM)
+                .align_y(Alignment::Center),
             )
-            .padding([8, 12])
+            .padding([10, 12])
             .width(Fill)
-            .style(|_theme: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(iced::Color { r: 0.35, g: 0.12, b: 0.12, a: 1.0 })),
-                border: iced::Border { radius: theme::RADIUS_MD.into(), ..Default::default() },
-                ..Default::default()
-            });
+            .style(theme::error_banner);
             column![err_banner, content].spacing(theme::SPACE_MD).into()
         } else {
             content
@@ -149,11 +177,53 @@ impl App {
 
         let content = container(content_with_error)
             .padding(theme::SPACE_LG)
-            .width(Fill);
+            .width(Fill)
+            .height(Fill);
 
-        row![sidebar, content]
+        row![sidebar, divider, content]
             .height(Fill)
-            .spacing(0)
             .into()
+    }
+
+    /// Compact always-visible connection status at the bottom of the sidebar.
+    fn sidebar_status(&self) -> Element<'_, Message> {
+        let (kind, label, detail) = match &self.connection_state {
+            ConnectionState::Connected { server_name, .. } => {
+                (DotKind::On, "Connected", Some(server_name.clone()))
+            }
+            ConnectionState::Connecting => (DotKind::Busy, "Connecting", None),
+            ConnectionState::Reconnecting => (DotKind::Busy, "Reconnecting", None),
+            ConnectionState::Disconnecting => (DotKind::Busy, "Disconnecting", None),
+            ConnectionState::Disconnected => (DotKind::Off, "Disconnected", None),
+        };
+        let lock_on = self.lock_session || self.lock_persistent;
+
+        let mut lines = column![
+            row![
+                container(Space::new()).width(8.0).height(8.0).style(theme::dot(kind)),
+                text(label).size(theme::TEXT_SM).font(theme::FONT_MEDIUM),
+            ]
+            .spacing(theme::SPACE_SM)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(2.0);
+        if let Some(name) = detail {
+            lines = lines.push(
+                container(text(name).size(theme::TEXT_XS).style(theme::text_muted))
+                    .padding(iced::Padding { left: 16.0, ..Default::default() }),
+            );
+        }
+        lines = lines.push(
+            row![
+                icon(if lock_on { Icon::Lock } else { Icon::LockOpen }, 12.0, Ink::Muted),
+                text(if lock_on { "Network lock on" } else { "Network lock off" })
+                    .size(theme::TEXT_XS)
+                    .style(theme::text_muted),
+            ]
+            .spacing(theme::SPACE_XS + 2.0)
+            .align_y(Alignment::Center),
+        );
+
+        container(lines).padding([theme::SPACE_SM, 10.0]).width(Fill).into()
     }
 }

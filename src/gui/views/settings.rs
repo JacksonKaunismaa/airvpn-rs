@@ -1,8 +1,8 @@
 //! Settings tab: profile options, per-connect flags, persistent lock controls.
 //! Organized into sub-tabs: General, Network, WireGuard, Network Lock, Advanced.
 
-use iced::widget::{button, checkbox, column, container, pick_list, row, scrollable, text, text_input};
-use iced::{Element, Fill};
+use iced::widget::{button, column, container, pick_list, row, scrollable, text, text_input, toggler, Space};
+use iced::{Alignment, Element, Fill, Length};
 
 use crate::theme;
 use crate::Message;
@@ -39,85 +39,138 @@ impl SettingsSubTab {
     }
 }
 
-/// Section header styled text.
-fn section_header(label: &str) -> iced::widget::Text<'_> {
-    text(label).size(16).color(theme::TEXT)
-}
+// ── Building blocks ────────────────────────────────────────────────────
 
-/// Hint text below a field.
-fn hint(s: &str) -> iced::widget::Text<'_> {
-    text(s).size(12).color(theme::TEXT_SECONDARY)
-}
+const INPUT_WIDTH: f32 = 240.0;
+const NUMBER_WIDTH: f32 = 120.0;
 
-/// A single sub-tab button in the pill bar.
-fn tab_button(tab: SettingsSubTab, active: bool) -> Element<'static, Message> {
-    let btn = button(text(tab.label()).size(13))
-        .on_press(Message::SettingsSubTabChanged(tab))
-        .padding([6, 16]);
-    if active {
-        btn.style(theme::pill_active)
-    } else {
-        btn.style(theme::pill_inactive)
+/// A titled group of rows inside one bordered panel, separated by hairlines.
+fn group<'a>(
+    title: &'a str,
+    description: Option<&'a str>,
+    rows: Vec<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    let mut heading = column![text(title).size(theme::TEXT_MD).font(theme::FONT_SEMIBOLD)].spacing(2.0);
+    if let Some(desc) = description {
+        heading = heading.push(text(desc).size(theme::TEXT_SM).style(theme::text_muted));
     }
-    .into()
-}
 
-/// A labeled text input row (label above).
-fn text_field<'a>(
-    field_label: &'a str,
-    placeholder: &'a str,
-    value: &'a str,
-    on_input: fn(String) -> Message,
-) -> Element<'a, Message> {
+    let mut list = column![].spacing(0);
+    let count = rows.len();
+    for (i, r) in rows.into_iter().enumerate() {
+        list = list.push(r);
+        if i + 1 < count {
+            list = list.push(container(Space::new()).width(Fill).height(1.0).style(theme::rule));
+        }
+    }
+
     column![
-        text(field_label).size(13).color(theme::TEXT_SECONDARY),
-        text_input(placeholder, value)
-            .on_input(on_input)
-            .style(theme::text_input_style)
-            .width(Fill),
+        container(heading).padding([0.0, 4.0]),
+        container(list).width(Fill).style(theme::panel),
     ]
-    .spacing(4.0)
+    .spacing(theme::SPACE_SM)
     .into()
 }
 
-/// A labeled dropdown row.
-fn dropdown_field<'a>(
-    field_label: &'a str,
-    options: Vec<&'a str>,
-    selected: Option<&'a str>,
-    on_select: impl Fn(&'a str) -> Message + 'a,
+/// Label (+ optional hint) on the left, control on the right.
+fn setting_row<'a>(
+    label: &'a str,
+    hint: Option<&'a str>,
+    control: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    column![
-        text(field_label).size(13).color(theme::TEXT_SECONDARY),
-        pick_list(options, selected, on_select).width(200),
-    ]
-    .spacing(4.0)
-    .into()
-}
-
-/// Wrap content in a card.
-fn section_card<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
-    container(content)
-        .padding(theme::SPACE_MD)
-        .width(Fill)
-        .style(theme::card)
+    let mut left = column![text(label).size(theme::TEXT_MD)].spacing(2.0).width(Fill);
+    if let Some(h) = hint {
+        left = left.push(text(h).size(theme::TEXT_XS).style(theme::text_muted));
+    }
+    row![left, control.into()]
+        .spacing(theme::SPACE_MD)
+        .padding([11, 16])
+        .align_y(Alignment::Center)
         .into()
 }
 
-/// Save button (always at the bottom).
-fn save_button(dirty: bool, loaded: bool) -> Element<'static, Message> {
-    let mut btn = button(
-        container(text("Save Settings").size(15).color(iced::Color::WHITE))
-            .width(Fill)
-            .center_x(Fill),
+fn toggle_row<'a>(
+    label: &'a str,
+    hint: Option<&'a str>,
+    value: bool,
+    on_toggle: impl Fn(bool) -> Message + 'a,
+) -> Element<'a, Message> {
+    setting_row(
+        label,
+        hint,
+        toggler(value).on_toggle(on_toggle).size(20).style(theme::toggler_style),
     )
-    .width(Fill)
-    .padding([10, 20])
-    .style(theme::primary_button);
+}
+
+fn input_row<'a>(
+    label: &'a str,
+    hint: Option<&'a str>,
+    placeholder: &'a str,
+    value: &'a str,
+    width: f32,
+    on_input: fn(String) -> Message,
+) -> Element<'a, Message> {
+    setting_row(
+        label,
+        hint,
+        text_input(placeholder, value)
+            .on_input(on_input)
+            .padding([7, 10])
+            .size(theme::TEXT_MD)
+            .style(theme::text_input_style)
+            .width(width),
+    )
+}
+
+fn select_row<'a>(
+    label: &'a str,
+    hint: Option<&'a str>,
+    options: Vec<&'a str>,
+    current: &'a str,
+    on_select: impl Fn(&'a str) -> Message + 'a,
+) -> Element<'a, Message> {
+    let selected = options.iter().find(|&&o| o == current).copied();
+    setting_row(
+        label,
+        hint,
+        pick_list(options, selected, on_select)
+            .padding([7, 10])
+            .text_size(theme::TEXT_MD)
+            .width(Length::Fixed(NUMBER_WIDTH + 40.0))
+            .style(theme::pick_list_style)
+            .menu_style(theme::menu_style),
+    )
+}
+
+/// One option in the sub-tab segmented control.
+fn tab_button(tab: SettingsSubTab, active: bool) -> Element<'static, Message> {
+    button(text(tab.label()).size(theme::TEXT_SM))
+        .on_press(Message::SettingsSubTabChanged(tab))
+        .padding([6, 14])
+        .style(theme::segment(active))
+        .into()
+}
+
+/// Bottom bar: change state + Save.
+fn save_bar(dirty: bool, loaded: bool) -> Element<'static, Message> {
+    let status = if dirty {
+        text("Unsaved changes").size(theme::TEXT_SM)
+    } else {
+        text("All changes saved").size(theme::TEXT_SM).style(theme::text_muted)
+    };
+    let mut btn = button(text("Save").size(theme::TEXT_MD).font(theme::FONT_MEDIUM))
+        .padding([8, 20])
+        .style(theme::primary_button);
     if dirty && loaded {
         btn = btn.on_press(Message::SaveSettings);
     }
-    btn.into()
+    column![
+        container(Space::new()).width(Fill).height(1.0).style(theme::rule),
+        row![status, Space::new().width(Fill), btn]
+            .align_y(Alignment::Center)
+            .padding(iced::Padding { top: 12.0, ..Default::default() }),
+    ]
+    .into()
 }
 
 /// Render the settings tab.
@@ -178,16 +231,17 @@ pub fn view<'a>(
     check_route: bool,
 ) -> Element<'a, Message> {
     if !loaded {
-        return container(text("Loading settings...").size(16).color(theme::TEXT_SECONDARY))
+        return container(text("Loading settings\u{2026}").size(theme::TEXT_MD).style(theme::text_muted))
             .padding(theme::SPACE_MD)
             .into();
     }
 
-    // Sub-tab pill bar
-    let mut tab_bar = row![].spacing(4.0);
+    // Sub-tab segmented control
+    let mut tabs = row![].spacing(2.0);
     for &tab in SettingsSubTab::all() {
-        tab_bar = tab_bar.push(tab_button(tab, tab == sub_tab));
+        tabs = tabs.push(tab_button(tab, tab == sub_tab));
     }
+    let tab_bar = container(tabs).padding(3).style(theme::segment_track);
 
     // Content for the selected sub-tab
     let tab_content: Element<'a, Message> = match sub_tab {
@@ -234,15 +288,16 @@ pub fn view<'a>(
         ),
     };
 
-    let content = column![
-        tab_bar,
-        tab_content,
-        save_button(dirty, loaded),
-    ]
-    .spacing(theme::SPACE_MD);
+    let body = scrollable(
+        container(tab_content)
+            .max_width(680)
+            .padding(iced::Padding { top: 0.0, right: 14.0, bottom: theme::SPACE_MD, left: 0.0 }),
+    )
+    .style(theme::scrollable_style)
+    .height(Fill);
 
-    scrollable(container(content).padding([0.0, 4.0]))
-        .height(Fill)
+    column![tab_bar, body, save_bar(dirty, loaded)]
+        .spacing(theme::SPACE_LG)
         .into()
 }
 
@@ -257,69 +312,56 @@ fn view_general<'a>(
     ui_unit: &'a str,
     ui_iec: bool,
 ) -> Element<'a, Message> {
-    let mut sections = column![].spacing(theme::SPACE_MD);
-
-    // Credentials
-    let cred_content = if credentials_configured {
-        text("Credentials configured")
-            .size(14)
-            .color(theme::SUCCESS)
+    let credentials: Element<'a, Message> = if credentials_configured {
+        text("Configured").size(theme::TEXT_MD).style(theme::text_accent).into()
     } else {
-        text("Credentials not configured — run `sudo airvpn connect` or import from Eddie")
-            .size(14)
-            .color(theme::WARNING)
+        text("Not configured").size(theme::TEXT_MD).style(theme::text_warning).into()
     };
-    sections = sections.push(section_card(
-        column![section_header("Credentials"), cred_content].spacing(theme::SPACE_SM),
-    ));
+    let credentials_hint = if credentials_configured {
+        None
+    } else {
+        Some("Run `sudo airvpn connect` or import from Eddie")
+    };
 
-    // Server Preferences
-    sections = sections.push(section_card(
-        column![
-            section_header("Server Preferences"),
-            checkbox(connect)
-                .label("Connect at startup")
-                .on_toggle(Message::SettingsConnectToggle),
-            hint("Automatically connect to the best server at boot (via airvpn-autoconnect.service)."),
-            checkbox(startlast)
-                .label("Start with last server")
-                .on_toggle(Message::SettingsStartlastToggle),
-            checkbox(locklast)
-                .label("Lock to server during session")
-                .on_toggle(Message::SettingsLocklastToggle),
-        ]
-        .spacing(theme::SPACE_SM),
-    ));
-
-    // GUI
-    sections = sections.push(section_card(
-        column![
-            section_header("GUI"),
-            checkbox(show_errors)
-                .label("Show error messages")
-                .on_toggle(Message::ShowErrorsToggle),
-        ]
-        .spacing(theme::SPACE_SM),
-    ));
-
-    // Display Units
-    let unit_options: Vec<&str> = vec!["bytes", "bits"];
-    let unit_selected: Option<&str> = unit_options.iter().find(|&&o| o == ui_unit).copied();
-
-    sections = sections.push(section_card(
-        column![
-            section_header("Display Units"),
-            dropdown_field("Speed / Transfer Unit", unit_options, unit_selected, |selected: &str| {
-                Message::SettingsUiUnitChanged(selected.to_string())
-            }),
-            checkbox(ui_iec)
-                .label("Use binary IEC units (KiB/MiB instead of KB/MB)")
-                .on_toggle(Message::SettingsUiIecToggle),
-        ]
-        .spacing(theme::SPACE_SM),
-    ));
-
-    sections.into()
+    column![
+        group("Account", None, vec![setting_row("Credentials", credentials_hint, credentials)]),
+        group(
+            "Server preferences",
+            None,
+            vec![
+                toggle_row(
+                    "Connect at startup",
+                    Some("Connect to the best server at boot (airvpn-autoconnect.service)"),
+                    connect,
+                    Message::SettingsConnectToggle,
+                ),
+                toggle_row("Start with last server", None, startlast, Message::SettingsStartlastToggle),
+                toggle_row("Lock to server during session", None, locklast, Message::SettingsLocklastToggle),
+            ],
+        ),
+        group(
+            "Display",
+            None,
+            vec![
+                toggle_row("Show error messages", None, show_errors, Message::ShowErrorsToggle),
+                select_row(
+                    "Speed and transfer unit",
+                    None,
+                    vec!["bytes", "bits"],
+                    ui_unit,
+                    |selected: &str| Message::SettingsUiUnitChanged(selected.to_string()),
+                ),
+                toggle_row(
+                    "Binary units",
+                    Some("KiB/MiB instead of KB/MB"),
+                    ui_iec,
+                    Message::SettingsUiIecToggle,
+                ),
+            ],
+        ),
+    ]
+    .spacing(theme::SPACE_LG)
+    .into()
 }
 
 // ── Network sub-tab ────────────────────────────────────────────────────
@@ -335,98 +377,86 @@ fn view_network<'a>(
     areas_allowlist: &'a str,
     areas_denylist: &'a str,
 ) -> Element<'a, Message> {
-    let mut sections = column![].spacing(theme::SPACE_MD);
-
-    // IP modes
-    let ipv6_options: Vec<&str> = vec!["in", "in-block", "block"];
-    let ipv6_selected: Option<&str> = ipv6_options.iter().find(|&&o| o == ipv6_mode).copied();
-    let ipv4_options: Vec<&str> = vec!["in", "block"];
-    let ipv4_selected: Option<&str> = ipv4_options.iter().find(|&&o| o == ipv4_mode).copied();
-
-    sections = sections.push(section_card(
-        column![
-            section_header("Network"),
-            dropdown_field("IPv6 Mode", ipv6_options, ipv6_selected, |selected: &str| {
-                Message::SettingsIpv6ModeChanged(selected.to_string())
-            }),
-            dropdown_field("IPv4 Mode", ipv4_options, ipv4_selected, |selected: &str| {
-                Message::SettingsIpv4ModeChanged(selected.to_string())
-            }),
-            text_field(
-                "Entry Interface",
-                "empty = auto (e.g. eth0, wlan0)",
-                entry_iface,
-                Message::SettingsEntryIfaceChanged,
-            ),
-            text_field(
-                "Custom DNS",
-                "8.8.8.8, 1.1.1.1",
-                dns,
-                Message::SettingsDnsChanged,
-            ),
-        ]
-        .spacing(theme::SPACE_SM),
-    ));
-
-    // DNS Configuration
-    let dns_mode_options: Vec<&str> = vec!["auto", "resolvconf", "systemd-resolved"];
-    let dns_mode_selected: Option<&str> = dns_mode_options.iter().find(|&&o| o == dns_mode).copied();
-
-    sections = sections.push(section_card(
-        column![
-            section_header("DNS Configuration"),
-            dropdown_field("DNS Mode", dns_mode_options, dns_mode_selected, |selected: &str| {
-                Message::SettingsDnsModeChanged(selected.to_string())
-            }),
-            hint("auto = detect systemd-resolved; resolvconf = force /etc/resolv.conf swap"),
-            text_field(
-                "DNS Cache Services",
-                "nscd,dnsmasq,named,bind9",
-                dns_services,
-                Message::SettingsDnsServicesChanged,
-            ),
-            hint("Services restarted on DNS flush (comma-separated)"),
-        ]
-        .spacing(theme::SPACE_SM),
-    ));
-
-    // Custom routes
-    sections = sections.push(section_card(
-        column![
-            section_header("Custom Routes"),
-            hint("Routes with 'out' bypass the VPN. Routes with 'in' force through tunnel."),
-            text_field(
-                "Custom Routes",
+    column![
+        group(
+            "Network",
+            None,
+            vec![
+                select_row("IPv6 mode", None, vec!["in", "in-block", "block"], ipv6_mode, |selected: &str| {
+                    Message::SettingsIpv6ModeChanged(selected.to_string())
+                }),
+                select_row("IPv4 mode", None, vec!["in", "block"], ipv4_mode, |selected: &str| {
+                    Message::SettingsIpv4ModeChanged(selected.to_string())
+                }),
+                input_row(
+                    "Entry interface",
+                    Some("Empty = auto"),
+                    "eth0, wlan0",
+                    entry_iface,
+                    INPUT_WIDTH,
+                    Message::SettingsEntryIfaceChanged,
+                ),
+                input_row("Custom DNS", None, "8.8.8.8, 1.1.1.1", dns, INPUT_WIDTH, Message::SettingsDnsChanged),
+            ],
+        ),
+        group(
+            "DNS configuration",
+            None,
+            vec![
+                select_row(
+                    "DNS mode",
+                    Some("auto detects systemd-resolved; resolvconf swaps /etc/resolv.conf"),
+                    vec!["auto", "resolvconf", "systemd-resolved"],
+                    dns_mode,
+                    |selected: &str| Message::SettingsDnsModeChanged(selected.to_string()),
+                ),
+                input_row(
+                    "DNS cache services",
+                    Some("Restarted on DNS flush, comma-separated"),
+                    "nscd,dnsmasq,named,bind9",
+                    dns_services,
+                    INPUT_WIDTH,
+                    Message::SettingsDnsServicesChanged,
+                ),
+            ],
+        ),
+        group(
+            "Custom routes",
+            Some("Routes marked 'out' bypass the VPN; 'in' forces them through the tunnel."),
+            vec![input_row(
+                "Routes",
+                None,
                 "192.168.1.0/24,out; 10.0.0.0/8,in",
                 routes_custom,
+                INPUT_WIDTH,
                 Message::SettingsRoutesCustomChanged,
-            ),
-        ]
-        .spacing(theme::SPACE_SM),
-    ));
-
-    // Country filters
-    sections = sections.push(section_card(
-        column![
-            section_header("Country Filters"),
-            hint("Restrict which countries are used for server selection."),
-            text_field(
-                "Allowed Countries",
-                "US, NL, DE (empty = all)",
-                areas_allowlist,
-                Message::SettingsAreasAllowlistChanged,
-            ),
-            text_field(
-                "Denied Countries",
-                "CN, RU (empty = none)",
-                areas_denylist,
-                Message::SettingsAreasDenylistChanged,
-            ),
-        ]
-        .spacing(theme::SPACE_SM),
-    ));
-
-    sections.into()
+            )],
+        ),
+        group(
+            "Country filters",
+            Some("Restrict which countries are used for server selection."),
+            vec![
+                input_row(
+                    "Allowed countries",
+                    Some("Empty = all"),
+                    "US, NL, DE",
+                    areas_allowlist,
+                    INPUT_WIDTH,
+                    Message::SettingsAreasAllowlistChanged,
+                ),
+                input_row(
+                    "Denied countries",
+                    Some("Empty = none"),
+                    "CN, RU",
+                    areas_denylist,
+                    INPUT_WIDTH,
+                    Message::SettingsAreasDenylistChanged,
+                ),
+            ],
+        ),
+    ]
+    .spacing(theme::SPACE_LG)
+    .into()
 }
 
 // ── WireGuard sub-tab ──────────────────────────────────────────────────
@@ -438,30 +468,36 @@ fn view_wireguard<'a>(
     wg_handshake_connected: &'a str,
 ) -> Element<'a, Message> {
     // Device/key selection now lives on the Overview, not here.
-    section_card(
-        column![
-            section_header("WireGuard"),
-            text_field("Interface MTU", "1320", wg_mtu, Message::SettingsWgMtuChanged),
-            text_field(
-                "Persistent Keepalive (s)",
+    group(
+        "WireGuard",
+        None,
+        vec![
+            input_row("Interface MTU", None, "1320", wg_mtu, NUMBER_WIDTH, Message::SettingsWgMtuChanged),
+            input_row(
+                "Persistent keepalive",
+                Some("Seconds"),
                 "15",
                 wg_keepalive,
+                NUMBER_WIDTH,
                 Message::SettingsWgKeepaliveChanged,
             ),
-            text_field(
-                "Handshake Timeout — First (s)",
+            input_row(
+                "Handshake timeout, first",
+                Some("Seconds"),
                 "50",
                 wg_handshake_first,
+                NUMBER_WIDTH,
                 Message::SettingsWgHandshakeFirstChanged,
             ),
-            text_field(
-                "Handshake Timeout — Connected (s)",
+            input_row(
+                "Handshake timeout, connected",
+                Some("Seconds"),
                 "200",
                 wg_handshake_connected,
+                NUMBER_WIDTH,
                 Message::SettingsWgHandshakeConnectedChanged,
             ),
-        ]
-        .spacing(theme::SPACE_SM),
+        ],
     )
 }
 
@@ -479,141 +515,105 @@ fn view_network_lock<'a>(
     netlock_allowlist_ips: &'a str,
     netlock_local_forward_ifaces: &'a str,
 ) -> Element<'a, Message> {
-    let mut sections = column![].spacing(theme::SPACE_MD);
+    // Persistent lock status + controls
+    let (lock_status, lock_style): (&str, fn(&iced::Theme) -> iced::widget::text::Style) =
+        if lock_installed && lock_persistent {
+            ("Installed and active", theme::text_accent)
+        } else if lock_installed {
+            ("Installed, inactive", theme::text_warning)
+        } else {
+            ("Not installed", theme::text_muted)
+        };
 
-    // Connection settings
-    sections = sections.push(section_card(
-        column![
-            section_header("Connection"),
-            checkbox(!no_lock)
-                .label("Network lock (kill switch)")
-                .on_toggle(|checked| Message::ConnectNoLockToggle(!checked)),
-            checkbox(allow_lan)
-                .label("Allow LAN traffic")
-                .on_toggle(Message::ConnectAllowLanToggle),
-            checkbox(!no_reconnect)
-                .label("Auto-reconnect")
-                .on_toggle(|checked| Message::ConnectNoReconnectToggle(!checked)),
-            checkbox(no_verify)
-                .label("Skip tunnel verification")
-                .on_toggle(Message::ConnectNoVerifyToggle),
-        ]
-        .spacing(theme::SPACE_SM),
-    ));
+    let lock_button = |label: &'a str, enabled: bool, msg: Message| -> Element<'a, Message> {
+        let mut btn = button(text(label).size(theme::TEXT_SM))
+            .padding([6, 12])
+            .style(theme::secondary_button);
+        if enabled {
+            btn = btn.on_press(msg);
+        }
+        btn.into()
+    };
+    let lock_buttons = row![
+        lock_button("Install", !lock_installed, Message::LockInstall),
+        lock_button("Uninstall", lock_installed, Message::LockUninstall),
+        lock_button("Enable", lock_installed && !lock_persistent, Message::LockEnable),
+        lock_button("Disable", lock_installed && lock_persistent, Message::LockDisable),
+    ]
+    .spacing(theme::SPACE_SM);
 
-    // Policy settings
-    let incoming_options: Vec<&str> = vec!["block", "allow"];
-    let incoming_selected: Option<&str> = incoming_options
-        .iter()
-        .find(|&&o| o == netlock_incoming)
-        .copied();
-
-    sections = sections.push(section_card(
-        column![
-            section_header("Lock Policy"),
-            dropdown_field("Incoming Policy", incoming_options, incoming_selected, |selected: &str| {
-                Message::SettingsNetlockIncomingChanged(selected.to_string())
-            }),
-            checkbox(netlock_allow_ping)
-                .label("Allow ICMP ping")
-                .on_toggle(Message::SettingsNetlockAllowPingToggle),
-        ]
-        .spacing(theme::SPACE_SM),
-    ));
-
-    // Allowlist IPs
-    sections = sections.push(section_card(
-        column![
-            section_header("Allowlist"),
-            hint("CIDRs that pass through the kill switch (no routing change)."),
-            text_field(
+    column![
+        group(
+            "Connection",
+            None,
+            vec![
+                toggle_row(
+                    "Network lock",
+                    Some("Kill switch: block traffic outside the tunnel"),
+                    !no_lock,
+                    |checked| Message::ConnectNoLockToggle(!checked),
+                ),
+                toggle_row("Allow LAN traffic", None, allow_lan, Message::ConnectAllowLanToggle),
+                toggle_row("Auto-reconnect", None, !no_reconnect, |checked| {
+                    Message::ConnectNoReconnectToggle(!checked)
+                }),
+                toggle_row("Skip tunnel verification", None, no_verify, Message::ConnectNoVerifyToggle),
+            ],
+        ),
+        group(
+            "Persistent lock",
+            Some("Keeps the kill switch in place across reboots and disconnects."),
+            vec![
+                setting_row("Status", None, text(lock_status).size(theme::TEXT_MD).style(lock_style)),
+                container(lock_buttons).padding([11, 16]).into(),
+            ],
+        ),
+        group(
+            "Lock policy",
+            None,
+            vec![
+                select_row("Incoming policy", None, vec!["block", "allow"], netlock_incoming, |selected: &str| {
+                    Message::SettingsNetlockIncomingChanged(selected.to_string())
+                }),
+                toggle_row("Allow ICMP ping", None, netlock_allow_ping, Message::SettingsNetlockAllowPingToggle),
+            ],
+        ),
+        group(
+            "Allowlist",
+            Some("CIDRs that pass through the kill switch (no routing change)."),
+            vec![input_row(
                 "Allowlist IPs",
+                None,
                 "1.2.3.4, 5.6.7.0/24",
                 netlock_allowlist_ips,
+                INPUT_WIDTH,
                 Message::SettingsNetlockAllowlistIpsChanged,
-            ),
-        ]
-        .spacing(theme::SPACE_SM),
-    ));
-
-    // Local Forward Interfaces
-    sections = sections.push(section_card(
-        column![
-            section_header("Local Forward"),
-            hint("Local interfaces forwarded through the VPN tunnel with masquerade (e.g. phone-relay)."),
-            text_field(
-                "Forward Interfaces",
-                "phone-relay",
-                netlock_local_forward_ifaces,
-                Message::SettingsNetlockLocalForwardIfacesChanged,
-            ),
-            hint("Comma-separated. Adds FORWARD + NAT rules so these interfaces route through the tunnel."),
-            text("Requires persistent lock reinstall + reconnect to take effect.")
-                .size(12).color(theme::WARNING),
-        ]
-        .spacing(theme::SPACE_SM),
-    ));
-
-    // Persistent Lock controls
-    let lock_status = if lock_installed && lock_persistent {
-        "Installed and active"
-    } else if lock_installed {
-        "Installed but inactive"
-    } else {
-        "Not installed"
-    };
-    let lock_status_color = if lock_installed && lock_persistent {
-        theme::SUCCESS
-    } else if lock_installed {
-        theme::WARNING
-    } else {
-        theme::TEXT_SECONDARY
-    };
-
-    let mut lock_buttons = row![].spacing(theme::SPACE_SM);
-
-    let mut install_btn = button(text("Install").size(14))
-        .padding([8, 16])
-        .style(theme::secondary_button);
-    if !lock_installed {
-        install_btn = install_btn.on_press(Message::LockInstall);
-    }
-    lock_buttons = lock_buttons.push(install_btn);
-
-    let mut uninstall_btn = button(text("Uninstall").size(14))
-        .padding([8, 16])
-        .style(theme::secondary_button);
-    if lock_installed {
-        uninstall_btn = uninstall_btn.on_press(Message::LockUninstall);
-    }
-    lock_buttons = lock_buttons.push(uninstall_btn);
-
-    let mut enable_btn = button(text("Enable").size(14))
-        .padding([8, 16])
-        .style(theme::secondary_button);
-    if lock_installed && !lock_persistent {
-        enable_btn = enable_btn.on_press(Message::LockEnable);
-    }
-    lock_buttons = lock_buttons.push(enable_btn);
-
-    let mut disable_btn = button(text("Disable").size(14))
-        .padding([8, 16])
-        .style(theme::secondary_button);
-    if lock_installed && lock_persistent {
-        disable_btn = disable_btn.on_press(Message::LockDisable);
-    }
-    lock_buttons = lock_buttons.push(disable_btn);
-
-    sections = sections.push(section_card(
-        column![
-            section_header("Persistent Lock"),
-            text(lock_status).size(14).color(lock_status_color),
-            lock_buttons,
-        ]
-        .spacing(theme::SPACE_SM),
-    ));
-
-    sections.into()
+            )],
+        ),
+        group(
+            "Local forward",
+            Some("Local interfaces forwarded through the tunnel with masquerade (e.g. phone-relay)."),
+            vec![
+                input_row(
+                    "Forward interfaces",
+                    Some("Comma-separated; adds FORWARD + NAT rules"),
+                    "phone-relay",
+                    netlock_local_forward_ifaces,
+                    INPUT_WIDTH,
+                    Message::SettingsNetlockLocalForwardIfacesChanged,
+                ),
+                container(
+                    text("Requires persistent lock reinstall + reconnect to take effect.")
+                        .size(theme::TEXT_XS)
+                        .style(theme::text_warning),
+                )
+                .padding([10, 16])
+                .into(),
+            ],
+        ),
+    ]
+    .spacing(theme::SPACE_LG)
+    .into()
 }
 
 // ── Advanced sub-tab ───────────────────────────────────────────────────
@@ -631,59 +631,58 @@ fn view_advanced<'a>(
     mode_port: &'a str,
     check_route: bool,
 ) -> Element<'a, Message> {
-    let mut sections = column![].spacing(theme::SPACE_MD);
-
-    // Tuning
-    sections = sections.push(section_card(
-        column![
-            section_header("Tuning"),
-            text_field("Pinger Timeout (s)", "3", pinger_timeout, Message::SettingsPingerTimeoutChanged),
-            text_field("Manifest Refresh Interval (s)", "1800", manifest_refresh, Message::SettingsManifestRefreshChanged),
-            text_field("Penalty on Error", "30", penality, Message::SettingsPenalityChanged),
-            text_field("HTTP Timeout (s)", "10", http_timeout, Message::SettingsHttpTimeoutChanged),
-            text_field("Verification Retries", "3", checking_ntry, Message::SettingsCheckingNtryChanged),
-            text_field("Capacity Factor (0 = off)", "0", capacity_factor, Message::SettingsCapacityFactorChanged),
-        ]
-        .spacing(theme::SPACE_SM),
-    ));
-
-    // WireGuard Mode
-    sections = sections.push(section_card(
-        column![
-            section_header("WireGuard Mode"),
-            text_field("Force Port", "empty = auto", mode_port, Message::SettingsModePortChanged),
-            hint("Force a specific WireGuard port (e.g. 1637). Empty = auto-select."),
-        ]
-        .spacing(theme::SPACE_SM),
-    ));
-
-    // Logging
-    sections = sections.push(section_card(
-        column![
-            section_header("Logging"),
-            checkbox(log_file_enabled)
-                .label("Enable file logging")
-                .on_toggle(Message::SettingsLogFileEnabledToggle),
-            text_field("Log File Path", "/var/log/airvpn-rs/helper.log", log_file_path, Message::SettingsLogFilePathChanged),
-            checkbox(log_level_debug)
-                .label("Enable debug logging")
-                .on_toggle(Message::SettingsLogLevelDebugToggle),
-            hint("Debug level applies immediately. File path changes require helper restart."),
-        ]
-        .spacing(theme::SPACE_SM),
-    ));
-
-    // Verification
-    sections = sections.push(section_card(
-        column![
-            section_header("Verification"),
-            checkbox(check_route)
-                .label("Verify routes after connect")
-                .on_toggle(Message::SettingsCheckRouteToggle),
-            hint("Check routing table is correctly configured post-connection."),
-        ]
-        .spacing(theme::SPACE_SM),
-    ));
-
-    sections.into()
+    column![
+        group(
+            "Tuning",
+            None,
+            vec![
+                input_row("Pinger timeout", Some("Seconds"), "3", pinger_timeout, NUMBER_WIDTH, Message::SettingsPingerTimeoutChanged),
+                input_row("Manifest refresh interval", Some("Seconds"), "1800", manifest_refresh, NUMBER_WIDTH, Message::SettingsManifestRefreshChanged),
+                input_row("Penalty on error", None, "30", penality, NUMBER_WIDTH, Message::SettingsPenalityChanged),
+                input_row("HTTP timeout", Some("Seconds"), "10", http_timeout, NUMBER_WIDTH, Message::SettingsHttpTimeoutChanged),
+                input_row("Verification retries", None, "3", checking_ntry, NUMBER_WIDTH, Message::SettingsCheckingNtryChanged),
+                input_row("Capacity factor", Some("0 = off"), "0", capacity_factor, NUMBER_WIDTH, Message::SettingsCapacityFactorChanged),
+            ],
+        ),
+        group(
+            "WireGuard mode",
+            None,
+            vec![input_row(
+                "Force port",
+                Some("e.g. 1637; empty = auto-select"),
+                "auto",
+                mode_port,
+                NUMBER_WIDTH,
+                Message::SettingsModePortChanged,
+            )],
+        ),
+        group(
+            "Logging",
+            Some("Debug level applies immediately. File path changes require a helper restart."),
+            vec![
+                toggle_row("File logging", None, log_file_enabled, Message::SettingsLogFileEnabledToggle),
+                input_row(
+                    "Log file path",
+                    None,
+                    "/var/log/airvpn-rs/helper.log",
+                    log_file_path,
+                    INPUT_WIDTH,
+                    Message::SettingsLogFilePathChanged,
+                ),
+                toggle_row("Debug logging", None, log_level_debug, Message::SettingsLogLevelDebugToggle),
+            ],
+        ),
+        group(
+            "Verification",
+            None,
+            vec![toggle_row(
+                "Verify routes after connect",
+                Some("Check the routing table is correct once connected"),
+                check_route,
+                Message::SettingsCheckRouteToggle,
+            )],
+        ),
+    ]
+    .spacing(theme::SPACE_LG)
+    .into()
 }
