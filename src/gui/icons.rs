@@ -1,5 +1,5 @@
 //! Line icons as inline SVG, tinted per theme via [`theme::ink`].
-//! Paths adapted from Lucide (https://lucide.dev, ISC license).
+//! Paths adapted from Lucide (https://lucide.dev); see resources/LUCIDE-LICENSE.txt.
 
 use iced::widget::svg;
 use iced::Element;
